@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>gputemp</AssemblyName>
+    <RootNamespace>gputemp</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- 0.9.3 提供 net6/net7/netstandard2.0 目标，依赖 System.Management 8.0（net8 兼容）；
+         0.9.4+ 依赖 System.Management 9/10，无法在 net8 下还原 -->
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.3" />
+  </ItemGroup>
+</Project>

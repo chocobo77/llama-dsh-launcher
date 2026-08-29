@@ -1,0 +1,237 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Window x:Class="LlamaDSH_Launcher.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:local="clr-namespace:LlamaDSH_Launcher" Title="DeepSeek Harness &amp; Llama 启动器" Width="1400" Height="950" MinWidth="1000" MinHeight="700" Background="#1a1a2e" WindowStartupLocation="CenterScreen" Closing="Window_Closing" Loaded="Window_Loaded">
+  <FrameworkElement.Resources>
+    <ResourceDictionary>
+      <Style x:Key="{x:Type local:NoScrollComboBox}" TargetType="{x:Type local:NoScrollComboBox}">
+        <Setter Property="Background" Value="#161b22" />
+        <Setter Property="Foreground" Value="#c9d1d9" />
+        <Setter Property="BorderBrush" Value="#30363d" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="Padding" Value="6,3" />
+        <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Auto" />
+        <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Auto" />
+        <Setter Property="ItemContainerStyle">
+          <Setter.Value>
+            <Style TargetType="{x:Type ComboBoxItem}">
+              <Setter Property="Foreground" Value="#c9d1d9" />
+              <Setter Property="Background" Value="#161b22" />
+              <Setter Property="Padding" Value="6,3" />
+              <Style.Triggers>
+                <Trigger Property="ComboBoxItem.IsHighlighted" Value="True">
+                  <Setter Property="Background" Value="#1f2937" />
+                  <Setter Property="Foreground" Value="#e6edf3" />
+                </Trigger>
+                <Trigger Property="ListBoxItem.IsSelected" Value="True">
+                  <Setter Property="Background" Value="#1f6feb" />
+                  <Setter Property="Foreground" Value="#ffffff" />
+                </Trigger>
+              </Style.Triggers>
+            </Style>
+          </Setter.Value>
+        </Setter>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="{x:Type local:NoScrollComboBox}">
+              <Grid>
+                <ToggleButton Name="ToggleButton" Background="{TemplateBinding Control.Background}" BorderBrush="{TemplateBinding Control.BorderBrush}" BorderThickness="{TemplateBinding Control.BorderThickness}" ClickMode="Press" Focusable="False" IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                  <Control.Template>
+                    <ControlTemplate TargetType="{x:Type ToggleButton}">
+                      <Border Name="bd" Background="{TemplateBinding Control.Background}" BorderBrush="{TemplateBinding Control.BorderBrush}" BorderThickness="{TemplateBinding Control.BorderThickness}" CornerRadius="2" Padding="6,3">
+                        <Path Data="M0,0 L4,4 L8,0" Fill="{TemplateBinding Control.Foreground}" Width="8" Height="4" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,4,0" />
+                      </Border>
+                    </ControlTemplate>
+                  </Control.Template>
+                </ToggleButton>
+                <ContentPresenter Name="ContentSite" IsHitTestVisible="False" Content="{TemplateBinding ComboBox.SelectionBoxItem}" ContentTemplate="{TemplateBinding ComboBox.SelectionBoxItemTemplate}" ContentTemplateSelector="{TemplateBinding ItemsControl.ItemTemplateSelector}" Margin="7,3,25,3" HorizontalAlignment="Left" VerticalAlignment="Center" TextElement.Foreground="{TemplateBinding Control.Foreground}" />
+                <TextBox Name="PART_EditableTextBox" Background="#00FFFFFF" Foreground="{TemplateBinding Control.Foreground}" CaretBrush="{TemplateBinding Control.Foreground}" SelectionBrush="#1f6feb" BorderThickness="0" Padding="0" Margin="7,3,25,3" HorizontalAlignment="Stretch" VerticalAlignment="Center" Focusable="True" IsReadOnly="False" Visibility="Hidden" />
+                <Popup Name="Popup" IsOpen="{TemplateBinding ComboBox.IsDropDownOpen}" Placement="Bottom" AllowsTransparency="True" Focusable="False" PopupAnimation="Slide">
+                  <Border Name="DropDown" Background="{TemplateBinding Control.Background}" BorderBrush="{TemplateBinding Control.BorderBrush}" BorderThickness="1" CornerRadius="2" MinWidth="{TemplateBinding FrameworkElement.ActualWidth}" MaxHeight="{TemplateBinding ComboBox.MaxDropDownHeight}">
+                    <ScrollViewer>
+                      <StackPanel IsItemsHost="True" />
+                    </ScrollViewer>
+                  </Border>
+                </Popup>
+              </Grid>
+              <ControlTemplate.Triggers>
+                <Trigger Property="ComboBox.IsEditable" Value="True">
+                  <Setter TargetName="ContentSite" Property="Visibility" Value="Hidden" />
+                  <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible" />
+                </Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
+    </ResourceDictionary>
+  </FrameworkElement.Resources>
+  <Grid>
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="1.1*" />
+      <ColumnDefinition Width="1*" />
+    </Grid.ColumnDefinitions>
+    <ScrollViewer Name="LeftScroll" Grid.Column="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="8">
+      <StackPanel Name="LeftPanel">
+        <WrapPanel Margin="0,0,0,8">
+          <Button Content="💾 保存配置" Margin="0,0,6,0" ToolTip="保存当前配置到默认路径" Click="QuickSave_Click" />
+          <Button Content="📤 另存为" Margin="0,0,6,0" Click="SaveAs_Click" />
+          <Button Content="📥 加载配置" Margin="0,0,6,0" Click="LoadConfig_Click" />
+          <Button Content="📁 更改路径" ToolTip="自定义配置文件存放目录" Click="ChangeConfigPath_Click" />
+        </WrapPanel>
+        <Grid Margin="0,0,0,8">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+          </Grid.ColumnDefinitions>
+          <Label Content="方案:" VerticalAlignment="Center" Foreground="#e0e0e0" />
+          <local:NoScrollComboBox x:Name="ComboProfile" SelectionChanged="ProfileChanged" Grid.Column="1" Margin="4,0" />
+          <Button Name="BtnSaveProfile" Content="💾 保存" Grid.Column="2" Margin="4,0,0,0" Click="SaveProfile_Click" />
+          <Button Content="✏️ 重命名" Grid.Column="3" Margin="4,0,0,0" Click="RenameProfile_Click" />
+          <Button Content="➕ 新建" Grid.Column="4" Margin="4,0,0,0" Click="NewProfile_Click" />
+          <Button Name="BtnDeleteProfile" Content="🗑 删除" Grid.Column="5" Margin="4,0,0,0" Click="DeleteProfile_Click" />
+        </Grid>
+        <GroupBox Header="📂 路径配置">
+          <StackPanel>
+            <DockPanel Margin="0,0,0,6">
+              <Label Content="主模型路径:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
+              <Button Content="浏览..." DockPanel.Dock="Right" Margin="4,0,0,0" Click="BrowseModel_Click" />
+              <TextBox Name="InputModelPath" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+            </DockPanel>
+            <DockPanel Margin="0,0,0,6">
+              <Label Content="草稿模型 (MTP):" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
+              <Button Content="浏览..." DockPanel.Dock="Right" Margin="4,0,0,0" Click="BrowseMtp_Click" />
+              <TextBox Name="InputMtpPath" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+            </DockPanel>
+            <DockPanel Margin="0,0,0,6">
+              <Label Content="Llama 程序目录:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
+              <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                <Button Content="浏览..." Margin="4,0,0,0" Click="BrowseLlama_Click" />
+                <Button Name="BtnSearchLlama" Content="🔍 自动检索" Margin="4,0,0,0" ToolTip="自动检索 llama-server.exe 所在目录" Click="SearchLlama_Click" />
+              </StackPanel>
+              <TextBox Name="InputLlamaDir" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+            </DockPanel>
+            <DockPanel Margin="0,0,0,6">
+              <Label Content="DSH 启动模式:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
+              <local:NoScrollComboBox x:Name="ComboDshMode" SelectionChanged="DshModeChanged" DockPanel.Dock="Left" Width="280">
+                <ComboBoxItem Content="编译版 (node lib/bin.js，优先)" IsSelected="True" />
+                <ComboBoxItem Content="一键部署 (npx --yes @deepseek-ai/dsh web)" />
+              </local:NoScrollComboBox>
+            </DockPanel>
+            <DockPanel Margin="0,0,0,6">
+              <Label Content="DSH 项目目录:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
+              <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                <Button Content="浏览..." Margin="4,0,0,0" Click="BrowseDsh_Click" />
+                <Button Name="BtnSearchDsh" Content="🔍 自动检索" Margin="4,0,0,0" ToolTip="自动检索 DSH 项目目录（deepseek-harness）" Click="SearchDsh_Click" />
+              </StackPanel>
+              <TextBox Name="InputDshDir" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+            </DockPanel>
+          </StackPanel>
+        </GroupBox>
+        <StackPanel Name="ParamGroupsPanel" />
+        <Expander Header="📋 命令预览（点击折叠）" IsExpanded="True" Margin="0,6,0,0">
+          <StackPanel>
+            <TextBox Name="CmdPreview" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" MinHeight="200" MaxHeight="500" Background="#0d1117" Foreground="#7ee787" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" BorderBrush="#30363d" BorderThickness="1" />
+            <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+              <Button Content="🔄 刷新命令" Margin="0,0,6,0" Click="RefreshCmd_Click" />
+              <Button Content="📋 复制命令" Click="CopyCmd_Click" />
+            </StackPanel>
+          </StackPanel>
+        </Expander>
+      </StackPanel>
+    </ScrollViewer>
+    <Grid Column="1" Margin="8">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="*" />
+      </Grid.RowDefinitions>
+      <CheckBox Name="ChkMinimizeToTray" Content="📌 关闭时最小化到托盘" Grid.Row="0" IsChecked="True" HorizontalAlignment="Right" Margin="0,0,0,8" Foreground="#c9d1d9" />
+      <GroupBox Header="⚡ 服务与性能" Grid.Row="1">
+        <StackPanel>
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*" />
+              <ColumnDefinition Width="16" />
+              <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0">
+              <Button Name="BtnLlamaStart" Content="▶ 启动 Llama" Background="#238636" Foreground="#FFFFFFFF" Margin="0,0,0,4" FontSize="13" Click="StartLlama_Click" />
+              <Button Name="BtnLlamaStop" Content="⏹ 停止 Llama" Background="#da3633" Foreground="#FFFFFFFF" IsEnabled="False" Margin="0,0,0,4" FontSize="13" Click="StopLlama_Click" />
+              <TextBlock Name="LblLlamaStatus" Text="● 已停止" Foreground="#8b949e" HorizontalAlignment="Center" FontSize="12" />
+            </StackPanel>
+            <StackPanel Grid.Column="2">
+              <Button Name="BtnDshStart" Content="▶ 启动 DSH Web" Background="#238636" Foreground="#FFFFFFFF" Margin="0,0,0,4" FontSize="13" Click="StartDsh_Click" />
+              <Button Name="BtnDshStop" Content="⏹ 停止 DSH Web" Background="#da3633" Foreground="#FFFFFFFF" IsEnabled="False" Margin="0,0,0,4" FontSize="13" Click="StopDsh_Click" />
+              <Button Name="BtnOpenDsh" Content="🌐 打开 DSH Web" IsEnabled="False" Margin="0,0,0,4" Click="OpenDsh_Click" />
+              <TextBlock Name="LblDshStatus" Text="● 已停止" Foreground="#8b949e" HorizontalAlignment="Center" FontSize="12" />
+            </StackPanel>
+          </Grid>
+          <Border Background="#0d1117" CornerRadius="6" Padding="8" Margin="0,10,0,0" BorderBrush="#30363d" BorderThickness="1">
+            <UniformGrid Rows="2" Columns="4">
+              <StackPanel HorizontalAlignment="Center" Margin="4">
+                <TextBlock Text="🖥 CPU" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
+                <TextBlock Name="PerfCpu" Text="N/A" Foreground="#58a6ff" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
+              </StackPanel>
+              <StackPanel HorizontalAlignment="Center" Margin="4">
+                <TextBlock Text="💾 内存" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
+                <TextBlock Name="PerfMem" Text="N/A" Foreground="#58a6ff" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
+              </StackPanel>
+              <StackPanel HorizontalAlignment="Center" Margin="4">
+                <TextBlock Text="🎮 显卡" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
+                <TextBlock Name="PerfGpu" Text="N/A" Foreground="#f0883e" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
+              </StackPanel>
+              <StackPanel HorizontalAlignment="Center" Margin="4">
+                <TextBlock Text="📊 显存" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
+                <TextBlock Name="PerfVram" Text="N/A" Foreground="#f0883e" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
+              </StackPanel>
+              <StackPanel HorizontalAlignment="Center" Margin="4">
+                <TextBlock Text="🌡 显卡温度" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
+                <TextBlock Name="PerfGpuTemp" Text="N/A" Foreground="#f0883e" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
+              </StackPanel>
+              <StackPanel HorizontalAlignment="Center" Margin="4">
+                <TextBlock Text="⚡ TPS" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
+                <TextBlock Name="PerfTps" Text="—" Foreground="#7ee787" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
+              </StackPanel>
+              <StackPanel HorizontalAlignment="Center" Margin="4">
+                <TextBlock Text="⏱ 首Token" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
+                <TextBlock Name="PerfTtft" Text="—" Foreground="#7ee787" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
+              </StackPanel>
+              <StackPanel HorizontalAlignment="Center" Margin="4">
+                <TextBlock Text="📈 Prefill" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
+                <TextBlock Name="PerfPrefill" Text="—" Foreground="#7ee787" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
+              </StackPanel>
+            </UniformGrid>
+          </Border>
+          <Border Background="#0d1117" CornerRadius="6" Padding="8,6" Margin="0,6,0,0" BorderBrush="#30363d" BorderThickness="1">
+            <StackPanel Orientation="Horizontal">
+              <CheckBox Name="ChkVramBreaker" Content="🔒 显存熔断" Foreground="#c9d1d9" VerticalAlignment="Center" IsChecked="False" ToolTip="显存超过阈值时自动停止 Llama 服务，防止爆显存" />
+              <local:NoScrollComboBox x:Name="ComboVramBreakerType" Width="120" Margin="8,0,4,0" VerticalAlignment="Center">
+                <ComboBoxItem Content="百分比 (%)" IsSelected="True" />
+                <ComboBoxItem Content="固定值 (GB)" />
+              </local:NoScrollComboBox>
+              <TextBox Name="TxtVramBreakerVal" Width="60" Text="90" VerticalAlignment="Center" Margin="0,0,4,0" ToolTip="阈值：百分比模式填 0-100，GB 模式填小数如 20.0" />
+              <TextBlock Name="LblVramBreaker" Text="" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" />
+            </StackPanel>
+          </Border>
+        </StackPanel>
+      </GroupBox>
+      <GroupBox Header="📝 运行日志" Grid.Row="2" Margin="0,6,0,0">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+          </Grid.RowDefinitions>
+          <TextBox Name="LogArea" Grid.Row="0" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Background="#0d1117" Foreground="#c9d1d9" FontFamily="Consolas" FontSize="11" BorderBrush="#30363d" BorderThickness="1" />
+          <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,6,0,0">
+            <Button Content="🗑 清空日志" Margin="0,0,6,0" Click="ClearLog_Click" />
+            <Button Content="📂 打开日志目录" Margin="0,0,10,0" Click="OpenLogDir_Click" />
+            <CheckBox Name="ChkAutoScroll" Content="自动滚动" IsChecked="True" Foreground="#c9d1d9" />
+          </StackPanel>
+        </Grid>
+      </GroupBox>
+    </Grid>
+  </Grid>
+</Window>

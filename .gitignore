@@ -1,0 +1,30 @@
+# ===== Build outputs =====
+bin/
+obj/
+publish/
+*.user
+
+# Installer artifacts
+installer_output/
+installer_staging/
+
+# Copied publish artifact used as Content by the launcher (build from gputemp/)
+LlamaDSH_Launcher_CS/gputemp/gputemp.exe
+
+# Visual Studio
+.vs/
+.vscode/
+.idea/
+*.suo
+*.userprefs
+
+# Test results
+TestResults/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
