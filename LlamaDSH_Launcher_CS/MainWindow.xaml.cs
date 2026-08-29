@@ -535,6 +535,18 @@ public partial class MainWindow : Window, IComponentConnector
 		}
 	}
 
+	private void BrowseModelDir_Click(object s, RoutedEventArgs e)
+	{
+		using (System.Windows.Forms.FolderBrowserDialog folderBrowserDialog = new System.Windows.Forms.FolderBrowserDialog())
+		{
+			folderBrowserDialog.Description = "选择模型目录：分片 GGUF 自动取第一片，safetensors 需先转 GGUF";
+			if (folderBrowserDialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+			{
+				InputModelPath.Text = folderBrowserDialog.SelectedPath;
+			}
+		}
+	}
+
 	private void BrowseMtp_Click(object s, RoutedEventArgs e)
 	{
 		Microsoft.Win32.OpenFileDialog openFileDialog = new Microsoft.Win32.OpenFileDialog
@@ -699,23 +711,53 @@ public partial class MainWindow : Window, IComponentConnector
 		try
 		{
 			string p2 = mp.Trim().Trim('"');
-			if (!string.IsNullOrEmpty(p2) && File.Exists(p2))
+			bool mfOk = false;
+			if (!string.IsNullOrEmpty(p2) && Directory.Exists(p2))
 			{
-				string ext = Path.GetExtension(p2).ToLowerInvariant();
+				string[] fs = Directory.GetFiles(p2, "*-00001-of-*.gguf");
+				string[] ggs0 = Directory.GetFiles(p2, "*.gguf");
+				string[] sts0 = Directory.GetFiles(p2, "*.safetensors");
+				if (fs.Length > 0)
+				{
+					Array.Sort(fs, StringComparer.OrdinalIgnoreCase);
+					Log("[提示] 目录模式: 使用分片第一片 " + Path.GetFileName(fs[0]) + "(llama.cpp 自动加载其余分片)");
+					p2 = fs[0];
+					mfOk = true;
+				}
+				else if (ggs0.Length == 1)
+				{
+					Log("[提示] 目录模式: 使用 " + Path.GetFileName(ggs0[0]));
+					p2 = ggs0[0];
+					mfOk = true;
+				}
+				else if (ggs0.Length > 1)
+				{
+					Log("[提示] 目录中存在多个 GGUF(" + ggs0.Length + " 个)，请直接选择主模型文件");
+				}
+				else if (sts0.Length > 0)
+				{
+					Log("[提示] 目录中是 safetensors 分片(" + sts0.Length + " 个文件)，llama.cpp 不能直接加载。请先转换 GGUF：python convert_hf_to_gguf.py \"" + p2 + "\" --outfile model.gguf");
+				}
+				else
+				{
+					Log("[提示] 目录中未找到模型文件");
+				}
+			}
+			else if (!string.IsNullOrEmpty(p2) && File.Exists(p2))
+			{
+				mfOk = true;
+				if (p2.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase))
+				{
+					Log("[提示] llama.cpp 不能直接加载 .safetensors，请先转换为 GGUF：python convert_hf_to_gguf.py \"" + (Path.GetDirectoryName(p2) ?? ".") + "\" --outfile model.gguf");
+				}
+			}
+			if (mfOk)
+			{
 				string dir = Path.GetDirectoryName(p2) ?? "";
 				Match shm = Regex.Match(Path.GetFileName(p2), "-(\\d{5})-of-(\\d{5})\\.gguf$", RegexOptions.IgnoreCase);
 				if (shm.Success)
 				{
 					Log("[提示] 检测到分片 GGUF (" + shm.Groups[2].Value + " 片)：llama.cpp 会自动加载同目录其余分片，请勿移动/改名");
-				}
-				if (ext == ".safetensors")
-				{
-					Log("[提示] llama.cpp 不能直接加载 .safetensors，请先转换为 GGUF：python convert_hf_to_gguf.py <模型目录> --outfile model.gguf");
-					string[] ggs = Directory.GetFiles(dir, "*.gguf");
-					if (ggs.Length > 0)
-					{
-						Log("[提示] 同目录发现 GGUF: " + Path.GetFileName(ggs[0]) + "，可直接选择");
-					}
 				}
 				if (string.IsNullOrWhiteSpace(InputMmprojPath.Text))
 				{
@@ -737,6 +779,62 @@ public partial class MainWindow : Window, IComponentConnector
 		}
 	}
 
+	// 模型路径解析：支持 ①单 gguf 文件 ②分片第一片 ③模型目录(MoE 大模型的分片场景)。
+	// 目录解析顺序：分片第一片(*-00001-of-*.gguf) → 目录中唯一 gguf → safetensors 报错提示转换。
+	// throwOnError=true 供 BuildCmd 使用(错误显示在命令预览/日志)；false 供显存估算静默失败。
+	private string? ResolveModelPath(bool throwOnError)
+	{
+		string raw = InputModelPath.Text.Trim().Trim('"');
+		if (string.IsNullOrEmpty(raw))
+		{
+			return null;
+		}
+		if (Directory.Exists(raw))
+		{
+			string[] firstShards = Directory.GetFiles(raw, "*-00001-of-*.gguf");
+			if (firstShards.Length > 0)
+			{
+				Array.Sort(firstShards, StringComparer.OrdinalIgnoreCase);
+				return firstShards[0];
+			}
+			string[] ggu = Directory.GetFiles(raw, "*.gguf");
+			if (ggu.Length == 1)
+			{
+				return ggu[0];
+			}
+			if (ggu.Length > 1)
+			{
+				string msg = "目录中存在多个 GGUF(" + ggu.Length + " 个)，请直接选择主模型文件: " + raw;
+				if (throwOnError) throw new FileNotFoundException(msg);
+				Log("[提示] " + msg);
+				return null;
+			}
+			string[] st = Directory.GetFiles(raw, "*.safetensors");
+			if (st.Length > 0)
+			{
+				string msg2 = "目录中是 safetensors 分片(" + st.Length + " 个文件)，llama.cpp 不能直接加载。请先转换为 GGUF：python convert_hf_to_gguf.py \"" + raw + "\" --outfile model.gguf";
+				if (throwOnError) throw new NotSupportedException(msg2);
+				Log("[提示] " + msg2);
+				return null;
+			}
+			string msg3 = "目录中未找到 GGUF 模型文件: " + raw;
+			if (throwOnError) throw new FileNotFoundException(msg3);
+			return null;
+		}
+		if (File.Exists(raw))
+		{
+			if (raw.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase))
+			{
+				string msg4 = "llama.cpp 不能直接加载 .safetensors 文件。请先转换为 GGUF：python convert_hf_to_gguf.py \"" + (Path.GetDirectoryName(raw) ?? ".") + "\" --outfile model.gguf";
+				if (throwOnError) throw new NotSupportedException(msg4);
+				Log("[提示] " + msg4);
+				return null;
+			}
+			return raw;
+		}
+		return raw;
+	}
+
 	private List<string> BuildCmd()
 	{
 		string text = InputLlamaDir.Text.Trim().Trim('"');
@@ -751,7 +849,7 @@ public partial class MainWindow : Window, IComponentConnector
 			throw new FileNotFoundException($"llama-server.exe not found:{fileInfo}");
 		}
 		List<string> list = new List<string> { fileInfo.FullName };
-		string text2 = Cl(InputModelPath.Text);
+		string text2 = ResolveModelPath(throwOnError: true) ?? "";
 		if (!string.IsNullOrEmpty(text2))
 		{
 			list.AddRange(new string[2] { "--model", text2 });
@@ -1059,7 +1157,7 @@ public partial class MainWindow : Window, IComponentConnector
 	{
 		try
 		{
-			string modelPath = InputModelPath.Text.Trim().Trim('"');
+			string modelPath = ResolveModelPath(throwOnError: false) ?? "";
 			if (string.IsNullOrEmpty(modelPath) || !File.Exists(modelPath))
 			{
 				return null;

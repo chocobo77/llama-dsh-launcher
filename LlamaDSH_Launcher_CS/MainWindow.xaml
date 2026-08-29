@@ -97,8 +97,11 @@
           <StackPanel>
             <DockPanel Margin="0,0,0,6">
               <Label Content="主模型路径:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
-              <Button Content="浏览..." DockPanel.Dock="Right" Margin="4,0,0,0" Click="BrowseModel_Click" />
-              <TextBox Name="InputModelPath" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+              <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                <Button Content="浏览..." Margin="4,0,0,0" Click="BrowseModel_Click" />
+                <Button Content="📁 目录" Margin="4,0,0,0" Click="BrowseModelDir_Click" ToolTip="MoE/分片大模型包含多个文件——直接选择模型目录即可：自动使用分片第一片(*-00001-of-*.gguf，其余分片需在同目录)，或目录中唯一的 gguf。safetensors 需先转换为 GGUF。" />
+              </StackPanel>
+              <TextBox Name="InputModelPath" ToolTip="支持三种形式：① 单 gguf 文件；② 分片第一片(*-00001-of-*.gguf，自动加载其余分片)；③ 模型目录(自动解析)。safetensors 需先用 convert_hf_to_gguf.py 转为 GGUF。" />
             </DockPanel>
             <DockPanel Margin="0,0,0,6">
               <Label Content="草稿模型 (MTP):" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
