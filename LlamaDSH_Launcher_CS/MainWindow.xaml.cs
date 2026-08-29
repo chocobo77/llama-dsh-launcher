@@ -58,6 +58,8 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private int _dshHiddenCount;
 
+	private int _dshRetriesLeft;
+
 	private bool _vramBreakerTriggered;
 
 	private readonly ConcurrentQueue<double> _ttftSamples;
@@ -1311,6 +1313,16 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private void StartDsh_Click(object s, RoutedEventArgs e)
 	{
+		int? existing = ProcessHelper.FindProcessByPort(3080);
+		if (existing.HasValue)
+		{
+			_dshRetriesLeft = 0;
+			_dshProc = null;
+			_dshTracker = null;
+			AttachDsh(existing.Value, "检测到端口 3080 已有 DSH 在运行，直接接管", saveState: true);
+			return;
+		}
+		_dshRetriesLeft = 3;
 		StartDsh();
 	}
 
@@ -1344,6 +1356,13 @@ public partial class MainWindow : Window, IComponentConnector
 				{
 					text2 = "cd /d \"" + text + "\" && node apps/cli/lib/bin.js web";
 					text3 = "compiled-js";
+					if (_dshRetriesLeft <= 1)
+					{
+						// 编译版连续启动失败（多为 pnpm 符号链接在子进程环境间歇性解析失败），回退到 pnpm dsh web
+						text2 = "cd /d \"" + text + "\" && pnpm dsh web";
+						text3 = "compiled-tsx";
+						Log("--- 编译版连续启动失败，本次回退到 pnpm dsh web ---");
+					}
 				}
 				else
 				{
@@ -1433,8 +1452,16 @@ public partial class MainWindow : Window, IComponentConnector
 		else
 		{
 			Log("DSH failed");
+			bool dshExited = _dshProc != null && _dshProc.HasExited;
 			DisposeProc(ref _dshProc);
 			_dshTracker = null;
+			if (dshExited && _dshRetriesLeft > 0)
+			{
+				_dshRetriesLeft--;
+				Log("--- DSH 异常退出，自动重试（剩余 " + _dshRetriesLeft + " 次）---");
+				StartDsh();
+				return;
+			}
 			BtnDshStart.IsEnabled = true;
 			BtnDshStop.IsEnabled = false;
 			BtnOpenDsh.IsEnabled = false;
@@ -1690,6 +1717,24 @@ public partial class MainWindow : Window, IComponentConnector
 	private static bool IsDshNoise(string content)
 	{
 		if (string.IsNullOrWhiteSpace(content))
+		{
+			return false;
+		}
+		string trimmed = content.Trim();
+		if (trimmed.Length == 0)
+		{
+			return false;
+		}
+		// 错误/诊断相关行一律保留（堆栈、模块解析错误等），避免隐藏排查信息
+		if (trimmed.StartsWith("at ", StringComparison.Ordinal) ||
+			trimmed.StartsWith("^", StringComparison.Ordinal) ||
+			trimmed.Contains("node:internal") ||
+			trimmed.Contains("file:///") ||
+			trimmed.Contains("imported from") ||
+			trimmed.Contains("cannot find") ||
+			trimmed.Contains("module") ||
+			trimmed.Contains("require") ||
+			trimmed.Contains("resolve"))
 		{
 			return false;
 		}
