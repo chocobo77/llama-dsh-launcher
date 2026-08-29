@@ -56,6 +56,8 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private string _lastLogLine;
 
+	private int _dshHiddenCount;
+
 	private bool _vramBreakerTriggered;
 
 	private readonly ConcurrentQueue<double> _ttftSamples;
@@ -185,7 +187,7 @@ public partial class MainWindow : Window, IComponentConnector
 			new ParamDefinition("主机 (Host)", "host", ParamType.String, "127.0.0.1", "基础设置", enabled: true, isAdvanced: false, null, "监听 IP 地址。127.0.0.1 仅本机可访问；0.0.0.0 允许局域网访问（注意安全风险）。也支持 UNIX socket 路径（以 .sock 结尾）。建议：本地使用保持 127.0.0.1。"),
 			new ParamDefinition("端口 (Port)", "port", ParamType.String, "1234", "基础设置", enabled: true, isAdvanced: false, null, "HTTP 监听端口，范围 1-65535。llama-server 默认 8080，此启动器默认 1234 以避免与其他服务冲突。"),
 			new ParamDefinition("超时 (Timeout)", "timeout", ParamType.String, "600", "基础设置", enabled: true, isAdvanced: false, null, "llama-server 读写超时（秒）。超时后断开空闲连接。长文本生成建议 >=300s，多轮对话建议 600s。设为 0 表示永不超时。"),
-			new ParamDefinition("上下文大小 (Context)", "ctx-size", ParamType.String, "49152", "基础设置", enabled: true, isAdvanced: false, null, "Prompt 上下文窗口长度（token 数）。决定单次对话能处理的最大 token 量。支持 K/M 后缀（如 128K=131072）。越大越占显存：27B Q4 模型在 24GB 显卡建议 <=131072；128K 需配合 q4_0 KV 缓存。默认 0 = 从模型元数据读取。"),
+			new ParamDefinition("上下文大小 (Context)", "ctx-size", ParamType.String, "49152", "基础设置", enabled: true, isAdvanced: false, null, "Prompt 上下文窗口长度（token 数）。决定单次对话能处理的最大 token 量。支持 K/M 后缀（如 100K=102400）。越大越占显存：27B Q4 模型约 16GB，24GB 显卡 + q4_0 KV 时建议 <=48K；100K 以上预计总占用超 23GB，极易 OOM 崩溃。启动前会自动估算显存并预警。默认 0 = 从模型元数据读取。"),
 			new ParamDefinition("批处理大小 (Batch Size)", "batch-size", ParamType.String, "2048", "基础设置", enabled: true, isAdvanced: false, null, "逻辑最大批处理大小。控制 prompt 处理时一次送入模型的 token 上限。增大可加速 prompt 处理但增加显存占用。默认 2048，24GB 显卡建议 2048~4096。"),
 			new ParamDefinition("微批大小 (Ubatch)", "ubatch-size", ParamType.String, "512", "基础设置", enabled: true, isAdvanced: false, null, "物理微批处理大小。实际每次送入推理引擎的 token 数，必须 <= batch-size。较小值降低延迟但降低吞吐。默认 512，显存充裕可提至 1024。"),
 			new ParamDefinition("线程数 (Threads)", "threads", ParamType.String, processorCount.ToString(), "基础设置", enabled: true, isAdvanced: false, null, "生成阶段使用的 CPU 线程数。默认 -1 = 自动（使用全部物理核心）。建议设为 CPU 物理核心数（不含超线程），过多反而因上下文切换降低性能。"),
@@ -204,8 +206,8 @@ public partial class MainWindow : Window, IComponentConnector
 			new ParamDefinition("NUMA 策略", "numa", ParamType.Combo, "disabled", "性能与内存", enabled: false, isAdvanced: false, new List<string> { "disabled", "distribute", "isolate", "numactl" }, "NUMA 内存分配策略。仅多路 CPU（服务器）有意义。distribute=均匀分配；isolate=限制在启动 CPU 节点；numactl=使用 numactl 工具的映射。单路 CPU/桌面用户保持 disabled。"),
 			new ParamDefinition("RoPE 基础频率", "rope-freq-base", ParamType.String, "", "性能与内存", enabled: false, isAdvanced: false, null, "RoPE 旋转位置编码的基础频率。默认从模型元数据读取。NTK-aware 缩放时可调大此值以扩展上下文。一般无需手动设置，除非模型训练时使用了非标准值。"),
 			new ParamDefinition("RoPE 频率缩放", "rope-freq-scale", ParamType.String, "1.0", "性能与内存", enabled: false, isAdvanced: false, null, "RoPE 频率缩放因子。值为 N 时上下文扩展 N 倍。与 rope-scale 互为倒数关系。1.0 = 不缩放。长上下文扩展时配合 rope-scaling 方法使用。"),
-			new ParamDefinition("Cache 类型 K", "cache-type-k", ParamType.Combo, "q8_0", "KV 缓存", enabled: true, isAdvanced: false, new List<string> { "f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "q6_0" }, "KV 缓存 K 分量的数据类型。精度越低越省显存，但可能影响生成质量。f16=高精度高显存；q8_0=平衡；q4_0=省显存。24GB 显卡跑 27B + 131K 上下文推荐 q4_0。"),
-			new ParamDefinition("Cache 类型 V", "cache-type-v", ParamType.Combo, "q4_0", "KV 缓存", enabled: true, isAdvanced: false, new List<string> { "f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "q6_0" }, "KV 缓存 V 分量的数据类型。V 对精度不如 K 敏感，可更激进地压缩。24GB 显卡跑 27B + 131K 上下文推荐 q4_0。f16 仅在显存充裕且追求最高质量时使用。"),
+			new ParamDefinition("Cache 类型 K", "cache-type-k", ParamType.Combo, "q8_0", "KV 缓存", enabled: true, isAdvanced: false, new List<string> { "f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "q6_0" }, "KV 缓存 K 分量的数据类型。精度越低越省显存，但可能影响生成质量。f16=高精度高显存；q8_0=平衡；q4_0=省显存。24GB 显卡跑 27B Q4 建议配 q4_0 以留出上下文空间；48K 上下文下 f16 亦可。"),
+			new ParamDefinition("Cache 类型 V", "cache-type-v", ParamType.Combo, "q4_0", "KV 缓存", enabled: true, isAdvanced: false, new List<string> { "f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "q6_0" }, "KV 缓存 V 分量的数据类型。V 对精度不如 K 敏感，可更激进地压缩。24GB 显卡跑 27B Q4 建议 q4_0。f16 仅在显存充裕且追求最高质量时使用。"),
 			new ParamDefinition("缓存 Prompt", "cache-prompt", ParamType.Bool, false, "KV 缓存", enabled: false, isAdvanced: true, null, "缓存 prompt 的 KV 状态，避免重复计算相同前缀。默认开启。多轮对话时可显著加速后续请求的首 token 延迟。建议保持开启。"),
 			new ParamDefinition("缓存重用阈值", "cache-reuse", ParamType.String, "0", "KV 缓存", enabled: false, isAdvanced: true, null, "通过 KV 偏移复用缓存的最小 chunk 大小。需要启用 prompt 缓存。默认 0=禁用。设为 256~512 可在相似 prompt 间复用 KV，加速多轮对话。"),
 			new ParamDefinition("碎片整理阈值", "defrag-thold", ParamType.String, "-1.0", "KV 缓存", enabled: false, isAdvanced: true, null, "KV 缓存碎片整理触发阈值。当碎片率超过此值时自动整理。默认 -1=自动。设为 0.1~0.5 可手动控制触发频率。注意：此参数已废弃，新版 llama.cpp 自动处理。"),
@@ -766,6 +768,304 @@ public partial class MainWindow : Window, IComponentConnector
 		return ((int)Math.Round(num)).ToString();
 	}
 
+	private bool TryGetParamValue(string flag, out string value)
+	{
+		value = "";
+		if (_pw.TryGetValue(flag, out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) pair) && pair.Item1.IsChecked == true)
+		{
+			value = (pair.Item2 is System.Windows.Controls.ComboBox cb) ? cb.Text.Trim() : ((System.Windows.Controls.TextBox)pair.Item2).Text.Trim();
+			return true;
+		}
+		return false;
+	}
+
+	private static double CacheBytesPerElem(string cacheType)
+	{
+		switch (cacheType.Trim().ToLowerInvariant())
+		{
+		case "f16":
+			return 2.0;
+		case "q8_0":
+			return 1.0625;
+		case "q4_0":
+		case "iq4_nl":
+			return 0.5625;
+		case "q4_1":
+			return 0.625;
+		case "q5_0":
+			return 0.6875;
+		case "q5_1":
+			return 0.75;
+		case "q6_0":
+			return 0.875;
+		default:
+			return 2.0;
+		}
+	}
+
+	private sealed class GgufArchInfo
+	{
+		public bool Ok;
+		public int Layers;
+		public int KvHeads;
+		public int HeadDim;
+		public long ContextLen;
+		public string Architecture = "";
+	}
+
+	private static GgufArchInfo ReadGgufArch(string modelPath)
+	{
+		GgufArchInfo r = new GgufArchInfo();
+		try
+		{
+			using FileStream fs = new FileStream(modelPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+			using BinaryReader br = new BinaryReader(fs);
+			if (br.ReadUInt32() != 0x46554747u)
+			{
+				return r;
+			}
+			_ = br.ReadUInt32();
+			_ = br.ReadUInt64();
+			ulong kvCount = br.ReadUInt64();
+			int embed = 0;
+			int heads = 0;
+			for (ulong i = 0; i < kvCount; i++)
+			{
+				string key = ReadGgufString(br);
+				uint vt = br.ReadUInt32();
+				switch (vt)
+				{
+				case 4:
+				case 5:
+				{
+					uint v = br.ReadUInt32();
+					if (key.EndsWith(".block_count", StringComparison.Ordinal))
+					{
+						r.Layers = (int)v;
+					}
+					else if (key.EndsWith(".attention.head_count_kv", StringComparison.Ordinal))
+					{
+						r.KvHeads = (int)v;
+					}
+					else if (key.EndsWith(".attention.head_count", StringComparison.Ordinal))
+					{
+						heads = (int)v;
+					}
+					else if (key.EndsWith(".attention.key_length", StringComparison.Ordinal))
+					{
+						r.HeadDim = (int)v;
+					}
+					else if (key.EndsWith(".attention.value_length", StringComparison.Ordinal) && r.HeadDim == 0)
+					{
+						r.HeadDim = (int)v;
+					}
+					else if (key.EndsWith(".embedding_length", StringComparison.Ordinal))
+					{
+						embed = (int)v;
+					}
+					else if (key.EndsWith(".context_length", StringComparison.Ordinal))
+					{
+						r.ContextLen = v;
+					}
+					break;
+				}
+				case 10:
+				case 11:
+				{
+					ulong v = br.ReadUInt64();
+					if (key.EndsWith(".context_length", StringComparison.Ordinal))
+					{
+						r.ContextLen = (long)v;
+					}
+					break;
+				}
+				case 8:
+				{
+					string v = ReadGgufString(br);
+					if (key == "general.architecture")
+					{
+						r.Architecture = v;
+					}
+					break;
+				}
+				default:
+					SkipGgufValue(br, vt);
+					break;
+				}
+			}
+			if (r.HeadDim == 0 && heads > 0 && embed > 0)
+			{
+				r.HeadDim = (int)Math.Round((double)embed / heads);
+			}
+			if (r.Layers > 0 && r.KvHeads > 0 && r.HeadDim > 0)
+			{
+				r.Ok = true;
+			}
+		}
+		catch
+		{
+			r.Ok = false;
+		}
+		return r;
+	}
+
+	private static string ReadGgufString(BinaryReader br)
+	{
+		ulong len = br.ReadUInt64();
+		if (len > 4194304UL)
+		{
+			throw new InvalidDataException("bad gguf string length");
+		}
+		return System.Text.Encoding.UTF8.GetString(br.ReadBytes((int)len));
+	}
+
+	private static void SkipGgufValue(BinaryReader br, uint type)
+	{
+		switch (type)
+		{
+		case 0:
+		case 1:
+		case 7:
+			br.BaseStream.Position += 1;
+			break;
+		case 2:
+		case 3:
+			br.BaseStream.Position += 2;
+			break;
+		case 4:
+		case 5:
+		case 6:
+			br.BaseStream.Position += 4;
+			break;
+		case 8:
+			_ = ReadGgufString(br);
+			break;
+		case 9:
+		{
+			uint elemType = br.ReadUInt32();
+			ulong count = br.ReadUInt64();
+			for (ulong j = 0; j < count; j++)
+			{
+				SkipGgufValue(br, elemType);
+			}
+			break;
+		}
+		case 10:
+		case 11:
+		case 12:
+			br.BaseStream.Position += 8;
+			break;
+		default:
+			throw new InvalidDataException("unknown gguf value type: " + type);
+		}
+	}
+
+	private (double estBytes, double modelBytes, double kvBytes, double availBytes, string detail)? EstimateVramNeeded()
+	{
+		try
+		{
+			string modelPath = InputModelPath.Text.Trim().Trim('"');
+			if (string.IsNullOrEmpty(modelPath) || !File.Exists(modelPath))
+			{
+				return null;
+			}
+			double modelBytes = new FileInfo(modelPath).Length;
+			if (modelBytes <= 0.0)
+			{
+				return null;
+			}
+			long ctx = 0;
+			if (TryGetParamValue("ctx-size", out string ctxStr))
+			{
+				ctxStr = NormTok(ctxStr);
+				if (!long.TryParse(ctxStr, out ctx))
+				{
+					ctx = 0;
+				}
+			}
+			string ck = TryGetParamValue("cache-type-k", out string ckv) ? ckv : "f16";
+			string cv = TryGetParamValue("cache-type-v", out string cvv) ? cvv : "f16";
+			double bytesK = CacheBytesPerElem(ck);
+			double bytesV = CacheBytesPerElem(cv);
+			GgufArchInfo gi = ReadGgufArch(modelPath);
+			double gpuFrac = 1.0;
+			if (TryGetParamValue("n-gpu-layers", out string ngl) && double.TryParse(ngl, out double nglV) && nglV >= 0.0 && gi.Ok && gi.Layers > 0)
+			{
+				gpuFrac = Math.Clamp(nglV / gi.Layers, 0.0, 1.0);
+			}
+			double kvPerToken;
+			if (gi.Ok)
+			{
+				kvPerToken = (double)gi.KvHeads * gi.HeadDim * (bytesK + bytesV) * gi.Layers;
+			}
+			else
+			{
+				kvPerToken = 64.0 * 8.0 * 128.0 * (bytesK + bytesV);
+			}
+			double kvBytes = kvPerToken * ctx * gpuFrac;
+			double bufferBytes = 1.5 * 1073741824.0;
+			double estVram = modelBytes * gpuFrac + kvBytes + bufferBytes;
+			double total = 0.0;
+			double used = 0.0;
+			Dictionary<string, string> g = _gpuMonitor.QueryGpu();
+			if (g.TryGetValue("vram_total", out string ts) && double.TryParse(ts, NumberStyles.Float, CultureInfo.InvariantCulture, out total) && total > 0.0)
+			{
+				if (g.TryGetValue("vram_used", out string us))
+				{
+					double.TryParse(us, NumberStyles.Float, CultureInfo.InvariantCulture, out used);
+				}
+			}
+			double avail = Math.Max(0.0, total - used);
+			long safeCtx = 0;
+			if (kvPerToken > 0.0 && avail > 0.0)
+			{
+				safeCtx = (long)((avail - modelBytes * gpuFrac - bufferBytes) / kvPerToken);
+				if (safeCtx < 0)
+				{
+					safeCtx = 0;
+				}
+				safeCtx = (safeCtx / 1024L) * 1024L;
+			}
+			string detail = "模型文件: " + (modelBytes / 1073741824.0).ToString("F1") + " GiB\n"
+				+ "上下文: " + ctx + " token (" + (ctx / 1024L) + "K)\n"
+				+ "KV 缓存(按当前缓存类型估算): " + (kvBytes / 1073741824.0).ToString("F2") + " GiB\n"
+				+ "预计总占用: " + (estVram / 1073741824.0).ToString("F1") + " GiB\n"
+				+ "可用显存: " + (avail / 1073741824.0).ToString("F1") + " GiB";
+			if (safeCtx > 0)
+			{
+				detail += "\n建议: 当前显存下安全上下文约 " + safeCtx + " token (" + (safeCtx / 1024L) + "K)";
+			}
+			return (estVram, modelBytes, kvBytes, avail, detail);
+		}
+		catch
+		{
+			return null;
+		}
+	}
+
+	private bool ConfirmVramFit()
+	{
+		(double, double, double, double, string)? est = EstimateVramNeeded();
+		if (!est.HasValue)
+		{
+			return true;
+		}
+		(double estBytes, double modelBytes, double kvBytes, double availBytes, string detail) = est.Value;
+		if (availBytes <= 0.0)
+		{
+			return true;
+		}
+		if (estBytes <= availBytes)
+		{
+			return true;
+		}
+		string msg = "⚠ 预计显存不足，llama-server 很可能因显存耗尽而崩溃（bad allocation / GGML_ASSERT）。\n\n"
+			+ detail
+			+ "\n\n仍要尝试启动吗？\n（建议：减小“上下文大小”，或将 KV 缓存类型改为 q4_0/q4_1）";
+		System.Windows.MessageBoxResult r = System.Windows.MessageBox.Show(msg, "显存可能不足", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Warning);
+		return r == System.Windows.MessageBoxResult.Yes;
+	}
+
 	private static string FmtCmd(List<string> cl)
 	{
 		if (cl.Count == 0)
@@ -886,6 +1186,11 @@ public partial class MainWindow : Window, IComponentConnector
 			System.Windows.MessageBox.Show("Empty");
 			return;
 		}
+		if (!ConfirmVramFit())
+		{
+			Log("--- 启动已取消：预计显存不足 ---");
+			return;
+		}
 		try
 		{
 			ProcessStartInfo processStartInfo = new ProcessStartInfo
@@ -961,12 +1266,29 @@ public partial class MainWindow : Window, IComponentConnector
 	{
 		if (_llamaProc != null && _llamaProc.HasExited)
 		{
+			int exitCode = 0;
+			try
+			{
+				exitCode = _llamaProc.ExitCode;
+			}
+			catch
+			{
+			}
 			DisposeProc(ref _llamaProc);
 			BtnLlamaStart.IsEnabled = true;
 			BtnLlamaStop.IsEnabled = false;
-			LblLlamaStatus.Text = "● 已停止";
-			LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
-			Log("--- Llama 已退出 ---");
+			if (exitCode != 0)
+			{
+				LblLlamaStatus.Text = "● 启动失败/崩溃";
+				LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
+				Log("--- Llama 异常退出 (退出码 " + exitCode + ") --- 请查看上方日志，通常是显存不足或参数错误导致 ---");
+			}
+			else
+			{
+				LblLlamaStatus.Text = "● 已停止";
+				LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
+				Log("--- Llama 已退出 ---");
+			}
 			ClearStateFor("llama");
 		}
 	}
@@ -1301,24 +1623,45 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private void FlushLogs()
 	{
-		if (_logPending.IsEmpty)
-		{
-			return;
-		}
 		StringBuilder stringBuilder = new StringBuilder();
-		int num = 0;
-		string result;
-		while (num < 400 && _logPending.TryDequeue(out result))
+		if (!_logPending.IsEmpty)
 		{
-			num++;
-			string text = result.TrimEnd();
-			if (!string.IsNullOrWhiteSpace(text) && (!(text == _lastLogLine) || text.StartsWith("[Perf] Error")))
+			int num = 0;
+			string result;
+			while (num < 400 && _logPending.TryDequeue(out result))
 			{
-				_lastLogLine = text;
-				stringBuilder.AppendLine(text);
-				AppendRunLog($"[{DateTime.Now:HH:mm:ss}] {text}");
-				ParseTimings(text);
+				num++;
+				string text = result.TrimEnd();
+				if (text.StartsWith("[dsh] ", StringComparison.Ordinal))
+				{
+					string content = text.Substring("[dsh] ".Length);
+					if (IsDshNoise(content))
+					{
+						_dshHiddenCount++;
+						continue;
+					}
+					FlushDshHiddenSummary(stringBuilder);
+					if (text.Length > 600)
+					{
+						text = text.Substring(0, 600) + " ……[已截断]";
+					}
+				}
+				if (!string.IsNullOrWhiteSpace(text) && (!(text == _lastLogLine) || text.StartsWith("[Perf] Error")))
+				{
+					_lastLogLine = text;
+					stringBuilder.AppendLine(text);
+					AppendRunLog($"[{DateTime.Now:HH:mm:ss}] {text}");
+					ParseTimings(text);
+				}
 			}
+			if (_logPending.IsEmpty)
+			{
+				FlushDshHiddenSummary(stringBuilder);
+			}
+		}
+		else
+		{
+			FlushDshHiddenSummary(stringBuilder);
 		}
 		if (stringBuilder.Length != 0)
 		{
@@ -1329,6 +1672,40 @@ public partial class MainWindow : Window, IComponentConnector
 				LogArea.ScrollToEnd();
 			}
 		}
+	}
+
+	private void FlushDshHiddenSummary(StringBuilder stringBuilder)
+	{
+		if (_dshHiddenCount <= 0)
+		{
+			return;
+		}
+		string summary = "[dsh] ……(已隐藏 " + _dshHiddenCount + " 行非日志内容)";
+		_dshHiddenCount = 0;
+		_lastLogLine = summary;
+		stringBuilder.AppendLine(summary);
+		AppendRunLog($"[{DateTime.Now:HH:mm:ss}] {summary}");
+	}
+
+	private static bool IsDshNoise(string content)
+	{
+		if (string.IsNullOrWhiteSpace(content))
+		{
+			return false;
+		}
+		string lower = content.ToLowerInvariant();
+		if (lower.Contains("dsh web") || lower.Contains("http") || lower.Contains("127.0.0.1") ||
+			lower.Contains("localhost") || lower.Contains("listen") || lower.Contains("port") ||
+			lower.Contains("eaddrinuse") || lower.Contains("error") || lower.Contains("fail") ||
+			lower.Contains("exception") || lower.Contains("warn") || lower.Contains("started") ||
+			lower.Contains("ready") || lower.Contains("loaded") || lower.Contains("plugin") ||
+			lower.Contains("exit") || lower.Contains("browser") || lower.Contains("open") ||
+			lower.Contains("server") || lower.Contains("version") || lower.Contains("status") ||
+			lower.Contains("web"))
+		{
+			return false;
+		}
+		return true;
 	}
 
 	private void TruncateLogIfNeeded()

@@ -18,33 +18,84 @@ public static class ProcessHelper
 
 	public static void KillProcessTree(int pid, int timeoutMs = 3000)
 	{
+		List<int> ids = new List<int> { pid };
+		CollectProcessTree(pid, ids, 0);
+		if (ids.Count == 0)
+		{
+			return;
+		}
+		// 先杀叶子再杀父进程，递归收集整棵进程树，确保彻底退出（不会留下孤儿进程）
+		for (int i = ids.Count - 1; i >= 0; i--)
+		{
+			TryKillProcess(ids[i]);
+		}
+		for (int i = ids.Count - 1; i >= 0; i--)
+		{
+			TryWaitForExit(ids[i], timeoutMs);
+		}
+	}
+
+	private static void CollectProcessTree(int parentPid, List<int> result, int depth)
+	{
+		if (depth > 16)
+		{
+			return;
+		}
+		foreach (int child in GetChildProcessIds(parentPid))
+		{
+			if (!result.Contains(child))
+			{
+				result.Add(child);
+				CollectProcessTree(child, result, depth + 1);
+			}
+		}
+	}
+
+	private static List<int> GetChildProcessIds(int parentPid)
+	{
+		List<int> list = new List<int>();
 		try
 		{
-			Process processById = Process.GetProcessById(pid);
-			List<Process> list = new List<Process> { processById };
-			list.AddRange(GetChildProcesses(pid));
-			foreach (Process item in list)
+			using (ManagementObjectSearcher searcher = new ManagementObjectSearcher($"SELECT ProcessId FROM Win32_Process WHERE ParentProcessId={parentPid}"))
 			{
-				try
+				using (ManagementObjectCollection collection = searcher.Get())
 				{
-					item.Kill(entireProcessTree: false);
-				}
-				catch
-				{
+					foreach (ManagementObject obj in collection)
+					{
+						try
+						{
+							object value = obj["ProcessId"];
+							if (value != null && int.TryParse(value.ToString(), out int childId) && childId > 0 && childId != parentPid)
+							{
+								list.Add(childId);
+							}
+						}
+						catch
+						{
+						}
+						finally
+						{
+							obj.Dispose();
+						}
+					}
 				}
 			}
-			foreach (Process item2 in list)
+		}
+		catch
+		{
+		}
+		return list;
+	}
+
+	private static void TryKillProcess(int pid)
+	{
+		try
+		{
+			using (Process process = Process.GetProcessById(pid))
 			{
-				try
+				if (!process.HasExited)
 				{
-					item2.WaitForExit(timeoutMs);
-				}
-				catch
-				{
-				}
-				finally
-				{
-					item2.Dispose();
+					process.Kill(entireProcessTree: false);
 				}
 			}
 		}
@@ -53,63 +104,18 @@ public static class ProcessHelper
 		}
 	}
 
-	public static List<Process> GetChildProcesses(int parentPid)
+	private static void TryWaitForExit(int pid, int timeoutMs)
 	{
-		//IL_002a: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0030: Expected O, but got Unknown
-		//IL_0048: Unknown result type (might be due to invalid IL or missing references)
-		//IL_004f: Expected O, but got Unknown
-		List<Process> list = new List<Process>();
 		try
 		{
-			ManagementObjectSearcher val = new ManagementObjectSearcher($"SELECT * FROM Win32_Process WHERE ParentProcessId={parentPid}");
-			try
+			using (Process process = Process.GetProcessById(pid))
 			{
-				ManagementObjectCollection val2 = val.Get();
-				try
-				{
-					var enumerator = val2.GetEnumerator();
-					try
-					{
-						while (enumerator.MoveNext())
-						{
-							ManagementObject val3 = (ManagementObject)enumerator.Current;
-							try
-							{
-								int processId = Convert.ToInt32(((ManagementBaseObject)val3)["ProcessId"]);
-								try
-								{
-									list.Add(Process.GetProcessById(processId));
-								}
-								catch
-								{
-								}
-							}
-							finally
-							{
-								val3.Dispose();
-							}
-						}
-					}
-					finally
-					{
-						((IDisposable)enumerator)?.Dispose();
-					}
-				}
-				finally
-				{
-					((IDisposable)val2)?.Dispose();
-				}
-			}
-			finally
-			{
-				((IDisposable)val)?.Dispose();
+				process.WaitForExit(timeoutMs);
 			}
 		}
 		catch
 		{
 		}
-		return list;
 	}
 
 	public static int? FindProcessByPort(params int[] ports)
