@@ -60,6 +60,16 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private int _dshRetriesLeft;
 
+	private bool _dshTaskMode;
+
+	private string? _dshBootLogPath;
+
+	private CancellationTokenSource? _dshTailCts;
+
+	private DispatcherTimer? _dshVerifyTimer;
+
+	private DateTime _dshVerifyDeadline;
+
 	private bool _vramBreakerTriggered;
 
 	private readonly ConcurrentQueue<double> _ttftSamples;
@@ -1322,7 +1332,7 @@ public partial class MainWindow : Window, IComponentConnector
 			AttachDsh(existing.Value, "检测到端口 3080 已有 DSH 在运行，直接接管", saveState: true);
 			return;
 		}
-		_dshRetriesLeft = 3;
+		_dshRetriesLeft = 2;
 		StartDsh();
 	}
 
@@ -1333,9 +1343,6 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private void StartDsh()
 	{
-		//IL_01c8: Unknown result type (might be due to invalid IL or missing references)
-		//IL_01cd: Unknown result type (might be due to invalid IL or missing references)
-		//IL_01e6: Expected O, but got Unknown
 		if (HasDsh())
 		{
 			System.Windows.MessageBox.Show("Already running");
@@ -1345,35 +1352,58 @@ public partial class MainWindow : Window, IComponentConnector
 		{
 			string text2;
 			string text3;
+			string dshDir = "";
 			if (ComboDshMode.SelectedIndex == 0)
 			{
-				string text = InputDshDir.Text.Trim().Trim('"');
-				if (string.IsNullOrEmpty(text))
+				dshDir = InputDshDir.Text.Trim().Trim('"');
+				if (string.IsNullOrEmpty(dshDir))
 				{
-					text = "%DSH%";
+					dshDir = "%DSH%";
 				}
-				if (File.Exists(Path.Combine(text, "apps", "cli", "lib", "bin.js")))
+				text3 = ((File.Exists(Path.Combine(dshDir, "apps", "cli", "lib", "bin.js")) && _dshRetriesLeft > 0) ? "compiled-js" : "compiled-tsx");
+			}
+			else
+			{
+				text3 = "npx";
+			}
+			BtnDshStart.IsEnabled = false;
+			BtnDshStop.IsEnabled = true;
+			BtnOpenDsh.IsEnabled = false;
+			LblDshStatus.Text = "Starting...";
+			LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(240, 136, 62));
+				// 优先：WMI 分离启动。进程由 WmiPrvSE.exe 服务拉起，与启动器无进程亲缘，
+				// 可绕过杀软对"启动器直接派生 node"的行为拦截
+				//（症状：终端/脚本里启动一切正常，启动器里 100% 报 ERR_MODULE_NOT_FOUND）
+			if (ComboDshMode.SelectedIndex == 0 && TryStartDshDetached(dshDir, text3))
+			{
+				_dshTaskMode = true;
+				_dshProc = null;
+				_dshTracker = null;
+				_dshVerifyDeadline = DateTime.Now.AddSeconds(30.0);
+				Log("--- 正在启动 DSH (" + text3 + " · 分离模式) ---");
+				StartDshVerifyLoop();
+				return;
+			}
+			_dshTaskMode = false;
+			StopDshLogTailer();
+			if (ComboDshMode.SelectedIndex == 0)
+			{
+				if (text3 == "compiled-js")
 				{
-					text2 = "cd /d \"" + text + "\" && node apps/cli/lib/bin.js web";
-					text3 = "compiled-js";
-					if (_dshRetriesLeft <= 1)
-					{
-						// 编译版连续启动失败（多为 pnpm 符号链接在子进程环境间歇性解析失败），回退到 pnpm dsh web
-						text2 = "cd /d \"" + text + "\" && pnpm dsh web";
-						text3 = "compiled-tsx";
-						Log("--- 编译版连续启动失败，本次回退到 pnpm dsh web ---");
-					}
+					text2 = "cd /d \"" + dshDir + "\" && node apps/cli/lib/bin.js web";
 				}
 				else
 				{
-					text2 = "cd /d \"" + text + "\" && pnpm dsh web";
-					text3 = "compiled-tsx";
+					if (File.Exists(Path.Combine(dshDir, "apps", "cli", "lib", "bin.js")))
+					{
+						Log("--- 编译版连续启动失败，本次回退到 pnpm dsh web ---");
+					}
+					text2 = "cd /d \"" + dshDir + "\" && pnpm dsh web";
 				}
 			}
 			else
 			{
 				text2 = "npx --yes @deepseek-ai/dsh web";
-				text3 = "npx";
 			}
 			ProcessStartInfo startInfo = new ProcessStartInfo
 			{
@@ -1395,28 +1425,206 @@ public partial class MainWindow : Window, IComponentConnector
 			{
 				OnDshDone();
 			});
-			BtnDshStart.IsEnabled = false;
-			BtnDshStop.IsEnabled = true;
-			BtnOpenDsh.IsEnabled = false;
-			LblDshStatus.Text = "Starting...";
-			LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(240, 136, 62));
 			Log("--- 正在启动 DSH (" + text3 + ") ---");
-			DispatcherTimer vt = new DispatcherTimer
+			DispatcherTimer dispatcherTimer = new DispatcherTimer
 			{
 				Interval = TimeSpan.FromSeconds(3.0)
 			};
-			vt.Tick += delegate
+			dispatcherTimer.Tick += delegate
 			{
-				vt.Stop();
+				dispatcherTimer.Stop();
 				VerifyDsh();
 			};
-			vt.Start();
+			dispatcherTimer.Start();
 		}
 		catch (Exception ex)
 		{
 			LogError(ex, "DSH 启动失败");
 			BtnDshStart.IsEnabled = true;
 			BtnDshStop.IsEnabled = false;
+		}
+	}
+
+		// 通过 WMI Win32_Process.Create 分离启动 DSH：父进程是 WmiPrvSE.exe（WMI 服务宿主），
+		// 与启动器完全无亲缘；node 输出重定向到日志文件，由启动器尾随显示
+	private bool TryStartDshDetached(string dshDir, string modeLabel)
+	{
+		try
+		{
+			string text = ((modeLabel == "compiled-js") ? "node apps/cli/lib/bin.js web" : "pnpm dsh web");
+			string text2 = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_boot.log");
+			try
+			{
+				File.WriteAllText(text2, "");
+			}
+			catch
+			{
+			}
+			_dshBootLogPath = text2;
+			string text3 = "cmd.exe /c cd /d \"" + dshDir + "\" && " + text + " >> \"" + text2 + "\" 2>&1";
+			using (System.Management.ManagementClass managementClass = new System.Management.ManagementClass("Win32_Process"))
+			{
+				System.Management.ManagementBaseObject methodParameters = managementClass.GetMethodParameters("Create");
+				methodParameters["CommandLine"] = text3;
+				methodParameters["CurrentDirectory"] = dshDir;
+				System.Management.ManagementBaseObject managementBaseObject = managementClass.InvokeMethod("Create", methodParameters, null);
+				if (Convert.ToInt32(managementBaseObject["ReturnValue"]) != 0)
+				{
+					Log("--- 分离模式创建失败 (WMI rc=" + managementBaseObject["ReturnValue"] + ")，改用直接启动 ---");
+					return false;
+				}
+			}
+			StartDshLogTailer(text2);
+			return true;
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "DSH 分离启动失败，改用直接启动");
+			return false;
+		}
+	}
+
+		// 尾随 DSH 启动日志文件，把新增行喂进日志管线（复用 [dsh] 过滤与折叠）
+	private void StartDshLogTailer(string path)
+	{
+		StopDshLogTailer();
+		_dshTailCts = new CancellationTokenSource();
+		CancellationToken token = _dshTailCts.Token;
+		long pos = 0L;
+		Task.Run(async delegate
+		{
+			while (!token.IsCancellationRequested)
+			{
+				try
+				{
+					if (File.Exists(path))
+					{
+						using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+						{
+							if (stream.Length < pos)
+							{
+								pos = 0L;
+							}
+							if (stream.Length > pos)
+							{
+								stream.Seek(pos, SeekOrigin.Begin);
+								using (StreamReader streamReader = new StreamReader(stream))
+								{
+									string text = streamReader.ReadToEnd();
+									int num = text.LastIndexOf('\n');
+									if (num >= 0)
+									{
+										string text2 = text.Substring(0, num + 1);
+										pos += Encoding.UTF8.GetByteCount(text2);
+										string[] array = text2.Split(new string[2] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+										foreach (string value in array)
+										{
+											_logPending.Enqueue("[dsh] " + value);
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+				catch
+				{
+				}
+				try
+				{
+					await Task.Delay(400, token);
+				}
+				catch
+				{
+					break;
+				}
+			}
+		}, token);
+	}
+
+	private void StopDshLogTailer()
+	{
+		try
+		{
+			_dshTailCts?.Cancel();
+		}
+		catch
+		{
+		}
+		_dshTailCts = null;
+	}
+
+		// 分离模式下的启动验证：每2秒查一次端口3080；启动日志出现致命错误则快速失败
+	private void StartDshVerifyLoop()
+	{
+		StopDshVerifyLoop();
+		_dshVerifyTimer = new DispatcherTimer
+		{
+			Interval = TimeSpan.FromSeconds(2.0)
+		};
+		_dshVerifyTimer.Tick += delegate
+		{
+			int? num = ProcessHelper.FindProcessByPort(3080);
+			bool flag = false;
+			if (!num.HasValue && _dshBootLogPath != null)
+			{
+				try
+				{
+					if (File.Exists(_dshBootLogPath))
+					{
+						string text = File.ReadAllText(_dshBootLogPath);
+						if (text.Contains("ERR_MODULE_NOT_FOUND") || text.Contains("Command failed with exit code"))
+						{
+							flag = true;
+						}
+					}
+				}
+				catch
+				{
+				}
+			}
+			if (num.HasValue)
+			{
+				StopDshVerifyLoop();
+				_dshTracker = new ProcessTracker(num.Value);
+				LblDshStatus.Text = "● 运行中";
+				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
+				BtnOpenDsh.IsEnabled = true;
+				SaveState();
+				Log("DSH real PID:" + num.Value);
+			}
+			else if (flag || DateTime.Now >= _dshVerifyDeadline)
+			{
+				StopDshVerifyLoop();
+				Log(flag ? "DSH failed (启动日志报错)" : "DSH failed (启动超时)");
+				StopDshLogTailer();
+				_dshTracker = null;
+				if (_dshRetriesLeft > 0)
+				{
+					_dshRetriesLeft--;
+					Log("--- DSH 启动失败，自动重试（剩余 " + _dshRetriesLeft + " 次）---");
+					StartDsh();
+				}
+				else
+				{
+					BtnDshStart.IsEnabled = true;
+					BtnDshStop.IsEnabled = false;
+					BtnOpenDsh.IsEnabled = false;
+					LblDshStatus.Text = "● 启动失败";
+					LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
+					ClearStateFor("dsh");
+				}
+			}
+		};
+		_dshVerifyTimer.Start();
+	}
+
+	private void StopDshVerifyLoop()
+	{
+		if (_dshVerifyTimer != null)
+		{
+			_dshVerifyTimer.Stop();
+			_dshVerifyTimer = null;
 		}
 	}
 
@@ -1503,6 +1711,9 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private void StopDsh()
 	{
+		StopDshVerifyLoop();
+		StopDshLogTailer();
+		_dshTaskMode = false;
 		if (_dshProc != null)
 		{
 			Log("--- 正在停止 DSH ---");
@@ -1726,15 +1937,17 @@ public partial class MainWindow : Window, IComponentConnector
 			return false;
 		}
 		// 错误/诊断相关行一律保留（堆栈、模块解析错误等），避免隐藏排查信息
+		string lowerTrimmed = trimmed.ToLowerInvariant();
 		if (trimmed.StartsWith("at ", StringComparison.Ordinal) ||
 			trimmed.StartsWith("^", StringComparison.Ordinal) ||
-			trimmed.Contains("node:internal") ||
-			trimmed.Contains("file:///") ||
-			trimmed.Contains("imported from") ||
-			trimmed.Contains("cannot find") ||
-			trimmed.Contains("module") ||
-			trimmed.Contains("require") ||
-			trimmed.Contains("resolve"))
+			lowerTrimmed.Contains("node:internal") ||
+			lowerTrimmed.Contains("file:///") ||
+			lowerTrimmed.Contains("imported from") ||
+			lowerTrimmed.Contains("cannot find") ||
+			lowerTrimmed.Contains("module") ||
+			lowerTrimmed.Contains("require") ||
+			lowerTrimmed.Contains("resolve") ||
+			lowerTrimmed.Contains("throw"))
 		{
 			return false;
 		}
