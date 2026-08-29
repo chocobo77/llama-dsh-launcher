@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
@@ -18,36 +18,25 @@ public partial class App : System.Windows.Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
-        // 清除安装器遗留的兼容层标记：Inno Setup 拉起本程序时设置了
-        // __COMPAT_LAYER=ElevateCreateProcess，它会让本进程创建的每个子进程都被
-        // 强制走 UAC AppInfo 提权通道(实测导致 DSH 的 node 子进程符号链接解析失败
-        // ERR_MODULE_NOT_FOUND)，必须在启动任何子进程前移除。
+        // 安装器血统检测与血统切断：Inno Setup"安装完成后运行"拉起本程序时，会遗留
+        // __COMPAT_LAYER=ElevateCreateProcess 等不可见的安装器上下文。实测(调用代码隔离
+        // 探针 V1)：同样的 WMI 调用代码在用户自己的进程中一切正常，唯独从启动器进程
+        // 发起必失败——即问题在进程血统而非代码或环境。因此只要检测到安装器血统标记，
+        // 就经 explorer.exe 以用户 shell 的干净血统重启自己(无论是否提权)。
         try
         {
             string? compatLayer = Environment.GetEnvironmentVariable("__COMPAT_LAYER");
-            if (!string.IsNullOrEmpty(compatLayer))
-            {
-                AppLog.WriteInfo($"stripping installer compat layer: __COMPAT_LAYER={compatLayer}");
-                Environment.SetEnvironmentVariable("__COMPAT_LAYER", null);
-            }
-        }
-        catch { }
-
-        // 自我降权：从安装器拉起时继承提权(管理员)令牌，而提权上下文派生的 DSH 子进程
-        // 会因环境差异导致 pnpm 符号链接解析失败(ERR_MODULE_NOT_FOUND)，且 WMI 分离模式
-        // 同样受影响(提权调用者由提权 WmiPrvSE 实例服务)。检测到提权则经 explorer.exe
-        // 以普通令牌重启自己——与诊断结论一致：非提权上下文下一切正常。
-        try
-        {
+            bool installerSpawn = !string.IsNullOrEmpty(compatLayer);
             using (System.Security.Principal.WindowsIdentity identity = System.Security.Principal.WindowsIdentity.GetCurrent())
             {
                 var principal = new System.Security.Principal.WindowsPrincipal(identity);
-                if (principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator))
+                bool elevated = principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+                if (installerSpawn || elevated)
                 {
                     string? exePath = Process.GetCurrentProcess().MainModule?.FileName;
                     if (!string.IsNullOrEmpty(exePath) && File.Exists(exePath))
                     {
-                        AppLog.WriteInfo($"detected elevated launch (pid={Environment.ProcessId}), relaunching non-elevated via explorer.exe: {exePath}");
+                        AppLog.WriteInfo($"installer/elevated lineage detected (compat={compatLayer ?? "-"}, elevated={elevated}, pid={Environment.ProcessId}), relaunching clean via explorer.exe: {exePath}");
                         Process.Start(new ProcessStartInfo
                         {
                             FileName = "explorer.exe",
