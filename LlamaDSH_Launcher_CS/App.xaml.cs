@@ -32,6 +32,7 @@ public partial class App : System.Windows.Application
                     string? exePath = Process.GetCurrentProcess().MainModule?.FileName;
                     if (!string.IsNullOrEmpty(exePath) && File.Exists(exePath))
                     {
+                        AppLog.WriteInfo($"detected elevated launch (pid={Environment.ProcessId}), relaunching non-elevated via explorer.exe: {exePath}");
                         Process.Start(new ProcessStartInfo
                         {
                             FileName = "explorer.exe",

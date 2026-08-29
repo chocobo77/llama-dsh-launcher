@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 
 namespace LlamaDSH_Launcher
@@ -18,6 +18,8 @@ namespace LlamaDSH_Launcher
         }
 
         public static void WriteError(string message) => Append("error.log", message);
+
+        public static void WriteInfo(string message) => Append("info.log", message);
 
         public static void WriteRun(string content) => Append("run.log", content);
 

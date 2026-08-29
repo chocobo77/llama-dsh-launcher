@@ -1446,7 +1446,7 @@ public partial class MainWindow : Window, IComponentConnector
 	}
 
 		// 通过 WMI Win32_Process.Create 分离启动 DSH：父进程是 WmiPrvSE.exe（WMI 服务宿主），
-		// 与启动器完全无亲缘；node 输出重定向到日志文件，由启动器尾随显示
+	// 与启动器完全无亲缘；node 输出重定向到日志文件，由启动器尾随显示
 	private bool TryStartDshDetached(string dshDir, string modeLabel)
 	{
 		try
@@ -1461,12 +1461,39 @@ public partial class MainWindow : Window, IComponentConnector
 			{
 			}
 			_dshBootLogPath = text2;
+			bool elevated = new System.Security.Principal.WindowsPrincipal(System.Security.Principal.WindowsIdentity.GetCurrent()).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+			File.AppendAllText(text2, "[diag] launcher elevated=" + elevated + " temp=" + Path.GetTempPath() + "\r\n");
 			string text3 = "cmd.exe /c cd /d \"" + dshDir + "\" & echo ===CHILD-ENV=== >> \"" + text2 + "\" 2>&1 & set >> \"" + text2 + "\" 2>&1 & where node >> \"" + text2 + "\" 2>&1 & node -v >> \"" + text2 + "\" 2>&1 & echo ===BOOT=== >> \"" + text2 + "\" 2>&1 & " + text + " >> \"" + text2 + "\" 2>&1";
 			using (System.Management.ManagementClass managementClass = new System.Management.ManagementClass("Win32_Process"))
 			{
 				System.Management.ManagementBaseObject methodParameters = managementClass.GetMethodParameters("Create");
 				methodParameters["CommandLine"] = text3;
 				methodParameters["CurrentDirectory"] = dshDir;
+				// 显式传递环境变量：不依赖 WmiPrvSE 宿主按调用者上下文派生的环境，
+				// 保证子进程拿到与用户 PowerShell 一致的环境（矩阵测试验证过该环境下启动必成功）
+				try
+				{
+					System.Collections.IDictionary envVars = Environment.GetEnvironmentVariables();
+					string[] envArray = new string[envVars.Count];
+					int envIndex = 0;
+					foreach (System.Collections.DictionaryEntry entry in envVars)
+					{
+						if (entry.Key == null || entry.Value == null) continue;
+						envArray[envIndex++] = entry.Key + "=" + entry.Value;
+					}
+					Array.Resize(ref envArray, envIndex);
+					using (System.Management.ManagementClass startupClass = new System.Management.ManagementClass("Win32_ProcessStartup"))
+					{
+						System.Management.ManagementBaseObject startup = startupClass.CreateInstance();
+						startup["EnvironmentVariables"] = envArray;
+						methodParameters["ProcessStartupInformation"] = startup;
+					}
+					File.AppendAllText(text2, "[diag] explicit env entries=" + envIndex + "\r\n");
+				}
+				catch (Exception envEx)
+				{
+					File.AppendAllText(text2, "[diag] explicit env failed: " + envEx.Message + "\r\n");
+				}
 				System.Management.ManagementBaseObject managementBaseObject = managementClass.InvokeMethod("Create", methodParameters, null);
 				if (Convert.ToInt32(managementBaseObject["ReturnValue"]) != 0)
 				{
@@ -1484,7 +1511,6 @@ public partial class MainWindow : Window, IComponentConnector
 		}
 	}
 
-		// 尾随 DSH 启动日志文件，把新增行喂进日志管线（复用 [dsh] 过滤与折叠）
 	private void StartDshLogTailer(string path)
 	{
 		StopDshLogTailer();
