@@ -1479,6 +1479,8 @@ public partial class MainWindow : Window, IComponentConnector
 					foreach (System.Collections.DictionaryEntry entry in envVars)
 					{
 						if (entry.Key == null || entry.Value == null) continue;
+						// strip installer compat layer marker (would force-elevate every child)
+						if (string.Equals((string)entry.Key, "__COMPAT_LAYER", StringComparison.OrdinalIgnoreCase)) continue;
 						envArray[envIndex++] = entry.Key + "=" + entry.Value;
 					}
 					Array.Resize(ref envArray, envIndex);

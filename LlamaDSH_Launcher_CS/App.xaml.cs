@@ -18,6 +18,21 @@ public partial class App : System.Windows.Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        // 清除安装器遗留的兼容层标记：Inno Setup 拉起本程序时设置了
+        // __COMPAT_LAYER=ElevateCreateProcess，它会让本进程创建的每个子进程都被
+        // 强制走 UAC AppInfo 提权通道(实测导致 DSH 的 node 子进程符号链接解析失败
+        // ERR_MODULE_NOT_FOUND)，必须在启动任何子进程前移除。
+        try
+        {
+            string? compatLayer = Environment.GetEnvironmentVariable("__COMPAT_LAYER");
+            if (!string.IsNullOrEmpty(compatLayer))
+            {
+                AppLog.WriteInfo($"stripping installer compat layer: __COMPAT_LAYER={compatLayer}");
+                Environment.SetEnvironmentVariable("__COMPAT_LAYER", null);
+            }
+        }
+        catch { }
+
         // 自我降权：从安装器拉起时继承提权(管理员)令牌，而提权上下文派生的 DSH 子进程
         // 会因环境差异导致 pnpm 符号链接解析失败(ERR_MODULE_NOT_FOUND)，且 WMI 分离模式
         // 同样受影响(提权调用者由提权 WmiPrvSE 实例服务)。检测到提权则经 explorer.exe
