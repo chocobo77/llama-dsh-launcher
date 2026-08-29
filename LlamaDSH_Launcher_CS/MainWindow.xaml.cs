@@ -1536,7 +1536,9 @@ public partial class MainWindow : Window, IComponentConnector
 			string outtype = ((mbResult == System.Windows.MessageBoxResult.Yes) ? "f16" : "q8_0");
 			BtnLlamaStart.IsEnabled = false;
 			Log("--- 开始转换 safetensors → GGUF (" + outtype + ")，目录: " + stDir + " ---");
-			Task.Run((Action)(() => ConvertSafetensors(stDir, outtype, delegate (string? outFile)
+			// 直接在 UI 线程调用：本方法只是启动进程+挂接异步输出泵，立即返回不阻塞 UI；
+			// 内部访问了 InputLlamaDir/Log 等 UI 资源，放后台线程会触发跨线程异常
+			ConvertSafetensors(stDir, outtype, delegate (string? outFile)
 			{
 				((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
 				{
@@ -1550,7 +1552,8 @@ public partial class MainWindow : Window, IComponentConnector
 					Log("--- 转换完成，继续启动 llama ---");
 					StartLlama();
 				}, Array.Empty<object>());
-			})));
+			});
+			return;
 			return;
 		}
 		List<string> list;
