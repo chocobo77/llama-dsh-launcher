@@ -1211,6 +1211,22 @@ public partial class MainWindow : Window, IComponentConnector
 			{
 				gpuFrac = Math.Clamp(nglV / gi.Layers, 0.0, 1.0);
 			}
+			// MoE 专家在 CPU 时按经验系数折算显存中的模型占用(注意力+共享权重约占 12%)
+			bool cpuMoeOn = _pbw.TryGetValue("cpu-moe", out System.Windows.Controls.CheckBox cmCb) && cmCb.IsChecked == true;
+			double moeFactor = 1.0;
+			if (cpuMoeOn)
+			{
+				moeFactor = 0.12;
+			}
+			else if (TryGetParamValue("n-cpu-moe", out string ncm) && double.TryParse(ncm, out double ncmV) && ncmV > 0 && gi.Ok && gi.Layers > 0)
+			{
+				moeFactor = Math.Min(1.0, 0.12 + 0.88 * (ncmV / (double)gi.Layers));
+			}
+			double modelFileBytes = modelBytes;
+			if (moeFactor < 1.0)
+			{
+				modelBytes *= moeFactor;
+			}
 			double kvPerToken;
 			if (gi.Ok)
 			{
@@ -1244,11 +1260,15 @@ public partial class MainWindow : Window, IComponentConnector
 				}
 				safeCtx = (safeCtx / 1024L) * 1024L;
 			}
-			string detail = "模型文件: " + (modelBytes / 1073741824.0).ToString("F1") + " GiB\n"
+			string detail = "模型文件: " + (modelFileBytes / 1073741824.0).ToString("F1") + " GiB\n"
 				+ "上下文: " + ctx + " token (" + (ctx / 1024L) + "K)\n"
 				+ "KV 缓存(按当前缓存类型估算): " + (kvBytes / 1073741824.0).ToString("F2") + " GiB\n"
 				+ "预计总占用: " + (estVram / 1073741824.0).ToString("F1") + " GiB\n"
 				+ "可用显存: " + (avail / 1073741824.0).ToString("F1") + " GiB";
+			if (moeFactor < 1.0)
+			{
+				detail += "\nMoE 专家在 CPU: 显存按系数 " + moeFactor.ToString("F2") + " 折算";
+			}
 			if (safeCtx > 0)
 			{
 				detail += "\n建议: 当前显存下安全上下文约 " + safeCtx + " token (" + (safeCtx / 1024L) + "K)";
@@ -1360,6 +1380,122 @@ public partial class MainWindow : Window, IComponentConnector
 		StopLlama();
 	}
 
+	// 检测当前模型选择是否为未转换的 safetensors（目录含分片，或直接选了 .safetensors 文件）
+	private string? DetectSafetensorsDir()
+	{
+		try
+		{
+			string raw = InputModelPath.Text.Trim().Trim('"');
+			if (string.IsNullOrEmpty(raw))
+			{
+				return null;
+			}
+			if (Directory.Exists(raw))
+			{
+				return ((Directory.GetFiles(raw, "*.safetensors").Length > 0) ? raw : null);
+			}
+			if (File.Exists(raw) && raw.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase))
+			{
+				return Path.GetDirectoryName(raw);
+			}
+		}
+		catch
+		{
+		}
+		return null;
+	}
+
+	private void ConvertSafetensors(string dir, string outtype, Action<string?> onDone)
+	{
+		string? outFile = null;
+		try
+		{
+			string llamaDir = InputLlamaDir.Text.Trim().Trim('"');
+			string script = Path.Combine(llamaDir, "convert_hf_to_gguf.py");
+			if (!File.Exists(script))
+			{
+				Log("[转换] 未找到转换脚本: " + script);
+				Log("[转换] 请从 llama.cpp 仓库下载 convert_hf_to_gguf.py 放到 llama 目录，并安装依赖: pip install gguf torch transformers sentencepiece");
+				onDone(null);
+				return;
+			}
+			string dirName = dir.TrimEnd('\\', '/');
+			outFile = Path.Combine(dir, Path.GetFileName(dirName) + "-" + outtype + ".gguf");
+			if (File.Exists(outFile) && new FileInfo(outFile).Length > 0)
+			{
+				Log("[转换] 已存在转换产物，跳过转换: " + outFile);
+				onDone(outFile);
+				return;
+			}
+			double srcBytes = 0.0;
+			string[] srcFiles = Directory.GetFiles(dir, "*.safetensors");
+			foreach (string f in srcFiles)
+			{
+				srcBytes += new FileInfo(f).Length;
+			}
+			double needBytes = srcBytes * ((outtype == "f16") ? 1.05 : 0.62);
+			DriveInfo di = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(outFile)) ?? "C:\\");
+			Log("[转换] 源 safetensors 共 " + (srcBytes / 1073741824.0).ToString("F1") + " GiB，预计需要磁盘 " + (needBytes / 1073741824.0).ToString("F1") + " GiB，" + di.Name + " 剩余 " + (di.AvailableFreeSpace / 1073741824.0).ToString("F1") + " GiB");
+			if (di.AvailableFreeSpace < needBytes)
+			{
+				Log("[转换] 磁盘空间不足，已取消。请清理磁盘或把输出放到空间足够的分区。");
+				onDone(null);
+				return;
+			}
+			ProcessStartInfo psi = new ProcessStartInfo
+			{
+				FileName = "python",
+				Arguments = "\"" + script + "\" \"" + dir + "\" --outfile \"" + outFile + "\" --outtype " + outtype,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
+				UseShellExecute = false,
+				CreateNoWindow = true,
+				WorkingDirectory = dir
+			};
+			Log("[转换] " + psi.FileName + " " + psi.Arguments);
+			Process? proc = Process.Start(psi);
+			if (proc == null)
+			{
+				LogError(new Exception("python 启动失败"), "safetensors 转换");
+				onDone(null);
+				return;
+			}
+			PumpProcessStreams(proc, "[转换] ", delegate
+			{
+				try
+				{
+					int code = proc.ExitCode;
+					DisposeProc(ref proc);
+					if (code == 0 && File.Exists(outFile) && new FileInfo(outFile).Length > 0)
+					{
+						Log("[转换] 完成: " + outFile + " (" + (new FileInfo(outFile).Length / 1073741824.0).ToString("F1") + " GiB)");
+						onDone(outFile);
+						return;
+					}
+					LogError(new Exception("退出码 " + code), "safetensors 转换失败");
+					Log("[转换] 若报 ModuleNotFoundError 请先安装依赖: pip install gguf torch transformers sentencepiece");
+					onDone(null);
+				}
+				catch (Exception ex2)
+				{
+					LogError(ex2, "转换收尾");
+					onDone(null);
+				}
+			});
+		}
+		catch (System.ComponentModel.Win32Exception)
+		{
+			LogError(new Exception("python 未找到"), "safetensors 转换");
+			Log("[转换] 请确认 python 已安装并在 PATH 中");
+			onDone(null);
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "safetensors 自动转换");
+			onDone(null);
+		}
+	}
+
 	private void StartLlama()
 	{
 		//IL_0224: Unknown result type (might be due to invalid IL or missing references)
@@ -1388,6 +1524,35 @@ public partial class MainWindow : Window, IComponentConnector
 			PerfTps.Text = "—";
 			PerfTtft.Text = "—";
 		}, Array.Empty<object>());
+		string? stDir = DetectSafetensorsDir();
+		if (stDir != null)
+		{
+			System.Windows.MessageBoxResult mbResult = System.Windows.MessageBox.Show("检测到 safetensors 模型分片，llama.cpp 无法直接加载。\n\n是否自动转换为 GGUF？(大模型耗时较长，30B 级约 10~40 分钟)\n\n是 = F16（精度优先，磁盘≈源文件大小）\n否 = Q8_0（磁盘约省一半）\n取消 = 放弃启动", "自动转换 safetensors → GGUF", System.Windows.MessageBoxButton.YesNoCancel, System.Windows.MessageBoxImage.Question);
+			if (mbResult != System.Windows.MessageBoxResult.Yes && mbResult != System.Windows.MessageBoxResult.No)
+			{
+				Log("--- 已取消：模型为 safetensors，未转换 ---");
+				return;
+			}
+			string outtype = ((mbResult == System.Windows.MessageBoxResult.Yes) ? "f16" : "q8_0");
+			BtnLlamaStart.IsEnabled = false;
+			Log("--- 开始转换 safetensors → GGUF (" + outtype + ")，目录: " + stDir + " ---");
+			Task.Run((Action)(() => ConvertSafetensors(stDir, outtype, delegate (string? outFile)
+			{
+				((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
+				{
+					BtnLlamaStart.IsEnabled = true;
+					if (string.IsNullOrEmpty(outFile))
+					{
+						Log("--- 转换失败，启动已取消。修复问题后重新点击启动 ---");
+						return;
+					}
+					InputModelPath.Text = outFile;
+					Log("--- 转换完成，继续启动 llama ---");
+					StartLlama();
+				}, Array.Empty<object>());
+			})));
+			return;
+		}
 		List<string> list;
 		try
 		{
