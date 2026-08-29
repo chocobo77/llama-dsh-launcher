@@ -1718,9 +1718,26 @@ public partial class MainWindow : Window, IComponentConnector
 	// gguf-py/，版本永远匹配上游重构)，失败再退回单文件下载(仅旧版独立脚本可用)
 	private async System.Threading.Tasks.Task<bool> FetchConverterAsync()
 	{
-		if (FindConvertScript() != null)
+		string? existing = FindConvertScript();
+		if (existing != null)
 		{
-			return true;
+			// 完整性校验：上游新版脚本依赖 conversion 包，若只有单文件脚本则视为残缺，
+			// 必须删除后重新走源码 tarball 获取完整版
+			string entry = File.ReadAllText(existing);
+			bool needsPkg = entry.Contains("from conversion import");
+			bool hasPkg = Directory.Exists(Path.Combine(Path.GetDirectoryName(existing) ?? ".", "conversion"));
+			if (!needsPkg || hasPkg)
+			{
+				return true;
+			}
+			Log("[环境] 检测到残缺的转换脚本(缺少 conversion 包)，重新获取完整源码包 ...");
+			try
+			{
+				File.Delete(existing);
+			}
+			catch
+			{
+			}
 		}
 		Directory.CreateDirectory(ToolsDir);
 		string tgz = Path.Combine(Path.GetTempPath(), "llamacpp_master.tar.gz");
