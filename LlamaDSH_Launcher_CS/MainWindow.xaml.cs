@@ -1461,7 +1461,7 @@ public partial class MainWindow : Window, IComponentConnector
 			{
 			}
 			_dshBootLogPath = text2;
-			string text3 = "cmd.exe /c cd /d \"" + dshDir + "\" && " + text + " >> \"" + text2 + "\" 2>&1";
+			string text3 = "cmd.exe /c cd /d \"" + dshDir + "\" & echo ===CHILD-ENV=== >> \"" + text2 + "\" 2>&1 & set >> \"" + text2 + "\" 2>&1 & where node >> \"" + text2 + "\" 2>&1 & node -v >> \"" + text2 + "\" 2>&1 & echo ===BOOT=== >> \"" + text2 + "\" 2>&1 & " + text + " >> \"" + text2 + "\" 2>&1";
 			using (System.Management.ManagementClass managementClass = new System.Management.ManagementClass("Win32_Process"))
 			{
 				System.Management.ManagementBaseObject methodParameters = managementClass.GetMethodParameters("Create");

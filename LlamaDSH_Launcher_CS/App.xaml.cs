@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
@@ -18,6 +18,34 @@ public partial class App : System.Windows.Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        // 自我降权：从安装器拉起时继承提权(管理员)令牌，而提权上下文派生的 DSH 子进程
+        // 会因环境差异导致 pnpm 符号链接解析失败(ERR_MODULE_NOT_FOUND)，且 WMI 分离模式
+        // 同样受影响(提权调用者由提权 WmiPrvSE 实例服务)。检测到提权则经 explorer.exe
+        // 以普通令牌重启自己——与诊断结论一致：非提权上下文下一切正常。
+        try
+        {
+            using (System.Security.Principal.WindowsIdentity identity = System.Security.Principal.WindowsIdentity.GetCurrent())
+            {
+                var principal = new System.Security.Principal.WindowsPrincipal(identity);
+                if (principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator))
+                {
+                    string? exePath = Process.GetCurrentProcess().MainModule?.FileName;
+                    if (!string.IsNullOrEmpty(exePath) && File.Exists(exePath))
+                    {
+                        Process.Start(new ProcessStartInfo
+                        {
+                            FileName = "explorer.exe",
+                            Arguments = "\"" + exePath + "\"",
+                            UseShellExecute = true
+                        });
+                        Shutdown();
+                        return;
+                    }
+                }
+            }
+        }
+        catch { }
+
         // 禁用 WPF 硬件加速：AMD 驱动在长期运行 WPF 应用时可能泄漏显存/系统内存，
         // 导致"无法创建新的堆栈防护页面"。启动器界面简单，软件渲染完全够用。
         try { System.Windows.Media.RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.SoftwareOnly; } catch { }
