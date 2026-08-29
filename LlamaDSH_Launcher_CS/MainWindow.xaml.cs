@@ -1487,7 +1487,9 @@ public partial class MainWindow : Window, IComponentConnector
 					using (System.Management.ManagementClass startupClass = new System.Management.ManagementClass("Win32_ProcessStartup"))
 					{
 						System.Management.ManagementBaseObject startup = startupClass.CreateInstance();
-						startup["EnvironmentVariables"] = envArray;
+						startup["ShowWindow"] = 0;
+						// SW_HIDE: WMI Create shows a visible console window by default - force hide
+						if (envArray != null) startup["EnvironmentVariables"] = envArray;
 						methodParameters["ProcessStartupInformation"] = startup;
 					}
 					File.AppendAllText(text2, "[diag] explicit env entries=" + envIndex + "\r\n");
