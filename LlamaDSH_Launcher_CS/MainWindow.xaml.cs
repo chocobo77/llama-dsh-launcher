@@ -220,6 +220,8 @@ public partial class MainWindow : Window, IComponentConnector
 			new ParamDefinition("RoPE 频率缩放", "rope-freq-scale", ParamType.String, "1.0", "性能与内存", enabled: false, isAdvanced: false, null, "RoPE 频率缩放因子。值为 N 时上下文扩展 N 倍。与 rope-scale 互为倒数关系。1.0 = 不缩放。长上下文扩展时配合 rope-scaling 方法使用。"),
 			new ParamDefinition("Cache 类型 K", "cache-type-k", ParamType.Combo, "q8_0", "KV 缓存", enabled: true, isAdvanced: false, new List<string> { "f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "q6_0" }, "KV 缓存 K 分量的数据类型。精度越低越省显存，但可能影响生成质量。f16=高精度高显存；q8_0=平衡；q4_0=省显存。24GB 显卡跑 27B Q4 建议配 q4_0 以留出上下文空间；48K 上下文下 f16 亦可。"),
 			new ParamDefinition("Cache 类型 V", "cache-type-v", ParamType.Combo, "q4_0", "KV 缓存", enabled: true, isAdvanced: false, new List<string> { "f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "q6_0" }, "KV 缓存 V 分量的数据类型。V 对精度不如 K 敏感，可更激进地压缩。24GB 显卡跑 27B Q4 建议 q4_0。f16 仅在显存充裕且追求最高质量时使用。"),
+			new ParamDefinition("MoE 专家全CPU (cpu-moe)", "cpu-moe", ParamType.Bool, false, "MOE 专家", enabled: false, isAdvanced: false, null, "将混合专家(MoE)模型的全部专家权重保留在 CPU 内存，仅注意力等共享权重进 GPU。适合 24GB 显存运行超大 MoE 模型(如 GLM-4.5-Air、Qwen3-30B-A3B、DeepSeek 系列——这类模型原权重多为 safetensors 分片，需先转 GGUF)。比全 GPU 慢但远快于纯 CPU；专家不占显存后 -ngl 可保持较大值。仅对 MoE 模型有效。"),
+			new ParamDefinition("MoE 专家CPU层数 (n-cpu-moe)", "n-cpu-moe", ParamType.String, "", "MOE 专家", enabled: false, isAdvanced: false, null, "只把前 N 层的 MoE 专家权重放在 CPU，其余层专家留在 GPU——显存与速度的折中。与 cpu-moe 同时设置时以 llama.cpp 实际处理为准。建议从 0 开始逐步增大直到显存刚好不 OOM；经验值：24GB 显存 + 30B-A3B(Q4_K_M) 约 8~20。仅对 MoE 模型有效。"),
 			new ParamDefinition("缓存 Prompt", "cache-prompt", ParamType.Bool, false, "KV 缓存", enabled: false, isAdvanced: true, null, "缓存 prompt 的 KV 状态，避免重复计算相同前缀。默认开启。多轮对话时可显著加速后续请求的首 token 延迟。建议保持开启。"),
 			new ParamDefinition("缓存重用阈值", "cache-reuse", ParamType.String, "0", "KV 缓存", enabled: false, isAdvanced: true, null, "通过 KV 偏移复用缓存的最小 chunk 大小。需要启用 prompt 缓存。默认 0=禁用。设为 256~512 可在相似 prompt 间复用 KV，加速多轮对话。"),
 			new ParamDefinition("碎片整理阈值", "defrag-thold", ParamType.String, "-1.0", "KV 缓存", enabled: false, isAdvanced: true, null, "KV 缓存碎片整理触发阈值。当碎片率超过此值时自动整理。默认 -1=自动。设为 0.1~0.5 可手动控制触发频率。注意：此参数已废弃，新版 llama.cpp 自动处理。"),
@@ -525,7 +527,7 @@ public partial class MainWindow : Window, IComponentConnector
 	{
 		Microsoft.Win32.OpenFileDialog openFileDialog = new Microsoft.Win32.OpenFileDialog
 		{
-			Filter = "GGUF|*.gguf"
+			Filter = "模型文件|*.gguf;*.safetensors|GGUF|*.gguf"
 		};
 		if (openFileDialog.ShowDialog() == true)
 		{
@@ -542,6 +544,18 @@ public partial class MainWindow : Window, IComponentConnector
 		if (openFileDialog.ShowDialog() == true)
 		{
 			InputMtpPath.Text = openFileDialog.FileName;
+		}
+	}
+
+	private void BrowseMmproj_Click(object s, RoutedEventArgs e)
+	{
+		Microsoft.Win32.OpenFileDialog openFileDialog = new Microsoft.Win32.OpenFileDialog
+		{
+			Filter = "GGUF|*.gguf"
+		};
+		if (openFileDialog.ShowDialog() == true)
+		{
+			InputMmprojPath.Text = openFileDialog.FileName;
 		}
 	}
 
@@ -646,6 +660,22 @@ public partial class MainWindow : Window, IComponentConnector
 		{
 			RefreshCmd();
 		};
+		InputMmprojPath.TextChanged += delegate
+		{
+			RefreshCmd();
+		};
+		InputMmprojUrl.TextChanged += delegate
+		{
+			RefreshCmd();
+		};
+		ChkNoMmprojOffload.Checked += delegate
+		{
+			RefreshCmd();
+		};
+		ChkNoMmprojOffload.Unchecked += delegate
+		{
+			RefreshCmd();
+		};
 		InputLlamaDir.TextChanged += delegate
 		{
 			RefreshCmd();
@@ -665,6 +695,45 @@ public partial class MainWindow : Window, IComponentConnector
 			{
 				textBox.Text = text;
 			}
+		}
+		try
+		{
+			string p2 = mp.Trim().Trim('"');
+			if (!string.IsNullOrEmpty(p2) && File.Exists(p2))
+			{
+				string ext = Path.GetExtension(p2).ToLowerInvariant();
+				string dir = Path.GetDirectoryName(p2) ?? "";
+				Match shm = Regex.Match(Path.GetFileName(p2), "-(\\d{5})-of-(\\d{5})\\.gguf$", RegexOptions.IgnoreCase);
+				if (shm.Success)
+				{
+					Log("[提示] 检测到分片 GGUF (" + shm.Groups[2].Value + " 片)：llama.cpp 会自动加载同目录其余分片，请勿移动/改名");
+				}
+				if (ext == ".safetensors")
+				{
+					Log("[提示] llama.cpp 不能直接加载 .safetensors，请先转换为 GGUF：python convert_hf_to_gguf.py <模型目录> --outfile model.gguf");
+					string[] ggs = Directory.GetFiles(dir, "*.gguf");
+					if (ggs.Length > 0)
+					{
+						Log("[提示] 同目录发现 GGUF: " + Path.GetFileName(ggs[0]) + "，可直接选择");
+					}
+				}
+				if (string.IsNullOrWhiteSpace(InputMmprojPath.Text))
+				{
+					string[] mms = Directory.GetFiles(dir, "mmproj*.gguf");
+					if (mms.Length == 1)
+					{
+						InputMmprojPath.Text = mms[0];
+						Log("[提示] 已自动关联同目录多模态投影仪: " + Path.GetFileName(mms[0]));
+					}
+					else if (mms.Length > 1)
+					{
+						Log("[提示] 同目录发现 " + mms.Length + " 个 mmproj 文件，请手动选择(浏览...)");
+					}
+				}
+			}
+		}
+		catch
+		{
 		}
 	}
 
@@ -691,6 +760,20 @@ public partial class MainWindow : Window, IComponentConnector
 		if (!string.IsNullOrEmpty(text3))
 		{
 			list.AddRange(new string[2] { "--model-draft", text3 });
+		}
+		string mmprojFile = Cl(InputMmprojPath.Text);
+		string mmprojUrl = Cl(InputMmprojUrl.Text);
+		if (!string.IsNullOrEmpty(mmprojFile))
+		{
+			list.AddRange(new string[2] { "--mmproj", mmprojFile });
+		}
+		else if (!string.IsNullOrEmpty(mmprojUrl))
+		{
+			list.AddRange(new string[2] { "--mmproj-url", mmprojUrl });
+		}
+		if ((ChkNoMmprojOffload.IsChecked == true) && (!string.IsNullOrEmpty(mmprojFile) || !string.IsNullOrEmpty(mmprojUrl)))
+		{
+			list.Add("--no-mmproj-offload");
 		}
 		foreach (ParamDefinition paramDef in _paramDefs)
 		{
@@ -985,6 +1068,31 @@ public partial class MainWindow : Window, IComponentConnector
 			if (modelBytes <= 0.0)
 			{
 				return null;
+			}
+			Match shm2 = Regex.Match(Path.GetFileName(modelPath), "-(\\d{5})-of-(\\d{5})\\.gguf$", RegexOptions.IgnoreCase);
+			if (shm2.Success)
+			{
+				string sdir = Path.GetDirectoryName(modelPath) ?? "";
+				string sbase = Path.GetFileName(modelPath);
+				int dashIdx = sbase.LastIndexOf("-" + shm2.Groups[1].Value, StringComparison.OrdinalIgnoreCase);
+				if (dashIdx > 0)
+				{
+					sbase = sbase.Substring(0, dashIdx);
+					string[] shards = Directory.GetFiles(sdir, sbase + "-*-of-*.gguf");
+					foreach (string sh in shards)
+					{
+						if (!string.Equals(sh, modelPath, StringComparison.OrdinalIgnoreCase))
+						{
+							modelBytes += new FileInfo(sh).Length;
+						}
+					}
+				}
+			}
+			string mmpp = InputMmprojPath.Text.Trim().Trim('"');
+			bool mmCpu = (ChkNoMmprojOffload.IsChecked == true);
+			if (!mmCpu && !string.IsNullOrEmpty(mmpp) && File.Exists(mmpp))
+			{
+				modelBytes += new FileInfo(mmpp).Length;
 			}
 			long ctx = 0;
 			if (TryGetParamValue("ctx-size", out string ctxStr))
@@ -2817,6 +2925,9 @@ public partial class MainWindow : Window, IComponentConnector
 		{
 			ModelPath = InputModelPath.Text,
 			MtpPath = InputMtpPath.Text,
+			MmprojPath = InputMmprojPath.Text,
+			MmprojUrl = InputMmprojUrl.Text,
+			NoMmprojOffload = (ChkNoMmprojOffload.IsChecked == true),
 			LlamaDir = InputLlamaDir.Text,
 			DshDir = InputDshDir.Text,
 			DshMode = ComboDshMode.SelectedIndex,
@@ -2859,6 +2970,9 @@ public partial class MainWindow : Window, IComponentConnector
 	{
 		InputModelPath.Text = c.ModelPath;
 		InputMtpPath.Text = c.MtpPath;
+		InputMmprojPath.Text = c.MmprojPath;
+		InputMmprojUrl.Text = c.MmprojUrl;
+		ChkNoMmprojOffload.IsChecked = c.NoMmprojOffload;
 		InputLlamaDir.Text = c.LlamaDir;
 		InputDshDir.Text = c.DshDir;
 		ComboDshMode.SelectedIndex = c.DshMode;

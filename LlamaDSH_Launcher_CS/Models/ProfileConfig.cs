@@ -8,6 +8,12 @@ public class ProfileConfig
 
 	public string MtpPath { get; set; } = "";
 
+	public string MmprojPath { get; set; } = "";
+
+	public string MmprojUrl { get; set; } = "";
+
+	public bool NoMmprojOffload { get; set; }
+
 	public string LlamaDir { get; set; } = "";
 
 	public string DshDir { get; set; } = "";

@@ -106,6 +106,16 @@
               <TextBox Name="InputMtpPath" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
             </DockPanel>
             <DockPanel Margin="0,0,0,6">
+              <Label Content="mmproj 路径:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
+              <Button Content="浏览..." DockPanel.Dock="Right" Margin="4,0,0,0" Click="BrowseMmproj_Click" />
+              <TextBox Name="InputMmprojPath" ToolTip="多模态投影仪(视觉编码器)gguf 文件，用于图像理解。必须与主模型严格匹配(同一仓库下载，否则 n_embd mismatch 报错)。精度选 F16 优先于 BF16(老卡)。留空=纯文本模式。选择主模型后会自动关联同目录 mmproj 文件。" />
+            </DockPanel>
+            <DockPanel Margin="0,0,0,6">
+              <Label Content="mmproj URL:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
+              <CheckBox Name="ChkNoMmprojOffload" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="4,0,0,0" Content="mmproj 强制CPU (--no-mmproj-offload)" ToolTip="禁用 mmproj 卸载到 GPU，强制在 CPU 运行(--no-mmproj-offload)。显存不足时勾选，代价是图像处理变慢。视觉编码器一般占 0.5~2GB(F16)，显存够则不勾(快)。" />
+              <TextBox Name="InputMmprojUrl" ToolTip="远程 mmproj 地址(可选)。本地 mmproj 路径为空时使用 --mmproj-url。一般建议直接用本地文件。" />
+            </DockPanel>
+            <DockPanel Margin="0,0,0,6">
               <Label Content="Llama 程序目录:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
               <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
                 <Button Content="浏览..." Margin="4,0,0,0" Click="BrowseLlama_Click" />
