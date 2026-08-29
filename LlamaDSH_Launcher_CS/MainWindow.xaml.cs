@@ -1716,6 +1716,92 @@ public partial class MainWindow : Window, IComponentConnector
 
 	// 获取转换工具：优先源码 tarball(包含 convert_hf_to_gguf.py + conversion/ 包 +
 	// gguf-py/，版本永远匹配上游重构)，失败再退回单文件下载(仅旧版独立脚本可用)
+	// 通过 jsDelivr(国内可达 CDN)按文件清单抓取转换工具：
+	// data.jsdelivr.com 列出 conversion/ 包与入口脚本，cdn.jsdelivr.net 逐文件下载
+	private static readonly string[] ConversionPackageFiles = new string[]
+	{
+		"__init__.py", "afmoe.py", "arctic.py", "baichuan.py", "bailingmoe.py", "bailingmoe3.py",
+		"base.py", "bert.py", "bitnet.py", "bloom.py", "chameleon.py", "chatglm.py", "codeshell.py",
+		"cogvlm.py", "command_r.py", "dbrx.py", "deci.py", "deepseek.py", "dots1.py", "dots3.py",
+		"dotsocr.py", "dream.py", "ernie.py", "exaone.py", "falcon.py", "falcon_h1.py", "gemma.py",
+		"glm.py", "gpt2.py", "gpt_oss.py", "gptneox.py", "granite.py", "grok.py", "grovemoe.py",
+		"hunyuan.py", "internlm.py", "internvl.py", "jais.py", "jamba.py", "januspro.py",
+		"kimi_k3.py", "kimi_linear.py", "kimivl.py", "laguna.py", "lfm2.py", "lighton_ocr.py",
+		"llada.py", "llama.py", "llama4.py", "llava.py", "maincoder.py", "mamba.py", "mellum.py",
+		"mimo.py", "minicpm.py", "minimax.py", "mistral.py", "mistral3.py", "mpt.py",
+		"muse_glimmer.py", "nanbeige.py", "nemotron.py", "olmo.py", "openelm.py", "orion.py",
+		"pangu.py", "phi.py", "pixtral.py", "plamo.py", "plm.py", "pockettts.py", "qwen.py",
+		"qwen3tts.py", "qwen3vl.py", "qwen4exp.py", "qwenvl.py", "refact.py", "rwkv.py",
+		"sarashina2.py", "smallthinker.py", "smolvlm.py", "stablelm.py", "starcoder.py", "step3.py",
+		"t5.py", "talkie.py", "ultravox.py", "wavtokenizer.py", "xverse.py", "youtuvl.py"
+	};
+
+	// 通过 jsDelivr CDN 逐文件下载 conversion 包与入口脚本。
+	// 文件清单为 2026-08-30 经 api.github.com 核实并在 cdn.jsdelivr.net 逐一验证存在的真实列表。
+	private async System.Threading.Tasks.Task<bool> FetchConversionPackageViaJsDelivrAsync()
+	{
+		Log("[下载] 从 cdn.jsdelivr.net 获取 conversion 包(" + ConversionPackageFiles.Length + " 个文件，清单已核实) ...");
+		foreach (string name in ConversionPackageFiles)
+		{
+			string dest = Path.Combine(ToolsDir, "conversion", name);
+			string url = "https://cdn.jsdelivr.net/gh/ggml-org/llama.cpp@master/conversion/" + name;
+			bool got = false;
+			for (int attempt = 0; attempt < 2 && !got; attempt++)
+			{
+				try
+				{
+					byte[] data = await _httpClient.GetByteArrayAsync(url);
+					if (data.Length < 10)
+					{
+						continue;
+					}
+					Directory.CreateDirectory(Path.GetDirectoryName(dest) ?? ".");
+					File.WriteAllBytes(dest, data);
+					got = true;
+				}
+				catch (Exception ex)
+				{
+					Log("[下载] " + name + " 失败(" + ex.Message + ")" + ((attempt == 0) ? "，重试一次" : ""));
+				}
+			}
+			if (!got)
+			{
+				Log("[下载] " + name + " 最终失败，jsDelivr 方式中止");
+				return false;
+			}
+		}
+		string entryDest = Path.Combine(ToolsDir, "convert_hf_to_gguf.py");
+		bool gotEntry = false;
+		for (int a = 0; a < 2 && !gotEntry; a++)
+		{
+			try
+			{
+				byte[] d = await _httpClient.GetByteArrayAsync("https://cdn.jsdelivr.net/gh/ggml-org/llama.cpp@master/convert_hf_to_gguf.py");
+				if (d.Length < 10)
+				{
+					continue;
+				}
+				File.WriteAllBytes(entryDest, d);
+				gotEntry = true;
+			}
+			catch (Exception ex2)
+			{
+				Log("[下载] convert_hf_to_gguf.py 失败(" + ex2.Message + ")" + ((a == 0) ? "，重试一次" : ""));
+			}
+		}
+		if (!gotEntry)
+		{
+			Log("[下载] 入口脚本下载失败，jsDelivr 方式中止");
+			return false;
+		}
+		if (!File.Exists(Path.Combine(ToolsDir, "conversion", "__init__.py")))
+		{
+			Log("[下载] conversion 包不完整(缺 __init__.py)");
+			return false;
+		}
+		return true;
+	}
+
 	private async System.Threading.Tasks.Task<bool> FetchConverterAsync()
 	{
 		string? existing = FindConvertScript();
@@ -1740,11 +1826,18 @@ public partial class MainWindow : Window, IComponentConnector
 			}
 		}
 		Directory.CreateDirectory(ToolsDir);
+		// 方式一(国内可达优先)：jsDelivr 数据 API 拿文件清单 + CDN 逐文件下载
+		if (await FetchConversionPackageViaJsDelivrAsync())
+		{
+			Log("[环境] 转换工具就绪(jsDelivr: 脚本 + conversion 包)");
+			return true;
+		}
 		string tgz = Path.Combine(Path.GetTempPath(), "llamacpp_master.tar.gz");
 		string exDir = Path.Combine(Path.GetTempPath(), "llamacpp_master_src");
-		string[] tarUrls = new string[4]
+		string[] tarUrls = new string[5]
 		{
 			"https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
+			"https://gh-proxy.com/https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
 			"https://ghproxy.net/https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
 			"https://ghfast.top/https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
 			"https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.tar.gz"
