@@ -1410,12 +1410,11 @@ public partial class MainWindow : Window, IComponentConnector
 		string? outFile = null;
 		try
 		{
-			string llamaDir = InputLlamaDir.Text.Trim().Trim('"');
-			string script = Path.Combine(llamaDir, "convert_hf_to_gguf.py");
-			if (!File.Exists(script))
+			string? script = FindConvertScript();
+			if (script == null)
 			{
-				Log("[转换] 未找到转换脚本: " + script);
-				Log("[转换] 请从 llama.cpp 仓库下载 convert_hf_to_gguf.py 放到 llama 目录，并安装依赖: pip install gguf torch transformers sentencepiece");
+				Log("[转换] 未找到且无法自动下载 convert_hf_to_gguf.py。");
+				Log("[转换] 可手动下载后放到 " + ToolsDir + " 或 llama 目录，并安装依赖: pip install gguf torch transformers sentencepiece");
 				onDone(null);
 				return;
 			}
@@ -1496,6 +1495,239 @@ public partial class MainWindow : Window, IComponentConnector
 		}
 	}
 
+	// 启动器工具目录：存放自动下载的 convert_hf_to_gguf.py 等(避免写入 Program Files 无权限)
+	public string ToolsDir { get; } = Path.Combine(
+		Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh_launcher_tools");
+
+	private static readonly System.Net.Http.HttpClient _httpClient = new System.Net.Http.HttpClient()
+	{
+		Timeout = TimeSpan.FromSeconds(90)
+	};
+
+	private string? FindConvertScript()
+	{
+		string inTools = Path.Combine(ToolsDir, "convert_hf_to_gguf.py");
+		if (File.Exists(inTools))
+		{
+			return inTools;
+		}
+		string llamaDir = InputLlamaDir.Text.Trim().Trim('"');
+		string inLlama = Path.Combine(llamaDir, "convert_hf_to_gguf.py");
+		if (File.Exists(inLlama))
+		{
+			return inLlama;
+		}
+		return null;
+	}
+
+	// 检测 python：返回 (exe, 参数前缀)。python 失败则尝试 py -3
+	private (string exe, string pre)? DetectPython()
+	{
+		string[][] cands = new string[2][]
+		{
+			new string[2] { "python", "" },
+			new string[2] { "py", "-3" }
+		};
+		foreach (string[] cand in cands)
+		{
+			try
+			{
+				ProcessStartInfo psi = new ProcessStartInfo
+				{
+					FileName = cand[0],
+					Arguments = ((cand[1].Length > 0) ? (cand[1] + " ") : "") + "--version",
+					RedirectStandardOutput = true,
+					RedirectStandardError = true,
+					UseShellExecute = false,
+					CreateNoWindow = true
+				};
+				Process? p = Process.Start(psi);
+				if (p == null)
+				{
+					continue;
+				}
+				string o = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+				p.WaitForExit(20000);
+				if (p.ExitCode == 0)
+				{
+					Log("[环境] python 就绪: " + o.Trim());
+					return (cand[0], cand[1]);
+				}
+			}
+			catch
+			{
+			}
+		}
+		return null;
+	}
+
+	private async System.Threading.Tasks.Task<bool> DownloadFileWithMirrorsAsync(string[] urls, string dest)
+	{
+		foreach (string u in urls)
+		{
+			try
+			{
+				Log("[下载] " + u);
+				using (System.Net.Http.HttpResponseMessage resp = await _httpClient.GetAsync(u))
+				{
+					if (!resp.IsSuccessStatusCode)
+					{
+						Log("[下载] HTTP " + ((int)resp.StatusCode) + "，换下一个源");
+						continue;
+					}
+					byte[] data = await resp.Content.ReadAsByteArrayAsync();
+					if (data.Length < 1000)
+					{
+						Log("[下载] 内容异常(过短)，换下一个源");
+						continue;
+					}
+					Directory.CreateDirectory(Path.GetDirectoryName(dest) ?? ".");
+					File.WriteAllBytes(dest, data);
+					Log("[下载] 完成: " + (data.Length / 1024) + " KB -> " + dest);
+					return true;
+				}
+			}
+			catch (Exception ex)
+			{
+				Log("[下载] 失败(" + ex.Message + ")，换下一个源");
+			}
+		}
+		return false;
+	}
+
+	// 启动进程并实时把输出泵进日志，返回退出码
+	private System.Threading.Tasks.Task<int> RunProcessWithLog(string exe, string args, string cwd, string tag)
+	{
+		System.Threading.Tasks.TaskCompletionSource<int> tcs = new System.Threading.Tasks.TaskCompletionSource<int>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
+		try
+		{
+			ProcessStartInfo psi = new ProcessStartInfo
+			{
+				FileName = exe,
+				Arguments = args,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
+				UseShellExecute = false,
+				CreateNoWindow = true
+			};
+			if (cwd != null)
+			{
+				psi.WorkingDirectory = cwd;
+			}
+			Process? proc = Process.Start(psi);
+			if (proc == null)
+			{
+				tcs.TrySetResult(-1);
+				return tcs.Task;
+			}
+			Process? p = proc;
+			PumpProcessStreams(p, tag + " ", delegate
+			{
+				int code = 0;
+				try
+				{
+					code = p.ExitCode;
+				}
+				catch
+				{
+				}
+				DisposeProc(ref p);
+				tcs.TrySetResult(code);
+			});
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, tag + " 进程启动失败");
+			tcs.TrySetResult(-1);
+		}
+		return tcs.Task;
+	}
+
+	// 环境自动化总入口：python 检测 → 下载转换脚本 → 安装 pip 依赖 → 转换 → 继续启动
+	private async void EnsureConvertAndLaunchAsync(string dir, string outtype)
+	{
+		try
+		{
+			string? py = null;
+			string pyPre = "";
+			(string exe, string pre)? detected = DetectPython();
+			if (detected.HasValue)
+			{
+				py = detected.Value.exe;
+				pyPre = detected.Value.pre;
+			}
+			if (py == null)
+			{
+				Log("[环境] 未检测到 python。请安装 Python 3.10+ 后重试: https://www.python.org/downloads/");
+				try
+				{
+					Process.Start(new ProcessStartInfo("https://www.python.org/downloads/") { UseShellExecute = true });
+				}
+				catch
+				{
+				}
+				BtnLlamaStart.IsEnabled = true;
+				return;
+			}
+			string script = FindConvertScript() ?? "";
+			if (script == "")
+			{
+				Directory.CreateDirectory(ToolsDir);
+				script = Path.Combine(ToolsDir, "convert_hf_to_gguf.py");
+				string raw = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/convert_hf_to_gguf.py";
+				bool ok = await DownloadFileWithMirrorsAsync(new string[4]
+				{
+					raw,
+					"https://ghproxy.net/" + raw,
+					"https://ghfast.top/" + raw,
+					"https://github.com/ggml-org/llama.cpp/raw/master/convert_hf_to_gguf.py"
+				}, script);
+				if (!ok)
+				{
+					Log("[环境] 脚本自动下载失败(网络原因)。可手动下载后放到 " + ToolsDir);
+					BtnLlamaStart.IsEnabled = true;
+					return;
+				}
+			}
+			Log("[环境] 检查/安装 python 依赖: gguf torch transformers sentencepiece (首次可能需下载数 GB，请耐心等待)");
+			string mirror = " -i https://pypi.tuna.tsinghua.edu.cn/simple";
+			string pipArgs = ((pyPre.Length > 0) ? (pyPre + " ") : "") + "-m pip install --disable-pip-version-check --progress-bar off gguf torch transformers sentencepiece";
+			int rc = await RunProcessWithLog(py, pipArgs + mirror, null, "[pip]");
+			if (rc != 0)
+			{
+				Log("[环境] 清华镜像安装失败，改用官方 PyPI 重试 ...");
+				rc = await RunProcessWithLog(py, pipArgs, null, "[pip]");
+			}
+			if (rc != 0)
+			{
+				Log("[环境] python 依赖安装失败，已取消启动。请检查网络后重试。");
+				BtnLlamaStart.IsEnabled = true;
+				return;
+			}
+			Log("[环境] 依赖就绪，开始转换 safetensors → GGUF (" + outtype + ")");
+			ConvertSafetensors(dir, outtype, delegate (string? outFile)
+			{
+				((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
+				{
+					BtnLlamaStart.IsEnabled = true;
+					if (string.IsNullOrEmpty(outFile))
+					{
+						Log("--- 转换失败，启动已取消。修复问题后重新点击启动 ---");
+						return;
+					}
+					InputModelPath.Text = outFile;
+					Log("--- 转换完成，继续启动 llama ---");
+					StartLlama();
+				}, Array.Empty<object>());
+			});
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "自动准备转换环境");
+			BtnLlamaStart.IsEnabled = true;
+		}
+	}
+
 	private void StartLlama()
 	{
 		//IL_0224: Unknown result type (might be due to invalid IL or missing references)
@@ -1535,24 +1767,8 @@ public partial class MainWindow : Window, IComponentConnector
 			}
 			string outtype = ((mbResult == System.Windows.MessageBoxResult.Yes) ? "f16" : "q8_0");
 			BtnLlamaStart.IsEnabled = false;
-			Log("--- 开始转换 safetensors → GGUF (" + outtype + ")，目录: " + stDir + " ---");
-			// 直接在 UI 线程调用：本方法只是启动进程+挂接异步输出泵，立即返回不阻塞 UI；
-			// 内部访问了 InputLlamaDir/Log 等 UI 资源，放后台线程会触发跨线程异常
-			ConvertSafetensors(stDir, outtype, delegate (string? outFile)
-			{
-				((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
-				{
-					BtnLlamaStart.IsEnabled = true;
-					if (string.IsNullOrEmpty(outFile))
-					{
-						Log("--- 转换失败，启动已取消。修复问题后重新点击启动 ---");
-						return;
-					}
-					InputModelPath.Text = outFile;
-					Log("--- 转换完成，继续启动 llama ---");
-					StartLlama();
-				}, Array.Empty<object>());
-			});
+			Log("--- 检测到 safetensors，将自动准备环境(下载脚本/安装依赖)并转换，目录: " + stDir + " ---");
+			EnsureConvertAndLaunchAsync(stDir, outtype);
 			return;
 			return;
 		}
