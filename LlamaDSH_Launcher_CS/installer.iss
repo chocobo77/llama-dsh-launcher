@@ -2,7 +2,7 @@
 ; Inno Setup 6 中文版
 
 #define MyAppName "DeepSeek Harness & Llama 启动器"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "LlamaDSH"
 #define MyAppExeName "LlamaDSH_Launcher.exe"
 #define MyAppIcon "app.ico"

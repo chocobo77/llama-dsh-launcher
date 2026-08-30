@@ -119,7 +119,16 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private NotifyIcon? _trayIcon;
 
-	private readonly List<ParamDefinition> _paramDefs;
+	private List<ParamDefinition> _paramDefs;
+
+	private ParamSchemaLoadResult _paramSchema = new();
+
+	private List<ParamGroupDef> _paramGroups = new();
+
+	/// <summary>最近一次 BuildCmd 依赖/校验未通过的参数清单（启动时弹窗确认）。</summary>
+	private List<string> _lastViolations = new();
+
+	private bool _inDepEval;
 
 	private readonly Dictionary<string, (System.Windows.Controls.CheckBox ec, System.Windows.Controls.Control vw)> _pw;
 
@@ -171,7 +180,17 @@ public partial class MainWindow : Window, IComponentConnector
 		
 		_configDir = CFG_DIR;
 		_configFilename = "LlamaDSH_Launcher_config.json";
-		_paramDefs = BuildParamDefs();
+		_paramSchema = ParamSchemaService.Load();
+		_paramDefs = _paramSchema.Defs;
+		_paramGroups = _paramSchema.Groups;
+		if (_paramSchema.Errors.Count > 0 || _paramSchema.Warnings.Count > 0)
+		{
+			string schemaMsg = string.Join("\n", _paramSchema.Errors.Concat(_paramSchema.Warnings));
+			Dispatcher.BeginInvoke(new Action(delegate
+			{
+				System.Windows.MessageBox.Show(schemaMsg, "参数配置提示", MessageBoxButton.OK, MessageBoxImage.Warning);
+			}));
+		}
 		LoadConfigDirFromFile();
 		InitializeComponent();
 		BuildParamGroups();
@@ -190,87 +209,17 @@ public partial class MainWindow : Window, IComponentConnector
 		base.IsVisibleChanged += new DependencyPropertyChangedEventHandler(OnVisibilityChanged);
 	}
 
-	private static List<ParamDefinition> BuildParamDefs()
-	{
-		int processorCount = Environment.ProcessorCount;
-		return new List<ParamDefinition>
-		{
-			new ParamDefinition("别名 (Alias)", "alias", ParamType.String, "qwen3.8-27b", "基础设置", enabled: true, isAdvanced: false, null, "模型别名，用于 API 返回中的 model 字段标识。建议设为模型简称，方便上层应用识别。"),
-			new ParamDefinition("主机 (Host)", "host", ParamType.String, "127.0.0.1", "基础设置", enabled: true, isAdvanced: false, null, "监听 IP 地址。127.0.0.1 仅本机可访问；0.0.0.0 允许局域网访问（注意安全风险）。也支持 UNIX socket 路径（以 .sock 结尾）。建议：本地使用保持 127.0.0.1。"),
-			new ParamDefinition("端口 (Port)", "port", ParamType.String, "1234", "基础设置", enabled: true, isAdvanced: false, null, "HTTP 监听端口，范围 1-65535。llama-server 默认 8080，此启动器默认 1234 以避免与其他服务冲突。"),
-			new ParamDefinition("超时 (Timeout)", "timeout", ParamType.String, "600", "基础设置", enabled: true, isAdvanced: false, null, "llama-server 读写超时（秒）。超时后断开空闲连接。长文本生成建议 >=300s，多轮对话建议 600s。设为 0 表示永不超时。"),
-			new ParamDefinition("上下文大小 (Context)", "ctx-size", ParamType.String, "49152", "基础设置", enabled: true, isAdvanced: false, null, "Prompt 上下文窗口长度（token 数）。决定单次对话能处理的最大 token 量。支持 K/M 后缀（如 100K=102400）。越大越占显存：27B Q4 模型约 16GB，24GB 显卡 + q4_0 KV 时建议 <=48K；100K 以上预计总占用超 23GB，极易 OOM 崩溃。启动前会自动估算显存并预警。默认 0 = 从模型元数据读取。"),
-			new ParamDefinition("批处理大小 (Batch Size)", "batch-size", ParamType.String, "2048", "基础设置", enabled: true, isAdvanced: false, null, "逻辑最大批处理大小。控制 prompt 处理时一次送入模型的 token 上限。增大可加速 prompt 处理但增加显存占用。默认 2048，24GB 显卡建议 2048~4096。"),
-			new ParamDefinition("微批大小 (Ubatch)", "ubatch-size", ParamType.String, "512", "基础设置", enabled: true, isAdvanced: false, null, "物理微批处理大小。实际每次送入推理引擎的 token 数，必须 <= batch-size。较小值降低延迟但降低吞吐。默认 512，显存充裕可提至 1024。"),
-			new ParamDefinition("线程数 (Threads)", "threads", ParamType.String, processorCount.ToString(), "基础设置", enabled: true, isAdvanced: false, null, "生成阶段使用的 CPU 线程数。默认 -1 = 自动（使用全部物理核心）。建议设为 CPU 物理核心数（不含超线程），过多反而因上下文切换降低性能。"),
-			new ParamDefinition("GPU 层数", "n-gpu-layers", ParamType.String, "99", "基础设置", enabled: true, isAdvanced: false, null, "卸载到 GPU 的模型层数。0=纯 CPU；99=尽可能全部卸载。27B Q4 模型约需 99 层全卸载到 24GB 显卡。设为 auto 可自动计算。显存不足时逐层减少。"),
-			new ParamDefinition("主 GPU 编号", "main-gpu", ParamType.String, "0", "基础设置", enabled: true, isAdvanced: false, null, "主 GPU 设备编号（从 0 开始）。单卡用户保持 0。多卡时指定存放中间结果和 KV 缓存的 GPU。"),
-			new ParamDefinition("HTTP 线程数", "threads-http", ParamType.String, "-1", "基础设置", enabled: false, isAdvanced: false, null, "处理 HTTP 请求的线程数。默认 -1 = 自动（通常为 8）。高并发场景可适当增加，但过多会与推理线程争抢 CPU。建议：单用户保持 -1；多用户可设 4~8。"),
-			new ParamDefinition("API 密钥", "api-key", ParamType.String, "", "基础设置", enabled: false, isAdvanced: false, null, "API 认证密钥，多个用逗号分隔。留空表示无需认证。暴露在公网时务必设置，否则任何人都能调用你的模型。"),
-			new ParamDefinition("SSL 私钥文件", "ssl-key-file", ParamType.String, "", "基础设置", enabled: false, isAdvanced: false, null, "PEM 格式的 SSL 私钥文件路径。与证书文件配合启用 HTTPS 加密通信。本地使用无需设置。"),
-			new ParamDefinition("SSL 证书文件", "ssl-cert-file", ParamType.String, "", "基础设置", enabled: false, isAdvanced: false, null, "PEM 格式的 SSL 证书文件路径。需与私钥文件配对使用。可用 Let''s Encrypt 等免费证书。"),
-			new ParamDefinition("CORS 允许来源", "cors-origins", ParamType.String, "", "基础设置", enabled: false, isAdvanced: false, null, "跨域资源共享（CORS）允许的来源列表，逗号分隔。留空默认允许所有来源（*）。Web 前端跨域访问时需设置为前端域名。设为 localhost 只反射本机 Origin。"),
-			new ParamDefinition("Flash Attention", "flash-attn", ParamType.Combo, "on", "性能与内存", enabled: true, isAdvanced: false, new List<string> { "on", "off", "auto" }, "Flash Attention 加速。需要 GPU 硬件支持（AMD RDNA2+/NVIDIA Ampere+）。可显著降低长上下文的显存占用并加速推理。推荐 on；若启动报错则改 auto。"),
-			new ParamDefinition("张量拆分", "tensor-split", ParamType.String, "", "性能与内存", enabled: false, isAdvanced: false, null, "多 GPU 张量拆分比例，逗号分隔。如 ''3,5'' 表示第一块 GPU 占 3/8、第二块占 5/8。按显存大小比例分配。单卡无需设置。"),
-			new ParamDefinition("批处理线程数", "threads-batch", ParamType.String, "", "性能与内存", enabled: false, isAdvanced: false, null, "Prompt 处理（批处理）时的 CPU 线程数。默认与 --threads 相同。Prompt 处理是计算密集型，可适当增加线程数以加速首次响应。"),
-			new ParamDefinition("禁用 mmap", "no-mmap", ParamType.Bool, false, "性能与内存", enabled: false, isAdvanced: true, null, "禁用内存映射（mmap）加载模型。mmap 允许操作系统按需加载模型片段，节省内存。禁用后加载更慢但可减少系统交换。一般保持关闭。已废弃，推荐使用 --load-mode。"),
-			new ParamDefinition("禁用 mlock", "no-mlock", ParamType.Bool, false, "性能与内存", enabled: false, isAdvanced: true, null, "锁定模型到物理内存（mlock），防止被操作系统交换到磁盘。可避免长时间运行后的性能抖动，但需要足够的物理内存。已废弃，推荐使用 --load-mode mlock。"),
-			new ParamDefinition("NUMA 策略", "numa", ParamType.Combo, "disabled", "性能与内存", enabled: false, isAdvanced: false, new List<string> { "disabled", "distribute", "isolate", "numactl" }, "NUMA 内存分配策略。仅多路 CPU（服务器）有意义。distribute=均匀分配；isolate=限制在启动 CPU 节点；numactl=使用 numactl 工具的映射。单路 CPU/桌面用户保持 disabled。"),
-			new ParamDefinition("RoPE 基础频率", "rope-freq-base", ParamType.String, "", "性能与内存", enabled: false, isAdvanced: false, null, "RoPE 旋转位置编码的基础频率。默认从模型元数据读取。NTK-aware 缩放时可调大此值以扩展上下文。一般无需手动设置，除非模型训练时使用了非标准值。"),
-			new ParamDefinition("RoPE 频率缩放", "rope-freq-scale", ParamType.String, "1.0", "性能与内存", enabled: false, isAdvanced: false, null, "RoPE 频率缩放因子。值为 N 时上下文扩展 N 倍。与 rope-scale 互为倒数关系。1.0 = 不缩放。长上下文扩展时配合 rope-scaling 方法使用。"),
-			new ParamDefinition("Cache 类型 K", "cache-type-k", ParamType.Combo, "q8_0", "KV 缓存", enabled: true, isAdvanced: false, new List<string> { "f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "q6_0" }, "KV 缓存 K 分量的数据类型。精度越低越省显存，但可能影响生成质量。f16=高精度高显存；q8_0=平衡；q4_0=省显存。24GB 显卡跑 27B Q4 建议配 q4_0 以留出上下文空间；48K 上下文下 f16 亦可。"),
-			new ParamDefinition("Cache 类型 V", "cache-type-v", ParamType.Combo, "q4_0", "KV 缓存", enabled: true, isAdvanced: false, new List<string> { "f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "q6_0" }, "KV 缓存 V 分量的数据类型。V 对精度不如 K 敏感，可更激进地压缩。24GB 显卡跑 27B Q4 建议 q4_0。f16 仅在显存充裕且追求最高质量时使用。"),
-			new ParamDefinition("MoE 专家全CPU (cpu-moe)", "cpu-moe", ParamType.Bool, false, "MOE 专家", enabled: false, isAdvanced: false, null, "将混合专家(MoE)模型的全部专家权重保留在 CPU 内存，仅注意力等共享权重进 GPU。适合 24GB 显存运行超大 MoE 模型(如 GLM-4.5-Air、Qwen3-30B-A3B、DeepSeek 系列——这类模型原权重多为 safetensors 分片，需先转 GGUF)。比全 GPU 慢但远快于纯 CPU；专家不占显存后 -ngl 可保持较大值。仅对 MoE 模型有效。"),
-			new ParamDefinition("MoE 专家CPU层数 (n-cpu-moe)", "n-cpu-moe", ParamType.String, "", "MOE 专家", enabled: false, isAdvanced: false, null, "只把前 N 层的 MoE 专家权重放在 CPU，其余层专家留在 GPU——显存与速度的折中。与 cpu-moe 同时设置时以 llama.cpp 实际处理为准。建议从 0 开始逐步增大直到显存刚好不 OOM；经验值：24GB 显存 + 30B-A3B(Q4_K_M) 约 8~20。仅对 MoE 模型有效。"),
-			new ParamDefinition("缓存 Prompt", "cache-prompt", ParamType.Bool, false, "KV 缓存", enabled: false, isAdvanced: true, null, "缓存 prompt 的 KV 状态，避免重复计算相同前缀。默认开启。多轮对话时可显著加速后续请求的首 token 延迟。建议保持开启。"),
-			new ParamDefinition("缓存重用阈值", "cache-reuse", ParamType.String, "0", "KV 缓存", enabled: false, isAdvanced: true, null, "通过 KV 偏移复用缓存的最小 chunk 大小。需要启用 prompt 缓存。默认 0=禁用。设为 256~512 可在相似 prompt 间复用 KV，加速多轮对话。"),
-			new ParamDefinition("碎片整理阈值", "defrag-thold", ParamType.String, "-1.0", "KV 缓存", enabled: false, isAdvanced: true, null, "KV 缓存碎片整理触发阈值。当碎片率超过此值时自动整理。默认 -1=自动。设为 0.1~0.5 可手动控制触发频率。注意：此参数已废弃，新版 llama.cpp 自动处理。"),
-			new ParamDefinition("随机种子 (Seed)", "seed", ParamType.String, "-1", "采样控制", enabled: true, isAdvanced: false, null, "RNG 随机种子。-1 = 每次随机（默认）。设为固定值可使相同输入产生相同输出，便于调试和复现。测试时建议固定种子，生产环境保持 -1。"),
-			new ParamDefinition("最大生成 Token", "predict", ParamType.String, "-1", "采样控制", enabled: false, isAdvanced: false, null, "单次请求最大生成 token 数。-1 = 无限（直到模型决定停止或达到上下文上限）。设为 512~2048 可防止模型过度生成。API 调用时通常由客户端的 max_tokens 参数覆盖。"),
-			new ParamDefinition("温度 (Temp)", "temp", ParamType.String, "0.8", "采样控制", enabled: true, isAdvanced: false, null, "采样温度，控制输出随机性。0=确定性（贪心解码）；0.1~0.4=保守精确；0.6~0.8=平衡创意与连贯（推荐）；1.0+=高随机性。代码生成建议 0.1~0.3；对话建议 0.6~0.8；创意写作 0.8~1.2。"),
-			new ParamDefinition("Top-K", "top-k", ParamType.String, "40", "采样控制", enabled: true, isAdvanced: false, null, "Top-K 采样：仅从概率最高的 K 个 token 中采样。K 越小输出越保守。默认 40。设为 1=贪心；10~40=平衡；0=禁用（仅用 Top-P/Min-P）。建议配合 Top-P 使用，保持默认 40。"),
-			new ParamDefinition("Top-P", "top-p", ParamType.String, "0.9", "采样控制", enabled: true, isAdvanced: false, null, "核采样（Nucleus Sampling）：从累计概率达到 P 的最小 token 集合中采样。P 越小输出越集中。默认 0.95。0.9=保守；1.0=禁用。建议 0.9~0.95，配合 Min-P 效果更佳。"),
-			new ParamDefinition("Min-P", "min-p", ParamType.String, "0.1", "采样控制", enabled: true, isAdvanced: false, null, "Min-P 采样：过滤掉概率低于最高概率 * min_p 的 token。比 Top-P 更直观的截断方式。默认 0.05。0.05~0.1=温和过滤；0.3~0.5=较强过滤。推荐与 Top-P 配合使用，保持 0.05~0.1。"),
-			new ParamDefinition("局部典型采样", "typical", ParamType.String, "1.0", "采样控制", enabled: false, isAdvanced: true, null, "Locally Typical Sampling：基于信息量的采样策略，使输出更典型。1.0=禁用（默认）。0.5~0.9=启用。一般场景无需开启，对特定任务（如翻译）可能有帮助。"),
-			new ParamDefinition("重复惩罚", "repeat-penalty", ParamType.String, "1.1", "采样控制", enabled: true, isAdvanced: false, null, "重复惩罚系数，抑制连续重复。1.0=禁用；>1.0=惩罚重复。默认 1.1。1.05~1.1=轻度（推荐）；1.2~1.3=较强。过高会导致用词贫乏。对中文模型建议 1.0~1.1。"),
-			new ParamDefinition("频率惩罚", "frequency-penalty", ParamType.String, "0.0", "采样控制", enabled: true, isAdvanced: false, null, "频率惩罚：基于 token 出现频率的惩罚。频率越高的 token 被惩罚越重。0.0=禁用（默认）。0.1~0.5=轻度；1.0~2.0=较强。与 repeat-penalty 互补，可同时使用。"),
-			new ParamDefinition("存在惩罚", "presence-penalty", ParamType.String, "0.0", "采样控制", enabled: true, isAdvanced: false, null, "存在惩罚：只要 token 出现过就施加固定惩罚（不关心频率）。鼓励模型谈论新话题。0.0=禁用（默认）。0.1~0.5=轻度；1.0~2.0=较强。适合长对话/写作场景。"),
-			new ParamDefinition("Mirostat 模式", "mirostat", ParamType.Combo, "0", "采样控制", enabled: false, isAdvanced: false, new List<string> { "0", "1", "2" }, "Mirostat 自适应采样。自动调节温度以维持目标困惑度。0=禁用；1=Mirostat 1.0；2=Mirostat 2.0（推荐）。启用后 Top-K/Top-P/Min-P 被忽略。适合追求稳定质量的场景。"),
-			new ParamDefinition("Mirostat 学习率", "mirostat-lr", ParamType.String, "0.1", "采样控制", enabled: false, isAdvanced: false, null, "Mirostat 学习率（eta）。控制对目标熵的追踪速度。越大调整越快但可能不稳定。默认 0.1。0.05~0.2 均可。仅在 Mirostat 模式 != 0 时生效。"),
-			new ParamDefinition("Mirostat 目标熵", "mirostat-ent", ParamType.String, "5.0", "采样控制", enabled: false, isAdvanced: false, null, "Mirostat 目标熵（tau）。控制输出的困惑度/多样性。值越大输出越多样。默认 5.0。3.0~8.0 均可。仅在 Mirostat 模式 != 0 时生效。"),
-			new ParamDefinition("BNF 语法", "grammar", ParamType.String, "", "采样控制", enabled: false, isAdvanced: false, null, "BNF-like 语法约束。强制模型输出符合指定语法结构。用于结构化输出（如 SQL、代码）。语法文件在 grammars/ 目录。一般场景用 JSON Schema 更方便。"),
-			new ParamDefinition("JSON Schema", "json-schema", ParamType.String, "", "采样控制", enabled: false, isAdvanced: false, null, "JSON Schema 约束。强制模型输出符合指定的 JSON Schema。用于 API 返回结构化数据。如 {type:object,properties:{name:{type:string}}}。"),
-			new ParamDefinition("推测类型", "spec-type", ParamType.Combo, "draft-mtp", "推测解码", enabled: true, isAdvanced: false, new List<string> { "draft", "draft-mtp", "draft-mtp-v3" }, "推测解码类型。draft=外部草稿模型；draft-mtp=模型自带 MTP 层（Qwen3 等原生支持）；draft-mtp-v3=MTP v3 版本。Qwen3 系列推荐 draft-mtp，可加速 2~3 倍。无 MTP 的模型用 draft + 独立草稿模型。"),
-			new ParamDefinition("最大草稿 Token", "spec-draft-n-max", ParamType.String, "2", "推测解码", enabled: true, isAdvanced: false, null, "每次推测生成的最大草稿 token 数。越大越快但接受率可能下降。默认 3。2~5=平衡（推荐）；8~10=激进。24GB 显卡跑 27B 建议 2~3。接受率低于 50% 时应减小此值。"),
-			new ParamDefinition("草稿接受阈值", "spec-draft-p-min", ParamType.String, "", "推测解码", enabled: false, isAdvanced: false, null, "草稿 token 的最低接受概率。低于此值的草稿 token 被拒绝。默认 0.0（全部接受）。带宽受限时设为 0.60~0.75 可提升质量。一般保持默认。"),
-			new ParamDefinition("草稿线程数", "threads-draft", ParamType.String, "", "推测解码", enabled: false, isAdvanced: false, null, "草稿模型的 CPU 生成线程数。默认与 --threads 相同。使用外部草稿模型时可单独设置以平衡 CPU 负载。使用 draft-mtp 时无需设置。"),
-			new ParamDefinition("多模态投影", "mmproj", ParamType.String, "", "多模态", enabled: false, isAdvanced: false, null, "多模态投影仪 GGUF 文件路径。启用视觉/音频等多模态能力。需与基础语言模型配对使用。如 Qwen2.5-VL 的 mmproj 文件。本地文件路径或 HuggingFace 均可。"),
-			new ParamDefinition("媒体根目录", "media-path", ParamType.String, "", "多模态", enabled: false, isAdvanced: false, null, "本地媒体文件的根目录。API 可通过 file:// 相对路径访问此目录下的图片/视频。用于多模态推理时加载本地媒体资源。"),
-			new ParamDefinition("并行序列数", "parallel", ParamType.String, "1", "并行与序列", enabled: true, isAdvanced: false, null, "服务器并发槽位数（同时处理的请求数）。默认 -1=自动。1=单用户（推荐本地使用）；2~4=多用户并发。每个槽位占用独立的 KV 缓存空间，增加会线性增加显存占用。MTP 推测解码建议保持 1。"),
-			new ParamDefinition("序列数 (旧版)", "sequences", ParamType.String, "1", "并行与序列", enabled: false, isAdvanced: true, null, "旧版并行序列数参数，已被 --parallel 取代。保持默认值即可。"),
-			new ParamDefinition("启用 Jinja", "jinja", ParamType.Bool, true, "模板与对话", enabled: true, isAdvanced: false, null, "启用 Jinja2 模板引擎处理聊天模板。默认开启。大多数模型需要 Jinja 正确格式化对话。禁用后使用内置的简单模板，可能导致对话格式错误。建议保持开启。"),
-			new ParamDefinition("自定义模板", "chat-template", ParamType.String, "", "模板与对话", enabled: false, isAdvanced: false, null, "自定义 Jinja 聊天模板字符串。覆盖模型自带的模板。支持的内置模板名：chatml, llama2, llama3, gemma, mistral, deepseek 等。一般无需设置，使用模型自带模板即可。"),
-			new ParamDefinition("模板文件", "chat-template-file", ParamType.String, "", "模板与对话", enabled: false, isAdvanced: false, null, "从文件加载自定义聊天模板。与 --chat-template 功能相同但内容从文件读取。适合模板较长时使用。"),
-			new ParamDefinition("日志详细度", "verbosity", ParamType.String, "3", "扩展功能", enabled: false, isAdvanced: true, null, "日志输出详细程度。0=仅关键信息；1=错误；2=警告；3=信息（默认）；4=追踪；5=调试。调试时设 4~5；日常使用 2~3；安静模式 0~1。"),
-			new ParamDefinition("启用 Embedding", "embedding", ParamType.Bool, false, "扩展功能", enabled: false, isAdvanced: true, null, "启用 Embeddings API 端点（/embedding）。需要使用专门的 Embedding 模型（如 nomic-embed、bge 等）。启用后只能用于 Embedding，不能用于文本生成。普通对话场景不要开启。"),
-			new ParamDefinition("启用 Metrics", "metrics", ParamType.Bool, true, "扩展功能", enabled: false, isAdvanced: true, null, "启用 Prometheus 兼容的 /metrics 监控端点。启动器用它在运行中实时读取 TPS / Prefill / 首Token（也可在接管已有 Llama 进程时显示指标）。仅监听本机，安全无虞。"),
-			new ParamDefinition("显示槽位", "slots", ParamType.Bool, false, "扩展功能", enabled: false, isAdvanced: true, null, "暴露 /slots 端点，显示各推理槽位的状态（正在处理、空闲等）。默认开启。调试并发问题时有用。安全敏感环境建议关闭。"),
-			new ParamDefinition("LoRA", "lora", ParamType.String, "", "扩展功能", enabled: false, isAdvanced: true, null, "LoRA 适配器路径。在基础模型上叠加微调效果。支持多个适配器（逗号分隔）。格式：文件路径。无需重启可通过 API 热切换。"),
-			new ParamDefinition("LoRA (带比例)", "lora-scaled", ParamType.String, "", "扩展功能", enabled: false, isAdvanced: true, null, "带缩放因子的 LoRA。格式：路径:比例，如 adapter.safetensors:0.8。比例控制 LoRA 影响强度，0.0~1.0。多个适配器用逗号分隔。"),
-			new ParamDefinition("控制向量", "control-vector", ParamType.String, "", "扩展功能", enabled: false, isAdvanced: true, null, "控制向量（Control Vector）路径。通过向量运算引导模型行为（如更积极/更谨慎）。多个向量可逗号分隔叠加使用。"),
-			new ParamDefinition("控制向量 (带比例)", "control-vector-scaled", ParamType.String, "", "扩展功能", enabled: false, isAdvanced: true, null, "带缩放因子的控制向量。格式：路径:比例。比例控制向量影响强度。负值可反转效果。多个用逗号分隔。"),
-			new ParamDefinition("休眠空闲秒数", "sleep-idle-seconds", ParamType.String, "-1", "扩展功能", enabled: false, isAdvanced: false, null, "空闲多少秒后服务器自动休眠（卸载模型释放显存）。-1=禁用（默认）。设为 300~600 可在闲置时释放显存给其他程序。收到新请求时自动唤醒（需重新加载模型）。")
-		};
-	}
-
 	private void BuildParamGroups()
 	{
-		string[] array = new string[9] { "基础设置", "性能与内存", "KV 缓存", "采样控制", "推测解码", "多模态", "并行与序列", "模板与对话", "扩展功能" };
-		foreach (string gn in array)
+		foreach (ParamGroupDef g in _paramGroups.OrderBy((ParamGroupDef x) => x.Order))
 		{
+			if (!_paramDefs.Any((ParamDefinition p) => p.Group == g.Id && !p.Hidden))
+			{
+				continue;
+			}
 			Expander expander = new Expander
 			{
-				Header = gn,
+				Header = g.Title,
 				IsExpanded = true,
 				Margin = new Thickness(0.0, 4.0, 0.0, 0.0),
 				Foreground = System.Windows.Media.Brushes.White
@@ -292,14 +241,14 @@ public partial class MainWindow : Window, IComponentConnector
 				Width = new GridLength(1.0, GridUnitType.Star)
 			});
 			int idx = 0;
-			foreach (ParamDefinition item in _paramDefs.Where((ParamDefinition p) => p.Group == gn))
+			foreach (ParamDefinition item in _paramDefs.Where((ParamDefinition p) => p.Group == g.Id && !p.Hidden))
 			{
 				if (item.Type == ParamType.Bool)
 				{
 					System.Windows.Controls.CheckBox checkBox = new System.Windows.Controls.CheckBox
 					{
 						Content = item.Label,
-						IsChecked = (bool)item.DefaultValue,
+						IsChecked = string.Equals(item.DefaultValue, "true", StringComparison.OrdinalIgnoreCase),
 						ToolTip = item.Tooltip,
 						Foreground = System.Windows.Media.Brushes.White,
 						Margin = new Thickness(0.0, 2.0, 0.0, 2.0)
@@ -416,6 +365,252 @@ public partial class MainWindow : Window, IComponentConnector
 		Grid.SetColumn(el, value);
 		g.Children.Add(el);
 		idx++;
+	}
+
+	// ==================== 参数依赖引擎（配置驱动） ====================
+
+	/// <summary>参数是否处于"生效"状态：bool 已勾选；值参数已勾选且值非空。</summary>
+	private bool IsEffectivelyOn(ParamDefinition d)
+	{
+		if (d.Type == ParamType.Bool)
+		{
+			return _pbw.TryGetValue(d.Flag, out System.Windows.Controls.CheckBox cb) && cb.IsChecked == true;
+		}
+		if (_pw.TryGetValue(d.Flag, out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) p) && p.Item1.IsChecked == true)
+		{
+			string v = ((p.Item2 is System.Windows.Controls.ComboBox c) ? c.Text.Trim() : ((System.Windows.Controls.TextBox)p.Item2).Text.Trim());
+			return v.Length > 0;
+		}
+		return false;
+	}
+
+	/// <summary>用于 ==/!= 比较的有效值：未生效时回退默认值（如 mirostat 未勾选视为 "0"）。</summary>
+	private string EffectiveValue(ParamDefinition d)
+	{
+		if (d.Type == ParamType.Bool)
+		{
+			return (_pbw.TryGetValue(d.Flag, out System.Windows.Controls.CheckBox cb) && cb.IsChecked == true) ? "true" : "false";
+		}
+		string text = "";
+		bool hasCtl = _pw.TryGetValue(d.Flag, out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) p);
+		if (hasCtl)
+		{
+			text = ((p.Item2 is System.Windows.Controls.ComboBox c) ? c.Text.Trim() : ((System.Windows.Controls.TextBox)p.Item2).Text.Trim());
+		}
+		bool on = hasCtl && p.Item1.IsChecked == true && text.Length > 0;
+		if (on)
+		{
+			return text;
+		}
+		return d.DefaultValue ?? "";
+	}
+
+	private static bool CompareValues(string v, string op, string target)
+	{
+		bool isNumA = double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out double a);
+		bool isNumB = double.TryParse(target, NumberStyles.Float, CultureInfo.InvariantCulture, out double b);
+		int c = (isNumA && isNumB) ? a.CompareTo(b) : string.CompareOrdinal(v, target);
+		return op switch
+		{
+			"==" => c == 0,
+			"!=" => c != 0,
+			">" => c > 0,
+			"<" => c < 0,
+			">=" => c >= 0,
+			"<=" => c <= 0,
+			_ => true
+		};
+	}
+
+	private bool RuleMet(ParamRule r)
+	{
+		ParamDefinition? def = _paramDefs.FirstOrDefault((ParamDefinition x) => x.Flag == r.Flag);
+		if (def == null)
+		{
+			return true;
+		}
+		switch (r.Op)
+		{
+		case "enabled":
+			return IsEffectivelyOn(def);
+		case "disabled":
+			return !IsEffectivelyOn(def);
+		default:
+			return CompareValues(EffectiveValue(def), r.Op, r.Value);
+		}
+	}
+
+	/// <summary>按 role 查找参数定义（启动器内部逻辑的绑定入口）。</summary>
+	private ParamDefinition? RoleDef(string role)
+	{
+		return _paramDefs.FirstOrDefault((ParamDefinition d) => d.Role == role);
+	}
+
+	private bool RoleText(string role, out string value)
+	{
+		value = "";
+		ParamDefinition? d = RoleDef(role);
+		return d != null && TryGetParamValue(d.Flag, out value);
+	}
+
+	private bool RoleBool(string role)
+	{
+		ParamDefinition? d = RoleDef(role);
+		return d != null && _pbw.TryGetValue(d.Flag, out System.Windows.Controls.CheckBox cb) && cb.IsChecked == true;
+	}
+
+	/// <summary>
+	/// UI 层依赖评估：前置条件不满足 → 控件灰显并在悬浮提示标注原因。
+	/// 在 RefreshCmd 中调用（任何勾选/输入变化都会触发），收敛无递归。
+	/// </summary>
+	private void EvaluateDepUI()
+	{
+		if (_inDepEval || _paramDefs == null)
+		{
+			return;
+		}
+		_inDepEval = true;
+		try
+		{
+			// 联动：本参数生效 → 自动勾选目标（bool 勾选 / 值参数勾启用框）
+			foreach (ParamDefinition dImp in _paramDefs)
+			{
+				if (dImp.Hidden || dImp.Implies == null || dImp.Implies.Count == 0 || !IsEffectivelyOn(dImp))
+				{
+					continue;
+				}
+				foreach (string t in dImp.Implies)
+				{
+					if (_pbw.TryGetValue(t, out System.Windows.Controls.CheckBox tcb) && tcb.IsChecked != true)
+					{
+						tcb.IsChecked = true;
+					}
+					if (_pw.TryGetValue(t, out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) tp) && tp.Item1.IsChecked != true)
+					{
+						tp.Item1.IsChecked = true;
+					}
+				}
+			}
+			foreach (ParamDefinition d in _paramDefs)
+			{
+				if (d.Hidden || d.Requires == null || d.Requires.Count == 0)
+				{
+					continue;
+				}
+				bool ok = d.Requires.All(RuleMet);
+				if (_pbw.TryGetValue(d.Flag, out System.Windows.Controls.CheckBox bcb))
+				{
+					bcb.IsEnabled = ok;
+					bcb.ToolTip = ok ? d.Tooltip : d.Tooltip + "\n⚠ 前置未满足: " + string.Join(" 且 ", d.Requires.Select((ParamRule r) => r.Describe()));
+				}
+				if (_pw.TryGetValue(d.Flag, out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) pair))
+				{
+					pair.Item1.IsEnabled = ok;
+					pair.Item2.IsEnabled = ok;
+					pair.Item2.ToolTip = ok ? d.Tooltip : d.Tooltip + "\n⚠ 前置未满足: " + string.Join(" 且 ", d.Requires.Select((ParamRule r) => r.Describe()));
+				}
+			}
+		}
+		catch
+		{
+		}
+		finally
+		{
+			_inDepEval = false;
+		}
+	}
+
+	/// <summary>启动时输出软性提示：废弃参数在用、suggests 依赖缺失。仅日志，不阻断。</summary>
+	private void LogParamHints()
+	{
+		try
+		{
+			HashSet<string> on = new HashSet<string>();
+			foreach (ParamDefinition d in _paramDefs)
+			{
+				if (!d.Hidden && d.Flag != "model" && d.Flag != "model-draft" && IsEffectivelyOn(d))
+				{
+					on.Add(d.Flag);
+				}
+			}
+			foreach (ParamDefinition d in _paramDefs)
+			{
+				if (!on.Contains(d.Flag))
+				{
+					continue;
+				}
+				if (d.Deprecated)
+				{
+					Log("[参数] ⚠ --" + d.Flag + " 已废弃，建议从参数面板取消勾选");
+				}
+				if (d.Suggests is { Count: > 0 } && !d.Suggests.Any((string s) => on.Contains(s)))
+				{
+					Log("[参数] 提示: --" + d.Flag + " 通常配合 " + string.Join(" / ", d.Suggests.Select((string s) => "--" + s)) + " 使用");
+				}
+			}
+		}
+		catch
+		{
+		}
+	}
+
+	/// <summary>单参数依赖/互斥/校验检查。返回 null=通过，否则返回剔除原因。</summary>
+	private string? CheckParam(ParamDefinition d, HashSet<string> on)
+	{
+		if (d.Requires is { Count: > 0 })
+		{
+			List<ParamRule> unmet = d.Requires.Where((ParamRule r) => !RuleMet(r)).ToList();
+			if (unmet.Count > 0)
+			{
+				return "前置不满足（" + string.Join(" 且 ", unmet.Select((ParamRule r) => r.Describe())) + "）";
+			}
+		}
+		if (d.Conflicts is { Count: > 0 })
+		{
+			string? hit = d.Conflicts.FirstOrDefault((string c) => on.Contains(c));
+			if (hit != null)
+			{
+				return "与 --" + hit + " 互斥";
+			}
+		}
+		if (d.Validate != null)
+		{
+			string v = (d.Type == ParamType.Bool) ? "true" : EffectiveValue(d);
+			ParamValidate val = d.Validate;
+			if (d.Type != ParamType.Bool)
+			{
+				string vn = NormTok(v);
+				bool isNum = double.TryParse(vn, NumberStyles.Float, CultureInfo.InvariantCulture, out double n);
+				if ((val.Min.HasValue || val.Max.HasValue) && !isNum)
+				{
+					return "值 '" + v + "' 不是数字";
+				}
+				if (val.Min.HasValue && isNum && n < val.Min.Value)
+				{
+					return "值 " + vn + " 小于下限 " + val.Min.Value;
+				}
+				if (val.Max.HasValue && isNum && n > val.Max.Value)
+				{
+					return "值 " + vn + " 大于上限 " + val.Max.Value;
+				}
+				if (val.Leq != null)
+				{
+					ParamDefinition? other = _paramDefs.FirstOrDefault((ParamDefinition x) => x.Flag == val.Leq);
+					if (other != null && on.Contains(other.Flag) && double.TryParse(NormTok(EffectiveValue(other)), NumberStyles.Float, CultureInfo.InvariantCulture, out double cap))
+					{
+						if (isNum && n > cap)
+						{
+							return "值 " + vn + " 超过 --" + other.Flag + " (" + cap + ")";
+						}
+					}
+				}
+				if (val.Regex != null && !Regex.IsMatch(v, val.Regex))
+				{
+					return "值 '" + v + "' 不匹配格式 " + val.Regex;
+				}
+			}
+		}
+		return null;
 	}
 
 	private void SetupTray()
@@ -873,25 +1068,41 @@ public partial class MainWindow : Window, IComponentConnector
 		{
 			list.Add("--no-mmproj-offload");
 		}
+		// 参数依赖引擎：先收集所有"生效"参数，再逐个检查前置/互斥/校验，不通过则剔除并记录原因
+		_lastViolations = new List<string>();
+		HashSet<string> on = new HashSet<string>();
+		foreach (ParamDefinition d0 in _paramDefs)
+		{
+			if (!d0.Hidden && d0.Flag != "model" && d0.Flag != "model-draft" && IsEffectivelyOn(d0))
+			{
+				on.Add(d0.Flag);
+			}
+		}
 		foreach (ParamDefinition paramDef in _paramDefs)
 		{
 			string flag = paramDef.Flag;
-			if ((flag == "model" || flag == "model-draft") ? true : false)
+			if (flag == "model" || flag == "model-draft" || paramDef.Hidden)
 			{
 				continue;
 			}
-			(System.Windows.Controls.CheckBox, System.Windows.Controls.Control) value2;
+			if (!on.Contains(flag))
+			{
+				continue;
+			}
+			string? reject = CheckParam(paramDef, on);
+			if (reject != null)
+			{
+				_lastViolations.Add("--" + flag + "（" + reject + "）");
+				continue;
+			}
 			if (paramDef.Type == ParamType.Bool)
 			{
-				if (_pbw.TryGetValue(paramDef.Flag, out System.Windows.Controls.CheckBox value) && value.IsChecked == true)
-				{
-					list.Add("--" + paramDef.Flag);
-				}
+				list.Add("--" + paramDef.Flag);
 			}
-			else if (_pw.TryGetValue(paramDef.Flag, out value2) && value2.Item1.IsChecked == true)
+			else
 			{
-				string text4 = ((value2.Item2 is System.Windows.Controls.ComboBox comboBox) ? comboBox.Text.Trim() : ((System.Windows.Controls.TextBox)value2.Item2).Text.Trim());
-				if (paramDef.Flag == "ctx-size")
+				string text4 = EffectiveValue(paramDef);
+				if (paramDef.Role == "ctx_size")
 				{
 					text4 = NormTok(text4);
 				}
@@ -1193,7 +1404,7 @@ public partial class MainWindow : Window, IComponentConnector
 				modelBytes += new FileInfo(mmpp).Length;
 			}
 			long ctx = 0;
-			if (TryGetParamValue("ctx-size", out string ctxStr))
+			if (RoleText("ctx_size", out string ctxStr))
 			{
 				ctxStr = NormTok(ctxStr);
 				if (!long.TryParse(ctxStr, out ctx))
@@ -1201,24 +1412,24 @@ public partial class MainWindow : Window, IComponentConnector
 					ctx = 0;
 				}
 			}
-			string ck = TryGetParamValue("cache-type-k", out string ckv) ? ckv : "f16";
-			string cv = TryGetParamValue("cache-type-v", out string cvv) ? cvv : "f16";
+			string ck = (RoleText("cache_type_k", out string ckv) && !string.IsNullOrEmpty(ckv)) ? ckv : "f16";
+			string cv = (RoleText("cache_type_v", out string cvv) && !string.IsNullOrEmpty(cvv)) ? cvv : "f16";
 			double bytesK = CacheBytesPerElem(ck);
 			double bytesV = CacheBytesPerElem(cv);
 			GgufArchInfo gi = ReadGgufArch(modelPath);
 			double gpuFrac = 1.0;
-			if (TryGetParamValue("n-gpu-layers", out string ngl) && double.TryParse(ngl, out double nglV) && nglV >= 0.0 && gi.Ok && gi.Layers > 0)
+			if (RoleText("ngl", out string ngl) && double.TryParse(ngl, out double nglV) && nglV >= 0.0 && gi.Ok && gi.Layers > 0)
 			{
 				gpuFrac = Math.Clamp(nglV / gi.Layers, 0.0, 1.0);
 			}
 			// MoE 专家在 CPU 时按经验系数折算显存中的模型占用(注意力+共享权重约占 12%)
-			bool cpuMoeOn = _pbw.TryGetValue("cpu-moe", out System.Windows.Controls.CheckBox cmCb) && cmCb.IsChecked == true;
+			bool cpuMoeOn = RoleBool("cpu_moe");
 			double moeFactor = 1.0;
 			if (cpuMoeOn)
 			{
 				moeFactor = 0.12;
 			}
-			else if (TryGetParamValue("n-cpu-moe", out string ncm) && double.TryParse(ncm, out double ncmV) && ncmV > 0 && gi.Ok && gi.Layers > 0)
+			else if (RoleText("n_cpu_moe", out string ncm) && double.TryParse(ncm, out double ncmV) && ncmV > 0 && gi.Ok && gi.Layers > 0)
 			{
 				moeFactor = Math.Min(1.0, 0.12 + 0.88 * (ncmV / (double)gi.Layers));
 			}
@@ -1341,6 +1552,7 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private void RefreshCmd()
 	{
+		EvaluateDepUI();
 		try
 		{
 			List<string> list = BuildCmd();
@@ -1358,6 +1570,34 @@ public partial class MainWindow : Window, IComponentConnector
 	private void RefreshCmd_Click(object s, RoutedEventArgs e)
 	{
 		RefreshCmd();
+	}
+
+	// 重载参数配置（llama_params.yml / override 修改后即时生效，无需重启启动器）
+	private void ReloadSchema_Click(object s, RoutedEventArgs e)
+	{
+		try
+		{
+			ProfileConfig snap = BuildConfig();
+			ParamSchemaLoadResult r = ParamSchemaService.Load();
+			_paramSchema = r;
+			_paramDefs = r.Defs;
+			_paramGroups = r.Groups;
+			ParamGroupsPanel.Children.Clear();
+			_pw.Clear();
+			_pbw.Clear();
+			BuildParamGroups();
+			ApplyConfig(snap);
+			Log("[参数] 配置已重载，来源: " + r.Source + "，参数 " + r.Defs.Count + " 项 / 组 " + r.Groups.Count + " 个");
+			if (r.Errors.Count > 0 || r.Warnings.Count > 0)
+			{
+				System.Windows.MessageBox.Show(string.Join("\n", r.Errors.Concat(r.Warnings)), "参数配置提示", MessageBoxButton.OK, MessageBoxImage.Warning);
+			}
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "重载参数配置失败");
+			System.Windows.MessageBox.Show("重载失败: " + ex.Message);
+		}
 	}
 
 	private void CopyCmd_Click(object s, RoutedEventArgs e)
@@ -2061,7 +2301,8 @@ public partial class MainWindow : Window, IComponentConnector
 			CopyDir(d, Path.Combine(dst, Path.GetFileName(d)));
 		}
 	}
-    private static readonly string Q = ((char)34).ToString();
+
+    private static readonly string Q = ((char)34).ToString();
 
     private System.Windows.Threading.DispatcherTimer? _convertPollTimer;
 
@@ -2323,6 +2564,21 @@ public partial class MainWindow : Window, IComponentConnector
 			System.Windows.MessageBox.Show("Empty");
 			return;
 		}
+		// 参数依赖/校验弹窗确认（用户选择：不满足时列出并确认，而非静默剔除）
+		if (_lastViolations.Count > 0)
+		{
+			string msg = "以下参数未通过依赖/校验检查，将被剔除：\n\n" + string.Join("\n", _lastViolations.Select((string v) => " • " + v)) + "\n\n是 = 剔除这些参数并继续启动\n否 = 取消启动";
+			if (System.Windows.MessageBox.Show(msg, "参数依赖检查", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+			{
+				Log("--- 启动已取消：参数依赖检查未通过（" + _lastViolations.Count + " 项）---");
+				return;
+			}
+			foreach (string v2 in _lastViolations)
+			{
+				Log("[参数] 剔除 " + v2);
+			}
+		}
+		LogParamHints();
 		if (!ConfirmVramFit())
 		{
 			Log("--- 启动已取消：预计显存不足 ---");
@@ -3985,6 +4241,8 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private void ApplyConfig(ProfileConfig c)
 	{
+		// llama.cpp 参数改名后，旧 profile 里旧 flag 键的值自动迁移到新 flag
+		ParamSchemaService.MigrateProfileFlags(c, _paramDefs);
 		InputModelPath.Text = c.ModelPath;
 		InputMtpPath.Text = c.MtpPath;
 		InputMmprojPath.Text = c.MmprojPath;

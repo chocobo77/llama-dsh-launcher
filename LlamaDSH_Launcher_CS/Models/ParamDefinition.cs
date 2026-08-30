@@ -2,19 +2,30 @@ using System.Collections.Generic;
 
 namespace LlamaDSH_Launcher.Models;
 
+/// <summary>
+/// 单个 llama.cpp 启动参数的定义。来源于 Resources\llama_params.yml（或 exe 旁同名文件 / 用户 override）。
+/// 启动器内部逻辑（显存估算、ctx 归一化等）通过 Role 绑定参数，而不是硬编码 flag，
+/// 这样 llama.cpp 改参数名时只需改配置文件。
+/// </summary>
 public class ParamDefinition
 {
 	public string Label { get; set; } = "";
 
 	public string Flag { get; set; } = "";
 
+	/// <summary>语义角色，如 ctx_size / cache_type_k / ngl / cpu_moe。启动器内部逻辑按此绑定。</summary>
+	public string? Role { get; set; }
+
 	public ParamType Type { get; set; }
 
-	public object DefaultValue { get; set; } = "";
+	/// <summary>默认值（统一字符串；bool 参数用 "true"/"false"）。YAML 键为 default。</summary>
+	[YamlDotNet.Serialization.YamlMember(Alias = "default")]
+	public string DefaultValue { get; set; } = "";
 
 	public string Group { get; set; } = "";
 
-	public bool Enabled { get; set; } = true;
+	/// <summary>值参数的启用复选框初始状态。</summary>
+	public bool Enabled { get; set; }
 
 	public bool IsAdvanced { get; set; }
 
@@ -22,16 +33,26 @@ public class ParamDefinition
 
 	public string Tooltip { get; set; } = "";
 
-	public ParamDefinition(string label, string flag, ParamType type, object defaultValue, string group, bool enabled, bool isAdvanced, List<string>? options, string tooltip)
-	{
-		Label = label;
-		Flag = flag;
-		Type = type;
-		DefaultValue = defaultValue;
-		Group = group;
-		Enabled = enabled;
-		IsAdvanced = isAdvanced;
-		Options = options;
-		Tooltip = tooltip;
-	}
+	/// <summary>前置条件：全部满足才允许生效（UI 灰显 + 启动时剔除并确认）。</summary>
+	public List<ParamRule>? Requires { get; set; }
+
+	/// <summary>互斥参数：对方生效时本参数被剔除。</summary>
+	public List<string>? Conflicts { get; set; }
+
+	/// <summary>联动：本参数生效时自动勾选目标参数（bool 勾选 / 值参数勾启用框）。</summary>
+	public List<string>? Implies { get; set; }
+
+	/// <summary>软性建议：不阻止生效，仅在日志提示。</summary>
+	public List<string>? Suggests { get; set; }
+
+	public ParamValidate? Validate { get; set; }
+
+	/// <summary>llama.cpp 改名后的旧 flag 列表，用于旧 profile 配置自动迁移。</summary>
+	public List<string>? Aliases { get; set; }
+
+	/// <summary>隐藏：不渲染到 UI、不参与命令组装（如 mmproj 由专用输入行管理）。</summary>
+	public bool Hidden { get; set; }
+
+	/// <summary>已废弃参数（仅提示，仍可使用）。</summary>
+	public bool Deprecated { get; set; }
 }

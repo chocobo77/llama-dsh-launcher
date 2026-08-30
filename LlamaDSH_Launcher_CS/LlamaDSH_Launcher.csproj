@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -25,6 +25,7 @@
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
     <EmbeddedResource Include="Resources\conversion_kit.zip" />
+    <EmbeddedResource Include="Resources\llama_params.yml" />
     <Content Include="gputemp\gputemp.exe">
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
@@ -34,6 +35,7 @@
   <ItemGroup>
     <PackageReference Include="System.Management" Version="8.*" />
     <PackageReference Include="System.Drawing.Common" Version="8.*" />
+    <PackageReference Include="YamlDotNet" Version="16.*" />
   </ItemGroup>
 
 </Project>

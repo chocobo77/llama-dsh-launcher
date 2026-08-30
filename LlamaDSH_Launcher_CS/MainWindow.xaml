@@ -149,6 +149,7 @@
             <TextBox Name="CmdPreview" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" MinHeight="200" MaxHeight="500" Background="#0d1117" Foreground="#7ee787" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" BorderBrush="#30363d" BorderThickness="1" />
             <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
               <Button Content="🔄 刷新命令" Margin="0,0,6,0" Click="RefreshCmd_Click" />
+                <Button Content="⟳ 重载参数配置" Margin="0,0,6,0" Click="ReloadSchema_Click" ToolTip="修改 llama_params.yml 或 params_override.yml 后点此即时生效，无需重启启动器" />
               <Button Content="📋 复制命令" Click="CopyCmd_Click" />
             </StackPanel>
           </StackPanel>
