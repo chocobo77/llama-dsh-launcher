@@ -4252,39 +4252,34 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private void ClampToWorkArea()
 	{
-		//IL_001d: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0022: Unknown result type (might be due to invalid IL or missing references)
 		try
 		{
-			double num = Math.Max(VisualTreeHelper.GetDpi(this).DpiScaleX, 0.5);
+			// SystemParameters.WorkArea 已是 DIP(WPF 逻辑单位)，直接使用；
+			// 旧实现误除以 DPI 缩放系数，导致缩放≠100% 的屏幕上工作区被算错、窗体超出屏幕
 			Rect workArea = SystemParameters.WorkArea;
-			double num2 = workArea.Width / num;
-			double num3 = workArea.Height / num;
-			double num4 = workArea.Left / num;
-			double num5 = workArea.Top / num;
-			if (base.Width > num2)
+			if (base.Width > workArea.Width)
 			{
-				base.Width = num2;
+				base.Width = workArea.Width;
 			}
-			if (base.Height > num3)
+			if (base.Height > workArea.Height)
 			{
-				base.Height = num3;
+				base.Height = workArea.Height;
 			}
-			if (base.Left < num4)
+			if (base.Left < workArea.Left)
 			{
-				base.Left = num4;
+				base.Left = workArea.Left;
 			}
-			if (base.Top < num5)
+			if (base.Top < workArea.Top)
 			{
-				base.Top = num5;
+				base.Top = workArea.Top;
 			}
-			if (base.Left + base.Width > num4 + num2)
+			if (base.Left + base.Width > workArea.Right)
 			{
-				base.Left = num4 + num2 - base.Width;
+				base.Left = workArea.Right - base.Width;
 			}
-			if (base.Top + base.Height > num5 + num3)
+			if (base.Top + base.Height > workArea.Bottom)
 			{
-				base.Top = num5 + num3 - base.Height;
+				base.Top = workArea.Bottom - base.Height;
 			}
 		}
 		catch (Exception ex)
