@@ -1529,45 +1529,7 @@ public partial class MainWindow : Window, IComponentConnector
 				onDone(null);
 				return;
 			}
-			ProcessStartInfo psi = new ProcessStartInfo
-			{
-				FileName = "python",
-				Arguments = "\"" + script + "\" \"" + dir + "\" --outfile \"" + outFile + "\" --outtype " + outtype,
-				RedirectStandardOutput = true,
-				RedirectStandardError = true,
-				UseShellExecute = false,
-				CreateNoWindow = true,
-				WorkingDirectory = dir
-			};
-			Log("[转换] " + psi.FileName + " " + psi.Arguments);
-			Process? proc = Process.Start(psi);
-			if (proc == null)
-			{
-				LogError(new Exception("python 启动失败"), "safetensors 转换");
-				onDone(null);
-				return;
-			}
-			PumpProcessStreams(proc, "[转换] ", delegate
-			{
-				try
-				{
-					int code = proc.ExitCode;
-					DisposeProc(ref proc);
-					if (code == 0 && File.Exists(outFile) && new FileInfo(outFile).Length > 0)
-					{
-						Log("[转换] 完成: " + outFile + " (" + (new FileInfo(outFile).Length / 1073741824.0).ToString("F1") + " GiB)");
-						onDone(outFile);
-						return;
-					}
-					LogError(new Exception("退出码 " + code), "safetensors 转换失败");
-					onDone(null);
-				}
-				catch (Exception ex2)
-				{
-					LogError(ex2, "转换收尾");
-					onDone(null);
-				}
-			});
+			StartDetachedConversion(dir, outtype, script, outFile, srcBytes, onDone);
 		}
 		catch (Exception ex)
 		{
@@ -2099,7 +2061,193 @@ public partial class MainWindow : Window, IComponentConnector
 			CopyDir(d, Path.Combine(dst, Path.GetFileName(d)));
 		}
 	}
+    private static readonly string Q = ((char)34).ToString();
 
+    private System.Windows.Threading.DispatcherTimer? _convertPollTimer;
+
+    private string? _convertLogPath;
+
+    private long _convertLogPos;
+
+    private string? _convertOutFile;
+
+    private double _convertSrcBytes;
+
+    private DateTime _convertDeadline;
+
+    // WMI 分离启动转换：进程由 WmiPrvSE 托管、输出走文件——
+    // 断开远程/关闭启动器均不中断(修复二次远程场景下转换意外退出)
+    private void StartDetachedConversion(string dir, string outtype, string script, string outFile, double srcBytes, Action<string?> onDone)
+    {
+        string logPath = Path.Combine(dir, "llamadsh_convert.log");
+        string cmdPath = Path.Combine(Path.GetTempPath(), "llamadsh_convert.cmd");
+        try
+        {
+            File.WriteAllText(logPath, "");
+        string pyCmd = "python " + Q + script + Q + " " + Q + dir + Q + " --outfile " + Q + outFile + Q + " --outtype " + outtype;
+        string cmdText = "@echo off" + Environment.NewLine + "cd /d " + Q + dir + Q + Environment.NewLine + pyCmd + " >> " + Q + logPath + Q + " 2>&1" + Environment.NewLine + "echo EXITCODE:%errorlevel% >> " + Q + logPath + Q;
+        File.WriteAllText(cmdPath, cmdText);
+        }
+        catch (Exception ex)
+        {
+            LogError(ex, "生成转换引导脚本");
+            onDone(null);
+            return;
+        }
+        try
+        {
+            using (System.Management.ManagementClass mc = new System.Management.ManagementClass("Win32_Process"))
+            {
+                System.Management.ManagementBaseObject inParams = mc.GetMethodParameters("Create");
+                inParams["CommandLine"] = "cmd.exe /c " + Q + cmdPath + Q;
+                inParams["CurrentDirectory"] = dir;
+                using (System.Management.ManagementClass suClass = new System.Management.ManagementClass("Win32_ProcessStartup"))
+                {
+                    System.Management.ManagementBaseObject su = suClass.CreateInstance();
+                    su["ShowWindow"] = 0;
+                    inParams["ProcessStartupInformation"] = su;
+                }
+                System.Management.ManagementBaseObject outParams = mc.InvokeMethod("Create", inParams, null);
+                int rc = Convert.ToInt32(outParams["ReturnValue"]);
+                if (rc != 0)
+                {
+                    Log("[转换] 分离启动失败(WMI rc=" + rc + ")");
+                    onDone(null);
+                    return;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogError(ex, "转换分离启动");
+            onDone(null);
+            return;
+        }
+        _convertLogPath = logPath;
+        _convertLogPos = 0;
+        _convertOutFile = outFile;
+        _convertSrcBytes = srcBytes;
+        _convertDeadline = DateTime.Now.AddHours(3);
+        Log("[转换] 已分离到后台运行——断开远程/关闭启动器都不会中断转换");
+        Log("[转换] 转换日志: " + logPath);
+        _convertPollTimer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(2)
+        };
+        _convertPollTimer.Tick += delegate
+        {
+            PollDetachedConversion(srcBytes, onDone);
+        };
+        _convertPollTimer.Start();
+    }
+
+    private void PollDetachedConversion(double srcBytes, Action<string?> onDone)
+    {
+        try
+        {
+            if (_convertLogPath != null && File.Exists(_convertLogPath))
+            {
+                using (FileStream fs = File.OpenRead(_convertLogPath))
+                {
+                    if (fs.Length < _convertLogPos)
+                    {
+                        _convertLogPos = 0;
+                    }
+                    if (fs.Length > _convertLogPos)
+                    {
+                        fs.Seek(_convertLogPos, SeekOrigin.Begin);
+                        using (StreamReader sr = new StreamReader(fs))
+                        {
+                            string text = sr.ReadToEnd();
+                            int num = text.LastIndexOf((char)10);
+                            if (num >= 0)
+                            {
+                                string done = text.Substring(0, num + 1);
+                                _convertLogPos += Encoding.UTF8.GetByteCount(done);
+                                string[] parts = done.Split((char)10);
+                                foreach (string value in parts)
+                                {
+                                    string v = value.TrimEnd((char)13);
+                                    if (v.Length > 0)
+                                    {
+                                        Log("[转换] " + v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+        string? exitCodeStr = null;
+        try
+        {
+            if (_convertLogPath != null && File.Exists(_convertLogPath))
+            {
+                foreach (string line in File.ReadAllLines(_convertLogPath))
+                {
+                    if (line.StartsWith("EXITCODE:"))
+                    {
+                        exitCodeStr = line.Substring("EXITCODE:".Length).Trim();
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+        if (exitCodeStr == null && DateTime.Now < _convertDeadline)
+        {
+            return;
+        }
+        StopConvertPoll();
+        if (exitCodeStr == null)
+        {
+            Log("[转换] 超时(3 小时)未完成，停止跟踪。转换可能仍在后台继续。");
+            onDone(null);
+            return;
+        }
+        int exitCode = -1;
+        int.TryParse(exitCodeStr, out exitCode);
+        bool valid = false;
+        if (exitCode == 0 && _convertOutFile != null && File.Exists(_convertOutFile))
+        {
+            try
+            {
+                using (FileStream fs0 = File.OpenRead(_convertOutFile))
+                using (BinaryReader br0 = new BinaryReader(fs0))
+                {
+                    if (br0.ReadInt32() == 0x46554747 && fs0.Length >= _convertSrcBytes * 0.9)
+                    {
+                        valid = true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+        if (valid)
+        {
+            Log("[转换] 完成: " + _convertOutFile);
+            onDone(_convertOutFile);
+            return;
+        }
+        Log("[转换] 转换失败(退出码 " + exitCode + ")");
+        onDone(null);
+    }
+
+    private void StopConvertPoll()
+    {
+        if (_convertPollTimer != null)
+        {
+            _convertPollTimer.Stop();
+            _convertPollTimer = null;
+        }
+    }
 	private void StartLlama()
 	{
 		//IL_0224: Unknown result type (might be due to invalid IL or missing references)
