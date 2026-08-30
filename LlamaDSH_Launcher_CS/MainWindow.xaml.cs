@@ -2115,6 +2115,21 @@ public partial class MainWindow : Window, IComponentConnector
                     onDone(null);
                     return;
                 }
+                // 降低转换进程优先级：转换吃 CPU/内存/IO 较重，BelowNormal 让位给
+                // 机器上的其他实例(DSH/llama 等)，避免资源争抢导致其他进程异常
+                try
+                {
+                    int childPid = Convert.ToInt32(outParams["ProcessId"]);
+                    using (System.Diagnostics.Process cp = System.Diagnostics.Process.GetProcessById(childPid))
+                    {
+                        cp.PriorityClass = System.Diagnostics.ProcessPriorityClass.BelowNormal;
+                    }
+                    Log("[转换] 转换进程优先级已设为 BelowNormal(减少对其他实例的影响)");
+                }
+                catch (Exception prioEx)
+                {
+                    Log("[转换] 优先级设置失败(不影响转换): " + prioEx.Message);
+                }
             }
         }
         catch (Exception ex)
