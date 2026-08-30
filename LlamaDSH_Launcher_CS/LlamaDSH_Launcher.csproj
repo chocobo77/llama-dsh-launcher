@@ -24,6 +24,7 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
+    <EmbeddedResource Include="Resources\conversion_kit.zip" />
     <Content Include="gputemp\gputemp.exe">
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>

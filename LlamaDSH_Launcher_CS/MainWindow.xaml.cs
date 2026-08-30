@@ -1405,6 +1405,66 @@ public partial class MainWindow : Window, IComponentConnector
 		return null;
 	}
 
+	// 解压内置转换工具包(嵌入式资源 conversion_kit.zip：入口脚本+sitecustomize 垫片+conversion 包)
+	private void ExtractConversionKit()
+	{
+		try
+		{
+			string? resName = null;
+			foreach (string n in typeof(MainWindow).Assembly.GetManifestResourceNames())
+			{
+				if (n.EndsWith("conversion_kit.zip"))
+				{
+					resName = n;
+					break;
+				}
+			}
+			if (resName == null)
+			{
+				Log("[转换] 内置转换工具包缺失(打包问题)");
+				return;
+			}
+			Directory.CreateDirectory(ToolsDir);
+			string zipPath = Path.Combine(Path.GetTempPath(), "conversion_kit.zip");
+			using (System.IO.Stream src = typeof(MainWindow).Assembly.GetManifestResourceStream(resName)!)
+			using (FileStream dst = File.Create(zipPath))
+			{
+				src.CopyTo(dst);
+			}
+			using (System.IO.Compression.ZipArchive za = System.IO.Compression.ZipFile.OpenRead(zipPath))
+			{
+				int count = 0;
+				foreach (System.IO.Compression.ZipArchiveEntry e in za.Entries)
+				{
+					if (string.IsNullOrEmpty(e.Name))
+					{
+						continue;
+					}
+					string dest = Path.Combine(ToolsDir, e.FullName.Replace('/', Path.DirectorySeparatorChar));
+					Directory.CreateDirectory(Path.GetDirectoryName(dest) ?? ".");
+					using (System.IO.Stream es = e.Open())
+					using (FileStream fs = File.Create(dest))
+					{
+						es.CopyTo(fs);
+					}
+					count++;
+				}
+				Log("[转换] 内置转换工具包已解压(" + count + " 个文件)");
+			}
+			try
+			{
+				File.Delete(zipPath);
+			}
+			catch
+			{
+			}
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "解压内置转换工具包");
+		}
+	}
+
 	private void ConvertSafetensors(string dir, string outtype, Action<string?> onDone)
 	{
 		string? outFile = null;
@@ -1451,13 +1511,6 @@ public partial class MainWindow : Window, IComponentConnector
 				CreateNoWindow = true,
 				WorkingDirectory = dir
 			};
-			// PYTHONPATH 指向仓库内 gguf-py：pip 的 gguf 版本滞后于 conversion 包所需(缺新 MODEL_ARCH)
-			string ggufPyDir = Path.Combine(ToolsDir, "gguf-py");
-			if (Directory.Exists(ggufPyDir))
-			{
-				string existingPyPath = psi.EnvironmentVariables.ContainsKey("PYTHONPATH") ? (psi.EnvironmentVariables["PYTHONPATH"] ?? "") : "";
-				psi.EnvironmentVariables["PYTHONPATH"] = string.IsNullOrEmpty(existingPyPath) ? ggufPyDir : (ggufPyDir + ";" + existingPyPath);
-			}
 			Log("[转换] " + psi.FileName + " " + psi.Arguments);
 			Process? proc = Process.Start(psi);
 			if (proc == null)
@@ -1676,12 +1729,7 @@ public partial class MainWindow : Window, IComponentConnector
 				BtnLlamaStart.IsEnabled = true;
 				return;
 			}
-			if (!await FetchConverterAsync())
-			{
-				Log("[环境] 转换工具获取失败(网络原因)。可手动下载 llama.cpp 源码包，把 convert_hf_to_gguf.py 和 conversion/ 目录放到 " + ToolsDir);
-				BtnLlamaStart.IsEnabled = true;
-				return;
-			}
+			ExtractConversionKit();
 			Log("[环境] 检查/安装 python 依赖: gguf torch transformers sentencepiece (首次可能需下载数 GB，请耐心等待)");
 			string mirror = " -i https://pypi.tuna.tsinghua.edu.cn/simple";
 			string pipArgs = ((pyPre.Length > 0) ? (pyPre + " ") : "") + "-m pip install --disable-pip-version-check --progress-bar off gguf torch transformers sentencepiece";
