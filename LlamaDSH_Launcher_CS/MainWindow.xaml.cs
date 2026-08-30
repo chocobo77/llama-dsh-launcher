@@ -1451,6 +1451,13 @@ public partial class MainWindow : Window, IComponentConnector
 				CreateNoWindow = true,
 				WorkingDirectory = dir
 			};
+			// PYTHONPATH 指向仓库内 gguf-py：pip 的 gguf 版本滞后于 conversion 包所需(缺新 MODEL_ARCH)
+			string ggufPyDir = Path.Combine(ToolsDir, "gguf-py");
+			if (Directory.Exists(ggufPyDir))
+			{
+				string existingPyPath = psi.EnvironmentVariables["PYTHONPATH"] ?? "";
+				psi.EnvironmentVariables["PYTHONPATH"] = string.IsNullOrEmpty(existingPyPath) ? ggufPyDir : (ggufPyDir + ";" + existingPyPath);
+			}
 			Log("[转换] " + psi.FileName + " " + psi.Arguments);
 			Process? proc = Process.Start(psi);
 			if (proc == null)
@@ -1802,137 +1809,210 @@ public partial class MainWindow : Window, IComponentConnector
 		return true;
 	}
 
-	private async System.Threading.Tasks.Task<bool> FetchConverterAsync()
-	{
-		string? existing = FindConvertScript();
-		if (existing != null)
-		{
-			// 完整性校验：上游新版脚本依赖 conversion 包，若只有单文件脚本则视为残缺，
-			// 必须删除后重新走源码 tarball 获取完整版
-			string entry = File.ReadAllText(existing);
-			bool needsPkg = entry.Contains("from conversion import");
-			bool hasPkg = Directory.Exists(Path.Combine(Path.GetDirectoryName(existing) ?? ".", "conversion"));
-			if (!needsPkg || hasPkg)
-			{
-				return true;
-			}
-			Log("[环境] 检测到残缺的转换脚本(缺少 conversion 包)，重新获取完整源码包 ...");
-			try
-			{
-				File.Delete(existing);
-			}
-			catch
-			{
-			}
-		}
-		Directory.CreateDirectory(ToolsDir);
-		// 方式一(国内可达优先)：jsDelivr 数据 API 拿文件清单 + CDN 逐文件下载
-		if (await FetchConversionPackageViaJsDelivrAsync())
-		{
-			Log("[环境] 转换工具就绪(jsDelivr: 脚本 + conversion 包)");
-			return true;
-		}
-		string tgz = Path.Combine(Path.GetTempPath(), "llamacpp_master.tar.gz");
-		string exDir = Path.Combine(Path.GetTempPath(), "llamacpp_master_src");
-		string[] tarUrls = new string[5]
-		{
-			"https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
-			"https://gh-proxy.com/https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
-			"https://ghproxy.net/https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
-			"https://ghfast.top/https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
-			"https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.tar.gz"
-		};
-		foreach (string u in tarUrls)
-		{
-			try
-			{
-				Log("[下载] " + u + " (源码包约 20~45MB，含匹配的 conversion 包)");
-				using (System.Net.Http.HttpResponseMessage resp = await _httpClient.GetAsync(u))
-				{
-					if (!resp.IsSuccessStatusCode)
-					{
-						Log("[下载] HTTP " + ((int)resp.StatusCode) + "，换下一个源");
-						continue;
-					}
-					byte[] data = await resp.Content.ReadAsByteArrayAsync();
-					if (data.Length < 1000000)
-					{
-						Log("[下载] 内容异常(过短)，换下一个源");
-						continue;
-					}
-					File.WriteAllBytes(tgz, data);
-					Log("[下载] 完成: " + (data.Length / 1048576.0).ToString("F1") + " MB，解压中 ...");
-				}
-				if (Directory.Exists(exDir))
-				{
-					Directory.Delete(exDir, true);
-				}
-				using (FileStream fs = File.OpenRead(tgz))
-				using (System.IO.Compression.GZipStream gz = new System.IO.Compression.GZipStream(fs, System.IO.Compression.CompressionMode.Decompress))
-				{
-					System.Formats.Tar.TarFile.ExtractToDirectory(gz, exDir, overwriteFiles: true);
-				}
-				string root = Path.Combine(exDir, "llama.cpp-master");
-				if (!Directory.Exists(root))
-				{
-					string[] dirs = Directory.GetDirectories(exDir);
-					if (dirs.Length == 1)
-					{
-						root = dirs[0];
-					}
-					else
-					{
-						Log("[下载] 解压结构异常，换下一个源");
-						continue;
-					}
-				}
-				string entrySrc = Path.Combine(root, "convert_hf_to_gguf.py");
-				if (!File.Exists(entrySrc))
-				{
-					Log("[下载] 源码包中没有 convert_hf_to_gguf.py，换下一个源");
-					continue;
-				}
-				File.Copy(entrySrc, Path.Combine(ToolsDir, "convert_hf_to_gguf.py"), overwrite: true);
-				CopyDir(Path.Combine(root, "conversion"), Path.Combine(ToolsDir, "conversion"));
-				CopyDir(Path.Combine(root, "gguf-py"), Path.Combine(ToolsDir, "gguf-py"));
-				try
-				{
-					Directory.Delete(exDir, true);
-					File.Delete(tgz);
-				}
-				catch
-				{
-				}
-				Log("[环境] 转换工具就绪(脚本 + conversion 包 + gguf-py)");
-				return true;
-			}
-			catch (Exception ex)
-			{
-				Log("[下载] 失败(" + ex.Message + ")，换下一个源");
-			}
-		}
-		// 兜底：单文件下载(仅当上游仍是独立脚本时可用)，下载后校验
-		string raw1 = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/convert_hf_to_gguf.py";
-		bool got = await DownloadFileWithMirrorsAsync(new string[4]
-		{
-			raw1,
-			"https://ghproxy.net/" + raw1,
-			"https://ghfast.top/" + raw1,
-			"https://github.com/ggml-org/llama.cpp/raw/master/convert_hf_to_gguf.py"
-		}, Path.Combine(ToolsDir, "convert_hf_to_gguf.py"));
-		if (!got)
-		{
-			return false;
-		}
-		string entryText = File.ReadAllText(Path.Combine(ToolsDir, "convert_hf_to_gguf.py"));
-		if (entryText.Contains("from conversion import") && !Directory.Exists(Path.Combine(ToolsDir, "conversion")))
-		{
-			Log("[环境] 上游脚本已重构为多文件包但源码包下载失败，无法继续。请检查网络后重试。");
-			return false;
-		}
-		Log("[环境] 转换脚本就绪(独立版)");
-		return true;
-	}
+    private async System.Threading.Tasks.Task<bool> FetchConverterAsync()
+    {
+        string? existing = FindConvertScript();
+        if (existing != null)
+        {
+            // 完整性校验：上游新版脚本依赖 conversion 包，若只有单文件脚本则视为残缺，
+            // 必须删除后重新获取完整版
+            string entry = File.ReadAllText(existing);
+            bool needsPkg = entry.Contains("from conversion import");
+            bool hasPkg = Directory.Exists(Path.Combine(Path.GetDirectoryName(existing) ?? ".", "conversion"));
+            if (!needsPkg || hasPkg)
+            {
+                Log("[环境] 转换脚本与 conversion 包已就绪");
+            }
+            else
+            {
+                Log("[环境] 检测到残缺的转换脚本(缺少 conversion 包)，重新获取完整源码包 ...");
+                try
+                {
+                    File.Delete(existing);
+                }
+                catch
+                {
+                }
+            }
+        }
+        if (FindConvertScript() == null)
+        {
+            Directory.CreateDirectory(ToolsDir);
+            if (await FetchConversionPackageViaJsDelivrAsync())
+            {
+                Log("[环境] 转换工具就绪(jsDelivr: 脚本 + conversion 包)");
+            }
+            else
+            {
+                bool tarOk = false;
+                string tgz = Path.Combine(Path.GetTempPath(), "llamacpp_master.tar.gz");
+                string exDir = Path.Combine(Path.GetTempPath(), "llamacpp_master_src");
+                string[] tarUrls = new string[5]
+                {
+                    "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
+                    "https://gh-proxy.com/https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
+                    "https://ghproxy.net/https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
+                    "https://ghfast.top/https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
+                    "https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.tar.gz"
+                };
+                foreach (string u in tarUrls)
+                {
+                    try
+                    {
+                        Log("[下载] " + u + " (源码包约 20~45MB，含匹配的 conversion 包)");
+                        using (System.Net.Http.HttpResponseMessage resp = await _httpClient.GetAsync(u))
+                        {
+                            if (!resp.IsSuccessStatusCode)
+                            {
+                                Log("[下载] HTTP " + ((int)resp.StatusCode) + "，换下一个源");
+                                continue;
+                            }
+                            byte[] data = await resp.Content.ReadAsByteArrayAsync();
+                            if (data.Length < 1000000)
+                            {
+                                Log("[下载] 内容异常(过短)，换下一个源");
+                                continue;
+                            }
+                            File.WriteAllBytes(tgz, data);
+                            Log("[下载] 完成: " + (data.Length / 1048576.0).ToString("F1") + " MB，解压中 ...");
+                        }
+                        if (Directory.Exists(exDir))
+                        {
+                            Directory.Delete(exDir, true);
+                        }
+                        using (FileStream fs = File.OpenRead(tgz))
+                        using (System.IO.Compression.GZipStream gz = new System.IO.Compression.GZipStream(fs, System.IO.Compression.CompressionMode.Decompress))
+                        {
+                            System.Formats.Tar.TarFile.ExtractToDirectory(gz, exDir, overwriteFiles: true);
+                        }
+                        string root = Path.Combine(exDir, "llama.cpp-master");
+                        if (!Directory.Exists(root))
+                        {
+                            string[] dirs = Directory.GetDirectories(exDir);
+                            if (dirs.Length == 1)
+                            {
+                                root = dirs[0];
+                            }
+                            else
+                            {
+                                Log("[下载] 解压结构异常，换下一个源");
+                                continue;
+                            }
+                        }
+                        string entrySrc = Path.Combine(root, "convert_hf_to_gguf.py");
+                        if (!File.Exists(entrySrc))
+                        {
+                            Log("[下载] 源码包中没有 convert_hf_to_gguf.py，换下一个源");
+                            continue;
+                        }
+                        File.Copy(entrySrc, Path.Combine(ToolsDir, "convert_hf_to_gguf.py"), overwrite: true);
+                        CopyDir(Path.Combine(root, "conversion"), Path.Combine(ToolsDir, "conversion"));
+                        CopyDir(Path.Combine(root, "gguf-py"), Path.Combine(ToolsDir, "gguf-py"));
+                        try
+                        {
+                            Directory.Delete(exDir, true);
+                            File.Delete(tgz);
+                        }
+                        catch
+                        {
+                        }
+                        Log("[环境] 转换工具就绪(脚本 + conversion 包 + gguf-py)");
+                        tarOk = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("[下载] 失败(" + ex.Message + ")，换下一个源");
+                    }
+                }
+                if (!tarOk)
+                {
+                    string raw1 = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/convert_hf_to_gguf.py";
+                    bool got = await DownloadFileWithMirrorsAsync(new string[4]
+                    {
+                        raw1,
+                        "https://ghproxy.net/" + raw1,
+                        "https://ghfast.top/" + raw1,
+                        "https://github.com/ggml-org/llama.cpp/raw/master/convert_hf_to_gguf.py"
+                    }, Path.Combine(ToolsDir, "convert_hf_to_gguf.py"));
+                    if (!got)
+                    {
+                        return false;
+                    }
+                    string entryText = File.ReadAllText(Path.Combine(ToolsDir, "convert_hf_to_gguf.py"));
+                    if (entryText.Contains("from conversion import") && !Directory.Exists(Path.Combine(ToolsDir, "conversion")))
+                    {
+                        Log("[环境] 上游脚本已重构为多文件包但源码包下载失败，无法继续。请检查网络后重试。");
+                        return false;
+                    }
+                    Log("[环境] 转换脚本就绪(独立版)");
+                }
+            }
+        }
+        // 仓库内 gguf-py 含最新 MODEL_ARCH(如 DFLASH)，pip 版滞后；确保存在并以 PYTHONPATH 优先
+        if (!await EnsureGgufPyFilesAsync())
+        {
+            Log("[环境] gguf-py 获取失败(网络原因)，已取消启动。");
+            return false;
+        }
+        return true;
+    }
+
+    // 补齐仓库内 gguf-py/gguf(缺失文件从 jsDelivr CDN 下载，清单 2026-08-30 逐一核实)
+    private async System.Threading.Tasks.Task<bool> EnsureGgufPyFilesAsync()
+    {
+        bool missing = false;
+        foreach (string name in GgufPyFiles)
+        {
+            if (!File.Exists(Path.Combine(ToolsDir, "gguf-py", "gguf", name)))
+            {
+                missing = true;
+                break;
+            }
+        }
+        if (!missing)
+        {
+            return true;
+        }
+        Log("[环境] 补齐仓库内 gguf-py(含最新 MODEL_ARCH，优先于 pip 版) ...");
+        foreach (string name in GgufPyFiles)
+        {
+            string dest = Path.Combine(ToolsDir, "gguf-py", "gguf", name);
+            if (File.Exists(dest))
+            {
+                continue;
+            }
+            string url = "https://cdn.jsdelivr.net/gh/ggml-org/llama.cpp@master/gguf-py/gguf/" + name;
+            bool got = false;
+            for (int attempt = 0; attempt < 2 && !got; attempt++)
+            {
+                try
+                {
+                    byte[] data = await _httpClient.GetByteArrayAsync(url);
+                    Directory.CreateDirectory(Path.GetDirectoryName(dest) ?? ".");
+                    File.WriteAllBytes(dest, data);
+                    got = true;
+                }
+                catch (Exception ex)
+                {
+                    Log("[下载] gguf-py/" + name + " 失败(" + ex.Message + ")" + ((attempt == 0) ? "，重试一次" : ""));
+                }
+            }
+            if (!got)
+            {
+                return false;
+            }
+        }
+        Log("[环境] gguf-py 就绪");
+        return true;
+    }
+
+    private static readonly string[] GgufPyFiles = new string[]
+    {
+        "__init__.py", "constants.py", "gguf.py", "gguf_reader.py", "gguf_writer.py",
+        "lazy.py", "metadata.py", "py.typed", "quants.py", "tensor_mapping.py",
+        "utility.py", "vocab.py"
+    };
+
 
 	private static void CopyDir(string src, string dst)
 	{
