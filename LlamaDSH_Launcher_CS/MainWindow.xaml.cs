@@ -1473,17 +1473,8 @@ public partial class MainWindow : Window, IComponentConnector
 			string? script = FindConvertScript();
 			if (script == null)
 			{
-				Log("[转换] 未找到且无法自动下载 convert_hf_to_gguf.py。");
-				Log("[转换] 可手动下载后放到 " + ToolsDir + " 或 llama 目录，并安装依赖: pip install gguf torch transformers sentencepiece");
+				Log("[转换] 未找到 convert_hf_to_gguf.py(内置工具包解压失败)。");
 				onDone(null);
-				return;
-			}
-			string dirName = dir.TrimEnd('\\', '/');
-			outFile = Path.Combine(dir, Path.GetFileName(dirName) + "-" + outtype + ".gguf");
-			if (File.Exists(outFile) && new FileInfo(outFile).Length > 0)
-			{
-				Log("[转换] 已存在转换产物，跳过转换: " + outFile);
-				onDone(outFile);
 				return;
 			}
 			double srcBytes = 0.0;
@@ -1491,6 +1482,43 @@ public partial class MainWindow : Window, IComponentConnector
 			foreach (string f in srcFiles)
 			{
 				srcBytes += new FileInfo(f).Length;
+			}
+			string dirName = dir.TrimEnd('\\', '/');
+			outFile = Path.Combine(dir, Path.GetFileName(dirName) + "-" + outtype + ".gguf");
+			// 已有产物需完整性校验：GGUF 魔数 + 文件大小达到源的合理比例(上次中断会留下截断文件)
+			if (File.Exists(outFile))
+			{
+				long existLen = new FileInfo(outFile).Length;
+				bool headerOk = false;
+				if (existLen > 24)
+				{
+					try
+					{
+						using (FileStream fs0 = File.OpenRead(outFile))
+						using (BinaryReader br0 = new BinaryReader(fs0))
+						{
+							headerOk = (br0.ReadInt32() == 0x46554747);
+						}
+					}
+					catch
+					{
+					}
+				}
+				double expectFactor = ((outtype == "f16") ? 0.9 : 0.45);
+				if (headerOk && existLen >= (double)srcBytes * expectFactor)
+				{
+					Log("[转换] 已存在有效的转换产物(" + (existLen / 1073741824.0).ToString("F1") + " GiB)，跳过转换: " + outFile);
+					onDone(outFile);
+					return;
+				}
+				Log("[转换] 检测到不完整的转换产物(" + (existLen / 1073741824.0).ToString("F1") + " GiB，疑似上次中断)，删除后重新转换");
+				try
+				{
+					File.Delete(outFile);
+				}
+				catch
+				{
+				}
 			}
 			double needBytes = srcBytes * ((outtype == "f16") ? 1.05 : 0.62);
 			DriveInfo di = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(outFile)) ?? "C:\\");
@@ -1532,7 +1560,6 @@ public partial class MainWindow : Window, IComponentConnector
 						return;
 					}
 					LogError(new Exception("退出码 " + code), "safetensors 转换失败");
-					Log("[转换] 若报 ModuleNotFoundError 请先安装依赖: pip install gguf torch transformers sentencepiece");
 					onDone(null);
 				}
 				catch (Exception ex2)
@@ -1541,12 +1568,6 @@ public partial class MainWindow : Window, IComponentConnector
 					onDone(null);
 				}
 			});
-		}
-		catch (System.ComponentModel.Win32Exception)
-		{
-			LogError(new Exception("python 未找到"), "safetensors 转换");
-			Log("[转换] 请确认 python 已安装并在 PATH 中");
-			onDone(null);
 		}
 		catch (Exception ex)
 		{
