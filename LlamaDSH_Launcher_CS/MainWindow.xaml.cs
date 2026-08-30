@@ -1455,7 +1455,7 @@ public partial class MainWindow : Window, IComponentConnector
 			string ggufPyDir = Path.Combine(ToolsDir, "gguf-py");
 			if (Directory.Exists(ggufPyDir))
 			{
-				string existingPyPath = psi.EnvironmentVariables["PYTHONPATH"] ?? "";
+				string existingPyPath = psi.EnvironmentVariables.ContainsKey("PYTHONPATH") ? (psi.EnvironmentVariables["PYTHONPATH"] ?? "") : "";
 				psi.EnvironmentVariables["PYTHONPATH"] = string.IsNullOrEmpty(existingPyPath) ? ggufPyDir : (ggufPyDir + ";" + existingPyPath);
 			}
 			Log("[转换] " + psi.FileName + " " + psi.Arguments);
