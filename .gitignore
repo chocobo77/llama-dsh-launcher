@@ -10,6 +10,7 @@ installer_staging/
 
 # Copied publish artifact used as Content by the launcher (build from gputemp/)
 LlamaDSH_Launcher_CS/gputemp/gputemp.exe
+LlamaDSH_Launcher_CS/gputemp/gputemp.sys
 
 # Visual Studio
 .vs/
