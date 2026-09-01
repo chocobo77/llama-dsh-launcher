@@ -66,6 +66,14 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private CancellationTokenSource? _dshTailCts;
 
+	// DSH 升级自动重建 (git HEAD 变化 → clean + build:lib + build:web)
+	private DispatcherTimer? _dshRebuildTimer;
+	private string _dshRebuildLogPath = "";
+	private long _dshRebuildLogPos;
+	private string _dshRebuildHead = "";
+	private Action? _dshRebuildDone;
+	private DateTime _dshRebuildDeadline;
+
 	private DispatcherTimer? _dshVerifyTimer;
 
 	private DateTime _dshVerifyDeadline;
@@ -1187,7 +1195,10 @@ public partial class MainWindow : Window, IComponentConnector
 	{
 		switch (cacheType.Trim().ToLowerInvariant())
 		{
+		case "f32":
+			return 4.0;
 		case "f16":
+		case "bf16":
 			return 2.0;
 		case "q8_0":
 			return 1.0625;
@@ -1202,6 +1213,8 @@ public partial class MainWindow : Window, IComponentConnector
 			return 0.75;
 		case "q6_0":
 			return 0.875;
+		case "tq3_0":
+			return 0.4375;
 		default:
 			return 2.0;
 		}
@@ -2714,7 +2727,273 @@ public partial class MainWindow : Window, IComponentConnector
 			return;
 		}
 		_dshRetriesLeft = 2;
+		PrepareDshThenStart();
+	}
+
+	/// <summary>
+	/// DSH 启动前的维护步骤（依据 DSH_启动操作记录_20260830.md 遗留建议）:
+	/// 1) 无 host 运行时自动清理 task-board 残留锁; 2) git HEAD 变化时提示自动重建编译产物。
+	/// </summary>
+	private void PrepareDshThenStart()
+	{
+		// 1) 残留锁: 锁存在 + 端口无监听 + 无 DSH node 进程 → 判定为未干净关闭的残留
+		try
+		{
+			if (DshMaintenance.IsStaleLockPresent(3080))
+			{
+				File.Delete(DshMaintenance.LockPath);
+				Log("[DSH] 已自动清理残留锁: " + DshMaintenance.LockPath);
+			}
+		}
+		catch (Exception lockEx)
+		{
+			Log("[DSH] 清理残留锁失败(不影响启动): " + lockEx.Message);
+		}
+		// 2) 升级检测: 仅本地目录模式(npx 安装模式无仓库可检测)
+		if (ComboDshMode.SelectedIndex == 0)
+		{
+			try
+			{
+				string dshDir = InputDshDir.Text.Trim().Trim('"');
+				if (string.IsNullOrEmpty(dshDir))
+				{
+					dshDir = "%DSH%";
+				}
+				string? head = DshMaintenance.GetGitHead(dshDir);
+				(string? builtHead, string? builtAt) = DshMaintenance.LoadBuildState();
+				if (head != null && builtHead != null && builtHead != head)
+				{
+					string msg = "检测到 DSH 仓库已升级 (基线 " + builtHead.Substring(0, 7) + " → 当前 " + head.Substring(0, 7) + ")。\n\n"
+						+ "旧编译产物会导致启动失败(大面积 MISSING_EXPORT)，需要全量重建:\n"
+						+ "  1/3 pnpm clean\n  2/3 pnpm build:lib\n  3/3 build:web (vite)\n\n"
+						+ "是 = 现在自动重建 (后台运行，约几分钟，断开远程不中断)\n"
+						+ "否 = 跳过重建直接启动 (大概率报旧产物错误)";
+					if (System.Windows.MessageBox.Show(msg, "DSH 升级重建", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+					{
+						StartDshRebuild(dshDir, head, PrepareDshThenStart);
+						return;
+					}
+					Log("[DSH] 跳过重建直接启动 (上次重建基线 " + builtAt + ")，旧产物可能报错");
+				}
+				else if (head != null && builtHead == null)
+				{
+					DshMaintenance.SaveBuildState(head);
+					Log("[DSH] 已记录 DSH 构建基线 HEAD " + head.Substring(0, 7) + " (之后仓库升级将提示自动重建)");
+				}
+			}
+			catch (Exception upEx)
+			{
+				Log("[DSH] 升级检测失败(不影响启动): " + upEx.Message);
+			}
+		}
 		StartDsh();
+	}
+
+	/// <summary>
+	/// DSH 编译产物全量重建: WMI 分离运行 cmd 脚本(clean → build:lib → node24 vite build)，
+	/// 输出重定向到日志文件由轮询器尾随显示。断开远程/关闭启动器都不会中断重建。
+	/// </summary>
+	private void StartDshRebuild(string dshDir, string head, Action onDone)
+	{
+		try
+		{
+			if (!File.Exists(DshMaintenance.Node24Path))
+			{
+				System.Windows.MessageBox.Show("未找到 node24: " + DshMaintenance.Node24Path + "\n无法自动重建，将直接启动。");
+				StartDsh();
+				return;
+			}
+			string logPath = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_rebuild.log");
+			string cmdPath = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_rebuild.cmd");
+			string nodeDir = Path.GetDirectoryName(DshMaintenance.Node24Path) ?? "C:\\Program Files\\nodejs";
+			string q = "\"";
+			string redirect = " >> " + q + logPath + q + " 2>&1";
+			string cmdText = "@echo off" + Environment.NewLine
+				+ "set \"PATH=" + nodeDir + ";%PATH%\"" + Environment.NewLine
+				+ "cd /d " + q + dshDir + q + Environment.NewLine
+				+ "echo [REBUILD] 1/3 pnpm clean" + redirect + Environment.NewLine
+				+ "call pnpm clean" + redirect + Environment.NewLine
+				+ "if errorlevel 1 goto :fail" + Environment.NewLine
+				+ "echo [REBUILD] 2/3 pnpm build:lib" + redirect + Environment.NewLine
+				+ "call pnpm build:lib" + redirect + Environment.NewLine
+				+ "if errorlevel 1 goto :fail" + Environment.NewLine
+				+ "echo [REBUILD] 3/3 build:web (node24 vite)" + redirect + Environment.NewLine
+				+ "cd /d " + q + dshDir + "\\apps\\web" + q + Environment.NewLine
+				+ q + DshMaintenance.Node24Path + q + " node_modules\\vite\\bin\\vite.js build" + redirect + Environment.NewLine
+				+ "if errorlevel 1 goto :fail" + Environment.NewLine
+				+ "echo EXITCODE:0" + redirect + Environment.NewLine
+				+ "exit /b 0" + Environment.NewLine
+				+ ":fail" + Environment.NewLine
+				+ "echo EXITCODE:1" + redirect + Environment.NewLine
+				+ "exit /b 1";
+			File.WriteAllText(cmdPath, cmdText);
+			File.WriteAllText(logPath, "");
+			bool spawned = false;
+			using (System.Management.ManagementClass mc = new System.Management.ManagementClass("Win32_Process"))
+			{
+				System.Management.ManagementBaseObject inParams = mc.GetMethodParameters("Create");
+				inParams["CommandLine"] = "cmd.exe /c " + q + cmdPath + q;
+				inParams["CurrentDirectory"] = dshDir;
+				using (System.Management.ManagementClass suClass = new System.Management.ManagementClass("Win32_ProcessStartup"))
+				{
+					System.Management.ManagementBaseObject su = suClass.CreateInstance();
+					su["ShowWindow"] = 0;
+					try
+					{
+						System.Collections.IDictionary envVars = Environment.GetEnvironmentVariables();
+						string[] envArray = new string[envVars.Count];
+						int envIndex = 0;
+						foreach (System.Collections.DictionaryEntry entry in envVars)
+						{
+							if (entry.Key == null || entry.Value == null) continue;
+							if (string.Equals((string)entry.Key, "__COMPAT_LAYER", StringComparison.OrdinalIgnoreCase)) continue;
+							envArray[envIndex++] = entry.Key + "=" + entry.Value;
+						}
+						Array.Resize(ref envArray, envIndex);
+						su["EnvironmentVariables"] = envArray;
+					}
+					catch
+					{
+					}
+					inParams["ProcessStartupInformation"] = su;
+				}
+				System.Management.ManagementBaseObject outParams = mc.InvokeMethod("Create", inParams, null);
+				int rc = Convert.ToInt32(outParams["ReturnValue"]);
+				if (rc != 0)
+				{
+					Log("[DSH重建] 分离启动失败(WMI rc=" + rc + ")，放弃重建直接启动");
+					StartDsh();
+					return;
+				}
+				spawned = true;
+				try
+				{
+					int childPid = Convert.ToInt32(outParams["ProcessId"]);
+					using (System.Diagnostics.Process cp = System.Diagnostics.Process.GetProcessById(childPid))
+					{
+						cp.PriorityClass = System.Diagnostics.ProcessPriorityClass.BelowNormal;
+					}
+					Log("[DSH重建] 重建进程优先级 BelowNormal(减少对其他实例的影响)");
+				}
+				catch
+				{
+				}
+			}
+			if (!spawned)
+			{
+				StartDsh();
+				return;
+			}
+			_dshRebuildLogPath = logPath;
+			_dshRebuildLogPos = 0;
+			_dshRebuildHead = head;
+			_dshRebuildDone = onDone;
+			_dshRebuildDeadline = DateTime.Now.AddMinutes(30.0);
+			BtnDshStart.IsEnabled = false;
+			BtnDshStop.IsEnabled = false;
+			LblDshStatus.Text = "Rebuilding...";
+			LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(240, 136, 62));
+			Log("--- 检测到 DSH 仓库升级，开始后台重建 (clean + build:lib + build:web) ---");
+			Log("[DSH重建] 日志: " + logPath);
+			_dshRebuildTimer = new DispatcherTimer
+			{
+				Interval = TimeSpan.FromSeconds(2.0)
+			};
+			_dshRebuildTimer.Tick += delegate
+			{
+				PollDshRebuild();
+			};
+			_dshRebuildTimer.Start();
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "DSH 重建启动失败");
+			StartDsh();
+		}
+	}
+
+	private void StopDshRebuildTimer()
+	{
+		_dshRebuildTimer?.Stop();
+		_dshRebuildTimer = null;
+	}
+
+	private void PollDshRebuild()
+	{
+		try
+		{
+			if (File.Exists(_dshRebuildLogPath))
+			{
+				using (FileStream fs = File.OpenRead(_dshRebuildLogPath))
+				{
+					if (fs.Length < _dshRebuildLogPos)
+					{
+						_dshRebuildLogPos = 0;
+					}
+					if (fs.Length > _dshRebuildLogPos)
+					{
+						fs.Seek(_dshRebuildLogPos, SeekOrigin.Begin);
+						using (StreamReader sr = new StreamReader(fs))
+						{
+							string chunk = sr.ReadToEnd();
+							_dshRebuildLogPos = fs.Length;
+							string[] lines = chunk.Replace("\r\n", "\n").Split('\n');
+							string[] array = lines;
+							foreach (string line in array)
+							{
+								string t = line.TrimEnd();
+								if (t.Length > 0)
+								{
+									Log("[DSH重建] " + ((t.Length > 300) ? (t.Substring(0, 300) + "…") : t));
+								}
+							}
+						}
+					}
+				}
+				string? exitCode = null;
+				foreach (string line2 in File.ReadLines(_dshRebuildLogPath))
+				{
+					if (line2.StartsWith("EXITCODE:"))
+					{
+						exitCode = line2.Substring(9).Trim();
+					}
+				}
+				if (exitCode != null)
+				{
+					StopDshRebuildTimer();
+					BtnDshStart.IsEnabled = true;
+					BtnDshStop.IsEnabled = false;
+					if (exitCode == "0")
+					{
+						DshMaintenance.SaveBuildState(_dshRebuildHead);
+						Log("--- [DSH重建] ✅ 重建完成，基线已更新为 " + _dshRebuildHead.Substring(0, 7) + "，继续启动 DSH ---");
+						LblDshStatus.Text = "Stopped";
+						LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
+						Action? done = _dshRebuildDone;
+						_dshRebuildDone = null;
+						done?.Invoke();
+					}
+					else
+					{
+						Log("--- [DSH重建] ❌ 重建失败 (EXITCODE=1)，请查看上方日志 ---");
+						LblDshStatus.Text = "Rebuild failed";
+						LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(248, 81, 73));
+						System.Windows.MessageBox.Show("DSH 重建失败，详见启动器日志。\n\n常见原因: node24/pnpm 不可用、依赖安装网络问题、TS 编译错误。", "DSH 重建失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+					}
+					return;
+				}
+			}
+			if (DateTime.Now > _dshRebuildDeadline)
+			{
+				StopDshRebuildTimer();
+				BtnDshStart.IsEnabled = true;
+				Log("[DSH重建] ⚠ 等待超时(30分钟)，停止监视。重建进程仍在后台运行，完成后可直接再点启动。");
+			}
+		}
+		catch (Exception ex2)
+		{
+			LogError(ex2, "DSH 重建轮询");
+		}
 	}
 
 	private void StopDsh_Click(object s, RoutedEventArgs e)
