@@ -1,4 +1,4 @@
-﻿; LlamaDSH_Launcher 安装程序脚本
+; LlamaDSH_Launcher 安装程序脚本
 ; Inno Setup 6 中文版
 
 #define MyAppName "DeepSeek Harness & Llama 启动器"
@@ -12,18 +12,18 @@ AppId={{A7F8B3C4-D5E6-4F78-9A0B-1C2D3E4F5A6B}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName=D:\Program Files\LlamaDSH_Launcher
+DefaultDirName={autopf}\LlamaDSH_Launcher
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 LicenseFile=
-OutputDir=D:\code\启动器\LlamaDSH_Launcher_CS\installer_output
+OutputDir={#SourcePath}installer_output
 OutputBaseFilename=LlamaDSH_Launcher_Setup
 SetupIconFile=installer_staging\{#MyAppIcon}
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763

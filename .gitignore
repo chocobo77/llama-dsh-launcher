@@ -29,3 +29,6 @@ Desktop.ini
 
 # Logs
 *.log
+
+# Archived review/audit artifacts (keep out of repo; delete or commit deliberately if needed)
+_archive/

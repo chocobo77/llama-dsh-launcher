@@ -43,8 +43,20 @@ rem ---------- [3/6] 结束运行中的实例, 避免发布目录文件被占用
 echo [3/6] 结束运行中的 LlamaDSH_Launcher...
 taskkill /IM LlamaDSH_Launcher.exe /F >nul 2>nul
 
-rem ---------- [4/6] 发布单文件主程序 ----------
-echo [4/6] 发布单文件主程序 (dotnet publish)...
+rem ---------- [4/6] 构建 gputemp 并发布单文件主程序 ----------
+echo [4/6] 构建 gputemp 并发布单文件主程序 (dotnet publish)...
+rem 先构建 gputemp 单文件(框架依赖，随 .NET 8 Desktop Runtime 运行)。
+rem 保证新克隆仓库(缺 gputemp.exe)也能封包；产物同步到 csproj 引用的目录，
+rem 这样 launcher 发布时也能把 gputemp.exe 一并打进输出目录。
+set "GPUBIN=%ROOT%gputemp\bin\Release\net8.0-windows\win-x64\publish\gputemp.exe"
+dotnet publish "%ROOT%gputemp\gputemp.csproj" -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:IncludeAllContentForSelfExtract=true -v q -nologo
+if errorlevel 1 goto :fail
+if not exist "%GPUBIN%" (
+    echo   [错误] gputemp 构建产物缺失
+    goto :fail
+)
+copy /Y "%GPUBIN%" "%PROJ%\gputemp\gputemp.exe" >nul
+if errorlevel 1 goto :fail
 if exist "%PUBDIR%" rd /s /q "%PUBDIR%"
 dotnet publish "%CSProj%" -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:IncludeAllContentForSelfExtract=true -v q -nologo
 if errorlevel 1 goto :fail
@@ -58,7 +70,7 @@ echo [5/6] 刷新 installer_staging...
 if not exist "%PROJ%\installer_staging" mkdir "%PROJ%\installer_staging"
 copy /Y "%PUBDIR%\LlamaDSH_Launcher.exe" "%PROJ%\installer_staging\LlamaDSH_Launcher.exe" >nul
 if errorlevel 1 goto :fail
-copy /Y "%PROJ%\gputemp\gputemp.exe" "%PROJ%\installer_staging\gputemp.exe" >nul
+copy /Y "%GPUBIN%" "%PROJ%\installer_staging\gputemp.exe" >nul
 if errorlevel 1 goto :fail
 copy /Y "%PROJ%\Resources\app.ico" "%PROJ%\installer_staging\app.ico" >nul
 if errorlevel 1 goto :fail

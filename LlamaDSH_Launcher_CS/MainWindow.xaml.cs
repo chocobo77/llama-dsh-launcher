@@ -60,11 +60,12 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private int _dshRetriesLeft;
 
-	private bool _dshTaskMode;
-
 	private string? _dshBootLogPath;
 
 	private CancellationTokenSource? _dshTailCts;
+
+	// 最近一次 AutoFill 提示集合（用于去重，避免击键刷屏）
+	private string? _lastAutoFillHints;
 
 	// DSH 升级自动重建 (git HEAD 变化 → clean + build:lib + build:web)
 	private DispatcherTimer? _dshRebuildTimer;
@@ -854,6 +855,297 @@ public partial class MainWindow : Window, IComponentConnector
 		});
 	}
 
+	// ==================== 更新：llama.cpp / deepseek-harness ====================
+
+	private void CheckLlamaUpdate_Click(object s, RoutedEventArgs e)
+	{
+		_ = CheckLlamaUpdateAsync(fromButton: true);
+	}
+
+	private void CheckDshUpdate_Click(object s, RoutedEventArgs e)
+	{
+		_ = CheckDshUpdateAsync(fromButton: true);
+	}
+
+	private string EffectiveLlamaDir()
+	{
+		string dir = InputLlamaDir.Text.Trim().Trim('"');
+		return string.IsNullOrEmpty(dir) ? "D:\\llama.cpp" : dir;
+	}
+
+	private string EffectiveDshDir()
+	{
+		string dir = InputDshDir.Text.Trim().Trim('"');
+		return string.IsNullOrEmpty(dir) ? "%DSH%" : dir;
+	}
+
+	private bool IsLlamaRunning()
+	{
+		if (_llamaProc != null && IsAlive(_llamaProc))
+		{
+			return true;
+		}
+		try
+		{
+			return ProcessHelper.FindProcessByPort(GetLlamaPort()).HasValue;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	private bool IsDshRunning()
+	{
+		try
+		{
+			return (_dshProc != null && IsAlive(_dshProc))
+				|| ProcessHelper.FindProcessByPort(3080).HasValue
+				|| Services.DshMaintenance.NodeHostRunning();
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	private void SetLlamaUpdBtn(bool busy, string busyText = "⏳ 处理中...")
+	{
+		if (BtnCheckLlamaUpdate == null)
+		{
+			return;
+		}
+		BtnCheckLlamaUpdate.IsEnabled = !busy;
+		BtnCheckLlamaUpdate.Content = busy ? busyText : "🔄 检查更新";
+	}
+
+	private void SetDshUpdBtn(bool busy, string busyText = "⏳ 处理中...")
+	{
+		if (BtnCheckDshUpdate == null)
+		{
+			return;
+		}
+		BtnCheckDshUpdate.IsEnabled = !busy;
+		BtnCheckDshUpdate.Content = busy ? busyText : "🔄 检查更新";
+	}
+
+	/// <summary>
+	/// llama.cpp 检查/更新。fromButton=true 时完整交互（错误与已是最新都提示）；
+	/// fromButton=false 供启动后台检查，仅在发现新版且 Llama 未运行时弹确认框。
+	/// </summary>
+	private async Task CheckLlamaUpdateAsync(bool fromButton)
+	{
+		try
+		{
+			if (IsLlamaRunning())
+			{
+				if (fromButton)
+				{
+					System.Windows.MessageBox.Show("Llama 服务正在运行，请先停止再更新。", "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Warning);
+				}
+				else
+				{
+					Log("[更新] 后台检测到 llama.cpp 有新版本，但 Llama 服务正在运行，跳过（请手动停止后点“检查更新”）");
+				}
+				return;
+			}
+			string dir = EffectiveLlamaDir();
+			if (UpdateService.FindLlamaServerExe(dir) == null)
+			{
+				if (fromButton)
+				{
+					System.Windows.MessageBox.Show("未找到 llama-server.exe，请先在“Llama 程序目录”填写实际路径。", "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Warning);
+				}
+				return;
+			}
+			SetLlamaUpdBtn(true, "⏳ 检查中...");
+			int? local = await Task.Run(() => UpdateService.GetLocalLlamaBuild(dir));
+			Services.UpdateService.LlamaReleaseInfo? latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease());
+			SetLlamaUpdBtn(false);
+			if (latest == null)
+			{
+				if (fromButton)
+				{
+					System.Windows.MessageBox.Show("无法获取 llama.cpp 最新版本（网络/GitHub 不可达）。", "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Warning);
+				}
+				return;
+			}
+			if (local.HasValue && latest.Build <= local.Value)
+			{
+				Log("[更新] llama.cpp 已是最新: build " + local.Value + "（上游 " + latest.Tag + "）");
+				if (fromButton)
+				{
+					System.Windows.MessageBox.Show("llama.cpp 已是最新版本。\n当前: build " + local.Value + "\n上游: " + latest.Tag, "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Information);
+				}
+				return;
+			}
+			string current = local.HasValue ? "build " + local.Value : "未知";
+			string msg = "发现 llama.cpp 新版本:\n\n"
+				+ "  当前: " + current + "\n"
+				+ "  上游: " + latest.Tag + " (build " + latest.Build + ")\n"
+				+ "  预编译包: " + latest.AssetName + "\n\n"
+				+ "将下载并覆盖更新到:\n  " + dir + "\n\n"
+				+ "（仅更新二进制，不触碰模型；若上游参数有变，更新后点“⟳ 重载参数配置”即可）";
+			if (System.Windows.MessageBox.Show(msg, "更新 llama.cpp", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+			{
+				Log("[更新] 用户取消 llama.cpp 更新");
+				return;
+			}
+			SetLlamaUpdBtn(true, "⏳ 下载更新中...");
+			(bool ok, string m) = await UpdateService.ApplyLlamaUpdateAsync(dir, latest);
+			SetLlamaUpdBtn(false);
+			UpdateService.CleanupLauncherTemp();
+			Log("[更新] " + m);
+			if (ok)
+			{
+				System.Windows.MessageBox.Show(m + "\n\n可点“⟳ 重载参数配置”加载新版本参数。", "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Information);
+			}
+			else
+			{
+				System.Windows.MessageBox.Show("更新失败:\n" + m, "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Warning);
+			}
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "llama.cpp 更新");
+			SetLlamaUpdBtn(false);
+		}
+	}
+
+	/// <summary>
+	/// deepseek-harness 检查/更新。仅“编译版”模式支持 git 更新；
+	/// 落后上游时 git pull --ff-only + 复用既有全量重建（clean + build:lib + build:web）。
+	/// </summary>
+	private async Task CheckDshUpdateAsync(bool fromButton)
+	{
+		try
+		{
+			if (ComboDshMode.SelectedIndex != 0)
+			{
+				if (fromButton)
+				{
+					System.Windows.MessageBox.Show("当前为 npx 一键部署模式，无法 git 更新。请切换到“编译版”模式。", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+				}
+				return;
+			}
+			if (IsDshRunning())
+			{
+				if (fromButton)
+				{
+					System.Windows.MessageBox.Show("DSH 正在运行，请先停止再更新。", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+				}
+				else
+				{
+					Log("[更新] 后台检测到 deepseek-harness 有更新，但 DSH 正在运行，跳过（请手动停止后点“检查更新”）");
+				}
+				return;
+			}
+			string dir = EffectiveDshDir();
+			if (!Directory.Exists(Path.Combine(dir, ".git")))
+			{
+				if (fromButton)
+				{
+					System.Windows.MessageBox.Show("DSH 目录不是 git 仓库: " + dir + "\n请先在“DSH 项目目录”填写实际仓库路径。", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+				}
+				return;
+			}
+			SetDshUpdBtn(true, "⏳ 检查中...");
+			Services.UpdateService.DshUpdateInfo? info = await Task.Run(() => UpdateService.CheckDshUpdate(dir));
+			SetDshUpdBtn(false);
+			if (info == null)
+			{
+				if (fromButton)
+				{
+					System.Windows.MessageBox.Show("无法检查 DSH 上游（git 或网络不可达）。", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+				}
+				return;
+			}
+			if (info.Ahead > 0)
+			{
+				if (fromButton)
+				{
+					System.Windows.MessageBox.Show("本地领先上游 " + info.Ahead + " 个提交（存在本地改动），为避免冲突不会自动更新。\n请自行处理本地提交后重试。", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+				}
+				else
+				{
+					Log("[更新] DSH 本地领先上游 " + info.Ahead + " 个提交，跳过自动更新");
+				}
+				return;
+			}
+			if (info.Behind <= 0)
+			{
+				Log("[更新] DSH 已是最新: " + info.LocalHead.Substring(0, 7) + "（分支 " + info.Branch + "）");
+				if (fromButton)
+				{
+					System.Windows.MessageBox.Show("deepseek-harness 已是最新。\n当前: " + info.LocalHead.Substring(0, 7) + " (" + info.Branch + ")", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Information);
+				}
+				return;
+			}
+			string msg = "发现 deepseek-harness 上游更新（落后 " + info.Behind + " 个提交）:\n\n"
+				+ "  当前: " + info.LocalHead.Substring(0, 7) + "\n"
+				+ "  上游: " + info.RemoteHead.Substring(0, 7) + " (" + info.Branch + ")\n\n"
+				+ "将执行:\n  1. git pull --ff-only\n  2. 全量重建 (clean + build:lib + build:web)\n\n继续？";
+			if (System.Windows.MessageBox.Show(msg, "更新 deepseek-harness", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+			{
+				Log("[更新] 用户取消 DSH 更新");
+				return;
+			}
+			SetDshUpdBtn(true, "⏳ 拉取中...");
+			(bool ok, string m) = await Task.Run(() => UpdateService.PullDsh(dir));
+			if (!ok)
+			{
+				SetDshUpdBtn(false);
+				Log("[更新] DSH git pull 失败: " + m);
+				System.Windows.MessageBox.Show("git pull 失败:\n" + m + "\n\n（可能有本地未提交改动，或上游历史已改写。请手动处理。）", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+				return;
+			}
+			SetDshUpdBtn(false);
+			string newHead = m;
+			Log("[更新] DSH 已拉取到 " + newHead.Substring(0, 7) + "，开始全量重建...");
+			StartDshRebuild(dir, newHead, delegate
+			{
+				UpdateService.CleanupLauncherTemp();
+				Log("[更新] DSH 更新完成，临时文件已清理");
+			});
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "DSH 更新");
+			SetDshUpdBtn(false);
+		}
+	}
+
+	/// <summary>启动后延迟几秒做一次后台检查，发现新版弹窗确认；无更新不打扰。</summary>
+	private void StartBackgroundUpdateCheck()
+	{
+		DispatcherTimer bg = new DispatcherTimer
+		{
+			Interval = TimeSpan.FromSeconds(6.0)
+		};
+		bg.Tick += async delegate
+		{
+			bg.Stop();
+			Log("[更新] 后台检查 llama.cpp / deepseek-harness ...");
+			try
+			{
+				await CheckLlamaUpdateAsync(fromButton: false);
+			}
+			catch (Exception ex)
+			{
+				LogError(ex, "后台检查 llama.cpp 更新");
+			}
+			try
+			{
+				await CheckDshUpdateAsync(fromButton: false);
+			}
+			catch (Exception ex)
+			{
+				LogError(ex, "后台检查 DSH 更新");
+			}
+		};
+		bg.Start();
+	}
+
 	private void DshModeChanged(object s, SelectionChangedEventArgs e)
 	{
 		if (InputDshDir != null && BtnSearchDsh != null)
@@ -915,6 +1207,7 @@ public partial class MainWindow : Window, IComponentConnector
 		{
 			string p2 = mp.Trim().Trim('"');
 			bool mfOk = false;
+			List<string> hints = new List<string>();
 			if (!string.IsNullOrEmpty(p2) && Directory.Exists(p2))
 			{
 				string[] fs = Directory.GetFiles(p2, "*-00001-of-*.gguf");
@@ -923,27 +1216,27 @@ public partial class MainWindow : Window, IComponentConnector
 				if (fs.Length > 0)
 				{
 					Array.Sort(fs, StringComparer.OrdinalIgnoreCase);
-					Log("[提示] 目录模式: 使用分片第一片 " + Path.GetFileName(fs[0]) + "(llama.cpp 自动加载其余分片)");
+					hints.Add("[提示] 目录模式: 使用分片第一片 " + Path.GetFileName(fs[0]) + "(llama.cpp 自动加载其余分片)");
 					p2 = fs[0];
 					mfOk = true;
 				}
 				else if (ggs0.Length == 1)
 				{
-					Log("[提示] 目录模式: 使用 " + Path.GetFileName(ggs0[0]));
+					hints.Add("[提示] 目录模式: 使用 " + Path.GetFileName(ggs0[0]));
 					p2 = ggs0[0];
 					mfOk = true;
 				}
 				else if (ggs0.Length > 1)
 				{
-					Log("[提示] 目录中存在多个 GGUF(" + ggs0.Length + " 个)，请直接选择主模型文件");
+					hints.Add("[提示] 目录中存在多个 GGUF(" + ggs0.Length + " 个)，请直接选择主模型文件");
 				}
 				else if (sts0.Length > 0)
 				{
-					Log("[提示] 目录中是 safetensors 分片(" + sts0.Length + " 个文件)，llama.cpp 不能直接加载。请先转换 GGUF：python convert_hf_to_gguf.py \"" + p2 + "\" --outfile model.gguf");
+					hints.Add("[提示] 目录中是 safetensors 分片(" + sts0.Length + " 个文件)，llama.cpp 不能直接加载。请先转换 GGUF：python convert_hf_to_gguf.py \"" + p2 + "\" --outfile model.gguf");
 				}
 				else
 				{
-					Log("[提示] 目录中未找到模型文件");
+					hints.Add("[提示] 目录中未找到模型文件");
 				}
 			}
 			else if (!string.IsNullOrEmpty(p2) && File.Exists(p2))
@@ -951,7 +1244,7 @@ public partial class MainWindow : Window, IComponentConnector
 				mfOk = true;
 				if (p2.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase))
 				{
-					Log("[提示] llama.cpp 不能直接加载 .safetensors，请先转换为 GGUF：python convert_hf_to_gguf.py \"" + (Path.GetDirectoryName(p2) ?? ".") + "\" --outfile model.gguf");
+					hints.Add("[提示] llama.cpp 不能直接加载 .safetensors，请先转换为 GGUF：python convert_hf_to_gguf.py \"" + (Path.GetDirectoryName(p2) ?? ".") + "\" --outfile model.gguf");
 				}
 			}
 			if (mfOk)
@@ -960,7 +1253,7 @@ public partial class MainWindow : Window, IComponentConnector
 				Match shm = Regex.Match(Path.GetFileName(p2), "-(\\d{5})-of-(\\d{5})\\.gguf$", RegexOptions.IgnoreCase);
 				if (shm.Success)
 				{
-					Log("[提示] 检测到分片 GGUF (" + shm.Groups[2].Value + " 片)：llama.cpp 会自动加载同目录其余分片，请勿移动/改名");
+					hints.Add("[提示] 检测到分片 GGUF (" + shm.Groups[2].Value + " 片)：llama.cpp 会自动加载同目录其余分片，请勿移动/改名");
 				}
 				if (string.IsNullOrWhiteSpace(InputMmprojPath.Text))
 				{
@@ -968,12 +1261,22 @@ public partial class MainWindow : Window, IComponentConnector
 					if (mms.Length == 1)
 					{
 						InputMmprojPath.Text = mms[0];
-						Log("[提示] 已自动关联同目录多模态投影仪: " + Path.GetFileName(mms[0]));
+						hints.Add("[提示] 已自动关联同目录多模态投影仪: " + Path.GetFileName(mms[0]));
 					}
 					else if (mms.Length > 1)
 					{
-						Log("[提示] 同目录发现 " + mms.Length + " 个 mmproj 文件，请手动选择(浏览...)");
+						hints.Add("[提示] 同目录发现 " + mms.Length + " 个 mmproj 文件，请手动选择(浏览...)");
 					}
+				}
+			}
+			// 只在一组提示发生变化时写日志，避免每次击键都重复刷屏
+			string joinedHints = string.Join("\n", hints);
+			if (joinedHints != _lastAutoFillHints)
+			{
+				_lastAutoFillHints = joinedHints;
+				foreach (string h in hints)
+				{
+					Log(h);
 				}
 			}
 		}
@@ -981,6 +1284,7 @@ public partial class MainWindow : Window, IComponentConnector
 		{
 		}
 	}
+
 
 	// 模型路径解析：支持 ①单 gguf 文件 ②分片第一片 ③模型目录(MoE 大模型的分片场景)。
 	// 目录解析顺序：分片第一片(*-00001-of-*.gguf) → 目录中唯一 gguf → safetensors 报错提示转换。
@@ -1475,9 +1779,12 @@ public partial class MainWindow : Window, IComponentConnector
 			}
 			double avail = Math.Max(0.0, total - used);
 			long safeCtx = 0;
-			if (kvPerToken > 0.0 && avail > 0.0)
+			// 部分卸载时 GPU 上只承载 kvPerToken*gpuFrac 的 KV，分母必须同步缩放，
+			// 否则 safeCtx 会被低估 ~1/gpuFrac 倍；gpuFrac=0 时显存不是瓶颈，跳过该提示
+			double gpuKvPerToken = kvPerToken * gpuFrac;
+			if (gpuFrac > 0.0 && gpuKvPerToken > 0.0 && avail > 0.0)
 			{
-				safeCtx = (long)((avail - modelBytes * gpuFrac - bufferBytes) / kvPerToken);
+				safeCtx = (long)((avail - modelBytes * gpuFrac - bufferBytes) / gpuKvPerToken);
 				if (safeCtx < 0)
 				{
 					safeCtx = 0;
@@ -1528,6 +1835,43 @@ public partial class MainWindow : Window, IComponentConnector
 		return r == System.Windows.MessageBoxResult.Yes;
 	}
 
+	// qwen35（Gated Delta Net 线性注意力）部分卸载风险提示：
+	// 混合 CPU/GPU 层会禁用 fused op，compute/KV 缓冲可能整段驻留显存 → OOM/崩溃。
+	// 返回警告文案；非 qwen35 或全量卸载时返回 null。
+	private string? Qwen35PartialOffloadWarning()
+	{
+		try
+		{
+			string? modelPath = ResolveModelPath(throwOnError: false) ?? "";
+			if (string.IsNullOrEmpty(modelPath) || !File.Exists(modelPath))
+			{
+				return null;
+			}
+			GgufArchInfo gi = ReadGgufArch(modelPath);
+			if (!gi.Ok || gi.Layers <= 0 || !string.Equals(gi.Architecture, "qwen35", StringComparison.OrdinalIgnoreCase))
+			{
+				return null;
+			}
+			if (RoleText("ngl", out string ngl) && double.TryParse(ngl, out double nglV) && nglV >= 0.0 && nglV < (double)gi.Layers)
+			{
+				return "模型架构 " + gi.Architecture + "（Gated Delta Net 线性注意力）检测到部分卸载（--gpu-layers " + nglV.ToString("F0") + " < " + gi.Layers + " 层）。部分卸载会禁用 fused op，compute/KV 缓冲可能整段驻留显存，极易 OOM 崩溃。建议 --gpu-layers 设为 " + gi.Layers + "（全量卸载）。";
+			}
+			// MoE 专家卸载到 CPU（cpu_moe / n_cpu_moe）同样会破坏 fused op 的全量卸载前提
+			if (RoleBool("cpu_moe"))
+			{
+				return "模型架构 " + gi.Architecture + "（Gated Delta Net 线性注意力）检测到 MoE 专家卸载到 CPU（--cpu-moe 生效）。该架构需要全量 GPU 卸载才能启用 fused op，否则 compute/KV 缓冲可能整段驻留显存，极易 OOM 崩溃。建议关闭 --cpu-moe。";
+			}
+			if (RoleText("n_cpu_moe", out string ncm) && double.TryParse(ncm, out double ncmV) && ncmV > 0.0)
+			{
+				return "模型架构 " + gi.Architecture + "（Gated Delta Net 线性注意力）检测到部分 MoE 专家卸载到 CPU（--n-cpu-moe " + ncmV.ToString("F0") + "）。该架构需要全量 GPU 卸载才能启用 fused op，否则 compute/KV 缓冲可能整段驻留显存，极易 OOM 崩溃。建议 --n-cpu-moe 设为 0。";
+			}
+		}
+		catch
+		{
+		}
+		return null;
+	}
+
 	private static string FmtCmd(List<string> cl)
 	{
 		if (cl.Count == 0)
@@ -1571,6 +1915,12 @@ public partial class MainWindow : Window, IComponentConnector
 			List<string> list = BuildCmd();
 			_lastCmd = string.Join(" ", list.Select(QA));
 			CmdPreview.Text = FmtCmd(list);
+			// qwen35 部分卸载风险：只显示在命令预览，不刷日志（避免每次击键刷屏）
+			string? qw = Qwen35PartialOffloadWarning();
+			if (qw != null)
+			{
+				CmdPreview.Text += Environment.NewLine + "⚠ " + qw;
+			}
 		}
 		catch (Exception ex)
 		{
@@ -1718,7 +2068,7 @@ public partial class MainWindow : Window, IComponentConnector
 		}
 	}
 
-	private void ConvertSafetensors(string dir, string outtype, Action<string?> onDone)
+	private void ConvertSafetensors(string dir, string outtype, string pyExe, string pyPre, Action<string?> onDone)
 	{
 		string? outFile = null;
 		try
@@ -1782,7 +2132,7 @@ public partial class MainWindow : Window, IComponentConnector
 				onDone(null);
 				return;
 			}
-			StartDetachedConversion(dir, outtype, script, outFile, srcBytes, onDone);
+			StartDetachedConversion(dir, outtype, pyExe, pyPre, script, outFile, srcBytes, onDone);
 		}
 		catch (Exception ex)
 		{
@@ -1795,10 +2145,6 @@ public partial class MainWindow : Window, IComponentConnector
 	public string ToolsDir { get; } = Path.Combine(
 		Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh_launcher_tools");
 
-	private static readonly System.Net.Http.HttpClient _httpClient = new System.Net.Http.HttpClient()
-	{
-		Timeout = TimeSpan.FromSeconds(90)
-	};
 
 	private string? FindConvertScript()
 	{
@@ -1855,40 +2201,6 @@ public partial class MainWindow : Window, IComponentConnector
 			}
 		}
 		return null;
-	}
-
-	private async System.Threading.Tasks.Task<bool> DownloadFileWithMirrorsAsync(string[] urls, string dest)
-	{
-		foreach (string u in urls)
-		{
-			try
-			{
-				Log("[下载] " + u);
-				using (System.Net.Http.HttpResponseMessage resp = await _httpClient.GetAsync(u))
-				{
-					if (!resp.IsSuccessStatusCode)
-					{
-						Log("[下载] HTTP " + ((int)resp.StatusCode) + "，换下一个源");
-						continue;
-					}
-					byte[] data = await resp.Content.ReadAsByteArrayAsync();
-					if (data.Length < 1000)
-					{
-						Log("[下载] 内容异常(过短)，换下一个源");
-						continue;
-					}
-					Directory.CreateDirectory(Path.GetDirectoryName(dest) ?? ".");
-					File.WriteAllBytes(dest, data);
-					Log("[下载] 完成: " + (data.Length / 1024) + " KB -> " + dest);
-					return true;
-				}
-			}
-			catch (Exception ex)
-			{
-				Log("[下载] 失败(" + ex.Message + ")，换下一个源");
-			}
-		}
-		return false;
 	}
 
 	// 启动进程并实时把输出泵进日志，返回退出码
@@ -1982,7 +2294,7 @@ public partial class MainWindow : Window, IComponentConnector
 				return;
 			}
 			Log("[环境] 依赖就绪，开始转换 safetensors → GGUF (" + outtype + ")");
-			ConvertSafetensors(dir, outtype, delegate (string? outFile)
+			ConvertSafetensors(dir, outtype, py, pyPre, delegate (string? outFile)
 			{
 				((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
 				{
@@ -2005,315 +2317,6 @@ public partial class MainWindow : Window, IComponentConnector
 		}
 	}
 
-	// 获取转换工具：优先源码 tarball(包含 convert_hf_to_gguf.py + conversion/ 包 +
-	// gguf-py/，版本永远匹配上游重构)，失败再退回单文件下载(仅旧版独立脚本可用)
-	// 通过 jsDelivr(国内可达 CDN)按文件清单抓取转换工具：
-	// data.jsdelivr.com 列出 conversion/ 包与入口脚本，cdn.jsdelivr.net 逐文件下载
-	private static readonly string[] ConversionPackageFiles = new string[]
-	{
-		"__init__.py", "afmoe.py", "arctic.py", "baichuan.py", "bailingmoe.py", "bailingmoe3.py",
-		"base.py", "bert.py", "bitnet.py", "bloom.py", "chameleon.py", "chatglm.py", "codeshell.py",
-		"cogvlm.py", "command_r.py", "dbrx.py", "deci.py", "deepseek.py", "dots1.py", "dots3.py",
-		"dotsocr.py", "dream.py", "ernie.py", "exaone.py", "falcon.py", "falcon_h1.py", "gemma.py",
-		"glm.py", "gpt2.py", "gpt_oss.py", "gptneox.py", "granite.py", "grok.py", "grovemoe.py",
-		"hunyuan.py", "internlm.py", "internvl.py", "jais.py", "jamba.py", "januspro.py",
-		"kimi_k3.py", "kimi_linear.py", "kimivl.py", "laguna.py", "lfm2.py", "lighton_ocr.py",
-		"llada.py", "llama.py", "llama4.py", "llava.py", "maincoder.py", "mamba.py", "mellum.py",
-		"mimo.py", "minicpm.py", "minimax.py", "mistral.py", "mistral3.py", "mpt.py",
-		"muse_glimmer.py", "nanbeige.py", "nemotron.py", "olmo.py", "openelm.py", "orion.py",
-		"pangu.py", "phi.py", "pixtral.py", "plamo.py", "plm.py", "pockettts.py", "qwen.py",
-		"qwen3tts.py", "qwen3vl.py", "qwen4exp.py", "qwenvl.py", "refact.py", "rwkv.py",
-		"sarashina2.py", "smallthinker.py", "smolvlm.py", "stablelm.py", "starcoder.py", "step3.py",
-		"t5.py", "talkie.py", "ultravox.py", "wavtokenizer.py", "xverse.py", "youtuvl.py"
-	};
-
-	// 通过 jsDelivr CDN 逐文件下载 conversion 包与入口脚本。
-	// 文件清单为 2026-08-30 经 api.github.com 核实并在 cdn.jsdelivr.net 逐一验证存在的真实列表。
-	private async System.Threading.Tasks.Task<bool> FetchConversionPackageViaJsDelivrAsync()
-	{
-		Log("[下载] 从 cdn.jsdelivr.net 获取 conversion 包(" + ConversionPackageFiles.Length + " 个文件，清单已核实) ...");
-		foreach (string name in ConversionPackageFiles)
-		{
-			string dest = Path.Combine(ToolsDir, "conversion", name);
-			string url = "https://cdn.jsdelivr.net/gh/ggml-org/llama.cpp@master/conversion/" + name;
-			bool got = false;
-			for (int attempt = 0; attempt < 2 && !got; attempt++)
-			{
-				try
-				{
-					byte[] data = await _httpClient.GetByteArrayAsync(url);
-					if (data.Length < 10)
-					{
-						continue;
-					}
-					Directory.CreateDirectory(Path.GetDirectoryName(dest) ?? ".");
-					File.WriteAllBytes(dest, data);
-					got = true;
-				}
-				catch (Exception ex)
-				{
-					Log("[下载] " + name + " 失败(" + ex.Message + ")" + ((attempt == 0) ? "，重试一次" : ""));
-				}
-			}
-			if (!got)
-			{
-				Log("[下载] " + name + " 最终失败，jsDelivr 方式中止");
-				return false;
-			}
-		}
-		string entryDest = Path.Combine(ToolsDir, "convert_hf_to_gguf.py");
-		bool gotEntry = false;
-		for (int a = 0; a < 2 && !gotEntry; a++)
-		{
-			try
-			{
-				byte[] d = await _httpClient.GetByteArrayAsync("https://cdn.jsdelivr.net/gh/ggml-org/llama.cpp@master/convert_hf_to_gguf.py");
-				if (d.Length < 10)
-				{
-					continue;
-				}
-				File.WriteAllBytes(entryDest, d);
-				gotEntry = true;
-			}
-			catch (Exception ex2)
-			{
-				Log("[下载] convert_hf_to_gguf.py 失败(" + ex2.Message + ")" + ((a == 0) ? "，重试一次" : ""));
-			}
-		}
-		if (!gotEntry)
-		{
-			Log("[下载] 入口脚本下载失败，jsDelivr 方式中止");
-			return false;
-		}
-		if (!File.Exists(Path.Combine(ToolsDir, "conversion", "__init__.py")))
-		{
-			Log("[下载] conversion 包不完整(缺 __init__.py)");
-			return false;
-		}
-		return true;
-	}
-
-    private async System.Threading.Tasks.Task<bool> FetchConverterAsync()
-    {
-        string? existing = FindConvertScript();
-        if (existing != null)
-        {
-            // 完整性校验：上游新版脚本依赖 conversion 包，若只有单文件脚本则视为残缺，
-            // 必须删除后重新获取完整版
-            string entry = File.ReadAllText(existing);
-            bool needsPkg = entry.Contains("from conversion import");
-            bool hasPkg = Directory.Exists(Path.Combine(Path.GetDirectoryName(existing) ?? ".", "conversion"));
-            if (!needsPkg || hasPkg)
-            {
-                Log("[环境] 转换脚本与 conversion 包已就绪");
-            }
-            else
-            {
-                Log("[环境] 检测到残缺的转换脚本(缺少 conversion 包)，重新获取完整源码包 ...");
-                try
-                {
-                    File.Delete(existing);
-                }
-                catch
-                {
-                }
-            }
-        }
-        if (FindConvertScript() == null)
-        {
-            Directory.CreateDirectory(ToolsDir);
-            if (await FetchConversionPackageViaJsDelivrAsync())
-            {
-                Log("[环境] 转换工具就绪(jsDelivr: 脚本 + conversion 包)");
-            }
-            else
-            {
-                bool tarOk = false;
-                string tgz = Path.Combine(Path.GetTempPath(), "llamacpp_master.tar.gz");
-                string exDir = Path.Combine(Path.GetTempPath(), "llamacpp_master_src");
-                string[] tarUrls = new string[5]
-                {
-                    "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
-                    "https://gh-proxy.com/https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
-                    "https://ghproxy.net/https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
-                    "https://ghfast.top/https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master",
-                    "https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.tar.gz"
-                };
-                foreach (string u in tarUrls)
-                {
-                    try
-                    {
-                        Log("[下载] " + u + " (源码包约 20~45MB，含匹配的 conversion 包)");
-                        using (System.Net.Http.HttpResponseMessage resp = await _httpClient.GetAsync(u))
-                        {
-                            if (!resp.IsSuccessStatusCode)
-                            {
-                                Log("[下载] HTTP " + ((int)resp.StatusCode) + "，换下一个源");
-                                continue;
-                            }
-                            byte[] data = await resp.Content.ReadAsByteArrayAsync();
-                            if (data.Length < 1000000)
-                            {
-                                Log("[下载] 内容异常(过短)，换下一个源");
-                                continue;
-                            }
-                            File.WriteAllBytes(tgz, data);
-                            Log("[下载] 完成: " + (data.Length / 1048576.0).ToString("F1") + " MB，解压中 ...");
-                        }
-                        if (Directory.Exists(exDir))
-                        {
-                            Directory.Delete(exDir, true);
-                        }
-                        using (FileStream fs = File.OpenRead(tgz))
-                        using (System.IO.Compression.GZipStream gz = new System.IO.Compression.GZipStream(fs, System.IO.Compression.CompressionMode.Decompress))
-                        {
-                            System.Formats.Tar.TarFile.ExtractToDirectory(gz, exDir, overwriteFiles: true);
-                        }
-                        string root = Path.Combine(exDir, "llama.cpp-master");
-                        if (!Directory.Exists(root))
-                        {
-                            string[] dirs = Directory.GetDirectories(exDir);
-                            if (dirs.Length == 1)
-                            {
-                                root = dirs[0];
-                            }
-                            else
-                            {
-                                Log("[下载] 解压结构异常，换下一个源");
-                                continue;
-                            }
-                        }
-                        string entrySrc = Path.Combine(root, "convert_hf_to_gguf.py");
-                        if (!File.Exists(entrySrc))
-                        {
-                            Log("[下载] 源码包中没有 convert_hf_to_gguf.py，换下一个源");
-                            continue;
-                        }
-                        File.Copy(entrySrc, Path.Combine(ToolsDir, "convert_hf_to_gguf.py"), overwrite: true);
-                        CopyDir(Path.Combine(root, "conversion"), Path.Combine(ToolsDir, "conversion"));
-                        CopyDir(Path.Combine(root, "gguf-py"), Path.Combine(ToolsDir, "gguf-py"));
-                        try
-                        {
-                            Directory.Delete(exDir, true);
-                            File.Delete(tgz);
-                        }
-                        catch
-                        {
-                        }
-                        Log("[环境] 转换工具就绪(脚本 + conversion 包 + gguf-py)");
-                        tarOk = true;
-                    }
-                    catch (Exception ex)
-                    {
-                        Log("[下载] 失败(" + ex.Message + ")，换下一个源");
-                    }
-                }
-                if (!tarOk)
-                {
-                    string raw1 = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/convert_hf_to_gguf.py";
-                    bool got = await DownloadFileWithMirrorsAsync(new string[4]
-                    {
-                        raw1,
-                        "https://ghproxy.net/" + raw1,
-                        "https://ghfast.top/" + raw1,
-                        "https://github.com/ggml-org/llama.cpp/raw/master/convert_hf_to_gguf.py"
-                    }, Path.Combine(ToolsDir, "convert_hf_to_gguf.py"));
-                    if (!got)
-                    {
-                        return false;
-                    }
-                    string entryText = File.ReadAllText(Path.Combine(ToolsDir, "convert_hf_to_gguf.py"));
-                    if (entryText.Contains("from conversion import") && !Directory.Exists(Path.Combine(ToolsDir, "conversion")))
-                    {
-                        Log("[环境] 上游脚本已重构为多文件包但源码包下载失败，无法继续。请检查网络后重试。");
-                        return false;
-                    }
-                    Log("[环境] 转换脚本就绪(独立版)");
-                }
-            }
-        }
-        // 仓库内 gguf-py 含最新 MODEL_ARCH(如 DFLASH)，pip 版滞后；确保存在并以 PYTHONPATH 优先
-        if (!await EnsureGgufPyFilesAsync())
-        {
-            Log("[环境] gguf-py 获取失败(网络原因)，已取消启动。");
-            return false;
-        }
-        return true;
-    }
-
-    // 补齐仓库内 gguf-py/gguf(缺失文件从 jsDelivr CDN 下载，清单 2026-08-30 逐一核实)
-    private async System.Threading.Tasks.Task<bool> EnsureGgufPyFilesAsync()
-    {
-        bool missing = false;
-        foreach (string name in GgufPyFiles)
-        {
-            if (!File.Exists(Path.Combine(ToolsDir, "gguf-py", "gguf", name)))
-            {
-                missing = true;
-                break;
-            }
-        }
-        if (!missing)
-        {
-            return true;
-        }
-        Log("[环境] 补齐仓库内 gguf-py(含最新 MODEL_ARCH，优先于 pip 版) ...");
-        foreach (string name in GgufPyFiles)
-        {
-            string dest = Path.Combine(ToolsDir, "gguf-py", "gguf", name);
-            if (File.Exists(dest))
-            {
-                continue;
-            }
-            string url = "https://cdn.jsdelivr.net/gh/ggml-org/llama.cpp@master/gguf-py/gguf/" + name;
-            bool got = false;
-            for (int attempt = 0; attempt < 2 && !got; attempt++)
-            {
-                try
-                {
-                    byte[] data = await _httpClient.GetByteArrayAsync(url);
-                    Directory.CreateDirectory(Path.GetDirectoryName(dest) ?? ".");
-                    File.WriteAllBytes(dest, data);
-                    got = true;
-                }
-                catch (Exception ex)
-                {
-                    Log("[下载] gguf-py/" + name + " 失败(" + ex.Message + ")" + ((attempt == 0) ? "，重试一次" : ""));
-                }
-            }
-            if (!got)
-            {
-                return false;
-            }
-        }
-        Log("[环境] gguf-py 就绪");
-        return true;
-    }
-
-    private static readonly string[] GgufPyFiles = new string[]
-    {
-        "__init__.py", "constants.py", "gguf.py", "gguf_reader.py", "gguf_writer.py",
-        "lazy.py", "metadata.py", "py.typed", "quants.py", "tensor_mapping.py",
-        "utility.py", "vocab.py"
-    };
-
-
-	private static void CopyDir(string src, string dst)
-	{
-		if (!Directory.Exists(src))
-		{
-			return;
-		}
-		Directory.CreateDirectory(dst);
-		foreach (string f in Directory.GetFiles(src))
-		{
-			File.Copy(f, Path.Combine(dst, Path.GetFileName(f)), overwrite: true);
-		}
-		foreach (string d in Directory.GetDirectories(src))
-		{
-			CopyDir(d, Path.Combine(dst, Path.GetFileName(d)));
-		}
-	}
 
     private static readonly string Q = ((char)34).ToString();
 
@@ -2331,14 +2334,14 @@ public partial class MainWindow : Window, IComponentConnector
 
     // WMI 分离启动转换：进程由 WmiPrvSE 托管、输出走文件——
     // 断开远程/关闭启动器均不中断(修复二次远程场景下转换意外退出)
-    private void StartDetachedConversion(string dir, string outtype, string script, string outFile, double srcBytes, Action<string?> onDone)
+    private void StartDetachedConversion(string dir, string outtype, string pyExe, string pyPre, string script, string outFile, double srcBytes, Action<string?> onDone)
     {
         string logPath = Path.Combine(dir, "llamadsh_convert.log");
         string cmdPath = Path.Combine(Path.GetTempPath(), "llamadsh_convert.cmd");
         try
         {
             File.WriteAllText(logPath, "");
-        string pyCmd = "python " + Q + script + Q + " " + Q + dir + Q + " --outfile " + Q + outFile + Q + " --outtype " + outtype;
+        string pyCmd = Q + pyExe + Q + " " + ((pyPre.Length > 0) ? (pyPre + " ") : "") + Q + script + Q + " " + Q + dir + Q + " --outfile " + Q + outFile + Q + " --outtype " + outtype;
         string cmdText = "@echo off" + Environment.NewLine + "cd /d " + Q + dir + Q + Environment.NewLine + pyCmd + " >> " + Q + logPath + Q + " 2>&1" + Environment.NewLine + "echo EXITCODE:%errorlevel% >> " + Q + logPath + Q;
         File.WriteAllText(cmdPath, cmdText);
         }
@@ -2405,12 +2408,12 @@ public partial class MainWindow : Window, IComponentConnector
         };
         _convertPollTimer.Tick += delegate
         {
-            PollDetachedConversion(srcBytes, onDone);
+            PollDetachedConversion(srcBytes, outtype, onDone);
         };
         _convertPollTimer.Start();
     }
 
-    private void PollDetachedConversion(double srcBytes, Action<string?> onDone)
+    private void PollDetachedConversion(double srcBytes, string outtype, Action<string?> onDone)
     {
         try
         {
@@ -2486,10 +2489,11 @@ public partial class MainWindow : Window, IComponentConnector
         {
             try
             {
+                double expectFactor = ((outtype == "f16") ? 0.9 : 0.45);
                 using (FileStream fs0 = File.OpenRead(_convertOutFile))
                 using (BinaryReader br0 = new BinaryReader(fs0))
                 {
-                    if (br0.ReadInt32() == 0x46554747 && fs0.Length >= _convertSrcBytes * 0.9)
+                    if (br0.ReadInt32() == 0x46554747 && fs0.Length >= _convertSrcBytes * expectFactor)
                     {
                         valid = true;
                     }
@@ -2559,7 +2563,6 @@ public partial class MainWindow : Window, IComponentConnector
 			Log("--- 检测到 safetensors，将自动准备环境(下载脚本/安装依赖)并转换，目录: " + stDir + " ---");
 			EnsureConvertAndLaunchAsync(stDir, outtype);
 			return;
-			return;
 		}
 		List<string> list;
 		try
@@ -2596,6 +2599,17 @@ public partial class MainWindow : Window, IComponentConnector
 		{
 			Log("--- 启动已取消：预计显存不足 ---");
 			return;
+		}
+		// qwen35(Gated Delta Net) 部分卸载风险：启动前强制确认，避免 fused op 禁用导致 OOM/崩溃
+		string? qw = Qwen35PartialOffloadWarning();
+		if (qw != null)
+		{
+			string msg = "⚠ " + qw + "\n\n是 = 仍然按当前设置启动（风险自负）\n否 = 取消启动，并把 --gpu-layers 改为全量卸载";
+			if (System.Windows.MessageBox.Show(msg, "线性注意力模型部分卸载风险", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+			{
+				Log("--- 启动已取消：qwen35 部分卸载风险 ---");
+				return;
+			}
 		}
 		try
 		{
@@ -3036,7 +3050,6 @@ public partial class MainWindow : Window, IComponentConnector
 				//（症状：终端/脚本里启动一切正常，启动器里 100% 报 ERR_MODULE_NOT_FOUND）
 			if (ComboDshMode.SelectedIndex == 0 && TryStartDshDetached(dshDir, text3))
 			{
-				_dshTaskMode = true;
 				_dshProc = null;
 				_dshTracker = null;
 				_dshVerifyDeadline = DateTime.Now.AddSeconds(30.0);
@@ -3044,7 +3057,6 @@ public partial class MainWindow : Window, IComponentConnector
 				StartDshVerifyLoop();
 				return;
 			}
-			_dshTaskMode = false;
 			StopDshLogTailer();
 			if (ComboDshMode.SelectedIndex == 0)
 			{
@@ -3403,7 +3415,6 @@ public partial class MainWindow : Window, IComponentConnector
 	{
 		StopDshVerifyLoop();
 		StopDshLogTailer();
-		_dshTaskMode = false;
 		if (_dshProc != null)
 		{
 			Log("--- 正在停止 DSH ---");
@@ -5017,6 +5028,7 @@ public partial class MainWindow : Window, IComponentConnector
 				LogError(ex, "加载窗口图标失败");
 			}
 		}
+		StartBackgroundUpdateCheck();
 	}
 
 	private void ClampToWorkArea()
