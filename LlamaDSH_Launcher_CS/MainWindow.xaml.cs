@@ -972,17 +972,23 @@ public partial class MainWindow : Window, IComponentConnector
 			}
 			if (local.HasValue && latest.Build <= local.Value)
 			{
-				Log("[更新] llama.cpp 已是最新: build " + local.Value + "（上游 " + latest.Tag + "）");
+				string upstream = string.IsNullOrEmpty(latest.StableVersion)
+					? latest.Tag + "（滚动构建）"
+					: latest.Tag + "（" + latest.StableVersion + " 稳定版）";
+				Log("[更新] llama.cpp 已是最新: build " + local.Value + "（上游 " + upstream + "）");
 				if (fromButton)
 				{
-					System.Windows.MessageBox.Show("llama.cpp 已是最新版本。\n当前: build " + local.Value + "\n上游: " + latest.Tag, "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Information);
+					System.Windows.MessageBox.Show("llama.cpp 已是最新版本。\n当前: build " + local.Value + "\n上游: " + upstream, "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Information);
 				}
 				return;
 			}
 			string current = local.HasValue ? "build " + local.Value : "未知";
+			string latestDesc = string.IsNullOrEmpty(latest.StableVersion)
+				? latest.Tag + "（滚动构建, build " + latest.Build + "）"
+				: latest.Tag + "（" + latest.StableVersion + " 稳定版, build " + latest.Build + "）";
 			string msg = "发现 llama.cpp 新版本:\n\n"
 				+ "  当前: " + current + "\n"
-				+ "  上游: " + latest.Tag + " (build " + latest.Build + ")\n"
+				+ "  上游: " + latestDesc + "\n"
 				+ "  预编译包: " + latest.AssetName + "\n\n"
 				+ "将下载并覆盖更新到:\n  " + dir + "\n\n"
 				+ "（仅更新二进制，不触碰模型；若上游参数有变，更新后点“⟳ 重载参数配置”即可）";

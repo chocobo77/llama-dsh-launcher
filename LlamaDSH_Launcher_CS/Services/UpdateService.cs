@@ -35,6 +35,8 @@ public static class UpdateService
 		public int Build;
 		public string AssetName = "";
 		public string AssetUrl = "";
+		/// <summary>稳定版标签（如 v0.4.0）；滚动构建时为空。</summary>
+		public string StableVersion = "";
 	}
 
 	/// <summary>从配置目录解析 llama-server.exe 完整路径（兼容目录或 exe 直填）。</summary>
@@ -102,83 +104,177 @@ public static class UpdateService
 		}
 	}
 
-	/// <summary>查询 GitHub 最新 llama.cpp release，返回标签/build/资产 URL。失败返回 null。</summary>
+	/// <summary>
+	/// 查询 llama.cpp 最新可更新版本。
+	/// llama.cpp 的 release 结构：
+	///  - 稳定版标签（v0.4.0）本身没有二进制，只有 nightly-tag.txt 指向对应的 bNNNNN 构建；
+	///  - 真正含预编译二进制的 release 是 bNNNNN（GitHub 标记为 prerelease）。
+	/// 因此优先读 stable release 的 nightly-tag.txt → 定位稳定构建资产；
+	/// 失败时回退扫描最近 releases 列表取最新 bNNNNN（滚动构建）。
+	/// </summary>
 	public static LlamaReleaseInfo? FetchLatestLlamaRelease()
 	{
-		string[] urls = new string[]
+		// 1) 稳定版：latest release 里读 nightly-tag.txt
+		try
 		{
-			"https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-		};
-		foreach (string url in urls)
-		{
-			try
+			string? latestJson = HttpGetString("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest");
+			if (latestJson != null)
 			{
-				using (HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Get, url))
+				using (JsonDocument doc = JsonDocument.Parse(latestJson))
 				{
-					req.Headers.TryAddWithoutValidation("User-Agent", "LlamaDSH_Launcher");
-					using (HttpResponseMessage resp = Http.Send(req))
+					JsonElement root = doc.RootElement;
+					string stableTag = root.TryGetProperty("tag_name", out JsonElement se) ? se.GetString() ?? "" : "";
+					string? nightlyUrl = null;
+					if (root.TryGetProperty("assets", out JsonElement assets) && assets.ValueKind == JsonValueKind.Array)
 					{
-						if (!resp.IsSuccessStatusCode)
+						foreach (JsonElement a in assets.EnumerateArray())
 						{
-							continue;
+							string name = a.TryGetProperty("name", out JsonElement ne) ? ne.GetString() ?? "" : "";
+							if (string.Equals(name, "nightly-tag.txt", StringComparison.OrdinalIgnoreCase))
+							{
+								nightlyUrl = a.TryGetProperty("browser_download_url", out JsonElement ue) ? ue.GetString() : null;
+								break;
+							}
 						}
-						using (JsonDocument doc = JsonDocument.Parse(resp.Content.ReadAsStream()))
+					}
+					if (!string.IsNullOrEmpty(nightlyUrl))
+					{
+						string content = HttpGetString(nightlyUrl) ?? "";
+						int? build = ParseBuildFromTag(content.Trim());
+						if (build != null)
 						{
-							JsonElement root = doc.RootElement;
-							string tag = root.TryGetProperty("tag_name", out JsonElement te) ? te.GetString() ?? "" : "";
-							int? build = ParseBuildFromTag(tag);
-							if (build == null)
+							LlamaReleaseInfo? ri = FetchBuildRelease(build.Value);
+							if (ri != null)
 							{
-								continue;
-							}
-							string assetName = "";
-							string assetUrl = "";
-							if (root.TryGetProperty("assets", out JsonElement assets) && assets.ValueKind == JsonValueKind.Array)
-							{
-								foreach (JsonElement a in assets.EnumerateArray())
-								{
-									string name = a.TryGetProperty("name", out JsonElement ne) ? ne.GetString() ?? "" : "";
-									if (!name.Contains("-bin-win-") || !name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
-									{
-										continue;
-									}
-									// 优先 Vulkan-x64；其次 AVX2-x64（Vulkan 包缺失时的保守回退）
-									if (name.Contains("vulkan-x64"))
-									{
-										assetName = name;
-										assetUrl = a.TryGetProperty("browser_download_url", out JsonElement ue) ? ue.GetString() ?? "" : "";
-										break;
-									}
-									if (string.IsNullOrEmpty(assetName) && name.Contains("avx2-x64"))
-									{
-										assetName = name;
-										assetUrl = a.TryGetProperty("browser_download_url", out JsonElement ue2) ? ue2.GetString() ?? "" : "";
-									}
-								}
-							}
-							if (!string.IsNullOrEmpty(assetUrl))
-							{
-								return new LlamaReleaseInfo { Tag = tag, Build = build.Value, AssetName = assetName, AssetUrl = assetUrl };
+								ri.StableVersion = stableTag;
+								return ri;
 							}
 						}
 					}
 				}
 			}
-			catch
+		}
+		catch
+		{
+		}
+
+		// 2) 回退：滚动构建（最新 bNNNNN）
+		try
+		{
+			string? listJson = HttpGetString("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=20");
+			if (listJson != null)
 			{
+				using (JsonDocument doc = JsonDocument.Parse(listJson))
+				{
+					foreach (JsonElement r in doc.RootElement.EnumerateArray())
+					{
+						string tag = r.TryGetProperty("tag_name", out JsonElement te) ? te.GetString() ?? "" : "";
+						int? build = ParseBuildFromTag(tag);
+						if (build == null)
+						{
+							continue;
+						}
+						LlamaReleaseInfo? ri = BuildFromReleaseJson(r, build.Value);
+						if (ri != null)
+						{
+							return ri;
+						}
+					}
+				}
 			}
+		}
+		catch
+		{
 		}
 		return null;
 	}
 
+	/// <summary>按 bNNNNN 标签拉取对应 release 并解析 Windows 预编译资产。</summary>
+	private static LlamaReleaseInfo? FetchBuildRelease(int build)
+	{
+		string? json = HttpGetString("https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/b" + build);
+		if (json == null)
+		{
+			return null;
+		}
+		using (JsonDocument doc = JsonDocument.Parse(json))
+		{
+			return BuildFromReleaseJson(doc.RootElement, build);
+		}
+	}
+
+	private static LlamaReleaseInfo? BuildFromReleaseJson(JsonElement release, int build)
+	{
+		string tag = release.TryGetProperty("tag_name", out JsonElement te) ? te.GetString() ?? ("b" + build) : ("b" + build);
+		string assetName = "";
+		string assetUrl = "";
+		if (release.TryGetProperty("assets", out JsonElement assets) && assets.ValueKind == JsonValueKind.Array)
+		{
+			foreach (JsonElement a in assets.EnumerateArray())
+			{
+				string name = a.TryGetProperty("name", out JsonElement ne) ? ne.GetString() ?? "" : "";
+				if (!name.Contains("-bin-win-") || !name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+				{
+					continue;
+				}
+				// 优先 Vulkan-x64；其次 AVX2-x64（Vulkan 包缺失时的保守回退）
+				if (name.Contains("vulkan-x64"))
+				{
+					assetName = name;
+					assetUrl = a.TryGetProperty("browser_download_url", out JsonElement ue) ? ue.GetString() ?? "" : "";
+					break;
+				}
+				if (string.IsNullOrEmpty(assetName) && name.Contains("avx2-x64"))
+				{
+					assetName = name;
+					assetUrl = a.TryGetProperty("browser_download_url", out JsonElement ue2) ? ue2.GetString() ?? "" : "";
+				}
+			}
+		}
+		if (string.IsNullOrEmpty(assetUrl))
+		{
+			return null;
+		}
+		return new LlamaReleaseInfo { Tag = tag, Build = build, AssetName = assetName, AssetUrl = assetUrl };
+	}
+
+	private static string? HttpGetString(string url)
+	{
+		try
+		{
+			using (HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Get, url))
+			{
+				req.Headers.TryAddWithoutValidation("User-Agent", "LlamaDSH_Launcher");
+				using (HttpResponseMessage resp = Http.Send(req))
+				{
+					if (!resp.IsSuccessStatusCode)
+					{
+						return null;
+					}
+					return resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+				}
+			}
+		}
+		catch
+		{
+			return null;
+		}
+	}
+
 	private static int? ParseBuildFromTag(string tag)
 	{
-		Match m = Regex.Match(tag ?? "", @"^b(\d+)$", RegexOptions.IgnoreCase);
+		string t = (tag ?? "").Trim();
+		Match m = Regex.Match(t, @"^b(\d+)$", RegexOptions.IgnoreCase);
 		if (m.Success && int.TryParse(m.Groups[1].Value, out int build))
 		{
 			return build;
 		}
-		// 兼容形如 v0.2.0 的标签：无 build 号时视为未知，不参与比较
+		// 兼容纯数字内容（如 nightly-tag.txt 只写 10809）
+		m = Regex.Match(t, @"^(\d+)$");
+		if (m.Success && int.TryParse(m.Groups[1].Value, out build))
+		{
+			return build;
+		}
 		return null;
 	}
 
