@@ -135,6 +135,10 @@
               </local:NoScrollComboBox>
             </DockPanel>
             <DockPanel Margin="0,0,0,6">
+              <Label Content="" DockPanel.Dock="Left" Width="110" />
+              <CheckBox Name="ChkDshAdmin" IsChecked="True" VerticalAlignment="Center" Foreground="#c9d1d9" ToolTip="以管理员身份启动 DSH（静默提权，无 UAC 弹窗）：子进程为高完整性，可读取游戏进程内存（如 Elite Dangerous）。需先停止再启动才生效；取消勾选恢复普通方式启动。" />
+            </DockPanel>
+            <DockPanel Margin="0,0,0,6">
               <Label Content="DSH 项目目录:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
               <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
                 <Button Content="浏览..." Margin="4,0,0,0" Click="BrowseDsh_Click" />

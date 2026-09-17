@@ -29,6 +29,7 @@
     <Content Include="gputemp\gputemp.exe">
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
+    <EmbeddedResource Include="Resources\GameAccessProbe.ps1" />
   </ItemGroup>
 
 

@@ -41,6 +41,7 @@ public partial class MainWindow : Window, IComponentConnector
 	private ProcessTracker? _dshTracker;
 
 	private Process? _dshProc;
+	private bool _dshAdminMode; // DSH 是否以管理员提权方式运行（影响停止回退与状态显示）
 
 	private readonly GpuMonitor _gpuMonitor;
 
@@ -3054,6 +3055,29 @@ public partial class MainWindow : Window, IComponentConnector
 				// 优先：WMI 分离启动。进程由 WmiPrvSE.exe 服务拉起，与启动器无进程亲缘，
 				// 可绕过杀软对"启动器直接派生 node"的行为拦截
 				//（症状：终端/脚本里启动一切正常，启动器里 100% 报 ERR_MODULE_NOT_FOUND）
+			// 管理员提权启动（runas 静默提权）：子进程拿到 admin 令牌 + 高完整性，可读游戏内存。
+			// WMI 分离路径不能用于提权（Win32_Process.Create 继承调用者非提权上下文），故走 ShellExecute runas；
+			// 提权失败不静默回退普通启动——那会让管理员模式名存实亡。
+			if (ChkDshAdmin.IsChecked == true)
+			{
+				string innerCmd = ((ComboDshMode.SelectedIndex == 0) ? (((text3 == "compiled-js") ? "node apps/cli/lib/bin.js web" : "pnpm dsh web")) : "npx --yes @deepseek-ai/dsh web");
+				if (TryStartDshElevated(dshDir, innerCmd))
+				{
+					_dshProc = null;
+					_dshTracker = null;
+					_dshVerifyDeadline = DateTime.Now.AddSeconds(30.0);
+					Log("--- 正在启动 DSH (" + text3 + " · 管理员提权) ---");
+					StartDshVerifyLoop();
+					return;
+				}
+				BtnDshStart.IsEnabled = true;
+				BtnDshStop.IsEnabled = false;
+				LblDshStatus.Text = "● 启动失败";
+				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
+				ClearStateFor("dsh");
+				return;
+			}
+			_dshAdminMode = false; // 非管理员路径（WMI 分离 / 直接启动）
 			if (ComboDshMode.SelectedIndex == 0 && TryStartDshDetached(dshDir, text3))
 			{
 				_dshProc = null;
@@ -3193,6 +3217,76 @@ public partial class MainWindow : Window, IComponentConnector
 		}
 	}
 
+	// 探针脚本以嵌入资源随 exe 发布（单文件发布下 AppContext.BaseDirectory 指向 bundle 自解压临时目录，旁边的落盘文件不可依赖），
+	// 每次提权启动前写到 %TEMP%，交给提权子进程调用；任何失败都返回 null（跳过探针，不影响 DSH 启动）。
+	private static string? ExtractGameAccessProbe()
+	{
+		try
+		{
+			string text = Path.Combine(Path.GetTempPath(), "LlamaDSH_GameAccessProbe.ps1");
+			using (Stream manifestResourceStream = typeof(MainWindow).Assembly.GetManifestResourceStream("LlamaDSH_Launcher.Resources.GameAccessProbe.ps1")!)
+			{
+				if (manifestResourceStream == null)
+				{
+					return null;
+				}
+				using (FileStream fileStream = File.Create(text))
+				{
+					manifestResourceStream.CopyTo(fileStream);
+				}
+			}
+			return text;
+		}
+		catch
+		{
+			return null;
+		}
+	}
+
+	// 管理员提权启动：ShellExecute runas 把子进程提升到 admin（本机 ConsentPromptBehaviorAdmin=0 → 静默提权，无 UAC 弹窗）；
+	// 子进程为高完整性，可 OpenProcess 游戏进程内存（中完整性进程会被 UIPI 拦截）。
+	// 注意：WMI 分离路径无法提权（Win32_Process.Create 继承调用者非提权上下文），故提权必须走 ShellExecute runas。
+	// innerCmd 由调用方按启动模式拼好（node lib/bin.js web 或 pnpm dsh web 或 npx ...）。
+	private bool TryStartDshElevated(string dshDir, string innerCmd)
+	{
+		try
+		{
+			string text = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_boot.log");
+			try
+			{
+				File.WriteAllText(text, "");
+			}
+			catch
+			{
+			}
+			_dshBootLogPath = text;
+			bool elevated = new System.Security.Principal.WindowsPrincipal(System.Security.Principal.WindowsIdentity.GetCurrent()).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+			// 启动前先用探针确认高完整性进程能否打开游戏进程句柄（探针文件缺失则跳过，不影响启动）
+			string text2 = ExtractGameAccessProbe();
+			string text3 = (string.IsNullOrEmpty(dshDir) ? "" : ("cd /d \"" + dshDir + "\" & "));
+			string text4 = ((text2 != null) ? ("powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" + text2 + "\" >> \"" + text + "\" 2>&1 & ") : "");
+			File.AppendAllText(text, "[diag] launcher elevated=" + elevated + " admin-mode=True temp=" + Path.GetTempPath() + "\r\n");
+			ProcessStartInfo processStartInfo = new ProcessStartInfo
+			{
+				UseShellExecute = true,
+				Verb = "runas",
+				FileName = "cmd.exe",
+				// WindowStyle 在 ShellExecute 下被传给 ShellExecuteEx 的 nShow，用于避免留下常驻黑色控制台窗口
+				WindowStyle = ProcessWindowStyle.Hidden,
+				Arguments = "/c " + text3 + text4 + innerCmd + " >> \"" + text + "\" 2>&1"
+			};
+			Process.Start(processStartInfo);
+			_dshAdminMode = true;
+			StartDshLogTailer(text);
+			return true;
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "DSH 管理员提权启动失败（提权被拒绝或 UAC 取消）");
+			return false;
+		}
+	}
+
 	private void StartDshLogTailer(string path)
 	{
 		StopDshLogTailer();
@@ -3295,7 +3389,7 @@ public partial class MainWindow : Window, IComponentConnector
 			{
 				StopDshVerifyLoop();
 				_dshTracker = new ProcessTracker(num.Value);
-				LblDshStatus.Text = "● 运行中";
+				LblDshStatus.Text = (_dshAdminMode ? "● 运行中(管理员)" : "● 运行中");
 				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
 				BtnOpenDsh.IsEnabled = true;
 				SaveState();
@@ -3361,7 +3455,7 @@ public partial class MainWindow : Window, IComponentConnector
 			{
 				_dshTracker = new ProcessTracker(id);
 			}
-			LblDshStatus.Text = "● 运行中";
+			LblDshStatus.Text = (_dshAdminMode ? "● 运行中(管理员)" : "● 运行中");
 			LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
 			BtnOpenDsh.IsEnabled = true;
 		}
@@ -3421,6 +3515,8 @@ public partial class MainWindow : Window, IComponentConnector
 	{
 		StopDshVerifyLoop();
 		StopDshLogTailer();
+		// 提权模式下 _dshProc 恒为 null，被托管的 pid 在 _dshTracker 里；先记下来供 UIPI 回退使用
+		int? adminKillPid = (_dshTracker?.Pid ?? _dshProc?.Id); // 接管来的提权进程同样需要 UIPI 回退
 		if (_dshProc != null)
 		{
 			Log("--- 正在停止 DSH ---");
@@ -3437,6 +3533,42 @@ public partial class MainWindow : Window, IComponentConnector
 				LogError(ex, "停止 DSH 进程失败");
 			}
 		}
+		if (adminKillPid.HasValue)
+		{
+			// UIPI：中完整性的启动器无法 TerminateProcess 高完整性（提权）子进程，普通停止会失败；
+			// 此时用同样的 runas 静默提权起一个 taskkill 收尾。
+			bool stillAlive = false;
+			try
+			{
+				using (Process process = Process.GetProcessById(adminKillPid.Value))
+				{
+					stillAlive = !process.HasExited;
+				}
+			}
+			catch
+			{
+			}
+			if (stillAlive)
+			{
+				try
+				{
+					Process.Start(new ProcessStartInfo
+					{
+						UseShellExecute = true,
+						Verb = "runas",
+						FileName = "taskkill.exe",
+						WindowStyle = ProcessWindowStyle.Hidden,
+						Arguments = "/F /T /PID " + adminKillPid.Value
+					});
+					Log("--- 提权 DSH 进程普通停止无效（UIPI），已下发提权 taskkill ---");
+				}
+				catch (Exception ex2)
+				{
+					LogError(ex2, "下发提权 taskkill 失败，请手动结束该 DSH 进程");
+				}
+			}
+		}
+		_dshAdminMode = false;
 		DisposeProc(ref _dshProc);
 		_dshTracker = null;
 		BtnDshStart.IsEnabled = true;
@@ -4500,6 +4632,7 @@ public partial class MainWindow : Window, IComponentConnector
 			LlamaDir = InputLlamaDir.Text,
 			DshDir = InputDshDir.Text,
 			DshMode = ComboDshMode.SelectedIndex,
+			DshAdminMode = (ChkDshAdmin.IsChecked == true),
 			MinimizeToTray = (ChkMinimizeToTray.IsChecked == true)
 		};
 		foreach (KeyValuePair<string, System.Windows.Controls.CheckBox> item3 in _pbw)
@@ -4547,6 +4680,7 @@ public partial class MainWindow : Window, IComponentConnector
 		InputLlamaDir.Text = c.LlamaDir;
 		InputDshDir.Text = c.DshDir;
 		ComboDshMode.SelectedIndex = c.DshMode;
+		ChkDshAdmin.IsChecked = c.DshAdminMode;
 		ChkMinimizeToTray.IsChecked = c.MinimizeToTray;
 		if (ChkVramBreaker != null)
 		{

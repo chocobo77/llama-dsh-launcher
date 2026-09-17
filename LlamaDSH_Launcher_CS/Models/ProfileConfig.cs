@@ -20,6 +20,9 @@ public class ProfileConfig
 
 	public int DshMode { get; set; }
 
+	// 以管理员身份启动 DSH（runas 静默提权，可读游戏内存）。旧 profile 无此字段时反序列化保留默认值 true。
+	public bool DshAdminMode { get; set; } = true;
+
 	public bool MinimizeToTray { get; set; }
 
 	public Dictionary<string, bool> BoolParams { get; set; } = new Dictionary<string, bool>();
