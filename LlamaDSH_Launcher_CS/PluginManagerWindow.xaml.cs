@@ -36,8 +36,12 @@ public partial class PluginManagerWindow : Window
 
 	private void Log(string msg)
 	{
-		MgrLog.AppendText("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + msg + "\r\n");
-		MgrLog.ScrollToEnd();
+		// 审计在后台线程运行, 日志须切回 UI 线程
+		Dispatcher.BeginInvoke((Action)delegate
+		{
+			MgrLog.AppendText("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + msg + "\r\n");
+			MgrLog.ScrollToEnd();
+		});
 	}
 
 	private sealed class Row
