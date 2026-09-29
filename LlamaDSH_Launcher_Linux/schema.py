@@ -24,7 +24,9 @@ OVERRIDE_PATH = os.path.join(OVERRIDE_DIR, "params_override.yml")
 
 
 def _read_builtin():
-    with open(EXE_PATH, "r", encoding="utf-8") as f:
+    # 注意: 读内置纯净副本(BUILTIN_PATH), 而非程序旁副本——
+    # 否则内置层永远等于程序旁层, schema 自动升级永远不会触发。
+    with open(BUILTIN_PATH, "r", encoding="utf-8") as f:
         return f.read()
 
 

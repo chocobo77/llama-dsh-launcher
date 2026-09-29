@@ -74,6 +74,11 @@
       </div>
     </fieldset>
 
+    <div style="display:flex;align-items:center;gap:8px;margin:8px 0 2px">
+      <label for="paramFilter" style="color:#8b949e;white-space:nowrap">🔍 过滤参数:</label>
+      <input type="text" id="paramFilter" style="flex:1" placeholder="输入关键词即时过滤参数，匹配名称/说明/分组（如: kv、量化、推测、flash）" />
+      <button id="paramFilterClear" style="display:none" title="清除过滤，显示全部参数">✕</button>
+    </div>
     <div id="paramGroups"></div>
 
     <details open>

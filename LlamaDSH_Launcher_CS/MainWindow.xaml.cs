@@ -149,6 +149,9 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private readonly Dictionary<string, System.Windows.Controls.CheckBox> _pbw;
 
+	/// <summary>参数行索引（过滤用）：每行记录所属 Expander、子组与其标题行、行元素。</summary>
+	private readonly List<(Expander Grp, string Sub, System.Windows.Controls.TextBlock? Header, UIElement Row, ParamDefinition Def)> _paramRows = new();
+
 	private static readonly Regex _rePromptTps = new Regex("prompt eval time\\s+=\\s*([\\d.]+)\\s*ms\\s*/\\s*(\\d+)\\s*tokens", RegexOptions.Compiled);
 
 	private static readonly Regex _rePromptMs = new Regex("prompt eval time\\s+=\\s*([\\d.]+)\\s*ms", RegexOptions.Compiled);
@@ -226,6 +229,11 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private void BuildParamGroups()
 	{
+		_paramRows.Clear();
+		InputParamFilter.TextChanged -= InputParamFilter_TextChanged;
+		InputParamFilter.Clear();
+		InputParamFilter.TextChanged += InputParamFilter_TextChanged;
+		ParamGroupsPanel.Children.Clear();
 		foreach (ParamGroupDef g in _paramGroups.OrderBy((ParamGroupDef x) => x.Order))
 		{
 			if (!_paramDefs.Any((ParamDefinition p) => p.Group == g.Id && !p.Hidden))
@@ -257,17 +265,19 @@ public partial class MainWindow : Window, IComponentConnector
 			});
 			int idx = 0;
 			string? lastSubgroup = null;
+			System.Windows.Controls.TextBlock header = null!;
 			foreach (ParamDefinition item in _paramDefs.Where((ParamDefinition p) => p.Group == g.Id && !p.Hidden))
 			{
 				if (!string.IsNullOrEmpty(item.Subgroup) && item.Subgroup != lastSubgroup)
 				{
 					lastSubgroup = item.Subgroup;
-					System.Windows.Controls.TextBlock header = new System.Windows.Controls.TextBlock
+					header = new System.Windows.Controls.TextBlock
 					{
 						Text = "▸ " + item.Subgroup,
 						Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(210, 168, 83)),
 						FontWeight = FontWeights.SemiBold,
-						Margin = new Thickness(0.0, 8.0, 0.0, 2.0)
+						FontSize = 12.0,
+						Margin = new Thickness(0.0, 6.0, 0.0, 1.0)
 					};
 					if (idx % 2 != 0)
 					{
@@ -291,7 +301,7 @@ public partial class MainWindow : Window, IComponentConnector
 						IsChecked = string.Equals(item.DefaultValue, "true", StringComparison.OrdinalIgnoreCase),
 						ToolTip = item.Tooltip,
 						Foreground = System.Windows.Media.Brushes.White,
-						Margin = new Thickness(0.0, 2.0, 0.0, 2.0)
+						Margin = new Thickness(0.0, 1.0, 0.0, 1.0)
 					};
 					checkBox.Checked += delegate
 					{
@@ -303,11 +313,12 @@ public partial class MainWindow : Window, IComponentConnector
 					};
 					_pbw[item.Flag] = checkBox;
 					PlaceParamRow(grid, checkBox, ref idx);
+					_paramRows.Add((expander, item.Subgroup ?? "", header, checkBox, item));
 					continue;
 				}
 				DockPanel dockPanel = new DockPanel
 				{
-					Margin = new Thickness(0.0, 2.0, 0.0, 2.0)
+					Margin = new Thickness(0.0, 1.0, 0.0, 1.0)
 				};
 				System.Windows.Controls.CheckBox checkBox2 = new System.Windows.Controls.CheckBox
 				{
@@ -384,10 +395,65 @@ public partial class MainWindow : Window, IComponentConnector
 				dockPanel.Children.Add(control);
 				_pw[item.Flag] = (checkBox2, control);
 				PlaceParamRow(grid, dockPanel, ref idx);
+				_paramRows.Add((expander, item.Subgroup ?? "", header, dockPanel, item));
 			}
 			expander.Content = grid;
 			ParamGroupsPanel.Children.Add(expander);
 		}
+		ApplyParamFilter();
+	}
+
+	/// <summary>按关键词过滤参数行：匹配 flag / 中文名 / 子组 / 组标题 / 悬浮说明。
+	/// 空关键词恢复全部；有匹配时自动展开所在组，子组与组无匹配项时整体隐藏。</summary>
+	private void ApplyParamFilter()
+	{
+		string q = (InputParamFilter.Text ?? "").Trim();
+		bool filtering = q.Length > 0;
+		BtnClearParamFilter.Visibility = filtering ? Visibility.Visible : Visibility.Collapsed;
+		foreach (var r in _paramRows)
+		{
+			bool match = !filtering
+				|| r.Def.Flag.Contains(q, StringComparison.OrdinalIgnoreCase)
+				|| r.Def.Label.Contains(q, StringComparison.OrdinalIgnoreCase)
+				|| r.Sub.Contains(q, StringComparison.OrdinalIgnoreCase)
+				|| r.Def.Tooltip.Contains(q, StringComparison.OrdinalIgnoreCase)
+				|| ((r.Grp.Header as string ?? "").Contains(q, StringComparison.OrdinalIgnoreCase));
+			r.Row.Visibility = match ? Visibility.Visible : Visibility.Collapsed;
+			if (r.Header != null)
+			{
+				r.Header.Visibility = Visibility.Visible;
+			}
+		}
+		foreach (var hs in _paramRows.Where(r => r.Header != null).GroupBy(r => (r.Grp, r.Sub)))
+		{
+			bool anyVisible = hs.Any(r => r.Row.Visibility == Visibility.Visible);
+			foreach (var t in hs)
+			{
+				if (t.Header != null)
+				{
+					t.Header.Visibility = anyVisible ? Visibility.Visible : Visibility.Collapsed;
+				}
+			}
+		}
+		foreach (var gs in _paramRows.GroupBy(r => r.Grp))
+		{
+			bool anyVisible = gs.Any(r => r.Row.Visibility == Visibility.Visible);
+			gs.Key.Visibility = anyVisible ? Visibility.Visible : Visibility.Collapsed;
+			if (filtering && anyVisible)
+			{
+				gs.Key.IsExpanded = true;
+			}
+		}
+	}
+
+	private void InputParamFilter_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
+	{
+		ApplyParamFilter();
+	}
+
+	private void ClearParamFilter_Click(object sender, RoutedEventArgs e)
+	{
+		InputParamFilter.Clear();
 	}
 
 	private static void PlaceParamRow(Grid g, UIElement el, ref int idx)

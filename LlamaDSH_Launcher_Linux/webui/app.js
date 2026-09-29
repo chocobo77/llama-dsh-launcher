@@ -213,6 +213,37 @@ function renderParams() {
   });
 }
 
+/* --------------------- 参数过滤 --------------------- */
+function applyParamFilter() {
+  const q = ($("paramFilter").value || "").trim().toLowerCase();
+  $("paramFilterClear").style.display = q ? "" : "none";
+  const matches = (d) => !q
+    || d.flag.toLowerCase().includes(q)
+    || (d.label || "").toLowerCase().includes(q)
+    || (d.subgroup || "").toLowerCase().includes(q)
+    || (d.tooltip || "").toLowerCase().includes(q);
+  for (const det of document.querySelectorAll("#paramGroups > details")) {
+    let anyVisible = false;
+    const subs = new Map();
+    for (const row of det.querySelectorAll(".prow")) {
+      const d = SCHEMA.params.find((p) => "pr_" + cssId(p.flag) === row.id);
+      const show = !d || matches(d);
+      row.style.display = show ? "" : "none";
+      if (show) anyVisible = true;
+      let prev = row.previousElementSibling;
+      while (prev && !prev.classList.contains("subgroup")) prev = prev.previousElementSibling;
+      if (prev) {
+        const arr = subs.get(prev) || [];
+        arr.push(show);
+        subs.set(prev, arr);
+      }
+    }
+    for (const [h, arr] of subs) h.style.display = arr.some(Boolean) ? "" : "none";
+    det.style.display = anyVisible ? "" : "none";
+    if (q && anyVisible) det.open = true;
+  }
+}
+
 /* --------------------- 依赖评估(EvaluateDepUI 复刻) --------------------- */
 function isOn(d) {
   if (d.type === "Bool") return $("pb_" + cssId(d.flag))?.checked || false;
@@ -626,6 +657,8 @@ async function loadAll() {
   CFG.Profiles[CFG.CurrentProfile] = PROF;
   renderParams();
   applyProfile(PROF);
+  $("paramFilter").addEventListener("input", applyParamFilter);
+  $("paramFilterClear").addEventListener("click", () => { $("paramFilter").value = ""; applyParamFilter(); });
   await refreshPreview();
   if (b.schema.errors && b.schema.errors.length) {
     logLine("[参数] ⚠ schema 错误: " + b.schema.errors.join("; "));

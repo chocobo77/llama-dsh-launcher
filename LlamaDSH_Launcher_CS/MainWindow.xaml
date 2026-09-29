@@ -164,6 +164,11 @@
             </DockPanel>
           </StackPanel>
         </GroupBox>
+        <DockPanel Margin="0,6,0,0">
+          <Button Name="BtnClearParamFilter" Content="✕" DockPanel.Dock="Right" Width="26" Margin="4,0,0,0" Visibility="Collapsed" Click="ClearParamFilter_Click" ToolTip="清除过滤，显示全部参数" />
+          <Label Content="🔍 过滤参数:" DockPanel.Dock="Left" Width="86" VerticalAlignment="Center" Foreground="#8b949e" Padding="0" />
+          <TextBox Name="InputParamFilter" ToolTip="输入关键词即时过滤参数，匹配名称/说明/分组（如: kv、量化、推测、flash）。清除后恢复全部。" />
+        </DockPanel>
         <StackPanel Name="ParamGroupsPanel" />
         <Expander Header="📋 命令预览（点击折叠）" IsExpanded="True" Margin="0,6,0,0">
           <StackPanel>

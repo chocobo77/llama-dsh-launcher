@@ -232,16 +232,17 @@ public static class ParamSchemaService
 		return result;
 	}
 
-	private static string ReadEmbedded()
-	{
-		using Stream? s = typeof(ParamSchemaService).Assembly.GetManifestResourceStream(EmbeddedResourceName);
-		if (s == null)
-		{
-			throw new InvalidOperationException("内嵌资源缺失: " + EmbeddedResourceName);
-		}
-		using StreamReader r = new(s, Encoding.UTF8);
-		return r.ReadToEnd();
-	}
+        private static string ReadEmbedded()
+        {
+                using Stream? s = typeof(ParamSchemaService).Assembly.GetManifestResourceStream(EmbeddedResourceName);
+                if (s == null)
+                {
+                        throw new InvalidOperationException("内嵌资源缺失: " + EmbeddedResourceName);
+                }
+                using StreamReader r = new(s, Encoding.UTF8);
+                return r.ReadToEnd();
+        }
+
 
 	private static IDeserializer BuildDeserializer()
 	{
