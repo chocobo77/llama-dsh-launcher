@@ -293,8 +293,7 @@ public partial class MainWindow : Window, IComponentConnector
 						_pbw[item.Flag] = checkBox;
 						PlaceParamRow(grid, checkBox, ref idx);
 						_paramRows.Add((g.Id, g.Title, sg.Key, checkBox, item));
-						continue;
-					}
+						continue;					}
 					DockPanel dockPanel = new DockPanel
 					{
 						Margin = new Thickness(0.0, 1.0, 0.0, 1.0)
@@ -373,7 +372,7 @@ public partial class MainWindow : Window, IComponentConnector
 					dockPanel.Children.Add(element);
 					dockPanel.Children.Add(control);
 					_pw[item.Flag] = (checkBox2, control);
-					PlaceParamRow(grid, dockPanel, ref idx);
+					PlaceParamRow(grid, dockPanel, ref idx, item.Wide);
 					_paramRows.Add((g.Id, g.Title, sg.Key, dockPanel, item));
 				}
 				_subPanels[g.Id + "\u0001" + sg.Key] = grid;
@@ -555,8 +554,26 @@ public partial class MainWindow : Window, IComponentConnector
 	}
 
 
-	private static void PlaceParamRow(Grid g, UIElement el, ref int idx)
+	private static void PlaceParamRow(Grid g, UIElement el, ref int idx, bool wide = false)
 	{
+		if (wide)
+		{
+			// 通栏宽行: 对齐到行首, 横跨 3 列独占一行
+			if (idx % 2 != 0)
+			{
+				idx++;
+			}
+			while (g.RowDefinitions.Count <= idx / 2)
+			{
+				g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+			}
+			Grid.SetRow(el, idx / 2);
+			Grid.SetColumn(el, 0);
+			Grid.SetColumnSpan(el, 3);
+			idx += 2;
+			g.Children.Add(el);
+			return;
+		}
 		int num = idx / 2;
 		int value = idx % 2 * 2;
 		while (g.RowDefinitions.Count <= num)

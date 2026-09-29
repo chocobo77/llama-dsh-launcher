@@ -5,8 +5,8 @@
 # 核心功能: 思考强度控制 (reasoning / reasoning-effort / reasoning-budget / reasoning-preserve)
 # =====================================================================
 meta:
-  schema: 5
-  adapt: "llama-server 0.5.0-dev (b11243, fc07d781e) 已验证 · schema v5（2026-09-29 顶层分组照搬官方分节 common/sampling/speculative/server，子组按官方 help 顺序切块）"
+  schema: 6
+  adapt: "llama-server 0.5.0-dev (b11243, fc07d781e) 已验证 · schema v6（2026-09-29 长值参数通栏宽行 wide；v5 顶层分组照搬官方分节，子组按官方 help 顺序切块）"
   notes: >
     llama.cpp 更新时的维护方法（改完点启动器"⟳ 重载参数配置"即时生效）:
     1. 新增参数: 在 params 下加一条, 必填 flag/label/type/default/group
@@ -45,6 +45,7 @@ params:
     type: String
     default: "qwen3.8-27b"
     group: common
+    wide: true
     enabled: true
     tooltip: "模型别名，用于 API 返回中的 model 字段标识。建议设为模型简称，方便上层应用识别。"
 
@@ -172,6 +173,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     tooltip: "API 认证密钥，多个用逗号分隔。留空表示无需认证。暴露在公网时务必设置，否则任何人都能调用你的模型。"
 
   - flag: api-key-file
@@ -181,6 +183,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     tooltip: "从文件读取 API 密钥，每行一个，# 开头为注释。与 api-key 二选一或互补。"
 
   - flag: ssl-key-file
@@ -190,6 +193,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     suggests: [ssl-cert-file]
     tooltip: "PEM 格式的 SSL 私钥文件路径。与证书文件配合启用 HTTPS 加密通信。本地使用无需设置。"
 
@@ -200,6 +204,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     suggests: [ssl-key-file]
     tooltip: "PEM 格式的 SSL 证书文件路径。需与私钥文件配对使用。可用 Let's Encrypt 等免费证书。"
 
@@ -210,6 +215,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     tooltip: "跨域资源共享（CORS）允许的来源列表，逗号分隔。留空默认允许所有来源（*）。Web 前端跨域访问时需设置为前端域名。设为 localhost 只反射本机 Origin。"
 
   - flag: cors-methods
@@ -219,6 +225,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     advanced: true
     tooltip: "CORS 允许的 HTTP 方法，逗号分隔。官方默认 GET, POST, DELETE, OPTIONS。留空=官方默认。"
 
@@ -229,6 +236,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     advanced: true
     tooltip: "CORS 允许的请求头，逗号分隔。官方默认 *（全部）。留空=官方默认。"
 
@@ -250,6 +258,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     advanced: true
     tooltip: "服务器提供服务的路径前缀（不带末尾斜杠）。如设为 /api 则接口位于 /api/v1/...。留空=无前缀。"
 
@@ -270,6 +279,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     advanced: true
     tooltip: "从该目录提供静态文件服务。留空=不提供静态文件。"
 
@@ -280,6 +290,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     advanced: true
     tooltip: "为模型设置标签（逗号分隔，仅信息用途，不参与路由）。"
 
@@ -310,6 +321,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "模型直接下载 URL（-mu）。通常不直接使用，推荐用 hf-repo 指定 Hugging Face 仓库。"
 
@@ -320,6 +332,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "Hugging Face 模型仓库（-hf）。格式: <user>/<model>[:quant]。quant 可选，不区分大小写，默认 Q4_K_M（不存在则取仓库第一个文件）。mmproj 会自动下载，禁用加 --no-mmproj。示例: ggml-org/GLM-4.7-Flash-GGUF:Q4_K_M"
 
@@ -330,6 +343,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "Hugging Face 模型文件名（-hff）。指定后覆盖 hf-repo 中的 quant 设置。"
 
@@ -340,6 +354,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "Hugging Face 访问令牌（-hft）。留空=使用 HF_TOKEN 环境变量。访问私有模型时需要。"
 
@@ -350,6 +365,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "Docker Hub 模型仓库（-dr）。格式: [<repo>/]<model>[:quant]。repo 可选默认 ai/，quant 可选默认 :latest。示例: gemma3"
 
@@ -406,6 +422,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     tooltip: "多 GPU 张量拆分比例，逗号分隔。如 '3,5' 表示第一块 GPU 占 3/8、第二块占 5/8。按显存大小比例分配。单卡无需设置。DeepSeek 4 新增 -sm tensor 模式。"
 
   - flag: threads-batch
@@ -633,6 +650,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     tooltip: "用于卸载的设备列表，逗号分隔（如 0,1）。none=完全不卸载到 GPU。使用 --list-devices 查看可用设备。留空=自动。"
 
   - flag: fit
@@ -713,6 +731,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "覆盖指定张量的缓冲区类型。格式: <张量名匹配>=<缓冲类型>，多个用逗号分隔。高级调优用。"
 
@@ -723,6 +742,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "覆盖模型元数据（KV）。格式: KEY=TYPE:VALUE，如 tokenizer.ggml.add_bos_token=bool:false。类型: int/float/bool/str。高级功能慎用。"
 
@@ -1157,6 +1177,7 @@ params:
     type: String
     default: ""
     group: sampling
+    wide: true
     tooltip: "DRY 采样的序列分隔符。默认清空默认分隔符('\\n',':','\"','*')。设为 'none' 表示不使用分隔符。"
 
   - flag: mirostat
@@ -1198,6 +1219,7 @@ params:
     type: String
     default: ""
     group: sampling
+    wide: true
     tooltip: "BNF-like 语法约束。强制模型输出符合指定语法结构。用于结构化输出（如 SQL、代码）。语法文件在 grammars/ 目录。"
 
   - flag: grammar-file
@@ -1207,6 +1229,7 @@ params:
     type: String
     default: ""
     group: sampling
+    wide: true
     tooltip: "从文件加载 BNF 语法约束。与 grammar 功能相同但内容从文件读取。"
 
   - flag: json-schema
@@ -1216,6 +1239,7 @@ params:
     type: String
     default: ""
     group: sampling
+    wide: true
     tooltip: "JSON Schema 约束。强制模型输出符合指定的 JSON Schema。用于 API 返回结构化数据。如 {type:object,properties:{name:{type:string}}}。"
 
   - flag: json-schema-file
@@ -1225,6 +1249,7 @@ params:
     type: String
     default: ""
     group: sampling
+    wide: true
     tooltip: "从文件加载 JSON Schema 约束。与 json-schema 功能相同但内容从文件读取。"
 
   - flag: logit-bias
@@ -1234,6 +1259,7 @@ params:
     type: String
     default: ""
     group: sampling
+    wide: true
     advanced: true
     tooltip: "修改特定 token 的生成概率。格式：TOKEN_ID(+/-)BIAS，如 '15043+1' 增加某 token 概率，'15043-1' 降低。多个用逗号分隔。"
 
@@ -1244,6 +1270,7 @@ params:
     type: String
     default: ""
     group: sampling
+    wide: true
     advanced: true
     tooltip: "采样器列表，按分号分隔。默认: penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature。一般无需修改。"
 
@@ -1254,6 +1281,7 @@ params:
     type: String
     default: ""
     group: sampling
+    wide: true
     advanced: true
     tooltip: "采样器序列简写形式。默认: edskypmxt。与 samplers 二选一。"
 
@@ -1360,6 +1388,7 @@ params:
     type: String
     default: ""
     group: spec
+    wide: true
     requires:
       - {flag: spec-type, op: "!=", value: none}
     advanced: true
@@ -1372,6 +1401,7 @@ params:
     type: String
     default: ""
     group: spec
+    wide: true
     requires:
       - {flag: spec-type, op: "!=", value: none}
     advanced: true
@@ -1384,6 +1414,7 @@ params:
     type: String
     default: ""
     group: spec
+    wide: true
     requires:
       - {flag: spec-type, op: "!=", value: none}
     advanced: true
@@ -1568,6 +1599,7 @@ params:
     type: String
     default: ""
     group: spec
+    wide: true
     requires:
       - {flag: spec-type, op: "!=", value: none}
     advanced: true
@@ -1784,6 +1816,7 @@ params:
     type: String
     default: ""
     group: spec
+    wide: true
     advanced: true
     tooltip: "逗号分隔的无条件逐位置合成接受概率（仅基准测试用）。正常使用留空。"
 
@@ -1830,6 +1863,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     hidden: true
     tooltip: "多模态投影仪 GGUF 文件路径。启用视觉/音频等多模态能力。需与基础语言模型配对使用。v0.3.0 新增 dots3-note 视觉/音频支持。"
 
@@ -1840,6 +1874,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     tooltip: "本地媒体文件的根目录。API 可通过 file:// 相对路径访问此目录下的图片/视频。用于多模态推理时加载本地媒体资源。"
 
   - flag: mmproj-url
@@ -1849,6 +1884,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     advanced: true
     tooltip: "多模态投影仪 GGUF 文件的下载 URL。配合 --model-url 自动下载使用。详见 tools/mtmd/README。"
 
@@ -1941,6 +1977,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     advanced: true
     tooltip: "包含 ffmpeg/ffprobe 的目录路径。留空=自动搜索 PATH。"
 
@@ -2030,6 +2067,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     conflicts: [chat-template-file]
     tooltip: "自定义 Jinja 聊天模板字符串。覆盖模型自带的模板。支持的内置模板名：chatml, llama2, llama3, gemma, mistral, deepseek 等。一般无需设置，使用模型自带模板即可。"
 
@@ -2040,6 +2078,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     conflicts: [chat-template]
     tooltip: "从文件加载自定义聊天模板。与 --chat-template 功能相同但内容从文件读取。适合模板较长时使用。"
 
@@ -2051,6 +2090,7 @@ params:
     type: String
     default: '{"reasoning_effort": "medium"}'
     group: server
+    wide: true
     tooltip: "【核心】以 JSON 格式传递给聊天模板的额外参数。Qwen3 模型设置 reasoning_effort 为 low/medium/xhigh 控制思考深度。设为 {\"enable_thinking\": false} 关闭思考。示例: low=快速响应, medium=平衡, xhigh=深度推理。"
 
   - flag: reasoning-preserve
@@ -2168,6 +2208,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "将日志同时写入指定文件。留空=仅输出到控制台。"
 
@@ -2219,6 +2260,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "把每个请求的 prompt 记录到指定目录（自动创建，仅用于调试）。留空=禁用。注意隐私。"
 
@@ -2303,6 +2345,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     advanced: true
     tooltip: "在独立运行时环境中执行工具。默认 none=使用宿主机环境。可选：docker:<镜像> / podman:<镜像>（每次调用复用容器，退出清理）；docker-container:<ID> / podman-container:<ID>（复用现有容器，不自动停止）；ssh:<目标>（SSH 远程执行）。"
 
@@ -2376,6 +2419,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "LoRA 适配器路径。在基础模型上叠加微调效果。支持多个适配器（逗号分隔）。"
 
@@ -2396,6 +2440,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "带缩放因子的 LoRA。格式：路径:比例，如 adapter.safetensors:0.8。"
 
@@ -2406,6 +2451,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "控制向量（Control Vector）路径。通过向量运算引导模型行为。"
 
@@ -2416,6 +2462,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "带缩放因子的控制向量。格式：路径:比例。比例控制向量影响强度。"
 
@@ -2426,6 +2473,7 @@ params:
     type: String
     default: ""
     group: common
+    wide: true
     advanced: true
     tooltip: "应用控制向量的层范围（起始 结束，含端点）。如 0 16。留空=应用到全部层。"
 
@@ -2473,6 +2521,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     advanced: true
     tooltip: "保存 slot KV 缓存的路径。默认禁用。用于持久化缓存，加速重启后的恢复。"
 
@@ -2483,6 +2532,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     advanced: true
     tooltip: "Router 服务器模型目录。启用后可在此目录下动态加载多个模型。默认禁用。"
 
@@ -2493,6 +2543,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     advanced: true
     tooltip: "Router 服务器模型预设 INI 文件路径。需配合 models-dir 使用。"
 
@@ -2526,6 +2577,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     advanced: true
     tooltip: "MCP (Model Context Protocol) 服务器配置文件路径。2026年7月新增，支持通过 stdio 连接外部 MCP 服务器。配置格式兼容 Cursor 的 JSON 格式。"
 
@@ -2535,6 +2587,7 @@ params:
     type: String
     default: ""
     group: server
+    wide: true
     advanced: true
     tooltip: "MCP 服务器配置（内联 JSON 格式）。与 --mcp-servers-config 二选一。支持 stdio 协议的 MCP 服务器。注意：此功能为实验性。"
 

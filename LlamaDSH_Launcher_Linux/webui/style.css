@@ -52,6 +52,7 @@ details.grp .body { padding: 4px 12px 10px; }
 .prow .plabel { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .prow input[type=text], .prow select { width: 100%; }
 .prow.dep-off { opacity: .4; }
+.prow.wide { grid-column: 1 / -1; }
 .prow .plabel { cursor: help; }
 
 .status { font-weight: 600; white-space: nowrap; }

@@ -38,6 +38,9 @@ public class ParamDefinition
 	/// 用于 llama 默认启用、省略参数无法关闭的选项。</summary>
 	public string? OffFlag { get; set; }
 
+	/// <summary>通栏宽行：值较长（路径/仓库/逗号列表/JSON）的参数独占整行，输入框横跨全宽。</summary>
+	public bool Wide { get; set; }
+
 	/// <summary>值参数的启用复选框初始状态。</summary>
 	public bool Enabled { get; set; }
 

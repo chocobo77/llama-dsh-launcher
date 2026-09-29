@@ -157,7 +157,7 @@ const cssId = (s) => s.replace(/[^a-zA-Z0-9_-]/g, "_");
 
 function buildParamRow(d, container) {
   const row = document.createElement("div");
-  row.className = "prow";
+  row.className = "prow" + (d.wide ? " wide" : "");
   row.id = "pr_" + cssId(d.flag);
   const tip = (d.tooltip || "") + (d.deprecated ? "\n⚠ 已废弃" : "");
   if (d.type === "Bool") {
