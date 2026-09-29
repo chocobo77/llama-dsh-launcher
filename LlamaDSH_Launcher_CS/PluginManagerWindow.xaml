@@ -19,8 +19,6 @@
               SelectionChanged="PluginList_SelectionChanged"
               MouseDoubleClick="PluginList_MouseDoubleClick">
       <ListView.Resources>
-        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}" Color="#264f78" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightBrushKey}" Color="#30363d" />
         <Style TargetType="GridViewColumnHeader">
           <Setter Property="Background" Value="#161b22" />
           <Setter Property="Foreground" Value="#8b949e" />
@@ -30,11 +28,34 @@
       <ListView.ItemContainerStyle>
         <Style TargetType="ListViewItem">
           <Setter Property="Foreground" Value="#c9d1d9" />
-          <Style.Triggers>
-            <Trigger Property="IsSelected" Value="True">
-              <Setter Property="Foreground" Value="#ffffff" />
-            </Trigger>
-          </Style.Triggers>
+          <Setter Property="Background" Value="Transparent" />
+          <Setter Property="Template">
+            <Setter.Value>
+              <ControlTemplate TargetType="ListViewItem">
+                <Border x:Name="Bd" Background="{TemplateBinding Background}" Padding="6,3">
+                  <GridViewRowPresenter Content="{TemplateBinding Content}"
+                                        Columns="{TemplateBinding GridView.ColumnCollection}"
+                                        TextElement.Foreground="{TemplateBinding Foreground}" />
+                </Border>
+                <ControlTemplate.Triggers>
+                  <Trigger Property="IsMouseOver" Value="True">
+                    <Setter TargetName="Bd" Property="Background" Value="#21262d" />
+                  </Trigger>
+                  <Trigger Property="IsSelected" Value="True">
+                    <Setter TargetName="Bd" Property="Background" Value="#264f78" />
+                    <Setter Property="Foreground" Value="#ffffff" />
+                  </Trigger>
+                  <MultiTrigger>
+                    <MultiTrigger.Conditions>
+                      <Condition Property="IsSelected" Value="True" />
+                      <Condition Property="IsMouseOver" Value="True" />
+                    </MultiTrigger.Conditions>
+                    <Setter TargetName="Bd" Property="Background" Value="#2d5a8c" />
+                  </MultiTrigger>
+                </ControlTemplate.Triggers>
+              </ControlTemplate>
+            </Setter.Value>
+          </Setter>
         </Style>
       </ListView.ItemContainerStyle>
       <ListView.View>
