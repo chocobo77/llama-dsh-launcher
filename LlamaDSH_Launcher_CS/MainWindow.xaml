@@ -160,6 +160,7 @@
               <StackPanel Orientation="Horizontal">
                 <Button Name="BtnDshCompat" Content="🩺 兼容性检查/修复" Margin="4,0,0,0" ToolTip="检查 DSH 升级后的插件 peer 兼容性、bundle 激活、cordis.patch.yml 补丁目标、node_modules 失效 junction，并可一键修复（自动备份）" Click="CheckDshCompat_Click" />
                 <Button Name="BtnDshPlugins" Content="🧩 插件智能检测/修复" Margin="4,0,0,0" ToolTip="智能检测 DSH 插件状态：是否被市场停用、是否被 cordis.patch.yml 误禁用、bundle 是否激活、依赖是否缺失、node_modules 链接是否失效；检测只读可随时执行，一键修复会自动备份。" Click="CheckDshPlugins_Click" />
+                <Button Name="BtnPluginManager" Content="🗂 插件管理" Margin="4,0,0,0" ToolTip="打开插件管理窗口：查看全部插件状态，支持 停用并锁定/启用、升级、版本豁免、卸载（锁定停用可对抗 DSH 网页端/市场插件的自动写回）" Click="OpenPluginManager_Click" />
               </StackPanel>
             </DockPanel>
           </StackPanel>

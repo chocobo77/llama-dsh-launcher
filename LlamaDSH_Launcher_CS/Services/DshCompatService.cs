@@ -498,6 +498,205 @@ public static class DshCompatService
                 "@deepseek-ai/dsh-experimental-agent-team-profile"
         };
 
+        // ============================== 插件管理（锁定停用 / 启停 / 升级 / 豁免 / 卸载） ==============================
+
+        /// <summary>锁定停用持久化路径：profile → 保持停用的插件名列表。
+        /// DSH 网页端插件管理 / 市场插件会把 bundle 写回 dsh.profile.bundles，
+        /// 启动器审计发现锁定列表中的包被写回时自动移除并提示。</summary>
+        public static string PinnedPluginsPath => Path.Combine(ResolveDshHome(), "pinned_plugins.json");
+
+        public static List<string> ReadPinnedInactive(string profile)
+        {
+            try
+            {
+                if (!File.Exists(PinnedPluginsPath))
+                {
+                    return new List<string>();
+                }
+                using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(PinnedPluginsPath, Encoding.UTF8));
+                if (doc.RootElement.ValueKind != JsonValueKind.Object || !doc.RootElement.TryGetProperty(profile, out JsonElement arr) || arr.ValueKind != JsonValueKind.Array)
+                {
+                    return new List<string>();
+                }
+                List<string> result = new();
+                foreach (JsonElement e in arr.EnumerateArray())
+                {
+                    if (e.ValueKind == JsonValueKind.String && e.GetString() is string s && s.Length > 0)
+                    {
+                        result.Add(s);
+                    }
+                }
+                return result;
+            }
+            catch
+            {
+                return new List<string>();
+            }
+        }
+
+        public static void PinInactive(string profile, string name)
+        {
+            Dictionary<string, List<string>> all = new(StringComparer.Ordinal);
+            try
+            {
+                if (File.Exists(PinnedPluginsPath))
+                {
+                    all = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(File.ReadAllText(PinnedPluginsPath, Encoding.UTF8)) ?? new();
+                }
+            }
+            catch
+            {
+            }
+            List<string> list = all.TryGetValue(profile, out List<string>? v) ? v : new List<string>();
+            if (!list.Contains(name, StringComparer.Ordinal))
+            {
+                list.Add(name);
+            }
+            all[profile] = list;
+            File.WriteAllText(PinnedPluginsPath, JsonSerializer.Serialize(all, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }), new UTF8Encoding(false));
+        }
+
+        public static void UnpinInactive(string profile, string name)
+        {
+            try
+            {
+                if (!File.Exists(PinnedPluginsPath))
+                {
+                    return;
+                }
+                Dictionary<string, List<string>>? all = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(File.ReadAllText(PinnedPluginsPath, Encoding.UTF8));
+                if (all != null && all.TryGetValue(profile, out List<string>? list))
+                {
+                    list.RemoveAll((string x) => x == name);
+                    all[profile] = list;
+                    File.WriteAllText(PinnedPluginsPath, JsonSerializer.Serialize(all, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }), new UTF8Encoding(false));
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        /// <summary>启用/停用 bundle：增删 dsh.profile.bundles（先备份）。停用写回锁定列表。</summary>
+        public static string SetBundleActive(string profile, string name, bool active, Action<string>? log = null)
+        {
+            string manifest = Path.Combine(ResolveProfileDir(profile), "package.json");
+            if (!File.Exists(manifest))
+            {
+                return "profile package.json 不存在";
+            }
+            try
+            {
+                JsonNode? root = JsonNode.Parse(File.ReadAllText(manifest, Encoding.UTF8));
+                JsonArray? bundles = root?["dsh"]?["profile"]?["bundles"] as JsonArray;
+                if (bundles == null)
+                {
+                    return "package.json 中没有 dsh.profile.bundles";
+                }
+                List<string> names = bundles.Where(n => n?.GetValue<string>() is string s).Select(n => n!.GetValue<string>()).ToList();
+                bool changed = false;
+                if (active && !names.Contains(name, StringComparer.Ordinal))
+                {
+                    names.Add(name);
+                    changed = true;
+                }
+                else if (!active)
+                {
+                    changed = names.RemoveAll((string x) => x == name) > 0;
+                }
+                if (!changed)
+                {
+                    return "无需变更";
+                }
+                string backup = manifest + ".bak-mgr-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                File.Copy(manifest, backup, true);
+                JsonArray rebuilt = new();
+                foreach (string n in names)
+                {
+                    rebuilt.Add(n);
+                }
+                root!["dsh"]!["profile"]!["bundles"] = rebuilt;
+                JsonSerializerOptions opt = new() { WriteIndented = true, TypeInfoResolver = new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver() };
+                File.WriteAllText(manifest, root.ToJsonString(opt) + Environment.NewLine, new UTF8Encoding(false));
+                if (active)
+                {
+                    UnpinInactive(profile, name);
+                    log?.Invoke("[插件管理] 已激活 bundle: " + name);
+                    return "已激活（DSH 重启后生效）";
+                }
+                PinInactive(profile, name);
+                log?.Invoke("[插件管理] 已停用并锁定 bundle: " + name);
+                return "已停用并锁定（DSH 重启后生效；被外部写回时启动器会自动移除）";
+            }
+            catch (Exception ex)
+            {
+                return "操作失败: " + ex.Message;
+            }
+        }
+
+        /// <summary>卸载插件：从 bundles 移除 + pnpm remove（需已停止 DSH）。</summary>
+        public static string UninstallPlugin(string profile, string name, Action<string>? log = null)
+        {
+            string msg = SetBundleActive(profile, name, false, log);
+            string dir = ResolveProfileDir(profile);
+            (int ExitCode, string StdOut, string StdErr)? r = RunCapture("cmd.exe",
+                new[] { "/c", "pnpm", "remove", name }, dir, 600);
+            if (r == null)
+            {
+                return msg + "；pnpm remove 启动失败（插件文件仍在）";
+            }
+            if (r.Value.ExitCode != 0)
+            {
+                return msg + "；pnpm remove 失败: " + Tail(r.Value.StdErr.Length > 0 ? r.Value.StdErr : r.Value.StdOut, 400);
+            }
+            log?.Invoke("[插件管理] 已卸载插件包: " + name);
+            return msg + "；插件包已卸载";
+        }
+
+        /// <summary>升级插件到最新版（需已停止 DSH）。</summary>
+        public static string UpgradePlugin(string profile, string name, Action<string>? log = null)
+        {
+            string dir = ResolveProfileDir(profile);
+            log?.Invoke("[插件管理] pnpm add " + name + "@latest ...");
+            (int ExitCode, string StdOut, string StdErr)? r = RunCapture("cmd.exe",
+                new[] { "/c", "pnpm", "add", name + "@latest" }, dir, 900);
+            if (r == null)
+            {
+                return "pnpm 启动失败";
+            }
+            if (r.Value.ExitCode != 0)
+            {
+                return "升级失败: " + Tail(r.Value.StdErr.Length > 0 ? r.Value.StdErr : r.Value.StdOut, 500);
+            }
+            return "已升级到最新版";
+        }
+
+        /// <summary>写入版本豁免（compatibility.json）：name@version → dsh 版本。</summary>
+        public static string ExemptPlugin(string profile, string name, string version, string dshVersion)
+        {
+            string path = Path.Combine(ResolveProfileDir(profile), "compatibility.json");
+            Dictionary<string, List<string>> map = new(StringComparer.Ordinal);
+            try
+            {
+                if (File.Exists(path))
+                {
+                    map = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(File.ReadAllText(path, Encoding.UTF8)) ?? new();
+                }
+            }
+            catch
+            {
+            }
+            string key = name + "@" + version;
+            List<string> versions = map.TryGetValue(key, out List<string>? v) ? v : new List<string>();
+            if (!versions.Contains(dshVersion, StringComparer.Ordinal))
+            {
+                versions.Add(dshVersion);
+            }
+            map[key] = versions;
+            File.WriteAllText(path, JsonSerializer.Serialize(map, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }), new UTF8Encoding(false));
+            return "已豁免 " + key + " @ dsh " + dshVersion;
+        }
+
         // ============================== 基础路径/工具 ==============================
 
         public static string ResolveDshHome()
@@ -1083,6 +1282,29 @@ public static class DshCompatService
                                 });
                         }
                 }
+                // 锁定停用检测：被用户在启动器中"停用并锁定"的插件被外部（DSH 网页端/市场插件）
+                // 写回 dsh.profile.bundles 时，报错并纳入修复（复用 BundlesToRemove 移除链路）
+                List<string> pinned = ReadPinnedInactive(r.Profile);
+                foreach (string p in pinned)
+                {
+                    if (bundleNames.Contains(p, StringComparer.Ordinal))
+                    {
+                        if (!r.BundlesToRemove.Contains(p, StringComparer.Ordinal))
+                        {
+                            r.BundlesToRemove.Add(p);
+                        }
+                        r.Add(DshCompatLevel.Error, "插件", "插件被外部重新激活: " + p,
+                                "该插件已在启动器中停用并锁定（peer 版本错位/导入失败），但被外部写回激活表；修复将再次移除并保持锁定", true, "从 dsh.profile.bundles 移除并保持锁定");
+                    }
+                    else
+                    {
+                        DshPluginInfo? pi = r.Plugins.FirstOrDefault((DshPluginInfo x) => x.Name == p);
+                        if (pi != null)
+                        {
+                            pi.StateLabel = "已锁定停用";
+                        }
+                    }
+                }
                 r.ManifestRepairNeeded = r.BundlesToAdd.Count > 0 || r.BundlesToRemove.Count > 0;
                 if (r.ManifestRepairNeeded)
                 {
@@ -1424,12 +1646,18 @@ public static class DshCompatService
                         r.Add(DshCompatLevel.Info, "解析", "DSH 兼容性探针未产出结果", string.Join("；", r.ProbeErrors.Take(2)));
                 }
                 FilterBundleActivation(r);
+                List<string> pinnedInactive = ReadPinnedInactive(r.Profile);
                 // 插件状态画像（面向“智能检测/修复插件”）
                 foreach (DshPluginInfo info in r.Plugins)
                 {
+                        bool pinned = pinnedInactive.Contains(info.Name, StringComparer.Ordinal);
                         if (!info.Installed)
                         {
-                                info.StateLabel = "未安装";
+                                info.StateLabel = pinned ? "已锁定停用" : "未安装";
+                        }
+                        else if (pinned)
+                        {
+                                info.StateLabel = "已锁定停用";
                         }
                         else if (info.Compatible == false)
                         {
@@ -1454,7 +1682,7 @@ public static class DshCompatService
                                 info.StateLabel = "已启用";
                         }
                 }
-                List<DshPluginInfo> abnormal = r.Plugins.Where((DshPluginInfo x) => x.Installed && x.StateLabel != "已启用" && x.StateLabel != "bundle 保持不激活").ToList();
+                List<DshPluginInfo> abnormal = r.Plugins.Where((DshPluginInfo x) => x.Installed && x.StateLabel != "已启用" && x.StateLabel != "bundle 保持不激活" && x.StateLabel != "已锁定停用").ToList();
                 if (abnormal.Count > 0)
                 {
                         r.Add(DshCompatLevel.Warning, "插件", "插件状态异常 " + abnormal.Count + " 个",
@@ -1485,7 +1713,8 @@ public static class DshCompatService
                                 continue;
                         }
                         bool peerMismatch = info.Compatible == false || (info.Exempted && info.PeerIssues.Count > 0);
-                        if (!peerMismatch && info.MissingSpecs.Count == 0 && info.Errors.Count == 0)
+                        // 用户锁定停用的包永远不自动激活
+                        if (!peerMismatch && info.MissingSpecs.Count == 0 && info.Errors.Count == 0 && !ReadPinnedInactive(r.Profile).Contains(name, StringComparer.Ordinal))
                         {
                                 continue;
                         }

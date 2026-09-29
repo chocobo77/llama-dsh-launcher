@@ -1030,6 +1030,17 @@ public partial class MainWindow : Window, IComponentConnector
 		}
 	}
 
+	/// <summary>打开插件管理窗口（停用并锁定/启用、升级、豁免、卸载）。</summary>
+	private void OpenPluginManager_Click(object s, RoutedEventArgs e)
+	{
+		PluginManagerWindow dlg = new PluginManagerWindow(EffectiveDshDir(), DshCompatService.DefaultProfile, IsDshRunning, delegate (string m)
+		{
+			Dispatcher.BeginInvoke((Action)delegate { Log(m); }, Array.Empty<object>());
+		});
+		dlg.Owner = this;
+		dlg.ShowDialog();
+	}
+
 	private void SetLlamaUpdBtn(bool busy, string busyText = "⏳ 处理中...")
 	{
 		if (BtnCheckLlamaUpdate == null)
