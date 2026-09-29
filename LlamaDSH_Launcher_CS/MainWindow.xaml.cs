@@ -76,6 +76,11 @@ public partial class MainWindow : Window, IComponentConnector
 	private Action? _dshRebuildDone;
 	private DateTime _dshRebuildDeadline;
 
+	private string _dshRebuildDir = "";
+
+	private bool _dshCompatRunning;
+	private bool _dshPluginsRunning;
+
 	private DispatcherTimer? _dshVerifyTimer;
 
 	private DateTime _dshVerifyDeadline;
@@ -1119,6 +1124,299 @@ public partial class MainWindow : Window, IComponentConnector
 		{
 			LogError(ex, "DSH 更新");
 			SetDshUpdBtn(false);
+		}
+	}
+
+	// ==================== DSH 兼容性检查/修复 ====================
+
+	private void CheckDshCompat_Click(object s, RoutedEventArgs e)
+	{
+		_ = CheckDshCompatAsync(fromButton: true);
+	}
+
+	private void SetDshCompatBtn(bool busy, string busyText = "⏳ 处理中...")
+	{
+		if (BtnDshCompat == null)
+		{
+			return;
+		}
+		BtnDshCompat.IsEnabled = !busy;
+		BtnDshCompat.Content = busy ? busyText : "🩺 兼容性检查/修复";
+	}
+
+	private void LogCompatReport(DshCompatReport report)
+	{
+		Log("--- [兼容] 错误 " + report.ErrorCount + " · 警告 " + report.WarningCount + " · 可修复 " + report.RepairableCount + " ---");
+		foreach (DshCompatItem item in report.Items)
+		{
+			if (item.Level == DshCompatLevel.Info)
+			{
+				continue;
+			}
+			Log("    " + item);
+		}
+	}
+
+	private string BuildCompatSummary(DshCompatReport report)
+	{
+		StringBuilder sb = new StringBuilder();
+		sb.AppendLine("DSH " + report.DshVersion + " · profile " + report.Profile);
+		sb.AppendLine("错误 " + report.ErrorCount + " · 警告 " + report.WarningCount + " · 可自动修复 " + report.RepairableCount);
+		sb.AppendLine();
+		int shown = 0;
+		foreach (DshCompatItem item in report.Items)
+		{
+			if (item.Level == DshCompatLevel.Info && !item.Repairable)
+			{
+				continue;
+			}
+			if (shown++ >= 28)
+			{
+				sb.AppendLine("… 其余见启动器日志");
+				break;
+			}
+			sb.AppendLine(item.ToString());
+		}
+		if (report.LinkIssues.Count > 0)
+		{
+			int relink = 0;
+			foreach (DshLinkIssue l in report.LinkIssues)
+			{
+				if (l.Action == "relink")
+				{
+					relink++;
+				}
+			}
+			sb.AppendLine("· 失效链接 " + report.LinkIssues.Count + " 条（可重连 " + relink + " / 可清理 " + (report.LinkIssues.Count - relink) + "）");
+		}
+		return sb.ToString().TrimEnd();
+	}
+
+	/// <summary>手动入口：完整检查 + 一键修复（需先停止 DSH）。</summary>
+	private async Task CheckDshCompatAsync(bool fromButton)
+	{
+		if (_dshCompatRunning)
+		{
+			return;
+		}
+		try
+		{
+			bool dshRunning = IsDshRunning();
+			if (dshRunning)
+			{
+				Log("[兼容] 检测到 DSH 正在运行：本次仅执行只读检查；如需自动修复请先停止 DSH。");
+			}
+			string dir = EffectiveDshDir();
+			string profile = DshCompatService.DefaultProfile;
+			_dshCompatRunning = true;
+			SetDshCompatBtn(true, "⏳ 检查中...");
+			Log("--- [兼容] 开始 DSH 兼容性检查 (" + profile + ") ---");
+			DshCompatReport report = await Task.Run(delegate
+			{
+				return DshCompatService.Audit(dir, profile, delegate (string m)
+				{
+					Dispatcher.BeginInvoke((Action)delegate { Log(m); }, Array.Empty<object>());
+				});
+			});
+			LogCompatReport(report);
+			SetDshCompatBtn(false);
+			if (!report.HasRepairable)
+			{
+				System.Windows.MessageBox.Show(BuildCompatSummary(report) + "\n\n未发现可自动修复的问题。", "DSH 兼容性检查", MessageBoxButton.OK, report.ErrorCount > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
+				return;
+			}
+			if (System.Windows.MessageBox.Show(BuildCompatSummary(report) + "\n\n是否立即执行自动修复？\n（会先备份 package.json / cordis.patch.yml）", "DSH 兼容性修复", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+			{
+				Log("[兼容] 用户取消自动修复");
+				return;
+			}
+			await RunDshCompatRepairAsync(dir, profile, report);
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "DSH 兼容性检查/修复");
+			SetDshCompatBtn(false);
+		}
+		finally
+		{
+			_dshCompatRunning = false;
+		}
+	}
+
+	private async Task RunDshCompatRepairAsync(string dir, string profile, DshCompatReport report)
+	{
+		if (IsDshRunning())
+		{
+			System.Windows.MessageBox.Show("DSH 正在运行，无法写入修复。\n\n请先在启动器中停止 DSH，再执行自动修复。", "DSH 兼容性修复", MessageBoxButton.OK, MessageBoxImage.Warning);
+			Log("[兼容] DSH 正在运行，已取消自动修复。");
+			return;
+		}
+		SetDshCompatBtn(true, "⏳ 修复中...");
+		Log("--- [兼容] 开始自动修复 ---");
+		DshCompatRepairResult res = await Task.Run(delegate
+		{
+			return DshCompatService.Repair(dir, profile, report, delegate (string m)
+			{
+				Dispatcher.BeginInvoke((Action)delegate { Log(m); }, Array.Empty<object>());
+			});
+		});
+		foreach (string m in res.Messages)
+		{
+			Log("    " + m);
+		}
+		LogCompatReport(res.Report);
+		SetDshCompatBtn(false);
+		System.Windows.MessageBox.Show("兼容性修复完成。\n\n" + string.Join("\n", res.Messages) + "\n\n" + BuildCompatSummary(res.Report), "DSH 兼容性修复", MessageBoxButton.OK, res.Report.ErrorCount > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
+	}
+
+	// ==================== 插件智能检测 / 修复 ====================
+
+	private void CheckDshPlugins_Click(object s, RoutedEventArgs e)
+	{
+		_ = CheckDshPluginsAsync();
+	}
+
+	private void SetDshPluginsBtn(bool busy, string busyText = "⏳ 处理中...")
+	{
+		if (BtnDshPlugins == null)
+		{
+			return;
+		}
+		BtnDshPlugins.IsEnabled = !busy;
+		BtnDshPlugins.Content = busy ? busyText : "🧩 插件智能检测/修复";
+	}
+
+	/// <summary>把插件状态整理成人类可读的清单文本。</summary>
+	private string BuildPluginSummary(DshCompatReport report)
+	{
+		StringBuilder sb = new StringBuilder();
+		List<DshPluginInfo> plugins = report.Plugins ?? new List<DshPluginInfo>();
+		int abnormal = 0;
+		foreach (DshPluginInfo p in plugins)
+		{
+			if (p.Installed && p.StateLabel != "已启用")
+			{
+				abnormal++;
+			}
+		}
+		sb.AppendLine("DSH " + report.DshVersion + " · profile " + report.Profile + " · 插件 " + plugins.Count + " 个");
+		sb.AppendLine("异常 " + abnormal + " 个 · 市场停用 " + report.MarketDisabled.Count + " 条 · 失效补丁目标 " + report.PatchIssues.Count + " 个 · 失效链接 " + report.LinkIssues.Count + " 条");
+		sb.AppendLine();
+		foreach (DshPluginInfo p in plugins)
+		{
+			string mark = !p.Installed ? "○" : (p.StateLabel == "已启用" ? "✔" : "✖");
+			string extra = "";
+			if (p.MissingSpecs.Count > 0)
+			{
+				extra += "  缺依赖: " + string.Join(", ", p.MissingSpecs);
+			}
+			if (p.Compatible == false)
+			{
+				extra += "  peer 不兼容: " + string.Join(", ", p.PeerIssues.Select(delegate (KeyValuePair<string, string> kv) { return kv.Key + "@" + kv.Value; }));
+			}
+			if (p.DisabledByPatch)
+			{
+				extra += "  补丁停用";
+			}
+			if (p.DisabledByMarket)
+			{
+				extra += "  市场停用";
+			}
+			sb.AppendLine(mark + " " + p.Name + "  [" + p.StateLabel + "]" + (p.Version.Length > 0 ? "  v" + p.Version : "") + extra);
+		}
+		if (report.PatchIssues.Count > 0)
+		{
+			sb.AppendLine();
+			sb.AppendLine("补丁目标异常 " + report.PatchIssues.Count + " 个（示例）:");
+			int shown = 0;
+			foreach (DshPatchIssue issue in report.PatchIssues)
+			{
+				if (shown++ >= 8)
+				{
+					sb.AppendLine("  ... 其余见启动器日志");
+					break;
+				}
+				sb.AppendLine("  - " + issue.Id + " (" + issue.Kind + ")" + (issue.Detail.Length > 0 ? "  " + issue.Detail : ""));
+			}
+		}
+		return sb.ToString().TrimEnd();
+	}
+
+	/// <summary>智能检测插件状态。检测为只读，DSH 运行中也可执行；修复前需停止 DSH。</summary>
+	private async Task CheckDshPluginsAsync()
+	{
+		if (_dshPluginsRunning)
+		{
+			return;
+		}
+		try
+		{
+			_dshPluginsRunning = true;
+			SetDshPluginsBtn(true, "⏳ 检测中...");
+			string dir = EffectiveDshDir();
+			string profile = DshCompatService.DefaultProfile;
+			Log("--- [插件] 开始智能检测插件状态 (" + profile + ") ---");
+			DshCompatReport report = await Task.Run(delegate
+			{
+				return DshCompatService.Audit(dir, profile, delegate (string m)
+				{
+					Dispatcher.BeginInvoke((Action)delegate { Log(m); }, Array.Empty<object>());
+				});
+			});
+			foreach (DshPluginInfo p in report.Plugins)
+			{
+				Log("    " + p.Name + " [" + p.StateLabel + "]" + (p.Installed ? "" : " (未安装)"));
+			}
+			SetDshPluginsBtn(false);
+			bool repairable = report.HasRepairable;
+			string tail = repairable
+				? "\n\n检测到可自动修复的问题，是否立即修复？\n（修复会先备份 package.json / cordis.patch.yml / state.json，需先停止 DSH）"
+				: "\n\n未发现可自动修复的问题。";
+			MessageBoxResult r = System.Windows.MessageBox.Show(BuildPluginSummary(report) + tail, "DSH 插件智能检测", repairable ? MessageBoxButton.YesNo : MessageBoxButton.OK, report.ErrorCount > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
+			if (repairable && r == MessageBoxResult.Yes)
+			{
+				await RunDshCompatRepairAsync(dir, profile, report);
+			}
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "插件智能检测/修复");
+			SetDshPluginsBtn(false);
+		}
+		finally
+		{
+			_dshPluginsRunning = false;
+		}
+	}
+
+	/// <summary>重建完成后自动做一次兼容性检查；发现可修复问题时询问是否修复，然后继续原回调。</summary>
+	private async Task CompleteRebuildWithCompatAsync(Action? done)
+	{
+		try
+		{
+			string dir = string.IsNullOrEmpty(_dshRebuildDir) ? EffectiveDshDir() : _dshRebuildDir;
+			string profile = DshCompatService.DefaultProfile;
+			Log("--- [兼容] 重建完成，开始 DSH 升级后兼容性检查 ---");
+			DshCompatReport report = await Task.Run(delegate
+			{
+				return DshCompatService.Audit(dir, profile, delegate (string m)
+				{
+					Dispatcher.BeginInvoke((Action)delegate { Log(m); }, Array.Empty<object>());
+				});
+			});
+			LogCompatReport(report);
+			if (report.HasRepairable && System.Windows.MessageBox.Show(BuildCompatSummary(report) + "\n\n是否立即自动修复？", "DSH 升级后兼容性修复", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+			{
+				await RunDshCompatRepairAsync(dir, profile, report);
+			}
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "重建后兼容性检查");
+		}
+		finally
+		{
+			done?.Invoke();
 		}
 	}
 
@@ -2751,6 +3049,67 @@ public partial class MainWindow : Window, IComponentConnector
 		PrepareDshThenStart();
 	}
 
+	/// <summary>独立全量重建入口（升级时跳过重建/旧产物状态的恢复手段）：若 DSH 在运行则先停止 → clean + build:lib + build:web → 兼容性检查 → 自动启动。</summary>
+	private void RebuildDsh_Click(object s, RoutedEventArgs e)
+	{
+		if (ComboDshMode.SelectedIndex != 0)
+		{
+			System.Windows.MessageBox.Show("仅本地目录模式支持重建。", "重建 DSH");
+			return;
+		}
+		string dshDir = InputDshDir.Text.Trim().Trim('"');
+		if (string.IsNullOrEmpty(dshDir))
+		{
+			dshDir = "%DSH%";
+		}
+		if (!Directory.Exists(Path.Combine(dshDir, "apps", "cli")))
+		{
+			System.Windows.MessageBox.Show("DSH 目录无效: " + dshDir, "重建 DSH");
+			return;
+		}
+		string? head = null;
+		try
+		{
+			head = DshMaintenance.GetGitHead(dshDir);
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "读取 git HEAD");
+		}
+		if (head == null)
+		{
+			System.Windows.MessageBox.Show("无法读取仓库 git HEAD，请确认是 deepseek-harness 的 git checkout。", "重建 DSH", MessageBoxButton.OK, MessageBoxImage.Warning);
+			return;
+		}
+		string msg = "将执行全量重建:\n  1/3 pnpm clean\n  2/3 pnpm build:lib\n  3/3 build:web (vite)\n"
+				+ (HasDsh() ? "\nDSH 正在运行，会先停止 DSH。" : "")
+				+ "\n重建完成后自动做兼容性检查并启动 DSH。\n继续？";
+		if (System.Windows.MessageBox.Show(msg, "重建 DSH", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+		{
+			return;
+		}
+		BtnRebuildDsh.IsEnabled = false;
+		LblDshStatus.Text = "准备重建...";
+		LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(240, 136, 62));
+		if (HasDsh())
+		{
+			StopDsh();
+			DateTime stopDeadline = DateTime.Now.AddSeconds(20.0);
+			while (HasDsh() && DateTime.Now < stopDeadline)
+			{
+				System.Threading.Thread.Sleep(500);
+			}
+			if (HasDsh())
+			{
+				BtnRebuildDsh.IsEnabled = true;
+				LblDshStatus.Text = "已停止";
+				System.Windows.MessageBox.Show("DSH 进程未完全退出，请手动结束后再点重建。", "重建 DSH", MessageBoxButton.OK, MessageBoxImage.Warning);
+				return;
+			}
+		}
+		StartDshRebuild(dshDir, head, PrepareDshThenStart);
+	}
+
 	/// <summary>
 	/// DSH 启动前的维护步骤（依据 DSH_启动操作记录_20260830.md 遗留建议）:
 	/// 1) 无 host 运行时自动清理 task-board 残留锁; 2) git HEAD 变化时提示自动重建编译产物。
@@ -2821,6 +3180,7 @@ public partial class MainWindow : Window, IComponentConnector
 			if (!File.Exists(DshMaintenance.Node24Path))
 			{
 				System.Windows.MessageBox.Show("未找到 node24: " + DshMaintenance.Node24Path + "\n无法自动重建，将直接启动。");
+				BtnRebuildDsh.IsEnabled = true;
 				StartDsh();
 				return;
 			}
@@ -2883,6 +3243,7 @@ public partial class MainWindow : Window, IComponentConnector
 				if (rc != 0)
 				{
 					Log("[DSH重建] 分离启动失败(WMI rc=" + rc + ")，放弃重建直接启动");
+					BtnRebuildDsh.IsEnabled = true;
 					StartDsh();
 					return;
 				}
@@ -2910,6 +3271,7 @@ public partial class MainWindow : Window, IComponentConnector
 			_dshRebuildHead = head;
 			_dshRebuildDone = onDone;
 			_dshRebuildDeadline = DateTime.Now.AddMinutes(30.0);
+			_dshRebuildDir = dshDir;
 			BtnDshStart.IsEnabled = false;
 			BtnDshStop.IsEnabled = false;
 			LblDshStatus.Text = "Rebuilding...";
@@ -2929,6 +3291,7 @@ public partial class MainWindow : Window, IComponentConnector
 		catch (Exception ex)
 		{
 			LogError(ex, "DSH 重建启动失败");
+			BtnRebuildDsh.IsEnabled = true;
 			StartDsh();
 		}
 	}
@@ -2945,7 +3308,7 @@ public partial class MainWindow : Window, IComponentConnector
 		{
 			if (File.Exists(_dshRebuildLogPath))
 			{
-				using (FileStream fs = File.OpenRead(_dshRebuildLogPath))
+				using (FileStream fs = new FileStream(_dshRebuildLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
 				{
 					if (fs.Length < _dshRebuildLogPos)
 					{
@@ -2972,17 +3335,23 @@ public partial class MainWindow : Window, IComponentConnector
 					}
 				}
 				string? exitCode = null;
-				foreach (string line2 in File.ReadLines(_dshRebuildLogPath))
+				using (FileStream ef = new FileStream(_dshRebuildLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+				using (StreamReader er = new StreamReader(ef))
 				{
-					if (line2.StartsWith("EXITCODE:"))
+					string line2;
+					while ((line2 = er.ReadLine()) != null)
 					{
-						exitCode = line2.Substring(9).Trim();
+						if (line2.StartsWith("EXITCODE:"))
+						{
+							exitCode = line2.Substring(9).Trim();
+						}
 					}
 				}
 				if (exitCode != null)
 				{
 					StopDshRebuildTimer();
 					BtnDshStart.IsEnabled = true;
+					BtnRebuildDsh.IsEnabled = true;
 					BtnDshStop.IsEnabled = false;
 					if (exitCode == "0")
 					{
@@ -2992,7 +3361,7 @@ public partial class MainWindow : Window, IComponentConnector
 						LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
 						Action? done = _dshRebuildDone;
 						_dshRebuildDone = null;
-						done?.Invoke();
+						_ = CompleteRebuildWithCompatAsync(done);
 					}
 					else
 					{
@@ -3008,6 +3377,7 @@ public partial class MainWindow : Window, IComponentConnector
 			{
 				StopDshRebuildTimer();
 				BtnDshStart.IsEnabled = true;
+				BtnRebuildDsh.IsEnabled = true;
 				Log("[DSH重建] ⚠ 等待超时(30分钟)，停止监视。重建进程仍在后台运行，完成后可直接再点启动。");
 			}
 		}

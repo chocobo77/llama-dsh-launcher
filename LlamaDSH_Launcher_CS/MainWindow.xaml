@@ -95,6 +95,8 @@
         </Grid>
         <GroupBox Header="📂 路径配置">
           <StackPanel>
+            <!-- ── 模型文件 ─────────────────────────────── -->
+            <TextBlock Text="模型文件" Foreground="#8b949e" FontWeight="Bold" FontSize="12" Margin="0,0,0,6" />
             <DockPanel Margin="0,0,0,6">
               <Label Content="主模型路径:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
               <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
@@ -115,9 +117,15 @@
             </DockPanel>
             <DockPanel Margin="0,0,0,6">
               <Label Content="mmproj URL:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
-              <CheckBox Name="ChkNoMmprojOffload" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="4,0,0,0" Content="mmproj 强制CPU (--no-mmproj-offload)" ToolTip="禁用 mmproj 卸载到 GPU，强制在 CPU 运行(--no-mmproj-offload)。显存不足时勾选，代价是图像处理变慢。视觉编码器一般占 0.5~2GB(F16)，显存够则不勾(快)。" />
               <TextBox Name="InputMmprojUrl" ToolTip="远程 mmproj 地址(可选)。本地 mmproj 路径为空时使用 --mmproj-url。一般建议直接用本地文件。" />
             </DockPanel>
+            <DockPanel Margin="0,0,0,6">
+              <Label Content="" DockPanel.Dock="Left" Width="110" />
+              <CheckBox Name="ChkNoMmprojOffload" VerticalAlignment="Center" Content="mmproj 强制CPU (--no-mmproj-offload)" ToolTip="禁用 mmproj 卸载到 GPU，强制在 CPU 运行(--no-mmproj-offload)。显存不足时勾选，代价是图像处理变慢。视觉编码器一般占 0.5~2GB(F16)，显存够则不勾(快)。" />
+            </DockPanel>
+
+            <!-- ── 程序目录 ─────────────────────────────── -->
+            <TextBlock Text="程序目录" Foreground="#8b949e" FontWeight="Bold" FontSize="12" Margin="0,8,0,6" />
             <DockPanel Margin="0,0,0,6">
               <Label Content="Llama 程序目录:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
               <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
@@ -128,17 +136,6 @@
               <TextBox Name="InputLlamaDir" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
             </DockPanel>
             <DockPanel Margin="0,0,0,6">
-              <Label Content="DSH 启动模式:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
-              <local:NoScrollComboBox x:Name="ComboDshMode" SelectionChanged="DshModeChanged" DockPanel.Dock="Left" Width="280">
-                <ComboBoxItem Content="编译版 (node lib/bin.js，优先)" IsSelected="True" />
-                <ComboBoxItem Content="一键部署 (npx --yes @deepseek-ai/dsh web)" />
-              </local:NoScrollComboBox>
-            </DockPanel>
-            <DockPanel Margin="0,0,0,6">
-              <Label Content="" DockPanel.Dock="Left" Width="110" />
-              <CheckBox Name="ChkDshAdmin" IsChecked="True" VerticalAlignment="Center" Foreground="#c9d1d9" ToolTip="以管理员身份启动 DSH（静默提权，无 UAC 弹窗）：子进程为高完整性，可读取游戏进程内存（如 Elite Dangerous）。需先停止再启动才生效；取消勾选恢复普通方式启动。" />
-            </DockPanel>
-            <DockPanel Margin="0,0,0,6">
               <Label Content="DSH 项目目录:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
               <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
                 <Button Content="浏览..." Margin="4,0,0,0" Click="BrowseDsh_Click" />
@@ -146,6 +143,24 @@
                 <Button Name="BtnCheckDshUpdate" Content="🔄 检查更新" Margin="4,0,0,0" ToolTip="检查 deepseek-harness 上游更新并全量重建（git pull + clean + build:lib + build:web，需先停止 DSH）" Click="CheckDshUpdate_Click" />
               </StackPanel>
               <TextBox Name="InputDshDir" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+            </DockPanel>
+
+            <!-- ── DSH 选项 ─────────────────────────────── -->
+            <TextBlock Text="DSH 选项" Foreground="#8b949e" FontWeight="Bold" FontSize="12" Margin="0,8,0,6" />
+            <DockPanel Margin="0,0,0,6">
+              <Label Content="启动模式:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
+              <CheckBox Name="ChkDshAdmin" IsChecked="True" DockPanel.Dock="Right" VerticalAlignment="Center" Foreground="#c9d1d9" ToolTip="以管理员身份启动 DSH（静默提权，无 UAC 弹窗）：子进程为高完整性，可读取游戏进程内存（如 Elite Dangerous）。需先停止再启动才生效；取消勾选恢复普通方式启动。" />
+              <local:NoScrollComboBox x:Name="ComboDshMode" SelectionChanged="DshModeChanged" DockPanel.Dock="Left" Width="280">
+                <ComboBoxItem Content="编译版 (node lib/bin.js，优先)" IsSelected="True" />
+                <ComboBoxItem Content="一键部署 (npx --yes @deepseek-ai/dsh web)" />
+              </local:NoScrollComboBox>
+            </DockPanel>
+            <DockPanel Margin="0,0,0,6">
+              <Label Content="维护工具:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
+              <StackPanel Orientation="Horizontal">
+                <Button Name="BtnDshCompat" Content="🩺 兼容性检查/修复" Margin="4,0,0,0" ToolTip="检查 DSH 升级后的插件 peer 兼容性、bundle 激活、cordis.patch.yml 补丁目标、node_modules 失效 junction，并可一键修复（自动备份）" Click="CheckDshCompat_Click" />
+                <Button Name="BtnDshPlugins" Content="🧩 插件智能检测/修复" Margin="4,0,0,0" ToolTip="智能检测 DSH 插件状态：是否被市场停用、是否被 cordis.patch.yml 误禁用、bundle 是否激活、依赖是否缺失、node_modules 链接是否失效；检测只读可随时执行，一键修复会自动备份。" Click="CheckDshPlugins_Click" />
+              </StackPanel>
             </DockPanel>
           </StackPanel>
         </GroupBox>
@@ -185,6 +200,8 @@
             <StackPanel Grid.Column="2">
               <Button Name="BtnDshStart" Content="▶ 启动 DSH Web" Background="#238636" Foreground="#FFFFFFFF" Margin="0,0,0,4" FontSize="13" Click="StartDsh_Click" />
               <Button Name="BtnDshStop" Content="⏹ 停止 DSH Web" Background="#da3633" Foreground="#FFFFFFFF" IsEnabled="False" Margin="0,0,0,4" FontSize="13" Click="StopDsh_Click" />
+              <Button Name="BtnRebuildDsh" Content="🔨 重建 DSH" Margin="0,0,0,4" Click="RebuildDsh_Click" ToolTip="全量重建 DSH 编译产物 (pnpm clean + build:lib + vite)。若 DSH 正在运行会先停止；重建完成后自动做兼容性检查并启动 DSH。" />
+
               <Button Name="BtnOpenDsh" Content="🌐 打开 DSH Web" IsEnabled="False" Margin="0,0,0,4" Click="OpenDsh_Click" />
               <TextBlock Name="LblDshStatus" Text="● 已停止" Foreground="#8b949e" HorizontalAlignment="Center" FontSize="12" />
             </StackPanel>
@@ -254,4 +271,5 @@
       </GroupBox>
     </Grid>
   </Grid>
-</Window>
+</Window
+>
