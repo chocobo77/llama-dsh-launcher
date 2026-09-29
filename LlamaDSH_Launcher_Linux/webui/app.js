@@ -155,6 +155,38 @@ function applyProfile(p) {
 
 const cssId = (s) => s.replace(/[^a-zA-Z0-9_-]/g, "_");
 
+function buildParamRow(d, container) {
+  const row = document.createElement("div");
+  row.className = "prow";
+  row.id = "pr_" + cssId(d.flag);
+  const tip = (d.tooltip || "") + (d.deprecated ? "\n⚠ 已废弃" : "");
+  if (d.type === "Bool") {
+    row.innerHTML = `<span><input type="checkbox" id="pb_${cssId(d.flag)}"></span>
+      <span class="plabel" title="${mEsc(tip)}">${mEsc(d.label)}</span><span></span>`;
+  } else {
+    row.innerHTML = `<span><input type="checkbox" id="pe_${cssId(d.flag)}"></span>
+      <span class="plabel" title="${mEsc(tip)}">${mEsc(d.label)}</span><span id="pw_${cssId(d.flag)}"></span>`;
+    const wrap = row.querySelector("#pw_" + cssId(d.flag));
+    if (d.type === "Combo" && (d.options || []).length) {
+      const sel = document.createElement("select");
+      sel.id = "pv_" + cssId(d.flag);
+      for (const o of d.options) {
+        const op = document.createElement("option"); op.value = o; op.textContent = o;
+        sel.appendChild(op);
+      }
+      sel.value = d.default || (d.options[0] || "");
+      wrap.appendChild(sel);
+    } else {
+      const inp = document.createElement("input");
+      inp.type = "text"; inp.id = "pv_" + cssId(d.flag);
+      inp.value = d.default || "";
+      inp.title = mEsc(tip);
+      wrap.appendChild(inp);
+    }
+  }
+  container.appendChild(row);
+}
+
 function renderParams() {
   const host = $("paramGroups");
   host.innerHTML = "";
@@ -165,44 +197,34 @@ function renderParams() {
     det.className = "grp";
     det.innerHTML = `<summary>${mEsc(g.title)}</summary><div class="body"></div>`;
     const body = det.querySelector(".body");
-    let lastSub = null;
+    // 子组聚合: 同一子组的参数聚拢(即使 yml 中不连续), 子组标题可点击折叠
+    const bySub = new Map();
     for (const d of params) {
-      if (d.subgroup && d.subgroup !== lastSub) {
-        lastSub = d.subgroup;
+      const k = d.subgroup || "";
+      if (!bySub.has(k)) bySub.set(k, []);
+      bySub.get(k).push(d);
+    }
+    for (const [sub, items] of bySub) {
+      if (sub) {
         const h = document.createElement("div");
         h.className = "subgroup";
-        h.textContent = "▸ " + d.subgroup;
+        h.style.cursor = "pointer";
+        h.title = "点击折叠/展开该小节";
+        h.textContent = "▾ " + sub;
+        const wrap = document.createElement("div");
+        wrap.className = "subwrap";
+        h.addEventListener("click", () => {
+          const hide = wrap.style.display !== "none";
+          wrap.style.display = hide ? "none" : "";
+          wrap.dataset.collapsed = hide ? "1" : "";
+          h.textContent = (hide ? "▸ " : "▾ ") + sub;
+        });
         body.appendChild(h);
-      }
-      const row = document.createElement("div");
-      row.className = "prow";
-      row.id = "pr_" + cssId(d.flag);
-      const tip = (d.tooltip || "") + (d.deprecated ? "\n⚠ 已废弃" : "");
-      if (d.type === "Bool") {
-        row.innerHTML = `<span><input type="checkbox" id="pb_${cssId(d.flag)}"></span>
-          <span class="plabel" title="${mEsc(tip)}">${mEsc(d.label)}</span><span></span>`;
+        body.appendChild(wrap);
+        for (const d of items) buildParamRow(d, wrap);
       } else {
-        row.innerHTML = `<span><input type="checkbox" id="pe_${cssId(d.flag)}"></span>
-          <span class="plabel" title="${mEsc(tip)}">${mEsc(d.label)}</span><span id="pw_${cssId(d.flag)}"></span>`;
-        const wrap = row.querySelector("#pw_" + cssId(d.flag));
-        if (d.type === "Combo" && (d.options || []).length) {
-          const sel = document.createElement("select");
-          sel.id = "pv_" + cssId(d.flag);
-          for (const o of d.options) {
-            const op = document.createElement("option"); op.value = o; op.textContent = o;
-            sel.appendChild(op);
-          }
-          sel.value = d.default || (d.options[0] || "");
-          wrap.appendChild(sel);
-        } else {
-          const inp = document.createElement("input");
-          inp.type = "text"; inp.id = "pv_" + cssId(d.flag);
-          inp.value = d.default || "";
-          inp.title = mEsc(tip);
-          wrap.appendChild(inp);
-        }
+        for (const d of items) buildParamRow(d, body);
       }
-      body.appendChild(row);
     }
     host.appendChild(det);
   }
@@ -230,12 +252,14 @@ function applyParamFilter() {
       const show = !d || matches(d);
       row.style.display = show ? "" : "none";
       if (show) anyVisible = true;
-      let prev = row.previousElementSibling;
-      while (prev && !prev.classList.contains("subgroup")) prev = prev.previousElementSibling;
-      if (prev) {
-        const arr = subs.get(prev) || [];
+      const subwrap = row.closest(".subwrap");
+      const headerEl = subwrap ? subwrap.previousElementSibling : row.previousElementSibling;
+      if (headerEl && headerEl.classList.contains("subgroup")) {
+        const arr = subs.get(headerEl) || [];
         arr.push(show);
-        subs.set(prev, arr);
+        subs.set(headerEl, arr);
+        if (q && show && subwrap) subwrap.style.display = ""; // 过滤命中时强制展开所在子组
+        if (!q && subwrap) subwrap.style.display = subwrap.dataset.collapsed ? "none" : ""; // 清空过滤后还原用户折叠状态
       }
     }
     for (const [h, arr] of subs) h.style.display = arr.some(Boolean) ? "" : "none";

@@ -149,8 +149,8 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private readonly Dictionary<string, System.Windows.Controls.CheckBox> _pbw;
 
-	/// <summary>参数行索引（过滤用）：每行记录所属 Expander、子组与其标题行、行元素。</summary>
-	private readonly List<(Expander Grp, string Sub, System.Windows.Controls.TextBlock? Header, UIElement Row, ParamDefinition Def)> _paramRows = new();
+	/// <summary>参数行索引（过滤用）：每行记录所属 Expander、子组、子组标题行、子组容器与行元素。</summary>
+	private readonly List<(Expander Grp, string Sub, System.Windows.Controls.TextBlock? Header, Grid SGrid, UIElement Row, ParamDefinition Def)> _paramRows = new();
 
 	private static readonly Regex _rePromptTps = new Regex("prompt eval time\\s+=\\s*([\\d.]+)\\s*ms\\s*/\\s*(\\d+)\\s*tokens", RegexOptions.Compiled);
 
@@ -247,79 +247,72 @@ public partial class MainWindow : Window, IComponentConnector
 				Margin = new Thickness(0.0, 4.0, 0.0, 0.0),
 				Foreground = System.Windows.Media.Brushes.White
 			};
-			Grid grid = new Grid
+			// 子组聚合渲染：同一子组的参数聚拢（即使 yml 中不连续），
+			// 子组标题可点击折叠/展开；无子组参数直接平铺
+			StackPanel panel = new StackPanel { Margin = new Thickness(4.0) };
+			foreach (IGrouping<string, ParamDefinition> sg in _paramDefs
+				.Where((ParamDefinition p) => p.Group == g.Id && !p.Hidden)
+				.GroupBy((ParamDefinition p) => p.Subgroup ?? ""))
 			{
-				Margin = new Thickness(4.0)
-			};
-			grid.ColumnDefinitions.Add(new ColumnDefinition
-			{
-				Width = new GridLength(1.0, GridUnitType.Star)
-			});
-			grid.ColumnDefinitions.Add(new ColumnDefinition
-			{
-				Width = new GridLength(12.0)
-			});
-			grid.ColumnDefinitions.Add(new ColumnDefinition
-			{
-				Width = new GridLength(1.0, GridUnitType.Star)
-			});
-			int idx = 0;
-			string? lastSubgroup = null;
-			System.Windows.Controls.TextBlock header = null!;
-			foreach (ParamDefinition item in _paramDefs.Where((ParamDefinition p) => p.Group == g.Id && !p.Hidden))
-			{
-				if (!string.IsNullOrEmpty(item.Subgroup) && item.Subgroup != lastSubgroup)
+				Grid grid = new Grid();
+				grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0, GridUnitType.Star) });
+				grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(12.0) });
+				grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0, GridUnitType.Star) });
+				int idx = 0;
+				System.Windows.Controls.TextBlock? header = null;
+				if (sg.Key.Length > 0)
 				{
-					lastSubgroup = item.Subgroup;
 					header = new System.Windows.Controls.TextBlock
 					{
-						Text = "▸ " + item.Subgroup,
+						Text = "▾ " + sg.Key,
 						Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(210, 168, 83)),
 						FontWeight = FontWeights.SemiBold,
 						FontSize = 12.0,
-						Margin = new Thickness(0.0, 6.0, 0.0, 1.0)
+						Margin = new Thickness(0.0, 6.0, 0.0, 2.0),
+						Cursor = System.Windows.Input.Cursors.Hand,
+						ToolTip = "点击折叠/展开该小节"
 					};
-					if (idx % 2 != 0)
+					System.Windows.Controls.TextBlock hHeader = header;
+					Grid hGrid = grid;
+					string sub = sg.Key;
+					header.MouseLeftButtonUp += delegate
 					{
-						idx++; // 子组标题总是从左列开始
-					}
-					Grid.SetRow(header, idx / 2);
-					Grid.SetColumnSpan(header, 3);
-					while (grid.RowDefinitions.Count <= idx / 2)
-					{
-						grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-					}
-					grid.Children.Add(header);
-					idx += 2;
-					continue;
+						bool collapsing = hGrid.Visibility == Visibility.Visible;
+						hGrid.Visibility = collapsing ? Visibility.Collapsed : Visibility.Visible;
+						hGrid.Tag = collapsing ? "user-collapsed" : null;
+						hHeader.Text = (collapsing ? "▸ " : "▾ ") + sub;
+					};
+					panel.Children.Add(header);
 				}
-				if (item.Type == ParamType.Bool)
+				foreach (ParamDefinition item in sg)
 				{
-					System.Windows.Controls.CheckBox checkBox = new System.Windows.Controls.CheckBox
+					if (item.Type == ParamType.Bool)
 					{
-						Content = item.Label,
-						IsChecked = string.Equals(item.DefaultValue, "true", StringComparison.OrdinalIgnoreCase),
-						ToolTip = item.Tooltip,
-						Foreground = System.Windows.Media.Brushes.White,
+						System.Windows.Controls.CheckBox checkBox = new System.Windows.Controls.CheckBox
+						{
+							Content = item.Label,
+							IsChecked = string.Equals(item.DefaultValue, "true", StringComparison.OrdinalIgnoreCase),
+							ToolTip = item.Tooltip,
+							Foreground = System.Windows.Media.Brushes.White,
+							Margin = new Thickness(0.0, 1.0, 0.0, 1.0)
+						};
+						checkBox.Checked += delegate
+						{
+							RefreshCmd();
+						};
+						checkBox.Unchecked += delegate
+						{
+							RefreshCmd();
+						};
+						_pbw[item.Flag] = checkBox;
+						PlaceParamRow(grid, checkBox, ref idx);
+						_paramRows.Add((expander, sg.Key, header, grid, checkBox, item));
+						continue;
+					}
+					DockPanel dockPanel = new DockPanel
+					{
 						Margin = new Thickness(0.0, 1.0, 0.0, 1.0)
 					};
-					checkBox.Checked += delegate
-					{
-						RefreshCmd();
-					};
-					checkBox.Unchecked += delegate
-					{
-						RefreshCmd();
-					};
-					_pbw[item.Flag] = checkBox;
-					PlaceParamRow(grid, checkBox, ref idx);
-					_paramRows.Add((expander, item.Subgroup ?? "", header, checkBox, item));
-					continue;
-				}
-				DockPanel dockPanel = new DockPanel
-				{
-					Margin = new Thickness(0.0, 1.0, 0.0, 1.0)
-				};
 				System.Windows.Controls.CheckBox checkBox2 = new System.Windows.Controls.CheckBox
 				{
 					IsChecked = item.Enabled,
@@ -395,16 +388,18 @@ public partial class MainWindow : Window, IComponentConnector
 				dockPanel.Children.Add(control);
 				_pw[item.Flag] = (checkBox2, control);
 				PlaceParamRow(grid, dockPanel, ref idx);
-				_paramRows.Add((expander, item.Subgroup ?? "", header, dockPanel, item));
+				_paramRows.Add((expander, sg.Key, header, grid, dockPanel, item));
+				}
 			}
-			expander.Content = grid;
+			expander.Content = panel;
 			ParamGroupsPanel.Children.Add(expander);
 		}
 		ApplyParamFilter();
 	}
 
 	/// <summary>按关键词过滤参数行：匹配 flag / 中文名 / 子组 / 组标题 / 悬浮说明。
-	/// 空关键词恢复全部；有匹配时自动展开所在组，子组与组无匹配项时整体隐藏。</summary>
+	/// 空关键词恢复全部（保留用户手动折叠的子组）；有匹配时自动展开所在组与子组，
+	/// 子组与组无匹配项时整体隐藏。</summary>
 	private void ApplyParamFilter()
 	{
 		string q = (InputParamFilter.Text ?? "").Trim();
@@ -419,9 +414,19 @@ public partial class MainWindow : Window, IComponentConnector
 				|| r.Def.Tooltip.Contains(q, StringComparison.OrdinalIgnoreCase)
 				|| ((r.Grp.Header as string ?? "").Contains(q, StringComparison.OrdinalIgnoreCase));
 			r.Row.Visibility = match ? Visibility.Visible : Visibility.Collapsed;
-			if (r.Header != null)
+			if (!filtering)
 			{
-				r.Header.Visibility = Visibility.Visible;
+				// 恢复用户手动折叠状态
+				r.SGrid.Visibility = (r.SGrid.Tag as string == "user-collapsed") ? Visibility.Collapsed : Visibility.Visible;
+				if (r.Header != null)
+				{
+					r.Header.Visibility = Visibility.Visible;
+					r.Header.Text = (r.SGrid.Visibility == Visibility.Collapsed ? "▸ " : "▾ ") + r.Sub;
+				}
+			}
+			else if (match)
+			{
+				r.SGrid.Visibility = Visibility.Visible; // 过滤命中时强制展开所在子组
 			}
 		}
 		foreach (var hs in _paramRows.Where(r => r.Header != null).GroupBy(r => (r.Grp, r.Sub)))
