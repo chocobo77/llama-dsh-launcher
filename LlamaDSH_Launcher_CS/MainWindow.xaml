@@ -168,9 +168,29 @@
         <DockPanel Margin="0,6,0,0">
           <Button Name="BtnClearParamFilter" Content="✕" DockPanel.Dock="Right" Width="26" Margin="4,0,0,0" Visibility="Collapsed" Click="ClearParamFilter_Click" ToolTip="清除过滤，显示全部参数" />
           <Label Content="🔍 过滤参数:" DockPanel.Dock="Left" Width="86" VerticalAlignment="Center" Foreground="#8b949e" Padding="0" />
-          <TextBox Name="InputParamFilter" ToolTip="输入关键词即时过滤参数，匹配名称/说明/分组（如: kv、量化、推测、flash）。清除后恢复全部。" />
+          <TextBox Name="InputParamFilter" ToolTip="输入关键词即时过滤参数，跨所有分类匹配名称/说明/分组（如: kv、量化、推测、flash）" />
         </DockPanel>
-        <StackPanel Name="ParamGroupsPanel" />
+        <Border Margin="0,6,0,0" BorderBrush="#30363d" BorderThickness="1" CornerRadius="6" Background="#0d1117" Height="560">
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="215" />
+              <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+              <StackPanel x:Name="ParamNavPanel" Margin="6" />
+            </ScrollViewer>
+            <Grid Grid.Column="1" Margin="12,8,12,8">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+              </Grid.RowDefinitions>
+              <TextBlock x:Name="ParamBreadcrumb" Text="" Foreground="#8b949e" FontSize="12" Margin="0,0,0,6" TextTrimming="CharacterEllipsis" />
+              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                <StackPanel x:Name="ParamContent" />
+              </ScrollViewer>
+            </Grid>
+          </Grid>
+        </Border>
         <Expander Header="📋 命令预览（点击折叠）" IsExpanded="True" Margin="0,6,0,0">
           <StackPanel>
             <TextBox Name="CmdPreview" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" MinHeight="200" MaxHeight="500" Background="#0d1117" Foreground="#7ee787" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" BorderBrush="#30363d" BorderThickness="1" />

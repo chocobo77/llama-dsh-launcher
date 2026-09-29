@@ -149,8 +149,16 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private readonly Dictionary<string, System.Windows.Controls.CheckBox> _pbw;
 
-	/// <summary>参数行索引（过滤用）：每行记录所属 Expander、子组、子组标题行、子组容器与行元素。</summary>
-	private readonly List<(Expander Grp, string Sub, System.Windows.Controls.TextBlock? Header, Grid SGrid, UIElement Row, ParamDefinition Def)> _paramRows = new();
+	/// <summary>参数行索引（过滤用）：每行记录所属组、子组与行元素。</summary>
+	private readonly List<(string GrpId, string GrpTitle, string Sub, UIElement Row, ParamDefinition Def)> _paramRows = new();
+
+	/// <summary>子组内容面板缓存（key = 组id + 子组名），导航切换时挂到 ParamContent。</summary>
+	private readonly Dictionary<string, FrameworkElement> _subPanels = new();
+
+	/// <summary>左侧导航条目（用于选中态与过滤徽章更新）。</summary>
+	private readonly List<(Border Item, TextBlock Title, TextBlock Badge, string GrpId, string GrpTitle, string Sub, int Count)> _navItems = new();
+
+	private (string GrpId, string Sub)? _currentSub;
 
 	private static readonly Regex _rePromptTps = new Regex("prompt eval time\\s+=\\s*([\\d.]+)\\s*ms\\s*/\\s*(\\d+)\\s*tokens", RegexOptions.Compiled);
 
@@ -230,60 +238,38 @@ public partial class MainWindow : Window, IComponentConnector
 	private void BuildParamGroups()
 	{
 		_paramRows.Clear();
+		_subPanels.Clear();
+		_navItems.Clear();
+		_currentSub = null;
 		InputParamFilter.TextChanged -= InputParamFilter_TextChanged;
 		InputParamFilter.Clear();
 		InputParamFilter.TextChanged += InputParamFilter_TextChanged;
-		ParamGroupsPanel.Children.Clear();
+		ParamNavPanel.Children.Clear();
+		ParamContent.Children.Clear();
 		foreach (ParamGroupDef g in _paramGroups.OrderBy((ParamGroupDef x) => x.Order))
 		{
-			if (!_paramDefs.Any((ParamDefinition p) => p.Group == g.Id && !p.Hidden))
+			List<ParamDefinition> items = _paramDefs.Where((ParamDefinition p) => p.Group == g.Id && !p.Hidden).ToList();
+			if (items.Count == 0)
 			{
 				continue;
 			}
-			Expander expander = new Expander
+			// 左侧导航: 组标题
+			ParamNavPanel.Children.Add(new System.Windows.Controls.TextBlock
 			{
-				Header = g.Title,
-				IsExpanded = true,
-				Margin = new Thickness(0.0, 4.0, 0.0, 0.0),
-				Foreground = System.Windows.Media.Brushes.White
-			};
-			// 子组聚合渲染：同一子组的参数聚拢（即使 yml 中不连续），
-			// 子组标题可点击折叠/展开；无子组参数直接平铺
-			StackPanel panel = new StackPanel { Margin = new Thickness(4.0) };
-			foreach (IGrouping<string, ParamDefinition> sg in _paramDefs
-				.Where((ParamDefinition p) => p.Group == g.Id && !p.Hidden)
-				.GroupBy((ParamDefinition p) => p.Subgroup ?? ""))
+				Text = g.Title,
+				Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158)),
+				FontSize = 11.0,
+				FontWeight = FontWeights.Bold,
+				Margin = new Thickness(4, 10, 0, 3)
+			});
+			// 子组聚合: 同一子组的参数聚拢（即使 yml 中不连续）
+			foreach (IGrouping<string, ParamDefinition> sg in items.GroupBy((ParamDefinition p) => p.Subgroup ?? ""))
 			{
 				Grid grid = new Grid();
 				grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0, GridUnitType.Star) });
 				grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(12.0) });
 				grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0, GridUnitType.Star) });
 				int idx = 0;
-				System.Windows.Controls.TextBlock? header = null;
-				if (sg.Key.Length > 0)
-				{
-					header = new System.Windows.Controls.TextBlock
-					{
-						Text = "▾ " + sg.Key,
-						Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(210, 168, 83)),
-						FontWeight = FontWeights.SemiBold,
-						FontSize = 12.0,
-						Margin = new Thickness(0.0, 6.0, 0.0, 2.0),
-						Cursor = System.Windows.Input.Cursors.Hand,
-						ToolTip = "点击折叠/展开该小节"
-					};
-					System.Windows.Controls.TextBlock hHeader = header;
-					Grid hGrid = grid;
-					string sub = sg.Key;
-					header.MouseLeftButtonUp += delegate
-					{
-						bool collapsing = hGrid.Visibility == Visibility.Visible;
-						hGrid.Visibility = collapsing ? Visibility.Collapsed : Visibility.Visible;
-						hGrid.Tag = collapsing ? "user-collapsed" : null;
-						hHeader.Text = (collapsing ? "▸ " : "▾ ") + sub;
-					};
-					panel.Children.Add(header);
-				}
 				foreach (ParamDefinition item in sg)
 				{
 					if (item.Type == ParamType.Bool)
@@ -306,150 +292,256 @@ public partial class MainWindow : Window, IComponentConnector
 						};
 						_pbw[item.Flag] = checkBox;
 						PlaceParamRow(grid, checkBox, ref idx);
-						_paramRows.Add((expander, sg.Key, header, grid, checkBox, item));
+						_paramRows.Add((g.Id, g.Title, sg.Key, checkBox, item));
 						continue;
 					}
 					DockPanel dockPanel = new DockPanel
 					{
 						Margin = new Thickness(0.0, 1.0, 0.0, 1.0)
 					};
-				System.Windows.Controls.CheckBox checkBox2 = new System.Windows.Controls.CheckBox
-				{
-					IsChecked = item.Enabled,
-					ToolTip = "--" + item.Flag,
-					VerticalAlignment = VerticalAlignment.Center,
-					Margin = new Thickness(0.0, 0.0, 6.0, 0.0)
-				};
-				System.Windows.Controls.Label element = new System.Windows.Controls.Label
-				{
-					Content = item.Label + ":",
-					ToolTip = item.Tooltip,
-					Width = 160.0,
-					Foreground = System.Windows.Media.Brushes.White,
-					VerticalAlignment = VerticalAlignment.Center,
-					Padding = new Thickness(0.0)
-				};
-				System.Windows.Controls.Control control;
-				if (item.Type == ParamType.Combo && item.Options != null)
-				{
-					NoScrollComboBox noScrollComboBox = new NoScrollComboBox
+					System.Windows.Controls.CheckBox checkBox2 = new System.Windows.Controls.CheckBox
 					{
-						IsEditable = true,
-						ToolTip = item.Tooltip,
-						MinWidth = 70.0,
-						HorizontalAlignment = System.Windows.HorizontalAlignment.Stretch
+						IsChecked = item.Enabled,
+						ToolTip = "--" + item.Flag,
+						VerticalAlignment = VerticalAlignment.Center,
+						Margin = new Thickness(0.0, 0.0, 6.0, 0.0)
 					};
-					foreach (string option in item.Options)
+					System.Windows.Controls.Label element = new System.Windows.Controls.Label
 					{
-						noScrollComboBox.Items.Add(option);
+						Content = item.Label + ":",
+						ToolTip = item.Tooltip,
+						Width = 160.0,
+						Foreground = System.Windows.Media.Brushes.White,
+						VerticalAlignment = VerticalAlignment.Center,
+						Padding = new Thickness(0.0)
+					};
+					System.Windows.Controls.Control control;
+					if (item.Type == ParamType.Combo && item.Options != null)
+					{
+						NoScrollComboBox noScrollComboBox = new NoScrollComboBox
+						{
+							IsEditable = true,
+							ToolTip = item.Tooltip,
+							MinWidth = 70.0,
+							HorizontalAlignment = System.Windows.HorizontalAlignment.Stretch
+						};
+						foreach (string option in item.Options)
+						{
+							noScrollComboBox.Items.Add(option);
+						}
+						noScrollComboBox.Text = item.DefaultValue.ToString() ?? "";
+						control = noScrollComboBox;
+						checkBox2.Checked += delegate
+						{
+							RefreshCmd();
+						};
+						checkBox2.Unchecked += delegate
+						{
+							RefreshCmd();
+						};
+						noScrollComboBox.SelectionChanged += delegate
+						{
+							RefreshCmd();
+						};
 					}
-					noScrollComboBox.Text = item.DefaultValue.ToString() ?? "";
-					control = noScrollComboBox;
-					checkBox2.Checked += delegate
+					else
 					{
-						RefreshCmd();
-					};
-					checkBox2.Unchecked += delegate
-					{
-						RefreshCmd();
-					};
-					noScrollComboBox.SelectionChanged += delegate
-					{
-						RefreshCmd();
-					};
+						System.Windows.Controls.TextBox obj = new System.Windows.Controls.TextBox
+						{
+							Text = (item.DefaultValue.ToString() ?? ""),
+							ToolTip = item.Tooltip,
+							MinWidth = 70.0,
+							HorizontalAlignment = System.Windows.HorizontalAlignment.Stretch
+						};
+						control = obj;
+						checkBox2.Checked += delegate
+						{
+							RefreshCmd();
+						};
+						checkBox2.Unchecked += delegate
+						{
+							RefreshCmd();
+						};
+						obj.TextChanged += delegate
+						{
+							RefreshCmd();
+						};
+					}
+					DockPanel.SetDock(checkBox2, Dock.Left);
+					dockPanel.Children.Add(checkBox2);
+					DockPanel.SetDock(element, Dock.Left);
+					dockPanel.Children.Add(element);
+					dockPanel.Children.Add(control);
+					_pw[item.Flag] = (checkBox2, control);
+					PlaceParamRow(grid, dockPanel, ref idx);
+					_paramRows.Add((g.Id, g.Title, sg.Key, dockPanel, item));
 				}
-				else
-				{
-					System.Windows.Controls.TextBox obj = new System.Windows.Controls.TextBox
-					{
-						Text = (item.DefaultValue.ToString() ?? ""),
-						ToolTip = item.Tooltip,
-						MinWidth = 70.0,
-						HorizontalAlignment = System.Windows.HorizontalAlignment.Stretch
-					};
-					control = obj;
-					checkBox2.Checked += delegate
-					{
-						RefreshCmd();
-					};
-					checkBox2.Unchecked += delegate
-					{
-						RefreshCmd();
-					};
-					obj.TextChanged += delegate
-					{
-						RefreshCmd();
-					};
-				}
-				DockPanel.SetDock(checkBox2, Dock.Left);
-				dockPanel.Children.Add(checkBox2);
-				DockPanel.SetDock(element, Dock.Left);
-				dockPanel.Children.Add(element);
-				dockPanel.Children.Add(control);
-				_pw[item.Flag] = (checkBox2, control);
-				PlaceParamRow(grid, dockPanel, ref idx);
-				_paramRows.Add((expander, sg.Key, header, grid, dockPanel, item));
-				}
-				panel.Children.Add(grid);
+				_subPanels[g.Id + "\u0001" + sg.Key] = grid;
+				AddNavItem(g, sg.Key, sg.Count());
 			}
-			expander.Content = panel;
-			ParamGroupsPanel.Children.Add(expander);
+		}
+		if (_navItems.Count > 0)
+		{
+			SelectSubgroup(_navItems[0].GrpId, _navItems[0].Sub);
 		}
 		ApplyParamFilter();
 	}
 
-	/// <summary>按关键词过滤参数行：匹配 flag / 中文名 / 子组 / 组标题 / 悬浮说明。
-	/// 空关键词恢复全部（保留用户手动折叠的子组）；有匹配时自动展开所在组与子组，
-	/// 子组与组无匹配项时整体隐藏。</summary>
+	/// <summary>添加左侧导航子组条目（名称 + 参数计数徽章），点击切换右侧内容。</summary>
+	private void AddNavItem(ParamGroupDef g, string sub, int count)
+	{
+		System.Windows.Controls.TextBlock title = new System.Windows.Controls.TextBlock
+		{
+			Text = sub,
+			Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(201, 209, 217)),
+			VerticalAlignment = VerticalAlignment.Center,
+			TextTrimming = TextTrimming.CharacterEllipsis
+		};
+		System.Windows.Controls.TextBlock badge = new System.Windows.Controls.TextBlock
+		{
+			Text = count.ToString(),
+			Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158)),
+			FontSize = 11.0,
+			VerticalAlignment = VerticalAlignment.Center
+		};
+		DockPanel.SetDock(badge, Dock.Right);
+		DockPanel dp = new DockPanel();
+		dp.Children.Add(badge);
+		dp.Children.Add(title);
+		Border item = new Border
+		{
+			Child = dp,
+			CornerRadius = new CornerRadius(4),
+			Padding = new Thickness(9, 5, 8, 5),
+			Margin = new Thickness(0, 1, 0, 1),
+			Background = System.Windows.Media.Brushes.Transparent,
+			Cursor = System.Windows.Input.Cursors.Hand,
+			ToolTip = g.Title + " ▸ " + sub + "（" + count + " 个参数）"
+		};
+		string grpId = g.Id;
+		string grpTitle = g.Title;
+		item.MouseEnter += delegate
+		{
+			if (_currentSub != (grpId, sub))
+			{
+				item.Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(33, 38, 45));
+			}
+		};
+		item.MouseLeave += delegate
+		{
+			if (_currentSub != (grpId, sub))
+			{
+				item.Background = System.Windows.Media.Brushes.Transparent;
+			}
+		};
+		item.MouseLeftButtonUp += delegate
+		{
+			SelectSubgroup(grpId, sub);
+		};
+		ParamNavPanel.Children.Add(item);
+		_navItems.Add((item, title, badge, grpId, grpTitle, sub, count));
+	}
+
+	private static string SubKey(string grpId, string sub)
+	{
+		return grpId + "\u0001" + sub;
+	}
+
+	/// <summary>切换右侧显示的子组，并更新导航选中态与面包屑。</summary>
+	private void SelectSubgroup(string grpId, string sub)
+	{
+		_currentSub = (grpId, sub);
+		string? grpTitle = _navItems.FirstOrDefault(n => n.GrpId == grpId && n.Sub == sub).GrpTitle;
+		ParamContent.Children.Clear();
+		if (_subPanels.TryGetValue(SubKey(grpId, sub), out FrameworkElement? panel))
+		{
+			ParamContent.Children.Add(panel);
+		}
+		int count = _navItems.FirstOrDefault(n => n.GrpId == grpId && n.Sub == sub).Count;
+		ParamBreadcrumb.Text = (grpTitle ?? grpId) + "  ▸  " + sub + "   ·   " + count + " 个参数";
+		foreach (var n in _navItems)
+		{
+			bool sel = n.GrpId == grpId && n.Sub == sub;
+			n.Item.Background = sel ? new SolidColorBrush(System.Windows.Media.Color.FromRgb(38, 79, 120)) : System.Windows.Media.Brushes.Transparent;
+			n.Title.Foreground = new SolidColorBrush(sel ? System.Windows.Media.Color.FromRgb(255, 255, 255) : System.Windows.Media.Color.FromRgb(201, 209, 217));
+			n.Badge.Foreground = new SolidColorBrush(sel ? System.Windows.Media.Color.FromRgb(255, 255, 255) : System.Windows.Media.Color.FromRgb(139, 148, 158));
+		}
+	}
+
+	private static bool ParamMatches(ParamDefinition d, string sub, string grpTitle, string q)
+	{
+		return d.Flag.Contains(q, StringComparison.OrdinalIgnoreCase)
+			|| d.Label.Contains(q, StringComparison.OrdinalIgnoreCase)
+			|| sub.Contains(q, StringComparison.OrdinalIgnoreCase)
+			|| d.Tooltip.Contains(q, StringComparison.OrdinalIgnoreCase)
+			|| grpTitle.Contains(q, StringComparison.OrdinalIgnoreCase);
+	}
+
+	/// <summary>按关键词全局过滤：右侧聚合显示所有命中的子组（分节标题 + 命中行），
+	/// 左侧导航显示命中数、无命中的条目淡化；空关键词恢复选中子组视图。</summary>
 	private void ApplyParamFilter()
 	{
 		string q = (InputParamFilter.Text ?? "").Trim();
 		bool filtering = q.Length > 0;
 		BtnClearParamFilter.Visibility = filtering ? Visibility.Visible : Visibility.Collapsed;
-		foreach (var r in _paramRows)
+		if (!filtering)
 		{
-			bool match = !filtering
-				|| r.Def.Flag.Contains(q, StringComparison.OrdinalIgnoreCase)
-				|| r.Def.Label.Contains(q, StringComparison.OrdinalIgnoreCase)
-				|| r.Sub.Contains(q, StringComparison.OrdinalIgnoreCase)
-				|| r.Def.Tooltip.Contains(q, StringComparison.OrdinalIgnoreCase)
-				|| ((r.Grp.Header as string ?? "").Contains(q, StringComparison.OrdinalIgnoreCase));
-			r.Row.Visibility = match ? Visibility.Visible : Visibility.Collapsed;
-			if (!filtering)
+			foreach (var r in _paramRows)
 			{
-				// 恢复用户手动折叠状态
-				r.SGrid.Visibility = (r.SGrid.Tag as string == "user-collapsed") ? Visibility.Collapsed : Visibility.Visible;
-				if (r.Header != null)
+				r.Row.Visibility = Visibility.Visible;
+			}
+			if (_currentSub.HasValue)
+			{
+				SelectSubgroup(_currentSub.Value.GrpId, _currentSub.Value.Sub);
+			}
+			return;
+		}
+		ParamContent.Children.Clear();
+		int total = 0;
+		bool any = false;
+		foreach (var n in _navItems)
+		{
+			var rows = _paramRows.Where(r => r.GrpId == n.GrpId && r.Sub == n.Sub).ToList();
+			var hits = rows.Where(r => ParamMatches(r.Def, n.Sub, n.GrpTitle, q)).ToList();
+			if (hits.Count == 0)
+			{
+				n.Item.Opacity = 0.35;
+				n.Badge.Text = "0";
+				continue;
+			}
+			any = true;
+			total += hits.Count;
+			n.Item.Opacity = 1;
+			n.Badge.Text = hits.Count.ToString();
+			ParamContent.Children.Add(new System.Windows.Controls.TextBlock
+			{
+				Text = n.GrpTitle + "  ▸  " + n.Sub + "   ·   " + hits.Count + " 项",
+				Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(210, 168, 83)),
+				FontSize = 12.0,
+				FontWeight = FontWeights.SemiBold,
+				Margin = new Thickness(0, 8, 0, 3)
+			});
+			string key = SubKey(n.GrpId, n.Sub);
+			if (_subPanels.TryGetValue(key, out FrameworkElement? panel))
+			{
+				foreach (var r in rows)
 				{
-					r.Header.Visibility = Visibility.Visible;
-					r.Header.Text = (r.SGrid.Visibility == Visibility.Collapsed ? "▸ " : "▾ ") + r.Sub;
+					r.Row.Visibility = hits.Contains(r) ? Visibility.Visible : Visibility.Collapsed;
 				}
-			}
-			else if (match)
-			{
-				r.SGrid.Visibility = Visibility.Visible; // 过滤命中时强制展开所在子组
+				panel.Visibility = Visibility.Visible;
+				ParamContent.Children.Add(panel);
 			}
 		}
-		foreach (var hs in _paramRows.Where(r => r.Header != null).GroupBy(r => (r.Grp, r.Sub)))
+		if (!any)
 		{
-			bool anyVisible = hs.Any(r => r.Row.Visibility == Visibility.Visible);
-			foreach (var t in hs)
+			ParamContent.Children.Add(new System.Windows.Controls.TextBlock
 			{
-				if (t.Header != null)
-				{
-					t.Header.Visibility = anyVisible ? Visibility.Visible : Visibility.Collapsed;
-				}
-			}
+				Text = "没有匹配 \"" + q + "\" 的参数",
+				Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158)),
+				Margin = new Thickness(0, 12, 0, 0)
+			});
 		}
-		foreach (var gs in _paramRows.GroupBy(r => r.Grp))
-		{
-			bool anyVisible = gs.Any(r => r.Row.Visibility == Visibility.Visible);
-			gs.Key.Visibility = anyVisible ? Visibility.Visible : Visibility.Collapsed;
-			if (filtering && anyVisible)
-			{
-				gs.Key.IsExpanded = true;
-			}
-		}
+		ParamBreadcrumb.Text = "🔍  \"" + q + "\"   ·   命中 " + total + " 个参数 / " + _navItems.Count(n => n.Item.Opacity == 1) + " 个分类";
 	}
 
 	private void InputParamFilter_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
@@ -461,6 +553,7 @@ public partial class MainWindow : Window, IComponentConnector
 	{
 		InputParamFilter.Clear();
 	}
+
 
 	private static void PlaceParamRow(Grid g, UIElement el, ref int idx)
 	{
@@ -2396,7 +2489,6 @@ public partial class MainWindow : Window, IComponentConnector
 			_paramSchema = r;
 			_paramDefs = r.Defs;
 			_paramGroups = r.Groups;
-			ParamGroupsPanel.Children.Clear();
 			_pw.Clear();
 			_pbw.Clear();
 			BuildParamGroups();
