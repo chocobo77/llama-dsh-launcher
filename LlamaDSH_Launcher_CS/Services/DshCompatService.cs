@@ -1423,6 +1423,7 @@ public static class DshCompatService
                 {
                         r.Add(DshCompatLevel.Info, "解析", "DSH 兼容性探针未产出结果", string.Join("；", r.ProbeErrors.Take(2)));
                 }
+                FilterBundleActivation(r);
                 // 插件状态画像（面向“智能检测/修复插件”）
                 foreach (DshPluginInfo info in r.Plugins)
                 {
@@ -1440,7 +1441,9 @@ public static class DshCompatService
                         }
                         else if (info.IsBundle && !info.InBundles)
                         {
-                                info.StateLabel = "bundle 未激活";
+                                info.StateLabel = r.BundlesToAdd.Contains(info.Name, StringComparer.Ordinal)
+                                        ? "bundle 未激活"
+                                        : "bundle 保持不激活";
                         }
                         else if (info.DisabledByMarket || info.DisabledByPatch)
                         {
@@ -1451,7 +1454,7 @@ public static class DshCompatService
                                 info.StateLabel = "已启用";
                         }
                 }
-                List<DshPluginInfo> abnormal = r.Plugins.Where((DshPluginInfo x) => x.Installed && x.StateLabel != "已启用").ToList();
+                List<DshPluginInfo> abnormal = r.Plugins.Where((DshPluginInfo x) => x.Installed && x.StateLabel != "已启用" && x.StateLabel != "bundle 保持不激活").ToList();
                 if (abnormal.Count > 0)
                 {
                         r.Add(DshCompatLevel.Warning, "插件", "插件状态异常 " + abnormal.Count + " 个",
@@ -1460,6 +1463,65 @@ public static class DshCompatService
                                 "恢复未激活 bundle 并删除误停用行，使插件回到已启用");
                 }
                 log?.Invoke("[兼容] 插件: 共 " + r.Plugins.Count + " 个，不兼容 " + r.Plugins.Count((DshPluginInfo x) => x.Compatible == false) + " 个，解析缺失 " + r.Plugins.Count((DshPluginInfo x) => x.MissingSpecs.Count > 0) + " 个，状态异常 " + abnormal.Count + " 个");
+        }
+
+        /// <summary>
+        /// bundle 自动激活守卫：peer 与当前 DSH 版本不匹配（含已豁免）/ 缺依赖 / 有错误的包，
+        /// 不自动补进 dsh.profile.bundles —— 版本检查能豁免，但 client 模块表是构建期对齐的，
+        /// 强行激活会在 web boot 报 "missed the module table" 加载失败（如 better-locale）。
+        /// 同时回写 bundle 未激活警告的措辞与 ManifestRepairNeeded。
+        /// </summary>
+        private static void FilterBundleActivation(DshCompatReport r)
+        {
+                if (r.BundlesToAdd.Count == 0)
+                {
+                        return;
+                }
+                foreach (string name in r.BundlesToAdd.ToList())
+                {
+                        DshPluginInfo? info = r.Plugins.FirstOrDefault((DshPluginInfo x) => string.Equals(x.Name, name, StringComparison.Ordinal));
+                        if (info == null)
+                        {
+                                continue;
+                        }
+                        bool peerMismatch = info.Compatible == false || (info.Exempted && info.PeerIssues.Count > 0);
+                        if (!peerMismatch && info.MissingSpecs.Count == 0 && info.Errors.Count == 0)
+                        {
+                                continue;
+                        }
+                        r.BundlesToAdd.Remove(name);
+                        string why = peerMismatch
+                                ? "peer 与当前 DSH 版本不匹配" + (info.Exempted ? "（版本检查已豁免）" : "")
+                                : (info.MissingSpecs.Count > 0 ? "依赖无法解析: " + string.Join(", ", info.MissingSpecs) : "插件自身状态异常");
+                        DshCompatItem? warn = r.Find("插件", "bundle 未激活: " + name);
+                        if (warn != null)
+                        {
+                                warn.Level = DshCompatLevel.Info;
+                                warn.Title = "bundle 保持不激活: " + name;
+                                warn.Detail = why + "；激活会导致 client 模块加载失败（module table 漂移），保持不激活。待插件发布兼容版本后再激活";
+                                warn.Repairable = false;
+                                warn.Repair = "";
+                        }
+                        else
+                        {
+                                r.Add(DshCompatLevel.Info, "插件", "bundle 保持不激活: " + name,
+                                        why + "；激活会导致 client 模块加载失败，保持不激活", false, "");
+                        }
+                }
+                r.ManifestRepairNeeded = r.BundlesToAdd.Count > 0 || r.BundlesToRemove.Count > 0;
+                DshCompatItem? infoItem = r.Find("插件", "bundle 激活表需要修复");
+                if (infoItem != null)
+                {
+                        if (!r.ManifestRepairNeeded)
+                        {
+                                r.Items.Remove(infoItem);
+                        }
+                        else
+                        {
+                                infoItem.Detail = "待补: " + (r.BundlesToAdd.Count == 0 ? "无" : string.Join(", ", r.BundlesToAdd))
+                                        + "；待移除: " + (r.BundlesToRemove.Count == 0 ? "无" : string.Join(", ", r.BundlesToRemove));
+                        }
+                }
         }
 
         private static Dictionary<string, List<string>> ReadExemptions(string profileDir)
