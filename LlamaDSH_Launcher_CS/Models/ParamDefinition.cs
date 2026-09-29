@@ -24,6 +24,20 @@ public class ParamDefinition
 
 	public string Group { get; set; } = "";
 
+	/// <summary>组内子组标题（渲染时插入小节标题行，形成两级层级）。</summary>
+	public string? Subgroup { get; set; }
+
+	/// <summary>
+	/// "关闭值"（枚举参数）：未勾选时显式发射 --flag &lt;offValue&gt; 而不是省略，
+	/// 用于 llama 默认值不等于关闭的选项（如 flash-attn 默认 auto、fit 默认 on）。
+	/// 依赖规则比较值在未勾选时同样回退到 offValue，保证"取消勾选=关闭"全链路一致。
+	/// </summary>
+	public string? OffValue { get; set; }
+
+	/// <summary>否定旗标（布尔参数）：未勾选时发射它（如 --no-jinja），
+	/// 用于 llama 默认启用、省略参数无法关闭的选项。</summary>
+	public string? OffFlag { get; set; }
+
 	/// <summary>值参数的启用复选框初始状态。</summary>
 	public bool Enabled { get; set; }
 

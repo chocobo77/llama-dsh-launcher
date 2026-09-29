@@ -256,8 +256,33 @@ public partial class MainWindow : Window, IComponentConnector
 				Width = new GridLength(1.0, GridUnitType.Star)
 			});
 			int idx = 0;
+			string? lastSubgroup = null;
 			foreach (ParamDefinition item in _paramDefs.Where((ParamDefinition p) => p.Group == g.Id && !p.Hidden))
 			{
+				if (!string.IsNullOrEmpty(item.Subgroup) && item.Subgroup != lastSubgroup)
+				{
+					lastSubgroup = item.Subgroup;
+					System.Windows.Controls.TextBlock header = new System.Windows.Controls.TextBlock
+					{
+						Text = "▸ " + item.Subgroup,
+						Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(210, 168, 83)),
+						FontWeight = FontWeights.SemiBold,
+						Margin = new Thickness(0.0, 8.0, 0.0, 2.0)
+					};
+					if (idx % 2 != 0)
+					{
+						idx++; // 子组标题总是从左列开始
+					}
+					Grid.SetRow(header, idx / 2);
+					Grid.SetColumnSpan(header, 3);
+					while (grid.RowDefinitions.Count <= idx / 2)
+					{
+						grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+					}
+					grid.Children.Add(header);
+					idx += 2;
+					continue;
+				}
 				if (item.Type == ParamType.Bool)
 				{
 					System.Windows.Controls.CheckBox checkBox = new System.Windows.Controls.CheckBox
@@ -399,7 +424,7 @@ public partial class MainWindow : Window, IComponentConnector
 		return false;
 	}
 
-	/// <summary>用于 ==/!= 比较的有效值：未生效时回退默认值（如 mirostat 未勾选视为 "0"）。</summary>
+	/// <summary>用于 ==/!= 比较的有效值：未生效时回退 offValue（如 spec-type 未勾选视为 "none"），否则默认值。</summary>
 	private string EffectiveValue(ParamDefinition d)
 	{
 		if (d.Type == ParamType.Bool)
@@ -417,7 +442,25 @@ public partial class MainWindow : Window, IComponentConnector
 		{
 			return text;
 		}
+		if (!string.IsNullOrEmpty(d.OffValue))
+		{
+			return d.OffValue;
+		}
 		return d.DefaultValue ?? "";
+	}
+
+	/// <summary>
+	/// 推测解码是否激活：spec-type 已勾选且有效值 != none（none 为其 offValue）。
+	/// --model-draft 的发射以此为准，避免"填了草稿模型路径但推测已关闭"时 llama-server 自行启用推测。
+	/// </summary>
+	private bool IsSpecDecodingActive()
+	{
+		ParamDefinition? d = RoleDef("spec_type");
+		if (d == null || !IsEffectivelyOn(d))
+		{
+			return false;
+		}
+		return !string.Equals(EffectiveValue(d), "none", StringComparison.OrdinalIgnoreCase);
 	}
 
 	private static bool CompareValues(string v, string op, string target)
@@ -1667,7 +1710,7 @@ public partial class MainWindow : Window, IComponentConnector
 			list.AddRange(new string[2] { "--model", text2 });
 		}
 		string text3 = Cl(InputMtpPath.Text);
-		if (!string.IsNullOrEmpty(text3))
+		if (!string.IsNullOrEmpty(text3) && IsSpecDecodingActive())
 		{
 			list.AddRange(new string[2] { "--model-draft", text3 });
 		}
@@ -1731,6 +1774,26 @@ public partial class MainWindow : Window, IComponentConnector
 						text4
 					});
 				}
+			}
+		}
+		// "取消勾选=关闭"语义：对配置了 off 语义的参数，未勾选时显式发射关闭值/否定旗标，
+		// 覆盖 llama-server 默认值不是"关闭"的选项（如 --no-jinja、--flash-attn off、--spec-type none）
+		foreach (ParamDefinition paramDef in _paramDefs)
+		{
+			if (paramDef.Hidden || paramDef.Flag == "model" || paramDef.Flag == "model-draft" || on.Contains(paramDef.Flag))
+			{
+				continue;
+			}
+			if (paramDef.Type == ParamType.Bool)
+			{
+				if (!string.IsNullOrEmpty(paramDef.OffFlag))
+				{
+					list.Add("--" + paramDef.OffFlag);
+				}
+			}
+			else if (!string.IsNullOrEmpty(paramDef.OffValue))
+			{
+				list.AddRange(new string[2] { "--" + paramDef.Flag, paramDef.OffValue });
 			}
 		}
 		return list;
@@ -5356,7 +5419,7 @@ public partial class MainWindow : Window, IComponentConnector
 		{
 			Title = "新建方案",
 			Width = 350.0,
-			Height = 150.0,
+			SizeToContent = SizeToContent.Height,
 			WindowStartupLocation = WindowStartupLocation.CenterOwner,
 			Owner = this,
 			Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(22, 27, 34)),
@@ -5429,7 +5492,7 @@ public partial class MainWindow : Window, IComponentConnector
 		{
 			Title = "重命名方案",
 			Width = 350.0,
-			Height = 150.0,
+			SizeToContent = SizeToContent.Height,
 			WindowStartupLocation = WindowStartupLocation.CenterOwner,
 			Owner = this,
 			Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(22, 27, 34)),

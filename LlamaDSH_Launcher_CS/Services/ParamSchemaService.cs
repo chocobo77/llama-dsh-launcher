@@ -60,6 +60,12 @@ public class ParamOverride
 
 	public string? Tooltip { get; set; }
 
+	public string? Subgroup { get; set; }
+
+	public string? OffValue { get; set; }
+
+	public string? OffFlag { get; set; }
+
 	public List<ParamRule>? Requires { get; set; }
 
 	public List<string>? Conflicts { get; set; }
@@ -351,6 +357,9 @@ public static class ParamSchemaService
 					Options = op.Options,
 					Tooltip = op.Tooltip ?? "",
 					Role = op.Role,
+					Subgroup = op.Subgroup,
+					OffValue = op.OffValue,
+					OffFlag = op.OffFlag,
 					Requires = op.Requires,
 					Conflicts = op.Conflicts,
 					Implies = op.Implies,
@@ -372,6 +381,9 @@ public static class ParamSchemaService
 			if (op.Advanced != null) target.IsAdvanced = op.Advanced.Value;
 			if (op.Options != null) target.Options = op.Options;
 			if (op.Tooltip != null) target.Tooltip = op.Tooltip;
+			if (op.Subgroup != null) target.Subgroup = op.Subgroup;
+			if (op.OffValue != null) target.OffValue = op.OffValue;
+			if (op.OffFlag != null) target.OffFlag = op.OffFlag;
 			if (op.Requires != null) target.Requires = op.Requires;
 			if (op.Conflicts != null) target.Conflicts = op.Conflicts;
 			if (op.Implies != null) target.Implies = op.Implies;
