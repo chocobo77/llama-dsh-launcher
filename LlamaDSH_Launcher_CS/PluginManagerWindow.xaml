@@ -19,16 +19,24 @@
               SelectionChanged="PluginList_SelectionChanged"
               MouseDoubleClick="PluginList_MouseDoubleClick">
       <ListView.Resources>
-        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}" Color="#1f6feb" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}" Color="#ffffff" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}" Color="#264f78" />
         <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightBrushKey}" Color="#30363d" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightTextBrushKey}" Color="#e6edf3" />
         <Style TargetType="GridViewColumnHeader">
           <Setter Property="Background" Value="#161b22" />
           <Setter Property="Foreground" Value="#8b949e" />
           <Setter Property="BorderBrush" Value="#30363d" />
         </Style>
       </ListView.Resources>
+      <ListView.ItemContainerStyle>
+        <Style TargetType="ListViewItem">
+          <Setter Property="Foreground" Value="#c9d1d9" />
+          <Style.Triggers>
+            <Trigger Property="IsSelected" Value="True">
+              <Setter Property="Foreground" Value="#ffffff" />
+            </Trigger>
+          </Style.Triggers>
+        </Style>
+      </ListView.ItemContainerStyle>
       <ListView.View>
         <GridView>
           <GridViewColumn Header="插件" Width="230" DisplayMemberBinding="{Binding Name}" />
