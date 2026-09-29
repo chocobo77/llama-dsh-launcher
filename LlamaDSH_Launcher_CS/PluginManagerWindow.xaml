@@ -15,9 +15,20 @@
       <Button Name="BtnRefresh" Content="⟳ 刷新" DockPanel.Dock="Left" Width="80" Click="Refresh_Click" />
       <TextBlock Name="TxtHeader" Text="正在检测插件状态..." Foreground="#8b949e" VerticalAlignment="Center" Margin="10,0,0,0" TextTrimming="CharacterEllipsis" />
     </DockPanel>
-    <ListView Grid.Row="1" Name="PluginList" Background="#0d1117" BorderBrush="#30363d"
+    <ListView Grid.Row="1" Name="PluginList" Background="#0d1117" BorderBrush="#30363d" Foreground="#c9d1d9"
               SelectionChanged="PluginList_SelectionChanged"
               MouseDoubleClick="PluginList_MouseDoubleClick">
+      <ListView.Resources>
+        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}" Color="#1f6feb" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}" Color="#ffffff" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightBrushKey}" Color="#30363d" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightTextBrushKey}" Color="#e6edf3" />
+        <Style TargetType="GridViewColumnHeader">
+          <Setter Property="Background" Value="#161b22" />
+          <Setter Property="Foreground" Value="#8b949e" />
+          <Setter Property="BorderBrush" Value="#30363d" />
+        </Style>
+      </ListView.Resources>
       <ListView.View>
         <GridView>
           <GridViewColumn Header="插件" Width="230" DisplayMemberBinding="{Binding Name}" />
