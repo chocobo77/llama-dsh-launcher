@@ -390,6 +390,7 @@ public partial class MainWindow : Window, IComponentConnector
 				PlaceParamRow(grid, dockPanel, ref idx);
 				_paramRows.Add((expander, sg.Key, header, grid, dockPanel, item));
 				}
+				panel.Children.Add(grid);
 			}
 			expander.Content = panel;
 			ParamGroupsPanel.Children.Add(expander);
