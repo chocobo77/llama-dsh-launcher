@@ -136,6 +136,10 @@ public sealed class DshCompatReport
         public List<DshInjectFix> InjectFixes = new();
         /// <summary>可通过共享 node_modules junction 补齐的缺失 peer/依赖（键=包名，值=DSH 内实体目录）。</summary>
         public Dictionary<string, string> PeerJunctionFixes = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>死依赖：插件声明的 peer/依赖已被上游官方删除、不可满足（自动从 package.json 移除声明）。</summary>
+        public List<DshDeadPeerFix> DeadPeerFixes = new();
+        /// <summary>compatibility.json 中版本列表不含当前 DSH 版本的豁免条目（陈旧豁免，仅提示）。</summary>
+        public List<string> StaleExemptions = new();
         /// <summary>属于“被市场/载体误停用”的补丁行 id，修复时整块删除以恢复插件。</summary>
         public List<string> OrphanDisableIds = new();
         public bool MarketStateRepairNeeded;
@@ -178,6 +182,10 @@ public sealed class DshCompatRepairResult
         /// <summary>为重新启用插件而删除的纯禁用补丁块数量。</summary>
         public int RemovedDisableBlocks;
         public bool MarketStateChanged;
+        /// <summary>从 package.json 移除的死依赖声明数量（peer/devDependencies）。</summary>
+        public int DeadPeersRemoved;
+        /// <summary>从 compatibility.json 移除的陈旧豁免条目数量。</summary>
+        public int StaleExemptionsRemoved;
 }
 
 
@@ -1553,9 +1561,140 @@ public static class DshCompatService
                 log?.Invoke("[兼容] 补丁: 条目 " + blocks.Count + " 个，失效目标 " + dump.DeadPatchIds.Count + " 个");
         }
 
-        // ============================== 插件 peer / 解析 ==============================
+        // ============================== 死依赖（dead peer）判定 ==============================
 
-        private static void AuditPlugins(DshCompatReport r, Action<string>? log)
+        private static readonly Dictionary<string, HashSet<string>> _shippedNamesCache = new();
+
+        /// <summary>DSH 源码树中仍存在的包名集合（packages/** 与 apps/** 下的嵌套 package.json，排除 node_modules/.pnpm）。</summary>
+        public static HashSet<string> ShippedDshPackageNames(string dshDir)
+        {
+                lock (_shippedNamesCache)
+                {
+                        string key = Path.GetFullPath(dshDir);
+                        if (_shippedNamesCache.TryGetValue(key, out HashSet<string>? cached))
+                        {
+                                return cached;
+                        }
+                        HashSet<string> names = new HashSet<string>(StringComparer.Ordinal);
+                        foreach (string root in new[] { Path.Combine(dshDir, "packages"), Path.Combine(dshDir, "apps") })
+                        {
+                                if (!Directory.Exists(root))
+                                {
+                                        continue;
+                                }
+                                Stack<string> dirs = new();
+                                dirs.Push(root);
+                                while (dirs.Count > 0)
+                                {
+                                        string dir = dirs.Pop();
+                                        JsonNode? m = TryReadManifest(Path.Combine(dir, "package.json"));
+                                        string? n = m?["name"]?.ToString();
+                                        if (!string.IsNullOrEmpty(n))
+                                        {
+                                                names.Add(n!);
+                                        }
+                                        try
+                                        {
+                                                foreach (string sub in Directory.EnumerateDirectories(dir))
+                                                {
+                                                        string leaf = Path.GetFileName(sub);
+                                                        if (leaf == ".pnpm" || leaf == "node_modules")
+                                                        {
+                                                                continue;
+                                                        }
+                                                        dirs.Push(sub);
+                                                }
+                                        }
+                                        catch
+                                        {
+                                        }
+                                }
+                        }
+                        _shippedNamesCache[key] = names;
+                        return names;
+                }
+        }
+
+        /// <summary>判定 DSH 包是否已被上游删除（死依赖）：所有 node_modules farm 均未安装，且 DSH 源码树中已无该 workspace 包。</summary>
+        public static bool IsDshPackageDead(string packageName, string dshDir, string profileDir)
+        {
+                if (!packageName.StartsWith("@deepseek-ai/", StringComparison.Ordinal))
+                {
+                        return false; // 只判定 DSH 命名空间内的包
+                }
+                string shortName = packageName.Substring("@deepseek-ai/".Length);
+                List<string> farms = new()
+                {
+                        Path.Combine(dshDir, "node_modules"),
+                        Path.Combine(dshDir, "apps", "cli", "node_modules"),
+                        Path.Combine(dshDir, "apps", "web", "node_modules"),
+                        Path.Combine(dshDir, "apps", "desktop", "node_modules"),
+                        Path.Combine(dshDir, "apps", "desktop-host", "node_modules"),
+                        Path.Combine(profileDir, "node_modules")
+                };
+                string? profileParent = Path.GetDirectoryName(Path.GetFullPath(profileDir));
+                if (profileParent != null)
+                {
+                        farms.Insert(0, Path.Combine(profileParent, "node_modules")); // 共享 DSH 运行时 farm（.dsh/profiles/node_modules）
+                }
+                foreach (string farm in farms)
+                {
+                        if (Directory.Exists(Path.Combine(farm, "@deepseek-ai", shortName)))
+                        {
+                                return false;
+                        }
+                }
+                return !ShippedDshPackageNames(dshDir).Contains(packageName);
+        }
+
+        private static void AddDeadPeerFix(DshCompatReport r, DshPluginInfo info, string peerName)
+        {
+                bool exists = r.DeadPeerFixes.Any((DshDeadPeerFix f) =>
+                        f.PluginName == info.Name && f.PeerName == peerName);
+                if (exists)
+                {
+                        return;
+                }
+                r.DeadPeerFixes.Add(new DshDeadPeerFix
+                {
+                        PluginName = info.Name,
+                        PackageJsonPath = Path.Combine(info.Dir, "package.json"),
+                        PeerName = peerName
+                });
+        }
+
+        /// <summary>扫描 compatibility.json 豁免：对应插件已不再安装、或版本列表不含当前 DSH 版本的条目记为陈旧。</summary>
+        public static void ScanStaleExemptions(DshCompatReport r, Dictionary<string, List<string>> exemptions)
+        {
+                foreach (KeyValuePair<string, List<string>> kv in exemptions)
+                {
+                        int at = kv.Key.LastIndexOf('@');
+                        if (at <= 0 || at >= kv.Key.Length - 1)
+                        {
+                                continue;
+                        }
+                        string pname = kv.Key.Substring(0, at);
+                        string pver = kv.Key.Substring(at + 1);
+                        bool installed = r.Plugins.Any((DshPluginInfo x) => x.Installed && x.Name == pname && x.Version == pver);
+                        if (!installed)
+                        {
+                                r.StaleExemptions.Add(kv.Key);
+                                r.Add(DshCompatLevel.Warning, "豁免", "陈旧豁免条目: " + kv.Key,
+                                        "对应插件已不在 profile 中安装（或版本不符），该 compatibility.json 豁免不再生效；启动器可自动清理", true,
+                                        "从 compatibility.json 移除该条目");
+                        }
+                        else if (!kv.Value.Contains(r.DshVersion, StringComparer.Ordinal))
+                        {
+                                r.StaleExemptions.Add(kv.Key);
+                                r.Add(DshCompatLevel.Warning, "豁免", "陈旧豁免条目: " + kv.Key,
+                                        "该豁免的 DSH 版本列表（" + string.Join(", ", kv.Value) + "）不含当前 " + r.DshVersion + "；启动器可自动清理", true,
+                                        "从 compatibility.json 移除该条目");
+                        }
+                }
+        }
+
+        // ============================== 插件 peer / 解析 ==============================
+        public static void AuditPlugins(DshCompatReport r, Action<string>? log)
         {
                 Dictionary<string, List<string>> exemptions = ReadExemptions(r.ProfileDir);
 
@@ -1586,6 +1725,28 @@ public static class DshCompatService
                                         if (!SemverUtil.Satisfies(r.DshVersion, range))
                                         {
                                                 info.PeerIssues[pname] = range;
+                                                // peer 包已被 DSH 上游删除 → 不可满足的死依赖（自动移除声明）
+                                                if (IsDshPackageDead(pname, r.DshDir, r.ProfileDir))
+                                                {
+                                                        AddDeadPeerFix(r, info, pname);
+                                                }
+                                        }
+                                }
+                        }
+                        // devDependencies：不影响安装/运行，但指向已删除上游包的引用属死声明（如 dsh-invariants）
+                        JsonNode? devDeps = m["devDependencies"];
+                        if (devDeps is JsonObject ddpo)
+                        {
+                                foreach (KeyValuePair<string, JsonNode?> kv in ddpo)
+                                {
+                                        string pname = kv.Key;
+                                        if (!(pname == "@deepseek-ai/dsh" || pname.StartsWith("@deepseek-ai/dsh-", StringComparison.Ordinal)))
+                                        {
+                                                continue;
+                                        }
+                                        if (IsDshPackageDead(pname, r.DshDir, r.ProfileDir))
+                                        {
+                                                AddDeadPeerFix(r, info, pname);
                                         }
                                 }
                         }
@@ -1597,6 +1758,7 @@ public static class DshCompatService
                                 info.Compatible = true;
                         }
                 }
+                ScanStaleExemptions(r, exemptions);
 
                 MergeNodeProbe(r, log);
 
@@ -1613,16 +1775,33 @@ public static class DshCompatService
                                 && !info.Spec.StartsWith("link:", StringComparison.OrdinalIgnoreCase)
                                 && !info.Spec.StartsWith("workspace:", StringComparison.OrdinalIgnoreCase)
                                 && !Path.IsPathRooted(info.Spec);
-                        if (fromRegistry && !r.PluginsToUpgrade.Contains(info.Name, StringComparer.Ordinal))
+                        // 死 peer（包已被 DSH 上游删除）：升级无法解决，不进升级列表，改为自动移除声明
+                        bool hasDeadPeer = info.PeerIssues.Keys.Any((string k) =>
+                                r.DeadPeerFixes.Any((DshDeadPeerFix f) => f.PluginName == info.Name && f.PeerName == k));
+                        if (fromRegistry && !hasDeadPeer && !r.PluginsToUpgrade.Contains(info.Name, StringComparer.Ordinal))
                         {
                                 r.PluginsToUpgrade.Add(info.Name);
                         }
-                        string suggestion = fromRegistry
-                                ? "升级该插件到兼容版本（启动器可自动执行 pnpm add " + info.Name + "@latest）；或显式接受风险: dsh plugin --profile " + r.Profile + " allow-version " + info.Name + "@" + info.Version + " --dsh-version " + r.DshVersion + " --accept-risk"
-                                : "本地/源码安装（" + (info.Spec.Length > 0 ? info.Spec : "未知来源") + "），请在源码项目放宽 peerDependencies 并重新构建安装；或显式 allow-version 接受风险";
+                        string suggestion = hasDeadPeer
+                                ? "peer 包已被 DSH 上游删除，属不可满足的死依赖：从插件 package.json 移除该声明（启动器可自动移除）"
+                                : fromRegistry
+                                        ? "升级该插件到兼容版本（启动器可自动执行 pnpm add " + info.Name + "@latest）；或显式接受风险: dsh plugin --profile " + r.Profile + " allow-version " + info.Name + "@" + info.Version + " --dsh-version " + r.DshVersion + " --accept-risk"
+                                        : "本地/源码安装（" + (info.Spec.Length > 0 ? info.Spec : "未知来源") + "），请在源码项目放宽 peerDependencies 并重新构建安装；或显式 allow-version 接受风险";
                         r.Add(DshCompatLevel.Error, "插件", "插件与 DSH 不兼容: " + info.Name,
-                                "已安装 " + info.Name + "@" + info.Version + "，peer " + peers + "；" + suggestion, fromRegistry,
-                                fromRegistry ? "pnpm add " + info.Name + "@latest（先停止 DSH）" : "");
+                                "已安装 " + info.Name + "@" + info.Version + "，peer " + peers + "；" + suggestion, fromRegistry && !hasDeadPeer,
+                                hasDeadPeer ? "移除死依赖声明（先停止 DSH）" : (fromRegistry ? "pnpm add " + info.Name + "@latest（先停止 DSH）" : ""));
+                }
+                // 不影响兼容性的死依赖声明（仅 devDependencies）：提示并给出自动移除
+                foreach (DshDeadPeerFix fix in r.DeadPeerFixes)
+                {
+                        DshPluginInfo? owner = r.Plugins.FirstOrDefault((DshPluginInfo x) => x.Name == fix.PluginName);
+                        if (owner != null && owner.PeerIssues.ContainsKey(fix.PeerName))
+                        {
+                                continue; // 已由上面的“不兼容”报告覆盖
+                        }
+                        r.Add(DshCompatLevel.Warning, "依赖", "死依赖声明: " + fix.PluginName,
+                                fix.PluginName + " 的 devDependencies 引用了已被上游删除的 DSH 包 " + fix.PeerName + "（不在运行时路径）；启动器可自动移除该声明", true,
+                                "从该插件 package.json 移除 " + fix.PeerName);
                 }
 
                 // 规划：缺失 peer 中能从 DSH 安装内找到实体的 → 修复时在共享 node_modules 建 junction
@@ -2315,6 +2494,26 @@ process.stdout.write(JSON.stringify(out));
                                 string imsg = RepairInjectFixes(fresh, log);
                                 res.Messages.Add(imsg);
                                 log?.Invoke("[兼容修复] " + imsg);
+                        }
+                        // 3d) 死依赖声明：peer/devDep 引用已被 DSH 上游删除的包
+                        if (fresh.DeadPeerFixes.Count > 0)
+                        {
+                                int dremoved = RepairDeadPeerFixes(fresh, log);
+                                res.DeadPeersRemoved += dremoved;
+                                string msg = "死依赖清理: 移除 " + dremoved + " 条死声明（涉及 "
+                                        + fresh.DeadPeerFixes.Select((DshDeadPeerFix f) => f.PluginName).Distinct().Count() + " 个插件，改前已备份）";
+                                res.Messages.Add(msg);
+                                log?.Invoke("[兼容修复] " + msg);
+                        }
+
+                        // 3e) compatibility.json 陈旧豁免条目
+                        if (fresh.StaleExemptions.Count > 0)
+                        {
+                                int sremoved = RepairStaleExemptions(fresh, log);
+                                res.StaleExemptionsRemoved += sremoved;
+                                string msg = "豁免清理: 移除 compatibility.json 中 " + sremoved + " 条陈旧条目（改前已备份）";
+                                res.Messages.Add(msg);
+                                log?.Invoke("[兼容修复] " + msg);
                         }
 
                         // 4) node_modules 失效链接
@@ -3402,6 +3601,112 @@ process.stdout.write(JSON.stringify(out));
                 return "inject 修复: 改写 " + files + " 个入口文件（处理 " + changed + " 处）"
                         + (failed > 0 ? "，失败 " + failed : "") + "；改前已备份 .bak-compat-*";
         }
+        /// <summary>从插件 package.json 移除死依赖声明（peer/devDep 指向已被上游删除的包）。</summary>
+        public static int RepairDeadPeerFixes(DshCompatReport report, Action<string>? log)
+        {
+                int files = 0;
+                int changed = 0;
+                int failed = 0;
+                foreach (IGrouping<string, DshDeadPeerFix> group in report.DeadPeerFixes.GroupBy((DshDeadPeerFix f) => f.PackageJsonPath, StringComparer.OrdinalIgnoreCase))
+                {
+                        string path = group.Key;
+                        try
+                        {
+                                FileInfo fi = new FileInfo(path);
+                                if (!fi.Exists || fi.Length > 8000000)
+                                {
+                                        failed++;
+                                        continue;
+                                }
+                                JsonNode? root = TryReadManifest(path);
+                                if (root is not JsonObject jo)
+                                {
+                                        failed++;
+                                        continue;
+                                }
+                                bool any = false;
+                                foreach (DshDeadPeerFix fix in group)
+                                {
+                                        foreach (string section in new[] { "peerDependencies", "devDependencies" })
+                                        {
+                                                if (jo[section] is JsonObject sec && sec.Remove(fix.PeerName))
+                                                {
+                                                        any = true;
+                                                }
+                                        }
+                                }
+                                if (!any)
+                                {
+                                        continue; // 声明已不存在，无需改写
+                                }
+                                string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                                File.Copy(path, backup, true);
+                                string text = JsonSerializer.Serialize(jo, new JsonSerializerOptions
+                                {
+                                        WriteIndented = true,
+                                        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+                                });
+                                File.WriteAllText(path, text, new UTF8Encoding(false));
+                                files++;
+                                changed += group.Count();
+                                log?.Invoke("[兼容修复] 死依赖已移除: " + path + "（" + string.Join(", ", group.Select((DshDeadPeerFix f) => f.PeerName)) + "，备份 " + Path.GetFileName(backup) + "）");
+                        }
+                        catch (Exception ex)
+                        {
+                                failed++;
+                                log?.Invoke("[兼容修复] 死依赖移除失败: " + path + " —— " + ex.Message);
+                        }
+                }
+                if (files > 0 || failed > 0)
+                {
+                        log?.Invoke("[兼容修复] 死依赖清理: 改写 " + files + " 个 package.json（处理 " + changed + " 条声明）" + (failed > 0 ? "，失败 " + failed : ""));
+                }
+                return changed;
+        }
+
+        /// <summary>从 compatibility.json 移除陈旧豁免条目（插件已不再安装 / 版本列表不含当前 DSH）。</summary>
+        public static int RepairStaleExemptions(DshCompatReport report, Action<string>? log)
+        {
+                string path = Path.Combine(report.ProfileDir, "compatibility.json");
+                if (!File.Exists(path))
+                {
+                        return 0;
+                }
+                int removed = 0;
+                try
+                {
+                        JsonNode? root = TryReadManifest(path);
+                        if (root is not JsonObject jo)
+                        {
+                                return 0;
+                        }
+                        foreach (string key in report.StaleExemptions)
+                        {
+                                if (jo.Remove(key))
+                                {
+                                        removed++;
+                                }
+                        }
+                        if (removed == 0)
+                        {
+                                return 0;
+                        }
+                        string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                        File.Copy(path, backup, true);
+                        string text = JsonSerializer.Serialize(jo, new JsonSerializerOptions
+                        {
+                                WriteIndented = true,
+                                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+                        });
+                        File.WriteAllText(path, text, new UTF8Encoding(false));
+                        log?.Invoke("[兼容修复] 陈旧豁免已移除: " + path + "（" + string.Join(", ", report.StaleExemptions) + "，备份 " + Path.GetFileName(backup) + "）");
+                }
+                catch (Exception ex)
+                {
+                        log?.Invoke("[兼容修复] 陈旧豁免清理失败 —— " + ex.Message);
+                }
+                return removed;
+        }
 
 }
 
@@ -3414,5 +3719,13 @@ public sealed class DshInjectFix
         public string Replacement = "";
         public string RowId = "";
         public string Module = "";
+}
+
+/// <summary>一条可自动修复的死依赖：插件声明的 peer/依赖指向已被上游官方删除的 DSH 包（不可满足）。</summary>
+public sealed class DshDeadPeerFix
+{
+        public string PluginName = "";
+        public string PackageJsonPath = "";
+        public string PeerName = "";
 }
 
