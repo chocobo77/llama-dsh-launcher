@@ -132,6 +132,8 @@ public sealed class DshCompatReport
         public List<string> ReenabledPlugins = new();
         /// <summary>peer 与 DSH 版本不兼容、且来自 npm registry（可 pnpm add @latest 升级）的插件名。</summary>
         public List<string> PluginsToUpgrade = new();
+        /// <summary>入口文件 inject 里声明了、但当前 DSH 永不解析的服务名（自动删除/改名）。</summary>
+        public List<DshInjectFix> InjectFixes = new();
         /// <summary>可通过共享 node_modules junction 补齐的缺失 peer/依赖（键=包名，值=DSH 内实体目录）。</summary>
         public Dictionary<string, string> PeerJunctionFixes = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>属于“被市场/载体误停用”的补丁行 id，修复时整块删除以恢复插件。</summary>
@@ -912,6 +914,10 @@ public static class DshCompatService
                         // 3) cordis.patch.yml 静态检查（结合 dead id）
                         AuditPatchFile(r, dump, log);
 
+                        // 3b) 插件行 inject 永不解析（fiber 永久 pending）+ bundle 补丁裸 id 静默失效
+                        AuditInject(r, dump, log);
+                        AuditBundlePatchRows(r, dump, log);
+
                         // 4) 插件 peer 兼容 + 解析
                         AuditPlugins(r, log);
 
@@ -945,6 +951,8 @@ public static class DshCompatService
                 public string StdOut = "";
                 public string StdErr = "";
                 public HashSet<string> EntryIds = new(StringComparer.Ordinal);
+                /// <summary>合成树里的每个 loader 行：(行 id, 模块名 name)。字面 disabled: true 的行不入内。</summary>
+                public List<(string RowId, string ModuleName)> Rows = new();
                 public HashSet<string> DeadPatchIds = new(StringComparer.Ordinal);
                 public HashSet<string> NameMismatchIds = new(StringComparer.Ordinal);
                 public List<string> BundleWarnings = new();
@@ -986,6 +994,8 @@ public static class DshCompatService
 
         private static void ParseDumpOutput(DumpData d)
         {
+                d.Rows.Clear();
+                d.Rows.AddRange(ParseDumpRows(d.StdOut));
                 foreach (string raw in (d.StdOut ?? "").Replace("\r\n", "\n").Split('\n'))
                 {
                         Match m = Regex.Match(raw, @"^\s*-\s+id:\s*(.+?)\s*$");
@@ -1375,7 +1385,7 @@ public static class DshCompatService
                                 {
                                         b.Id = idm.Groups["id"].Value.Trim().Trim('\'', '"');
                                 }
-                                if (Regex.IsMatch(lines[k], @"^\s*insert:\s*$") || Regex.IsMatch(lines[k], @"^\s*insert:\s*\S"))
+                                if (Regex.IsMatch(lines[k], @"^\s*(?:-\s*)?insert\s*:"))
                                 {
                                         b.HasInsert = true;
                                 }
@@ -2299,6 +2309,14 @@ process.stdout.write(JSON.stringify(out));
                                 log?.Invoke("[兼容修复] " + mmsg);
                         }
 
+                        // 3c) 入口文件里永不解析的 inject 服务名
+                        if (fresh.InjectFixes.Count > 0)
+                        {
+                                string imsg = RepairInjectFixes(fresh, log);
+                                res.Messages.Add(imsg);
+                                log?.Invoke("[兼容修复] " + imsg);
+                        }
+
                         // 4) node_modules 失效链接
                         (int relinked, int removed, int failed) = RepairLinks(fresh, log);
                         res.RelinkedLinks = relinked;
@@ -2767,4 +2785,634 @@ process.stdout.write(JSON.stringify(out));
                         return false;
                 }
         }
+
+        // ============================== inject 服务 / bundle 补丁裸 id ==============================
+
+        /// <summary>bundle 补丁文件里的行 id：insert 块插入的 id，与只覆盖已有行的顶层裸 id。</summary>
+        public sealed class DshBundlePatchIds
+        {
+                public List<string> InsertIds = new();
+                public List<string> BareIds = new();
+        }
+
+        /// <summary>
+        /// 从 --dump-config 输出解析每个 loader 行：(行 id, 紧随其后的模块名 name)。
+        /// name 带缩进或不带都接受；行体内出现字面 disabled: true 的行视为未挂载，跳过。
+        /// </summary>
+        public static List<(string RowId, string ModuleName)> ParseDumpRows(string? stdout)
+        {
+                List<(string RowId, string ModuleName)> rows = new List<(string, string)>();
+                string[] lines = (stdout ?? "").Replace("\r\n", "\n").Split('\n');
+                for (int i = 0; i < lines.Length; i++)
+                {
+                        Match m = Regex.Match(lines[i], @"^(\s*)-\s+id:\s*(?<id>.+?)\s*$");
+                        if (!m.Success)
+                        {
+                                continue;
+                        }
+                        string id = m.Groups["id"].Value.Trim().Trim('\'', '"');
+                        if (id.Length == 0)
+                        {
+                                continue;
+                        }
+                        int baseIndent = m.Groups[1].Value.Length;
+                        string name = "";
+                        bool disabled = false;
+                        for (int j = i + 1; j < lines.Length && j <= i + 24; j++)
+                        {
+                                string line = lines[j];
+                                if (line.Trim().Length == 0)
+                                {
+                                        break;
+                                }
+                                string trimmed = line.TrimStart();
+                                int indent = line.Length - trimmed.Length;
+                                if (trimmed.StartsWith("#", StringComparison.Ordinal))
+                                {
+                                        break;
+                                }
+                                if (indent <= baseIndent && trimmed.StartsWith("- ", StringComparison.Ordinal))
+                                {
+                                        break;
+                                }
+                                if (indent <= baseIndent + 2)
+                                {
+                                        if (Regex.IsMatch(trimmed, @"^disabled:\s*true\s*$"))
+                                        {
+                                                disabled = true;
+                                                break;
+                                        }
+                                        Match nm = Regex.Match(trimmed, @"^name:\s*(?<v>.+?)\s*$");
+                                        if (nm.Success && name.Length == 0)
+                                        {
+                                                name = nm.Groups["v"].Value.Trim().Trim('\'', '"');
+                                        }
+                                }
+                        }
+                        if (disabled || name.Length == 0)
+                        {
+                                continue;
+                        }
+                        rows.Add((id, name));
+                }
+                return rows;
+        }
+
+        /// <summary>
+        /// 从插件入口 js 文本提取 inject 声明的服务名。支持单引号/双引号、跨行缩进
+        /// 与 inject: [...] 形式；只认 inject 数组本身，不递归其它数组。
+        /// </summary>
+        public static List<string> ExtractInjectNames(string? jsText)
+        {
+                List<string> names = new List<string>();
+                string text = jsText ?? "";
+                foreach ((int start, int length) in FindInjectArraySpans(text))
+                {
+                        if (start < 0 || length <= 0 || start + length > text.Length)
+                        {
+                                continue;
+                        }
+                        string body = text.Substring(start, length);
+                        foreach (Match m in Regex.Matches(body, "['\"](?<n>[A-Za-z_$][A-Za-z0-9_$.-]*)['\"]"))
+                        {
+                                string n = m.Groups["n"].Value;
+                                if (n.Length > 0 && !names.Contains(n, StringComparer.Ordinal))
+                                {
+                                        names.Add(n);
+                                }
+                        }
+                }
+                return names;
+        }
+
+        /// <summary>定位文本里每个 inject 数组的括号内容区（左闭右开偏移）。</summary>
+        private static List<(int Start, int Length)> FindInjectArraySpans(string text)
+        {
+                List<(int Start, int Length)> spans = new List<(int, int)>();
+                if (text.Length == 0)
+                {
+                        return spans;
+                }
+                foreach (Match m in Regex.Matches(text, @"(?<![\w$.])inject\s*[:=]\s*\["))
+                {
+                        int open = m.Index + m.Length - 1;
+                        int depth = 0;
+                        for (int k = open; k < text.Length && k - open < 20000; k++)
+                        {
+                                if (text[k] == '[')
+                                {
+                                        depth++;
+                                }
+                                else if (text[k] == ']')
+                                {
+                                        depth--;
+                                        if (depth == 0)
+                                        {
+                                                spans.Add((open + 1, k - open - 1));
+                                                break;
+                                        }
+                                }
+                        }
+                }
+                return spans;
+        }
+
+        /// <summary>
+        /// 从入口文本的 inject 数组里删除（或改名）一个服务名，返回新文本。
+        /// 只改 inject 数组内的字符串字面量，绝不碰 ctx.logger 这类运行时引用。
+        /// </summary>
+        public static string RemoveFromInjectService(string text, string service, string replacement, out int count)
+        {
+                count = 0;
+                if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(service))
+                {
+                        return text;
+                }
+                List<(int Start, int Length)> spans = FindInjectArraySpans(text);
+                for (int i = spans.Count - 1; i >= 0; i--)
+                {
+                        int start = spans[i].Start;
+                        int length = spans[i].Length;
+                        if (start < 0 || length < 0 || start + length > text.Length)
+                        {
+                                continue;
+                        }
+                        string body = text.Substring(start, length);
+                        string dq = "\"" + service + "\"";
+                        string sq = "'" + service + "'";
+                        int at = body.IndexOf(dq, StringComparison.Ordinal);
+                        int len = dq.Length;
+                        if (at < 0)
+                        {
+                                at = body.IndexOf(sq, StringComparison.Ordinal);
+                                len = sq.Length;
+                        }
+                        if (at < 0)
+                        {
+                                continue;
+                        }
+                        string quote = body[at] == '\'' ? "'" : "\"";
+                        string newBody;
+                        if (replacement.Length > 0)
+                        {
+                                newBody = body.Substring(0, at) + quote + replacement + quote + body.Substring(at + len);
+                        }
+                        else
+                        {
+                                newBody = CleanupInjectArray(body.Remove(at, len));
+                        }
+                        text = text.Substring(0, start) + newBody + text.Substring(start + length);
+                        count++;
+                }
+                return text;
+        }
+
+        /// <summary>删掉一个数组元素后收拾多余逗号（保留尾逗号之外的空格与换行）。</summary>
+        private static string CleanupInjectArray(string body)
+        {
+                string prev;
+                do
+                {
+                        prev = body;
+                        body = Regex.Replace(body, @",\s*,", ",");
+                        body = Regex.Replace(body, @"^\s*,", "");
+                        body = Regex.Replace(body, @",\s*$", "");
+                }
+                while (!string.Equals(body, prev, StringComparison.Ordinal));
+                return body;
+        }
+
+        /// <summary>
+        /// 把 loader 行的模块名（包名，或 包名/子路径）解析成真正会执行的入口 js 文件：
+        /// 按 package.json exports（含条件对象）→ module → main → 约定 index.js 逐级回退。
+        /// </summary>
+        public static string? ResolveModuleEntryFile(string moduleName, string dshDir, string profileDir)
+        {
+                string name = (moduleName ?? "").Trim();
+                if (name.Length == 0)
+                {
+                        return null;
+                }
+                string pkgName = name;
+                string subPath = "";
+                int slash = name.IndexOf('/');
+                if (name.StartsWith("@", StringComparison.Ordinal))
+                {
+                        int second = slash >= 0 ? name.IndexOf('/', slash + 1) : -1;
+                        if (second > 0)
+                        {
+                                pkgName = name.Substring(0, second);
+                                subPath = name.Substring(second + 1);
+                        }
+                }
+                else if (slash > 0)
+                {
+                        pkgName = name.Substring(0, slash);
+                        subPath = name.Substring(slash + 1);
+                }
+                string? dir = ResolveInstalledPackageDir(pkgName, profileDir, dshDir)
+                        ?? FindPackageDir(pkgName, dshDir, profileDir);
+                if (dir == null || !Directory.Exists(dir))
+                {
+                        return null;
+                }
+                try
+                {
+                        JsonNode? manifest = TryReadManifest(Path.Combine(dir, "package.json"));
+                        if (manifest != null)
+                        {
+                                string key = subPath.Length == 0 ? "." : "./" + subPath;
+                                string? rel = null;
+                                if (manifest["exports"] is JsonObject exports
+                                        && exports.TryGetPropertyValue(key, out JsonNode? entry))
+                                {
+                                        rel = ExportTargetPath(entry);
+                                }
+                                if (rel == null && subPath.Length == 0)
+                                {
+                                        rel = ExportTargetPath(manifest["exports"])
+                                                ?? ExportTargetPath(manifest["module"])
+                                                ?? ExportTargetPath(manifest["main"]);
+                                }
+                                if (rel != null)
+                                {
+                                        string? file = ResolveRelativeFile(dir, rel);
+                                        if (file != null)
+                                        {
+                                                return file;
+                                        }
+                                }
+                        }
+                }
+                catch
+                {
+                }
+                return ResolveRelativeFile(dir, subPath.Length == 0 ? "index.js" : subPath);
+        }
+
+        /// <summary>从 exports 目标值（字符串，或 default/import/require 条件对象）取默认入口路径。</summary>
+        private static string? ExportTargetPath(JsonNode? node)
+        {
+                for (int depth = 0; node != null && depth < 5; depth++)
+                {
+                        if (node is JsonValue value)
+                        {
+                                try
+                                {
+                                        string s = value.GetValue<string>();
+                                        return string.IsNullOrWhiteSpace(s) ? null : s;
+                                }
+                                catch
+                                {
+                                        return null;
+                                }
+                        }
+                        if (node is not JsonObject obj)
+                        {
+                                return null;
+                        }
+                        JsonNode? next = null;
+                        foreach (string key in new[] { "default", "import", "module", "require", "node" })
+                        {
+                                if (obj.TryGetPropertyValue(key, out JsonNode? candidate) && candidate != null)
+                                {
+                                        next = candidate;
+                                        break;
+                                }
+                        }
+                        node = next;
+                }
+                return null;
+        }
+
+        /// <summary>把包内相对路径解析成存在的文件（补 .js/.mjs/.cjs 扩展名与 index 回退）。</summary>
+        private static string? ResolveRelativeFile(string dir, string rel)
+        {
+                if (string.IsNullOrWhiteSpace(rel))
+                {
+                        return null;
+                }
+                try
+                {
+                        string path = Path.GetFullPath(Path.Combine(dir, rel.Replace('/', Path.DirectorySeparatorChar)));
+                        if (File.Exists(path))
+                        {
+                                return path;
+                        }
+                        foreach (string ext in new[] { ".js", ".mjs", ".cjs" })
+                        {
+                                if (File.Exists(path + ext))
+                                {
+                                        return path + ext;
+                                }
+                        }
+                        foreach (string index in new[] { "index.js", "index.mjs", "index.cjs" })
+                        {
+                                string candidate = Path.Combine(path, index);
+                                if (File.Exists(candidate))
+                                {
+                                        return candidate;
+                                }
+                        }
+                }
+                catch
+                {
+                }
+                return null;
+        }
+
+        /// <summary>
+        /// 逐行检查合成树里的 loader 行：入口文件 inject 里若声明了当前 DSH 永不解析的服务名，
+        /// 该行会永久 pending（apply 从不执行）。logger 任何 cordis 4 版本都错；
+        /// webRuntime 自 0.2.1-alpha.1 被 webStartup 取代；invariants 自 0.2.0-rc.2 整包删除。
+        /// </summary>
+        private static void AuditInject(DshCompatReport r, DumpData dump, Action<string>? log)
+        {
+                if (!dump.Ran || dump.Rows.Count == 0)
+                {
+                        log?.Invoke("[兼容] inject 检查: 跳过（无 --dump-config 行）");
+                        return;
+                }
+                int resolved = 0;
+                HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+                foreach ((string rowId, string moduleName) in dump.Rows)
+                {
+                        string? entry = ResolveModuleEntryFile(moduleName, r.DshDir, r.ProfileDir);
+                        if (entry == null)
+                        {
+                                continue;
+                        }
+                        resolved++;
+                        string text;
+                        try
+                        {
+                                FileInfo fi = new FileInfo(entry);
+                                if (!fi.Exists || fi.Length > 8000000)
+                                {
+                                        continue;
+                                }
+                                text = File.ReadAllText(entry, Encoding.UTF8);
+                        }
+                        catch
+                        {
+                                continue;
+                        }
+                        foreach (string service in ExtractInjectNames(text))
+                        {
+                                string replacement = "";
+                                string reason;
+                                if (string.Equals(service, "logger", StringComparison.Ordinal))
+                                {
+                                        reason = "cordis 4 里 ctx.logger 是上下文普通属性、不是可注入服务（ctx.get('logger') 为 undefined）";
+                                }
+                                else if (string.Equals(service, "webRuntime", StringComparison.Ordinal)
+                                        && SemverUtil.Satisfies(r.DshVersion, ">=0.2.1-alpha.1"))
+                                {
+                                        reason = "DSH " + r.DshVersion + " 起 Web profile 不再提供 webRuntime，改由 web-startup 行提供 webStartup";
+                                        replacement = "webStartup";
+                                }
+                                else if (string.Equals(service, "invariants", StringComparison.Ordinal)
+                                        && SemverUtil.Satisfies(r.DshVersion, ">=0.2.0-rc.2"))
+                                {
+                                        reason = "@deepseek-ai/dsh-invariants 与 invariants 服务自 DSH 0.2.0-rc.2 起已整包删除";
+                                }
+                                else
+                                {
+                                        continue;
+                                }
+                                string key = entry.ToLowerInvariant() + "|" + service;
+                                if (!seen.Add(key))
+                                {
+                                        continue;
+                                }
+                                r.InjectFixes.Add(new DshInjectFix
+                                {
+                                        File = entry,
+                                        Service = service,
+                                        Replacement = replacement,
+                                        RowId = rowId,
+                                        Module = moduleName
+                                });
+                                string fixHint = replacement.Length > 0
+                                        ? "把入口 inject 里的 " + service + " 改名为 " + replacement + "（改前自动备份 .bak-compat-*）"
+                                        : "从入口 inject 里删除 " + service + "（改前自动备份 .bak-compat-*）";
+                                r.Add(DshCompatLevel.Error, "插件", "插件行 inject 永不解析: " + rowId + " → " + service,
+                                        "行 id " + rowId + "（模块 " + moduleName + "）的入口 " + entry
+                                        + " 把 " + service + " 列在 inject 中：" + reason
+                                        + "，该行会一直 pending、插件永不生效（--dump-config 不报错）", true, fixHint);
+                        }
+                }
+                log?.Invoke("[兼容] inject 检查: dump 行 " + dump.Rows.Count + " 个，定位入口 " + resolved
+                        + " 个，问题 " + r.InjectFixes.Count + " 项");
+        }
+
+        /// <summary>安全读取 JSON 字符串标量；数组/对象/数字返回 null 而不抛异常。</summary>
+        private static string? NodeString(JsonNode? node)
+        {
+                if (node is not JsonValue value)
+                {
+                        return null;
+                }
+                try
+                {
+                        string s = value.GetValue<string>();
+                        return string.IsNullOrWhiteSpace(s) ? null : s;
+                }
+                catch
+                {
+                        return null;
+                }
+        }
+
+        /// <summary>
+        /// 读取 bundle 声明的补丁文件（含约定 cordis.patch.yml）里的 id：
+        /// insert 块内插入的 id，与顶层裸 - id:（只覆盖已有行、不插入新行）。
+        /// </summary>
+        public static DshBundlePatchIds BundlePatchIds(string packageDir)
+        {
+                DshBundlePatchIds res = new DshBundlePatchIds();
+                if (string.IsNullOrEmpty(packageDir) || !Directory.Exists(packageDir))
+                {
+                        return res;
+                }
+                List<string> files = new List<string>();
+                JsonNode? manifest = TryReadManifest(Path.Combine(packageDir, "package.json"));
+                JsonNode? patchNode = null;
+                try
+                {
+                        patchNode = manifest?["dsh"]?["bundle"]?["patch"];
+                }
+                catch
+                {
+                        patchNode = null;
+                }
+                if (patchNode is JsonArray patchArray)
+                {
+                        foreach (JsonNode? node in patchArray)
+                        {
+                                string? rel = NodeString(node);
+                                if (!string.IsNullOrWhiteSpace(rel))
+                                {
+                                        files.Add(Path.Combine(packageDir, rel!));
+                                }
+                        }
+                }
+                else
+                {
+                        string? declared = NodeString(patchNode);
+                        if (!string.IsNullOrWhiteSpace(declared))
+                        {
+                                files.Add(Path.Combine(packageDir, declared!));
+                        }
+                }
+                string conventional = Path.Combine(packageDir, "cordis.patch.yml");
+                if (File.Exists(conventional) && !files.Contains(conventional, StringComparer.OrdinalIgnoreCase))
+                {
+                        files.Add(conventional);
+                }
+                foreach (string file in files)
+                {
+                        if (!File.Exists(file))
+                        {
+                                continue;
+                        }
+                        try
+                        {
+                                bool inInsert = false;
+                                foreach (string raw in File.ReadAllLines(file, Encoding.UTF8))
+                                {
+                                        if (Regex.IsMatch(raw, @"^-\s*insert\s*:"))
+                                        {
+                                                inInsert = true;
+                                                continue;
+                                        }
+                                        if (Regex.IsMatch(raw, @"^-\s"))
+                                        {
+                                                inInsert = false;
+                                        }
+                                        Match m = Regex.Match(raw, @"^\s*-\s*id:\s*(?<id>.+?)\s*$");
+                                        if (!m.Success)
+                                        {
+                                                continue;
+                                        }
+                                        string id = m.Groups["id"].Value.Trim().Trim('\'', '"');
+                                        if (id.Length == 0)
+                                        {
+                                                continue;
+                                        }
+                                        if (inInsert)
+                                        {
+                                                if (!res.InsertIds.Contains(id, StringComparer.Ordinal))
+                                                {
+                                                        res.InsertIds.Add(id);
+                                                }
+                                        }
+                                        else if (Regex.IsMatch(raw, @"^-\s*id:"))
+                                        {
+                                                if (!res.BareIds.Contains(id, StringComparer.Ordinal))
+                                                {
+                                                        res.BareIds.Add(id);
+                                                }
+                                        }
+                                }
+                        }
+                        catch
+                        {
+                        }
+                }
+                return res;
+        }
+
+        /// <summary>
+        /// 检出静默失效的 bundle 补丁：顶层裸 - id: X 只覆盖已有行，绝不会插入新行，
+        /// 且 id 不存在时 DSH 连 stderr 都不报（dsh-rea 的真实案例）。判据：
+        /// 该文件里的裸 id X 既不在合成树中，也不在该文件 insert 块的 id 集合里。
+        /// </summary>
+        private static void AuditBundlePatchRows(DshCompatReport r, DumpData dump, Action<string>? log)
+        {
+                if (!dump.Ran)
+                {
+                        return;
+                }
+                int suspicious = 0;
+                foreach (DshPluginInfo info in r.Plugins.Where((DshPluginInfo x) => x.Installed && x.IsBundle && x.Dir.Length > 0))
+                {
+                        DshBundlePatchIds ids = BundlePatchIds(info.Dir);
+                        foreach (string id in ids.BareIds)
+                        {
+                                if (dump.EntryIds.Contains(id))
+                                {
+                                        continue;
+                                }
+                                if (ids.InsertIds.Contains(id, StringComparer.Ordinal))
+                                {
+                                        continue;
+                                }
+                                suspicious++;
+                                r.Add(DshCompatLevel.Warning, "补丁", "补丁裸 id 从未插入新行: " + id,
+                                        "bundle " + info.Name + " 的补丁文件用顶层 - id: " + id
+                                        + " 定义了一行，但该 id 既不在合成树（--dump-config）里，也不在该文件的 insert 块里；"
+                                        + "裸 - id: 只覆盖已有行，新增行必须写成 - insert: 再在内层列 - id:（DSH 对此静默通过）",
+                                        false, "把该条目包成 - insert: 块（内层 - id:/name: 缩进）");
+                        }
+                }
+                log?.Invoke("[兼容] bundle 补丁裸 id 检查: 可疑 " + suspicious + " 条");
+        }
+
+        /// <summary>按 inject 审计结论改写入口文件：删除永不解析的服务名（webRuntime 改名为 webStartup）。</summary>
+        private static string RepairInjectFixes(DshCompatReport report, Action<string>? log)
+        {
+                int files = 0;
+                int changed = 0;
+                int failed = 0;
+                foreach (IGrouping<string, DshInjectFix> group in report.InjectFixes.GroupBy((DshInjectFix f) => f.File, StringComparer.OrdinalIgnoreCase))
+                {
+                        string path = group.Key;
+                        try
+                        {
+                                FileInfo fi = new FileInfo(path);
+                                if (!fi.Exists || fi.Length > 8000000)
+                                {
+                                        failed++;
+                                        continue;
+                                }
+                                string text = File.ReadAllText(path, Encoding.UTF8);
+                                string original = text;
+                                foreach (DshInjectFix fix in group)
+                                {
+                                        text = RemoveFromInjectService(text, fix.Service, fix.Replacement, out int n);
+                                        changed += n;
+                                }
+                                if (string.Equals(text, original, StringComparison.Ordinal))
+                                {
+                                        continue;
+                                }
+                                string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                                File.Copy(path, backup, true);
+                                File.WriteAllText(path, text, new UTF8Encoding(false));
+                                files++;
+                                log?.Invoke("[兼容修复] inject 已改写: " + path + "（备份 " + Path.GetFileName(backup) + "）");
+                        }
+                        catch (Exception ex)
+                        {
+                                failed++;
+                                log?.Invoke("[兼容修复] inject 改写失败: " + path + " —— " + ex.Message);
+                        }
+                }
+                return "inject 修复: 改写 " + files + " 个入口文件（处理 " + changed + " 处）"
+                        + (failed > 0 ? "，失败 " + failed : "") + "；改前已备份 .bak-compat-*";
+        }
+
 }
+
+/// <summary>一条可自动修复的 inject 服务名：入口文件、服务名与改法。</summary>
+public sealed class DshInjectFix
+{
+        public string File = "";
+        public string Service = "";
+        /// <summary>非空表示"改名"，为空表示"删除"。</summary>
+        public string Replacement = "";
+        public string RowId = "";
+        public string Module = "";
+}
+
