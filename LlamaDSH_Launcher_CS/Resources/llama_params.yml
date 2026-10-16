@@ -1,12 +1,12 @@
 # =====================================================================
 # LlamaDSH 启动器 · llama.cpp 启动参数配置（唯一升级入口）
 # 加载顺序: 内置默认 → 本文件(优先) → ~/.llamadsh/params_override.yml(差异覆盖)
-# 最后更新: 2026-08-31 (基于 llama.cpp b10441+ / v0.3.0)
+# 最后更新: 2026-10-16 (基于 llama-server 0.7.0-dev / build 11675 的 --help 复核)
 # 核心功能: 思考强度控制 (reasoning / reasoning-effort / reasoning-budget / reasoning-preserve)
 # =====================================================================
 meta:
   schema: 7
-  adapt: "llama-server 0.5.0-dev (b11243, fc07d781e) 已验证 · schema v7（2026-09-29 全量 238 参数逐条宽度评审：+13 wide / -1 wide；v6 长值参数通栏宽行 wide；v5 顶层分组照搬官方分节，子组按官方 help 顺序切块）"
+  adapt: "llama-server 0.7.0-dev (build 11675, 2851b3bcb) 实测对齐 · schema v7（2026-10-16 按 --help 复核：7 个 <0|1> 参数 Bool→Combo、numa 去掉非法 disabled、折叠重复 subgroup；<0|1> 裸旗标会 invalid stoul argument）"
   notes: >
     llama.cpp 更新时的维护方法（改完点启动器"⟳ 重载参数配置"即时生效）:
     1. 新增参数: 在 params 下加一条, 必填 flag/label/type/default/group
@@ -40,7 +40,6 @@ params:
   # ================================================================
   - flag: alias
     subgroup: 模型来源
-    subgroup: 模型来源
     label: 别名 (Alias)
     type: String
     default: "qwen3.8-27b"
@@ -50,7 +49,6 @@ params:
     tooltip: "模型别名，用于 API 返回中的 model 字段标识。建议设为模型简称，方便上层应用识别。"
 
   - flag: host
-    subgroup: 服务监听与安全
     subgroup: 服务监听与安全
     label: 主机 (Host)
     role: host
@@ -62,7 +60,6 @@ params:
 
   - flag: port
     subgroup: 服务监听与安全
-    subgroup: 服务监听与安全
     label: 端口 (Port)
     role: port
     type: String
@@ -73,7 +70,6 @@ params:
 
   - flag: timeout
     subgroup: 服务监听与安全
-    subgroup: 服务监听与安全
     label: 超时 (Timeout)
     type: String
     default: "600"
@@ -82,7 +78,6 @@ params:
     tooltip: "llama-server 读写超时（秒）。超时后断开空闲连接。长文本生成建议 >=300s，多轮对话建议 600s。设为 0 表示永不超时。"
 
   - flag: ctx-size
-    subgroup: 上下文与批处理
     subgroup: 上下文与批处理
     label: 上下文大小 (Context)
     role: ctx_size
@@ -94,7 +89,6 @@ params:
 
   - flag: keep
     subgroup: 上下文与批处理
-    subgroup: 上下文与批处理
     label: 保留 Token 数
     type: String
     default: "0"
@@ -102,7 +96,6 @@ params:
     tooltip: "从初始提示中保留的 token 数量。0=不保留，-1=全部保留。用于在多轮对话中保留系统提示等固定前缀。"
 
   - flag: batch-size
-    subgroup: 上下文与批处理
     subgroup: 上下文与批处理
     label: 批处理大小 (Batch Size)
     role: batch_size
@@ -113,7 +106,6 @@ params:
     tooltip: "逻辑最大批处理大小。控制 prompt 处理时一次送入模型的 token 上限。增大可加速 prompt 处理但增加显存占用。默认 2048，24GB 显卡建议 2048~4096。"
 
   - flag: ubatch-size
-    subgroup: 上下文与批处理
     subgroup: 上下文与批处理
     label: 微批大小 (Ubatch)
     role: ubatch_size
@@ -126,7 +118,6 @@ params:
 
   - flag: threads
     subgroup: 进程与 CPU 亲和
-    subgroup: 进程与 CPU 亲和
     label: 线程数 (Threads)
     role: threads
     type: String
@@ -136,7 +127,6 @@ params:
     tooltip: "生成阶段使用的 CPU 线程数。默认 -1 = 自动（使用全部物理核心）。建议设为 CPU 物理核心数（不含超线程），过多反而因上下文切换降低性能。"
 
   - flag: gpu-layers
-    subgroup: 后端与显存
     subgroup: 后端与显存
     label: GPU 层数
     role: ngl
@@ -149,7 +139,6 @@ params:
 
   - flag: main-gpu
     subgroup: 后端与显存
-    subgroup: 后端与显存
     label: 主 GPU 编号
     type: String
     default: "0"
@@ -159,7 +148,6 @@ params:
 
   - flag: threads-http
     subgroup: 服务管理
-    subgroup: 服务管理
     label: HTTP 线程数
     type: String
     default: "-1"
@@ -167,7 +155,6 @@ params:
     tooltip: "处理 HTTP 请求的线程数。默认 -1 = 自动（通常为 8）。高并发场景可适当增加，但过多会与推理线程争抢 CPU。建议：单用户保持 -1；多用户可设 4~8。"
 
   - flag: api-key
-    subgroup: 服务监听与安全
     subgroup: 服务监听与安全
     label: API 密钥
     type: String
@@ -178,7 +165,6 @@ params:
 
   - flag: api-key-file
     subgroup: 服务监听与安全
-    subgroup: 服务监听与安全
     label: API 密钥文件
     type: String
     default: ""
@@ -187,7 +173,6 @@ params:
     tooltip: "从文件读取 API 密钥，每行一个，# 开头为注释。与 api-key 二选一或互补。"
 
   - flag: ssl-key-file
-    subgroup: 服务监听与安全
     subgroup: 服务监听与安全
     label: SSL 私钥文件
     type: String
@@ -199,7 +184,6 @@ params:
 
   - flag: ssl-cert-file
     subgroup: 服务监听与安全
-    subgroup: 服务监听与安全
     label: SSL 证书文件
     type: String
     default: ""
@@ -210,7 +194,6 @@ params:
 
   - flag: cors-origins
     subgroup: 服务监听与安全
-    subgroup: 服务监听与安全
     label: CORS 允许来源
     type: String
     default: ""
@@ -219,7 +202,6 @@ params:
     tooltip: "跨域资源共享（CORS）允许的来源列表，逗号分隔。留空默认允许所有来源（*）。Web 前端跨域访问时需设置为前端域名。设为 localhost 只反射本机 Origin。"
 
   - flag: cors-methods
-    subgroup: 服务监听与安全
     subgroup: 服务监听与安全
     label: CORS 允许方法
     type: String
@@ -231,7 +213,6 @@ params:
 
   - flag: cors-headers
     subgroup: 服务监听与安全
-    subgroup: 服务监听与安全
     label: CORS 允许请求头
     type: String
     default: ""
@@ -241,7 +222,6 @@ params:
     tooltip: "CORS 允许的请求头，逗号分隔。官方默认 *（全部）。留空=官方默认。"
 
   - flag: cors-credentials
-    subgroup: 服务监听与安全
     subgroup: 服务监听与安全
     label: CORS 允许凭证
     type: Bool
@@ -253,7 +233,6 @@ params:
 
   - flag: api-prefix
     subgroup: 服务监听与安全
-    subgroup: 服务监听与安全
     label: API 前缀路径
     type: String
     default: ""
@@ -263,7 +242,6 @@ params:
 
   - flag: reuse-port
     subgroup: 服务监听与安全
-    subgroup: 服务监听与安全
     label: 端口复用
     type: Bool
     default: "false"
@@ -272,7 +250,6 @@ params:
     tooltip: "允许多个 socket 绑定同一端口（--reuse-port）。默认关闭。一般无需开启。"
 
   - flag: path
-    subgroup: 服务监听与安全
     subgroup: 服务监听与安全
     label: 静态文件目录
     type: String
@@ -284,7 +261,6 @@ params:
 
   - flag: tags
     subgroup: 服务监听与安全
-    subgroup: 服务监听与安全
     label: 模型标签
     type: String
     default: ""
@@ -295,7 +271,6 @@ params:
 
   - flag: offline
     subgroup: 服务监听与安全
-    subgroup: 服务监听与安全
     label: 离线模式
     type: Bool
     default: "false"
@@ -305,7 +280,6 @@ params:
 
   - flag: load-mode
     subgroup: 后端与显存
-    subgroup: 后端与显存
     label: 模型加载模式
     type: Combo
     default: "auto"
@@ -314,7 +288,6 @@ params:
     tooltip: "模型加载模式。auto=自动选择（CUDA/ROCm 和 Vulkan iGPU 上自动禁用 mmap）；none=无特殊模式（等价旧 --no-mmap）；mmap=内存映射（按需加载，省内存）；mlock=锁定到物理内存（防交换）；mmap+mlock=两者结合；dio=使用 DirectIO。推荐 auto。旧参数 --mmap/--no-mmap/--mlock/--direct-io 已合并为此参数。"
 
   - flag: model-url
-    subgroup: 模型来源
     subgroup: 模型来源
     label: 模型下载 URL
     type: String
@@ -326,7 +299,6 @@ params:
 
   - flag: hf-repo
     subgroup: 模型来源
-    subgroup: 模型来源
     label: HuggingFace 仓库
     type: String
     default: ""
@@ -336,7 +308,6 @@ params:
     tooltip: "Hugging Face 模型仓库（-hf）。格式: <user>/<model>[:quant]。quant 可选，不区分大小写，默认 Q4_K_M（不存在则取仓库第一个文件）。mmproj 会自动下载，禁用加 --no-mmproj。示例: ggml-org/GLM-4.7-Flash-GGUF:Q4_K_M"
 
   - flag: hf-file
-    subgroup: 模型来源
     subgroup: 模型来源
     label: HF 指定文件
     type: String
@@ -348,7 +319,6 @@ params:
 
   - flag: hf-token
     subgroup: 模型来源
-    subgroup: 模型来源
     label: HF 访问令牌
     type: String
     default: ""
@@ -358,7 +328,6 @@ params:
     tooltip: "Hugging Face 访问令牌（-hft）。留空=使用 HF_TOKEN 环境变量。访问私有模型时需要。"
 
   - flag: docker-repo
-    subgroup: 模型来源
     subgroup: 模型来源
     label: Docker 模型仓库
     type: String
@@ -370,7 +339,6 @@ params:
 
   - flag: ui
     subgroup: 服务监听与安全
-    subgroup: 服务监听与安全
     label: 启用 Web UI
     type: Bool
     default: "true"
@@ -380,7 +348,6 @@ params:
 
   - flag: sse-ping-interval
     subgroup: 服务监听与安全
-    subgroup: 服务监听与安全
     label: SSE Ping 间隔
     type: String
     default: "30"
@@ -388,7 +355,6 @@ params:
     tooltip: "SSE 心跳间隔（秒）。-1=禁用。默认 30。保持连接活跃，防止代理超时断开。"
 
   - flag: system-prompt-file
-    subgroup: 服务管理
     subgroup: 服务管理
     deprecated: true
     label: 系统提示文件
@@ -404,7 +370,6 @@ params:
   # ================================================================
   - flag: flash-attn
     subgroup: 注意力与性能
-    subgroup: 注意力与性能
     label: Flash Attention
     type: Combo
     default: "on"
@@ -416,7 +381,6 @@ params:
 
   - flag: tensor-split
     subgroup: 后端与显存
-    subgroup: 后端与显存
     label: 张量拆分
     type: String
     default: ""
@@ -426,7 +390,6 @@ params:
 
   - flag: threads-batch
     subgroup: 进程与 CPU 亲和
-    subgroup: 进程与 CPU 亲和
     label: 批处理线程数
     type: String
     default: ""
@@ -434,7 +397,6 @@ params:
     tooltip: "Prompt 处理（批处理）时的 CPU 线程数。默认与 --threads 相同。Prompt 处理是计算密集型，可适当增加线程数以加速首次响应。"
 
   - flag: cpu-mask
-    subgroup: 进程与 CPU 亲和
     subgroup: 进程与 CPU 亲和
     label: CPU 亲和性掩码
     type: String
@@ -446,7 +408,6 @@ params:
 
   - flag: cpu-range
     subgroup: 进程与 CPU 亲和
-    subgroup: 进程与 CPU 亲和
     label: CPU 亲和性范围
     type: String
     default: ""
@@ -456,16 +417,15 @@ params:
 
   - flag: cpu-strict
     subgroup: 进程与 CPU 亲和
-    subgroup: 进程与 CPU 亲和
     label: 严格 CPU 放置
-    type: Bool
-    default: "false"
+    type: Combo
+    default: "0"
+    options: ["0", "1"]
     group: common
     advanced: true
-    tooltip: "是否使用严格的 CPU 放置策略。启用后强制线程只运行在指定的 CPU 核心上。"
+    tooltip: "是否使用严格的 CPU 放置策略。启用后强制线程只运行在指定的 CPU 核心上。官方此参数需带 0/1 取值（0=关闭，默认 0）；勾选后按所选值发射 --cpu-strict 0 或 1。"
 
   - flag: prio
-    subgroup: 进程与 CPU 亲和
     subgroup: 进程与 CPU 亲和
     label: 进程优先级
     type: Combo
@@ -477,7 +437,6 @@ params:
 
   - flag: prio-batch
     subgroup: 进程与 CPU 亲和
-    subgroup: 进程与 CPU 亲和
     label: 批处理优先级
     type: Combo
     default: "0"
@@ -488,7 +447,6 @@ params:
 
   - flag: poll
     subgroup: 进程与 CPU 亲和
-    subgroup: 进程与 CPU 亲和
     label: 轮询级别
     type: String
     default: "50"
@@ -498,16 +456,15 @@ params:
 
   - flag: poll-batch
     subgroup: 进程与 CPU 亲和
-    subgroup: 进程与 CPU 亲和
     label: 批处理轮询模式
-    type: Bool
-    default: "false"
+    type: Combo
+    default: "0"
+    options: ["0", "1"]
     group: common
     advanced: true
-    tooltip: "批处理阶段是否使用轮询等待工作。默认与 --poll 相同。"
+    tooltip: "批处理阶段是否使用轮询等待工作。默认与 --poll 相同。官方此参数需带 0/1 取值（0=关闭，默认 0）；勾选后按所选值发射 --poll-batch 0 或 1。"
 
   - flag: cpu-mask-batch
-    subgroup: 进程与 CPU 亲和
     subgroup: 进程与 CPU 亲和
     label: 批处理 CPU 亲和性掩码
     type: String
@@ -519,7 +476,6 @@ params:
 
   - flag: cpu-range-batch
     subgroup: 进程与 CPU 亲和
-    subgroup: 进程与 CPU 亲和
     label: 批处理 CPU 亲和性范围
     type: String
     default: ""
@@ -529,26 +485,24 @@ params:
 
   - flag: cpu-strict-batch
     subgroup: 进程与 CPU 亲和
-    subgroup: 进程与 CPU 亲和
     label: 批处理严格 CPU 放置
-    type: Bool
-    default: "false"
+    type: Combo
+    default: "0"
+    options: ["0", "1"]
     group: common
     advanced: true
-    tooltip: "批处理阶段是否使用严格的 CPU 放置策略。默认与 cpu-strict 相同。"
+    tooltip: "批处理阶段是否使用严格的 CPU 放置策略。默认与 cpu-strict 相同。官方此参数需带 0/1 取值（0=关闭，默认 0）；勾选后按所选值发射 --cpu-strict-batch 0 或 1。"
 
   - flag: numa
     subgroup: 进程与 CPU 亲和
-    subgroup: 进程与 CPU 亲和
     label: NUMA 策略
     type: Combo
-    default: "disabled"
+    default: "distribute"
     group: common
-    options: [disabled, distribute, isolate, numactl]
-    tooltip: "NUMA 内存分配策略。仅多路 CPU（服务器）有意义。distribute=均匀分配；isolate=限制在启动 CPU 节点；numactl=使用 numactl 工具的映射。单路 CPU/桌面用户保持 disabled。"
+    options: [distribute, isolate, numactl]
+    tooltip: "NUMA 内存分配策略。仅多路 CPU（服务器）有意义。distribute=均匀分配；isolate=限制在启动 CPU 节点；numactl=使用 numactl 工具的映射。单路 CPU/桌面用户保持 disabled。官方仅接受 distribute/isolate/numactl 三个取值（disabled 不是合法取值，取消勾选即不发射）。"
 
   - flag: rope-freq-base
-    subgroup: RoPE / YaRN 缩放
     subgroup: RoPE / YaRN 缩放
     label: RoPE 基础频率
     type: String
@@ -558,7 +512,6 @@ params:
 
   - flag: rope-freq-scale
     subgroup: RoPE / YaRN 缩放
-    subgroup: RoPE / YaRN 缩放
     label: RoPE 频率缩放
     type: String
     default: "1.0"
@@ -566,7 +519,6 @@ params:
     tooltip: "RoPE 频率缩放因子。值为 N 时上下文扩展 N 倍。与 rope-scale 互为倒数关系。1.0 = 不缩放。长上下文扩展时配合 rope-scaling 方法使用。"
 
   - flag: rope-scaling
-    subgroup: RoPE / YaRN 缩放
     subgroup: RoPE / YaRN 缩放
     label: RoPE 缩放方法
     type: Combo
@@ -577,7 +529,6 @@ params:
 
   - flag: rope-scale
     subgroup: RoPE / YaRN 缩放
-    subgroup: RoPE / YaRN 缩放
     label: RoPE 上下文缩放
     type: String
     default: "1.0"
@@ -585,7 +536,6 @@ params:
     tooltip: "RoPE 上下文缩放因子，上下文按 N 倍扩展。与 rope-freq-scale 互为倒数。1.0 = 不缩放。"
 
   - flag: yarn-orig-ctx
-    subgroup: RoPE / YaRN 缩放
     subgroup: RoPE / YaRN 缩放
     label: YaRN 原始上下文
     type: String
@@ -596,7 +546,6 @@ params:
 
   - flag: yarn-ext-factor
     subgroup: RoPE / YaRN 缩放
-    subgroup: RoPE / YaRN 缩放
     label: YaRN 外推因子
     type: String
     default: "-1.0"
@@ -605,7 +554,6 @@ params:
     tooltip: "YaRN：外推混合因子（默认 -1.0）。0.0=完全内插。"
 
   - flag: yarn-attn-factor
-    subgroup: RoPE / YaRN 缩放
     subgroup: RoPE / YaRN 缩放
     label: YaRN 注意力因子
     type: String
@@ -616,7 +564,6 @@ params:
 
   - flag: yarn-beta-slow
     subgroup: RoPE / YaRN 缩放
-    subgroup: RoPE / YaRN 缩放
     label: YaRN 慢 Beta
     type: String
     default: "-1.0"
@@ -625,7 +572,6 @@ params:
     tooltip: "YaRN：高修正维度或 alpha（默认 -1.0）。"
 
   - flag: yarn-beta-fast
-    subgroup: RoPE / YaRN 缩放
     subgroup: RoPE / YaRN 缩放
     label: YaRN 快 Beta
     type: String
@@ -636,7 +582,6 @@ params:
 
   - flag: split-mode
     subgroup: 后端与显存
-    subgroup: 后端与显存
     label: 多 GPU 拆分模式
     type: Combo
     default: "layer"
@@ -646,7 +591,6 @@ params:
 
   - flag: device
     subgroup: 后端与显存
-    subgroup: 后端与显存
     label: 设备列表
     type: String
     default: ""
@@ -655,7 +599,6 @@ params:
     tooltip: "用于卸载的设备列表，逗号分隔（如 0,1）。none=完全不卸载到 GPU。使用 --list-devices 查看可用设备。留空=自动。"
 
   - flag: fit
-    subgroup: 后端与显存
     subgroup: 后端与显存
     label: 自动适配显存 (--fit)
     type: Combo
@@ -668,7 +611,6 @@ params:
 
   - flag: fit-target
     subgroup: 后端与显存
-    subgroup: 后端与显存
     label: Fit 显存余量 (MiB)
     type: String
     default: ""
@@ -678,7 +620,6 @@ params:
 
   - flag: fit-ctx
     subgroup: 后端与显存
-    subgroup: 后端与显存
     label: Fit 最小上下文
     type: String
     default: "4096"
@@ -686,7 +627,6 @@ params:
     tooltip: "--fit 能自动设置的最小 ctx 大小（token）。默认 4096。防止自动适配把上下文压得过小。"
 
   - flag: kv-offload
-    subgroup: KV 缓存与量化
     subgroup: KV 缓存与量化
     label: KV 缓存卸载
     type: Bool
@@ -697,7 +637,6 @@ params:
 
   - flag: repack
     subgroup: KV 缓存与量化
-    subgroup: KV 缓存与量化
     label: 权重重打包
     type: Bool
     default: "true"
@@ -707,7 +646,6 @@ params:
 
   - flag: no-host
     subgroup: KV 缓存与量化
-    subgroup: KV 缓存与量化
     label: 绕过 Host 缓冲
     type: Bool
     default: "false"
@@ -716,7 +654,6 @@ params:
     tooltip: "绕过 host 缓冲，允许使用额外缓冲。可略微提升显存利用率，视后端支持而定。"
 
   - flag: op-offload
-    subgroup: 后端与显存
     subgroup: 后端与显存
     label: 运算卸载到设备
     type: Bool
@@ -728,7 +665,6 @@ params:
 
   - flag: override-tensor
     subgroup: 后端与显存
-    subgroup: 后端与显存
     label: 张量缓冲覆盖
     type: String
     default: ""
@@ -738,7 +674,6 @@ params:
     tooltip: "覆盖指定张量的缓冲区类型。格式: <张量名匹配>=<缓冲类型>，多个用逗号分隔。高级调优用。"
 
   - flag: override-kv
-    subgroup: 后端与显存
     subgroup: 后端与显存
     label: 覆盖模型元数据
     type: String
@@ -750,7 +685,6 @@ params:
 
   - flag: n-cpu-ffn
     subgroup: 后端与显存
-    subgroup: 后端与显存
     label: 稠密 FFN CPU 层数
     type: String
     default: ""
@@ -758,7 +692,6 @@ params:
     tooltip: "把前 N 层的稠密 FFN 权重放在 CPU（针对非 MoE 模型；MoE 专家用 --n-cpu-moe）。显存与速度的折中。"
 
   - flag: lazy-mode
-    subgroup: 后端与显存
     subgroup: 后端与显存
     label: 张量按需读取
     type: Combo
@@ -770,7 +703,6 @@ params:
 
   - flag: rpc
     subgroup: 后端与显存
-    subgroup: 后端与显存
     label: RPC 服务器
     type: String
     default: ""
@@ -780,7 +712,6 @@ params:
     tooltip: "逗号分隔的 RPC 推理服务器列表（host:port）。用于跨机器分布式推理。"
 
   - flag: check-tensors
-    subgroup: 后端与显存
     subgroup: 后端与显存
     label: 检查张量有效性
     type: Bool
@@ -794,7 +725,6 @@ params:
   # ================================================================
   - flag: cache-type-k
     subgroup: KV 缓存与量化
-    subgroup: KV 缓存与量化
     label: Cache 类型 K
     role: cache_type_k
     type: Combo
@@ -805,7 +735,6 @@ params:
     tooltip: "KV 缓存 K 分量的数据类型。官方支持：f32/f16/bf16/q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1（默认 f16）。低 bit 可大幅扩展上下文（配合 Hadamard 旋转质量提升）。q6_0 与 tq3_0(TurboQuant 3.5bit) 为实验性/视构建版本而定，官方主线暂不支持，请确认你的 llama.cpp 包含该类型。24GB 显卡跑 27B 推荐 q8_0 或 q4_0。"
 
   - flag: cache-type-v
-    subgroup: KV 缓存与量化
     subgroup: KV 缓存与量化
     label: Cache 类型 V
     role: cache_type_v
@@ -818,7 +747,6 @@ params:
 
   - flag: cache-prompt
     subgroup: KV 缓存与检查点
-    subgroup: KV 缓存与检查点
     label: 缓存 Prompt
     type: Bool
     default: "true"
@@ -828,7 +756,6 @@ params:
     offFlag: no-cache-prompt
 
   - flag: cache-reuse
-    subgroup: KV 缓存与检查点
     subgroup: KV 缓存与检查点
     label: 缓存重用阈值
     type: String
@@ -841,7 +768,6 @@ params:
 
   - flag: cache-ram
     subgroup: KV 缓存与检查点
-    subgroup: KV 缓存与检查点
     label: 缓存 RAM 上限
     type: String
     default: ""
@@ -850,7 +776,6 @@ params:
     tooltip: "设置 prompt 缓存的最大大小（MiB）。官方默认 8192；-1=无限制；0=禁用。超出限制时自动淘汰旧缓存。留空=使用官方默认。"
 
   - flag: kv-unified
-    subgroup: KV 缓存与检查点
     subgroup: KV 缓存与检查点
     label: 统一 KV 缓冲
     type: Bool
@@ -862,7 +787,6 @@ params:
 
   - flag: kv-unified-per-slot
     subgroup: KV 缓存与检查点
-    subgroup: KV 缓存与检查点
     label: 每槽上下文上限
     type: String
     default: ""
@@ -871,7 +795,6 @@ params:
     tooltip: "每个并行槽位的上下文限制（token）。设置后共享 KV 池按 n_parallel*N 分配。留空=行为不变。"
 
   - flag: context-shift
-    subgroup: KV 缓存与检查点
     subgroup: KV 缓存与检查点
     label: 上下文移位
     type: Bool
@@ -882,7 +805,6 @@ params:
 
   - flag: ctx-checkpoints
     subgroup: KV 缓存与检查点
-    subgroup: KV 缓存与检查点
     label: 上下文检查点数
     type: String
     default: "32"
@@ -892,7 +814,6 @@ params:
 
   - flag: checkpoint-min-step
     subgroup: KV 缓存与检查点
-    subgroup: KV 缓存与检查点
     label: 检查点最小间距
     type: String
     default: "8192"
@@ -901,7 +822,6 @@ params:
     tooltip: "上下文检查点之间的最小 token 间距（默认 8192；0=无最小限制）。用于控制检查点数量与内存。"
 
   - flag: cache-idle-slots
-    subgroup: KV 缓存与检查点
     subgroup: KV 缓存与检查点
     label: 缓存空闲槽位
     type: Bool
@@ -913,7 +833,6 @@ params:
 
   - flag: defrag-thold
     subgroup: KV 缓存与量化
-    subgroup: KV 缓存与量化
     label: KV 碎片整理阈值
     type: String
     default: ""
@@ -923,7 +842,6 @@ params:
     tooltip: "已废弃（DEPRECATED）：KV 缓存碎片整理阈值已被自动机制取代。留空即可，无需设置。"
 
   - flag: swa-full
-    subgroup: 上下文与批处理
     subgroup: 上下文与批处理
     label: SWA 完整缓存
     type: Bool
@@ -958,7 +876,6 @@ params:
   # ================================================================
   - flag: seed
     subgroup: 基础采样
-    subgroup: 基础采样
     label: 随机种子 (Seed)
     type: String
     default: "-1"
@@ -968,7 +885,6 @@ params:
 
   - flag: predict
     subgroup: 上下文与批处理
-    subgroup: 上下文与批处理
     label: 最大生成 Token
     type: String
     default: "-1"
@@ -977,7 +893,6 @@ params:
 
   - flag: ignore-eos
     subgroup: 基础采样
-    subgroup: 基础采样
     label: 忽略 EOS
     type: Bool
     default: "false"
@@ -985,7 +900,6 @@ params:
     tooltip: "忽略结束标记 (EOS)，继续生成直到达到 predict 上限。慎用，可能导致无限生成。"
 
   - flag: temp
-    subgroup: 基础采样
     subgroup: 基础采样
     label: 温度 (Temp)
     type: String
@@ -996,7 +910,6 @@ params:
 
   - flag: dynatemp-range
     subgroup: 高级采样策略
-    subgroup: 高级采样策略
     label: 动态温度范围 (Dynatemp Range)
     type: String
     default: "0.0"
@@ -1005,7 +918,6 @@ params:
 
   - flag: dynatemp-exp
     subgroup: 高级采样策略
-    subgroup: 高级采样策略
     label: 动态温度指数 (Dynatemp Exp)
     type: String
     default: "1.0"
@@ -1013,7 +925,6 @@ params:
     tooltip: "动态温度指数。控制温度调整的曲线形状，默认 1.0（线性）。仅在 dynatemp-range > 0 时生效。"
 
   - flag: top-k
-    subgroup: 基础采样
     subgroup: 基础采样
     label: Top-K
     type: String
@@ -1024,7 +935,6 @@ params:
 
   - flag: top-p
     subgroup: 基础采样
-    subgroup: 基础采样
     label: Top-P
     type: String
     default: "0.95"
@@ -1033,7 +943,6 @@ params:
     tooltip: "核采样（Nucleus Sampling）：从累计概率达到 P 的最小 token 集合中采样。P 越小输出越集中。默认 0.95。0.9=保守；1.0=禁用。建议 0.9~0.95，配合 Min-P 效果更佳。"
 
   - flag: min-p
-    subgroup: 基础采样
     subgroup: 基础采样
     label: Min-P
     type: String
@@ -1044,7 +953,6 @@ params:
 
   - flag: top-nsigma
     subgroup: 基础采样
-    subgroup: 基础采样
     label: Top-N-Sigma
     type: String
     default: "-1.0"
@@ -1054,7 +962,6 @@ params:
 
   - flag: xtc-probability
     subgroup: 高级采样策略
-    subgroup: 高级采样策略
     label: XTC 概率
     type: String
     default: "0.0"
@@ -1062,7 +969,6 @@ params:
     tooltip: "XTC（eXtremely Truncated Configuration）采样概率。0.0=禁用。0.1~0.5 可提升输出质量，配合 xtc-threshold 使用。"
 
   - flag: xtc-threshold
-    subgroup: 高级采样策略
     subgroup: 高级采样策略
     label: XTC 阈值
     type: String
@@ -1072,7 +978,6 @@ params:
 
   - flag: adaptive-target
     subgroup: 高级采样策略
-    subgroup: 高级采样策略
     label: Adaptive-P 目标
     type: String
     default: "-1.0"
@@ -1081,7 +986,6 @@ params:
 
   - flag: adaptive-decay
     subgroup: 高级采样策略
-    subgroup: 高级采样策略
     label: Adaptive-P 衰减率
     type: String
     default: "0.9"
@@ -1089,7 +993,6 @@ params:
     tooltip: "Adaptive-P 衰减率。0.0~0.99，值越低响应越快，越高越稳定。默认 0.9。"
 
   - flag: typical
-    subgroup: 基础采样
     subgroup: 基础采样
     label: 局部典型采样
     type: String
@@ -1100,7 +1003,6 @@ params:
 
   - flag: repeat-penalty
     subgroup: 重复惩罚
-    subgroup: 重复惩罚
     label: 重复惩罚
     type: String
     default: "1.0"
@@ -1110,7 +1012,6 @@ params:
 
   - flag: repeat-last-n
     subgroup: 重复惩罚
-    subgroup: 重复惩罚
     label: 重复惩罚范围
     type: String
     default: "64"
@@ -1118,7 +1019,6 @@ params:
     tooltip: "重复惩罚考虑的最后 N 个 token。0=禁用，-1=上下文大小。默认 64。"
 
   - flag: frequency-penalty
-    subgroup: 重复惩罚
     subgroup: 重复惩罚
     label: 频率惩罚
     type: String
@@ -1129,7 +1029,6 @@ params:
 
   - flag: presence-penalty
     subgroup: 重复惩罚
-    subgroup: 重复惩罚
     label: 存在惩罚
     type: String
     default: "0.0"
@@ -1139,7 +1038,6 @@ params:
 
   - flag: dry-multiplier
     subgroup: 重复惩罚
-    subgroup: 重复惩罚
     label: DRY 乘数
     type: String
     default: "0.0"
@@ -1147,7 +1045,6 @@ params:
     tooltip: "DRY（Don't Repeat Yourself）采样乘数。0.0=禁用。0.5~2.0 可精细控制重复惩罚力度，比传统重复惩罚更智能。"
 
   - flag: dry-base
-    subgroup: 重复惩罚
     subgroup: 重复惩罚
     label: DRY 基数
     type: String
@@ -1157,7 +1054,6 @@ params:
 
   - flag: dry-allowed-length
     subgroup: 重复惩罚
-    subgroup: 重复惩罚
     label: DRY 允许长度
     type: String
     default: "2"
@@ -1166,7 +1062,6 @@ params:
 
   - flag: dry-penalty-last-n
     subgroup: 重复惩罚
-    subgroup: 重复惩罚
     label: DRY 惩罚范围
     type: String
     default: "64"
@@ -1174,7 +1069,6 @@ params:
     tooltip: "DRY 惩罚考虑的最后 N 个 token。默认 64，0=禁用。仅在 dry-multiplier > 0 时生效。"
 
   - flag: dry-sequence-breaker
-    subgroup: 重复惩罚
     subgroup: 重复惩罚
     label: DRY 序列分隔符
     type: String
@@ -1185,7 +1079,6 @@ params:
 
   - flag: mirostat
     subgroup: Mirostat
-    subgroup: Mirostat
     label: Mirostat 模式
     type: Combo
     default: "0"
@@ -1194,7 +1087,6 @@ params:
     tooltip: "Mirostat 自适应采样。自动调节温度以维持目标困惑度。0=禁用；1=Mirostat 1.0；2=Mirostat 2.0（推荐）。启用后 Top-K/Top-P/Min-P 被忽略。适合追求稳定质量的场景。"
 
   - flag: mirostat-lr
-    subgroup: Mirostat
     subgroup: Mirostat
     label: Mirostat 学习率
     type: String
@@ -1206,7 +1098,6 @@ params:
 
   - flag: mirostat-ent
     subgroup: Mirostat
-    subgroup: Mirostat
     label: Mirostat 目标熵
     type: String
     default: "5.0"
@@ -1217,7 +1108,6 @@ params:
 
   - flag: grammar
     subgroup: 约束生成
-    subgroup: 约束生成
     label: BNF 语法
     type: String
     default: ""
@@ -1226,7 +1116,6 @@ params:
     tooltip: "BNF-like 语法约束。强制模型输出符合指定语法结构。用于结构化输出（如 SQL、代码）。语法文件在 grammars/ 目录。"
 
   - flag: grammar-file
-    subgroup: 约束生成
     subgroup: 约束生成
     label: BNF 语法文件
     type: String
@@ -1237,7 +1126,6 @@ params:
 
   - flag: json-schema
     subgroup: 约束生成
-    subgroup: 约束生成
     label: JSON Schema
     type: String
     default: ""
@@ -1247,7 +1135,6 @@ params:
 
   - flag: json-schema-file
     subgroup: 约束生成
-    subgroup: 约束生成
     label: JSON Schema 文件
     type: String
     default: ""
@@ -1256,7 +1143,6 @@ params:
     tooltip: "从文件加载 JSON Schema 约束。与 json-schema 功能相同但内容从文件读取。"
 
   - flag: logit-bias
-    subgroup: 约束生成
     subgroup: 约束生成
     label: Logit 偏置
     type: String
@@ -1268,7 +1154,6 @@ params:
 
   - flag: samplers
     subgroup: 基础采样
-    subgroup: 基础采样
     label: 采样器列表
     type: String
     default: ""
@@ -1279,7 +1164,6 @@ params:
 
   - flag: sampler-seq
     subgroup: 基础采样
-    subgroup: 基础采样
     label: 采样器序列(简写)
     type: String
     default: ""
@@ -1289,7 +1173,6 @@ params:
     tooltip: "采样器序列简写形式。默认: edskypmxt。与 samplers 二选一。"
 
   - flag: backend-sampling
-    subgroup: 约束生成
     subgroup: 约束生成
     label: 后端采样 (实验性)
     type: Bool
@@ -1303,7 +1186,6 @@ params:
   # ================================================================
   - flag: reasoning-budget
     subgroup: 对话模板与思考
-    subgroup: 对话模板与思考
     label: 思考预算 (Reasoning Budget)
     type: String
     default: "-1"
@@ -1314,7 +1196,6 @@ params:
   # 推测解码
   # ================================================================
   - flag: spec-type
-    subgroup: 类型与草稿
     subgroup: 类型与草稿
     label: 推测类型
     role: spec_type
@@ -1328,7 +1209,6 @@ params:
 
   - flag: spec-default
     subgroup: 类型与草稿
-    subgroup: 类型与草稿
     label: 默认推测配置
     type: Bool
     default: "false"
@@ -1338,7 +1218,6 @@ params:
     tooltip: "启用 llama 内置的默认推测解码配置（草稿/MTP 已就绪时零配置加速）。与 spec-type=none 组合时以本开关为准；要完全关闭推测，请保持本项关闭且 spec-type 为 none/未勾选。"
 
   - flag: spec-draft-n-max
-    subgroup: 类型与草稿
     subgroup: 类型与草稿
     label: 最大草稿 Token
     type: String
@@ -1351,7 +1230,6 @@ params:
 
   - flag: spec-draft-n-min
     subgroup: 类型与草稿
-    subgroup: 类型与草稿
     label: 最小草稿 Token
     type: String
     default: "0"
@@ -1363,7 +1241,6 @@ params:
 
   - flag: spec-draft-p-min
     subgroup: 类型与草稿
-    subgroup: 类型与草稿
     label: 草稿接受阈值
     type: String
     default: ""
@@ -1373,7 +1250,6 @@ params:
     tooltip: "草稿 token 的最低接受概率。低于此值的草稿 token 被拒绝。默认 0.0（全部接受）。带宽受限时设为 0.60~0.75。"
 
   - flag: spec-draft-p-split
-    subgroup: 类型与草稿
     subgroup: 类型与草稿
     label: 草稿分割概率
     type: String
@@ -1385,7 +1261,6 @@ params:
     tooltip: "推测解码分割概率。默认 0.10。"
 
   - flag: spec-draft-hf
-    subgroup: 类型与草稿
     subgroup: 类型与草稿
     label: 草稿模型 HF 仓库
     type: String
@@ -1399,7 +1274,6 @@ params:
 
   - flag: spec-draft-model
     subgroup: 类型与草稿
-    subgroup: 类型与草稿
     label: 草稿模型文件
     type: String
     default: ""
@@ -1411,7 +1285,6 @@ params:
     tooltip: "外部草稿模型文件路径。仅当 spec-type=draft 时使用。"
 
   - flag: spec-draft-device
-    subgroup: 类型与草稿
     subgroup: 类型与草稿
     label: 草稿设备列表
     type: String
@@ -1425,7 +1298,6 @@ params:
 
   - flag: spec-draft-ngl
     subgroup: 类型与草稿
-    subgroup: 类型与草稿
     label: 草稿 GPU 层数
     type: String
     default: "auto"
@@ -1436,7 +1308,6 @@ params:
     tooltip: "草稿模型卸载到 GPU 的层数。auto/数字/all。"
 
   - flag: spec-draft-ctx-size
-    subgroup: 已废弃
     subgroup: 已废弃
     deprecated: true
     label: 草稿上下文大小
@@ -1450,7 +1321,6 @@ params:
 
   - flag: spec-draft-replace
     subgroup: 已废弃
-    subgroup: 已废弃
     deprecated: true
     label: 草稿 Token 替换
     type: String
@@ -1463,7 +1333,6 @@ params:
 
   - flag: spec-draft-threads
     subgroup: 草稿模型资源
-    subgroup: 草稿模型资源
     label: 草稿线程数
     type: String
     default: ""
@@ -1475,7 +1344,6 @@ params:
 
   - flag: spec-draft-threads-batch
     subgroup: 草稿模型资源
-    subgroup: 草稿模型资源
     label: 草稿批处理线程数
     type: String
     default: ""
@@ -1486,7 +1354,6 @@ params:
     tooltip: "草稿模型批处理阶段的线程数。默认与 --threads-draft 相同。"
 
   - flag: spec-draft-cpu-mask
-    subgroup: 草稿模型资源
     subgroup: 草稿模型资源
     label: 草稿 CPU 掩码
     type: String
@@ -1500,7 +1367,6 @@ params:
 
   - flag: spec-draft-cpu-range
     subgroup: 草稿模型资源
-    subgroup: 草稿模型资源
     label: 草稿 CPU 亲和性范围
     type: String
     default: ""
@@ -1512,18 +1378,17 @@ params:
 
   - flag: spec-draft-cpu-strict
     subgroup: 草稿模型资源
-    subgroup: 草稿模型资源
     label: 草稿 CPU 严格模式
-    type: Bool
-    default: "false"
+    type: Combo
+    default: "0"
+    options: ["0", "1"]
     group: spec
     requires:
       - {flag: spec-type, op: "!=", value: none}
     advanced: true
-    tooltip: "草稿模型是否使用严格的 CPU 放置策略。默认与 --cpu-strict 相同。"
+    tooltip: "草稿模型是否使用严格的 CPU 放置策略。默认与 --cpu-strict 相同。官方此参数需带 0/1 取值（0=关闭，默认 0）；勾选后按所选值发射 --spec-draft-cpu-strict 0 或 1。"
 
   - flag: spec-draft-prio
-    subgroup: 草稿模型资源
     subgroup: 草稿模型资源
     label: 草稿进程优先级
     type: Combo
@@ -1537,18 +1402,17 @@ params:
 
   - flag: spec-draft-poll
     subgroup: 草稿模型资源
-    subgroup: 草稿模型资源
     label: 草稿轮询模式
-    type: Bool
-    default: "false"
+    type: Combo
+    default: "0"
+    options: ["0", "1"]
     group: spec
     requires:
       - {flag: spec-type, op: "!=", value: none}
     advanced: true
-    tooltip: "使用轮询等待草稿模型完成。默认与 --poll 相同。"
+    tooltip: "使用轮询等待草稿模型完成。默认与 --poll 相同。官方此参数需带 0/1 取值（0=关闭，默认 0）；勾选后按所选值发射 --spec-draft-poll 0 或 1。"
 
   - flag: spec-draft-cpu-mask-batch
-    subgroup: 草稿模型资源
     subgroup: 草稿模型资源
     label: 草稿批处理 CPU 掩码
     type: String
@@ -1562,18 +1426,17 @@ params:
 
   - flag: spec-draft-cpu-strict-batch
     subgroup: 草稿模型资源
-    subgroup: 草稿模型资源
     label: 草稿批处理严格 CPU
-    type: Bool
-    default: "false"
+    type: Combo
+    default: "0"
+    options: ["0", "1"]
     group: spec
     requires:
       - {flag: spec-type, op: "!=", value: none}
     advanced: true
-    tooltip: "草稿模型批处理阶段是否使用严格的 CPU 放置策略。默认与 --cpu-strict-draft 相同。"
+    tooltip: "草稿模型批处理阶段是否使用严格的 CPU 放置策略。默认与 --cpu-strict-draft 相同。官方此参数需带 0/1 取值（0=关闭，默认 0）；勾选后按所选值发射 --spec-draft-cpu-strict-batch 0 或 1。"
 
   - flag: spec-draft-prio-batch
-    subgroup: 草稿模型资源
     subgroup: 草稿模型资源
     label: 草稿批处理优先级
     type: Combo
@@ -1587,18 +1450,17 @@ params:
 
   - flag: spec-draft-poll-batch
     subgroup: 草稿模型资源
-    subgroup: 草稿模型资源
     label: 草稿批处理轮询模式
-    type: Bool
-    default: "false"
+    type: Combo
+    default: "0"
+    options: ["0", "1"]
     group: spec
     requires:
       - {flag: spec-type, op: "!=", value: none}
     advanced: true
-    tooltip: "草稿模型批处理阶段是否使用轮询等待。默认与 --poll-draft 相同。"
+    tooltip: "草稿模型批处理阶段是否使用轮询等待。默认与 --poll-draft 相同。官方此参数需带 0/1 取值（0=关闭，默认 0）；勾选后按所选值发射 --spec-draft-poll-batch 0 或 1。"
 
   - flag: spec-draft-override-tensor
-    subgroup: 草稿模型资源
     subgroup: 草稿模型资源
     label: 草稿张量缓冲区覆盖
     type: String
@@ -1612,7 +1474,6 @@ params:
 
   - flag: spec-draft-type-k
     subgroup: 草稿模型 KV 类型
-    subgroup: 草稿模型 KV 类型
     label: 草稿 Cache 类型 K
     type: Combo
     default: ""
@@ -1624,7 +1485,6 @@ params:
     tooltip: "草稿模型 KV 缓存 K 分量的数据类型。留空=使用官方默认 f16（草稿模型 KV 缓存不压缩）。q6_0/tq3_0 为实验性，主线暂不支持。"
 
   - flag: spec-draft-type-v
-    subgroup: 草稿模型 KV 类型
     subgroup: 草稿模型 KV 类型
     label: 草稿 Cache 类型 V
     type: Combo
@@ -1638,7 +1498,6 @@ params:
 
   - flag: spec-draft-cpu-moe
     subgroup: 草稿模型资源
-    subgroup: 草稿模型资源
     label: 草稿 MoE 专家全CPU
     type: Bool
     default: "false"
@@ -1649,7 +1508,6 @@ params:
     tooltip: "草稿模型的 MoE 专家权重全部放在 CPU。仅对 MoE 草稿模型有效。"
 
   - flag: spec-draft-n-cpu-moe
-    subgroup: 草稿模型资源
     subgroup: 草稿模型资源
     label: 草稿 MoE 专家 CPU 层数
     type: String
@@ -1662,7 +1520,6 @@ params:
 
   - flag: spec-ngram-mod-n-min
     subgroup: ngram 推测
-    subgroup: ngram 推测
     label: ngram-mod 最小 token
     type: String
     default: "48"
@@ -1673,7 +1530,6 @@ params:
     tooltip: "ngram-mod 推测解码使用的最小 ngram token 数。"
 
   - flag: spec-ngram-mod-n-max
-    subgroup: ngram 推测
     subgroup: ngram 推测
     label: ngram-mod 最大 token
     type: String
@@ -1686,7 +1542,6 @@ params:
 
   - flag: spec-ngram-mod-n-match
     subgroup: ngram 推测
-    subgroup: ngram 推测
     label: ngram-mod 查找长度
     type: String
     default: "24"
@@ -1697,7 +1552,6 @@ params:
     tooltip: "ngram-mod 推测解码的查找长度。"
 
   - flag: spec-ngram-simple-size-n
-    subgroup: ngram 推测
     subgroup: ngram 推测
     label: ngram-simple 查找长度
     type: String
@@ -1710,7 +1564,6 @@ params:
 
   - flag: spec-ngram-simple-size-m
     subgroup: ngram 推测
-    subgroup: ngram 推测
     label: ngram-simple 草稿长度
     type: String
     default: "48"
@@ -1721,7 +1574,6 @@ params:
     tooltip: "ngram-simple 推测解码的草稿 mgram 长度。"
 
   - flag: spec-ngram-simple-min-hits
-    subgroup: ngram 推测
     subgroup: ngram 推测
     label: ngram-simple 最小命中
     type: String
@@ -1734,7 +1586,6 @@ params:
 
   - flag: spec-ngram-map-k-size-n
     subgroup: ngram 推测
-    subgroup: ngram 推测
     label: ngram-map-k 查找长度
     type: String
     default: "12"
@@ -1745,7 +1596,6 @@ params:
     tooltip: "ngram-map-k 推测解码的查找 ngram 长度。"
 
   - flag: spec-ngram-map-k-size-m
-    subgroup: ngram 推测
     subgroup: ngram 推测
     label: ngram-map-k 草稿长度
     type: String
@@ -1758,7 +1608,6 @@ params:
 
   - flag: spec-ngram-map-k-min-hits
     subgroup: ngram 推测
-    subgroup: ngram 推测
     label: ngram-map-k 最小命中
     type: String
     default: "1"
@@ -1769,7 +1618,6 @@ params:
     tooltip: "ngram-map-k 推测解码的最小命中数（默认 1）。调高可减少误接受但降低加速。"
 
   - flag: spec-ngram-map-k4v-size-n
-    subgroup: ngram 推测
     subgroup: ngram 推测
     label: ngram-map-k4v 查找长度
     type: String
@@ -1782,7 +1630,6 @@ params:
 
   - flag: spec-ngram-map-k4v-size-m
     subgroup: ngram 推测
-    subgroup: ngram 推测
     label: ngram-map-k4v 草稿长度
     type: String
     default: "48"
@@ -1793,7 +1640,6 @@ params:
     tooltip: "ngram-map-k4v 推测解码的草稿 mgram 长度 M（默认 48）。"
 
   - flag: spec-ngram-map-k4v-min-hits
-    subgroup: ngram 推测
     subgroup: ngram 推测
     label: ngram-map-k4v 最小命中
     type: String
@@ -1806,7 +1652,6 @@ params:
 
   - flag: spec-synth-len
     subgroup: 推测基准测试
-    subgroup: 推测基准测试
     label: 合成接受长度 (Benchmark)
     type: String
     default: ""
@@ -1815,7 +1660,6 @@ params:
     tooltip: "目标平均合成接受长度（含目标 token）。仅用于基准测试，正常使用留空。"
 
   - flag: spec-synth-rates
-    subgroup: 推测基准测试
     subgroup: 推测基准测试
     label: 合成接受率 (Benchmark)
     type: String
@@ -1826,7 +1670,6 @@ params:
     tooltip: "逗号分隔的无条件逐位置合成接受概率（仅基准测试用）。正常使用留空。"
 
   - flag: spec-draft-backend-sampling
-    subgroup: 类型与草稿
     subgroup: 类型与草稿
     label: 草稿后端采样
     type: Bool
@@ -1840,7 +1683,6 @@ params:
 
   - flag: lookup-cache-static
     subgroup: ngram 推测
-    subgroup: ngram 推测
     label: 静态查找缓存
     type: String
     default: ""
@@ -1850,7 +1692,6 @@ params:
     tooltip: "查找解码（lookup decoding）使用的静态缓存文件路径（生成时不更新）。"
 
   - flag: lookup-cache-dynamic
-    subgroup: ngram 推测
     subgroup: ngram 推测
     label: 动态查找缓存
     type: String
@@ -1865,7 +1706,6 @@ params:
   # ================================================================
   - flag: mmproj
     subgroup: 多模态
-    subgroup: 多模态
     label: 多模态投影
     type: String
     default: ""
@@ -1876,7 +1716,6 @@ params:
 
   - flag: media-path
     subgroup: 多模态
-    subgroup: 多模态
     label: 媒体根目录
     type: String
     default: ""
@@ -1885,7 +1724,6 @@ params:
     tooltip: "本地媒体文件的根目录。API 可通过 file:// 相对路径访问此目录下的图片/视频。用于多模态推理时加载本地媒体资源。"
 
   - flag: mmproj-url
-    subgroup: 多模态
     subgroup: 多模态
     label: 投影文件 URL
     type: String
@@ -1897,7 +1735,6 @@ params:
 
   - flag: mmproj-auto
     subgroup: 多模态
-    subgroup: 多模态
     label: 自动使用投影
     type: Bool
     default: "true"
@@ -1907,7 +1744,6 @@ params:
     offFlag: no-mmproj-auto
 
   - flag: mmproj-offload
-    subgroup: 多模态
     subgroup: 多模态
     label: 投影 GPU 卸载
     type: Bool
@@ -1919,7 +1755,6 @@ params:
 
   - flag: mmproj-device
     subgroup: 多模态
-    subgroup: 多模态
     label: 投影设备
     type: String
     default: "auto"
@@ -1930,7 +1765,6 @@ params:
 
   - flag: image-min-tokens
     subgroup: 多模态
-    subgroup: 多模态
     label: 图像最小 Token
     type: String
     default: ""
@@ -1939,7 +1773,6 @@ params:
     tooltip: "每张图像可占用的最小 token 数，仅动态分辨率视觉模型使用。留空=读模型元数据（官方默认）。"
 
   - flag: image-max-tokens
-    subgroup: 多模态
     subgroup: 多模态
     label: 图像最大 Token
     type: String
@@ -1950,7 +1783,6 @@ params:
 
   - flag: mtmd-batch-max-tokens
     subgroup: 多模态
-    subgroup: 多模态
     label: 编码批最大 Token
     type: String
     default: "1024"
@@ -1959,7 +1791,6 @@ params:
     tooltip: "图像编码时每批的最大 token 数（默认 1024）。显存紧张可调低。"
 
   - flag: video-fps
-    subgroup: 多模态
     subgroup: 多模态
     label: 视频帧率
     type: String
@@ -1970,7 +1801,6 @@ params:
 
   - flag: video-timestamp-interval
     subgroup: 多模态
-    subgroup: 多模态
     label: 视频时间戳间隔
     type: String
     default: "5000"
@@ -1979,7 +1809,6 @@ params:
     tooltip: "视频文本时间戳之间的间隔（毫秒，默认 5000）。"
 
   - flag: video-ffmpeg-dir
-    subgroup: 多模态
     subgroup: 多模态
     label: FFmpeg 目录
     type: String
@@ -1994,7 +1823,6 @@ params:
   # ================================================================
   - flag: parallel
     subgroup: 并行与槽位
-    subgroup: 并行与槽位
     label: 并行序列数
     type: String
     default: "1"
@@ -2003,7 +1831,6 @@ params:
     tooltip: "服务器并发槽位数（同时处理的请求数）。默认 -1=自动。1=单用户（推荐本地使用）；2~4=多用户并发。每个槽位占用独立的 KV 缓存空间，增加会线性增加显存占用。MTP 推测解码建议保持 1。"
 
   - flag: cont-batching
-    subgroup: 并行与槽位
     subgroup: 并行与槽位
     label: 连续批处理
     type: Bool
@@ -2015,7 +1842,6 @@ params:
 
   - flag: prefill-assistant
     subgroup: 并行与槽位
-    subgroup: 并行与槽位
     label: Assistant 预填充
     type: Bool
     default: "true"
@@ -2026,7 +1852,6 @@ params:
 
   - flag: slot-prompt-similarity
     subgroup: 并行与槽位
-    subgroup: 并行与槽位
     label: 槽位 Prompt 相似度
     type: String
     default: "0.10"
@@ -2035,7 +1860,6 @@ params:
     tooltip: "多个请求时判断同一槽位 prompt 相似度的阈值（默认 0.10）。0.0=仅完全一致复用槽位；>0=部分复用缓存加速。"
 
   - flag: warmup
-    subgroup: 提示处理
     subgroup: 提示处理
     label: 空跑预热
     type: Bool
@@ -2050,7 +1874,6 @@ params:
   # ================================================================
   - flag: jinja
     subgroup: 对话模板与思考
-    subgroup: 对话模板与思考
     label: 启用 Jinja
     type: Bool
     default: "true"
@@ -2059,7 +1882,6 @@ params:
     offFlag: no-jinja
 
   - flag: skip-chat-parsing
-    subgroup: 对话模板与思考
     subgroup: 对话模板与思考
     label: 跳过聊天解析
     type: Bool
@@ -2070,7 +1892,6 @@ params:
 
   - flag: chat-template
     subgroup: 对话模板与思考
-    subgroup: 对话模板与思考
     label: 自定义模板
     type: String
     default: ""
@@ -2080,7 +1901,6 @@ params:
     tooltip: "自定义 Jinja 聊天模板字符串。覆盖模型自带的模板。支持的内置模板名：chatml, llama2, llama3, gemma, mistral, deepseek 等。一般无需设置，使用模型自带模板即可。"
 
   - flag: chat-template-file
-    subgroup: 对话模板与思考
     subgroup: 对话模板与思考
     label: 模板文件
     type: String
@@ -2093,7 +1913,6 @@ params:
   # ⭐⭐⭐ 核心：思考强度控制 ⭐⭐⭐
   - flag: chat-template-kwargs
     subgroup: 对话模板与思考
-    subgroup: 对话模板与思考
     label: 聊天模板参数 (Chat Template Kwargs) ⭐思考强度
     type: String
     default: '{"reasoning_effort": "medium"}'
@@ -2102,7 +1921,6 @@ params:
     tooltip: "【核心】以 JSON 格式传递给聊天模板的额外参数。Qwen3 模型设置 reasoning_effort 为 low/medium/xhigh 控制思考深度。设为 {\"enable_thinking\": false} 关闭思考。示例: low=快速响应, medium=平衡, xhigh=深度推理。"
 
   - flag: reasoning-preserve
-    subgroup: 对话模板与思考
     subgroup: 对话模板与思考
     label: 保留思考轨迹 (Reasoning Preserve)
     type: Bool
@@ -2114,7 +1932,6 @@ params:
 
   - flag: reasoning
     subgroup: 对话模板与思考
-    subgroup: 对话模板与思考
     label: 思考开关 (Reasoning)
     type: Combo
     default: "auto"
@@ -2123,7 +1940,6 @@ params:
     tooltip: "【核心】是否在对话中使用思考/推理。auto=从聊天模板自动检测（默认）；on=强制开启；off=强制关闭。比 chat-template-kwargs 的 enable_thinking 更直接。"
 
   - flag: reasoning-effort
-    subgroup: 对话模板与思考
     subgroup: 对话模板与思考
     label: 思考强度 (Reasoning Effort)
     type: Combo
@@ -2134,7 +1950,6 @@ params:
 
   - flag: reasoning-format
     subgroup: 对话模板与思考
-    subgroup: 对话模板与思考
     label: 思考格式 (Reasoning Format)
     type: Combo
     default: "auto"
@@ -2143,7 +1958,6 @@ params:
     tooltip: "思考标签的解析/返回格式。auto=自动（默认）；none=思考标签保留在 message.content；deepseek=思考内容放入 message.reasoning_content；deepseek-legacy=标签留在 content 同时填充 reasoning_content。兼容 DeepSeek API 客户端。"
 
   - flag: reasoning-budget-message
-    subgroup: 对话模板与思考
     subgroup: 对话模板与思考
     label: 思考预算耗尽提示 (Budget Message)
     type: String
@@ -2156,7 +1970,6 @@ params:
   # ================================================================
   - flag: verbosity
     subgroup: 日志
-    subgroup: 日志
     label: 日志详细度
     type: String
     default: "3"
@@ -2165,7 +1978,6 @@ params:
     tooltip: "日志输出详细程度。0=仅关键信息；1=错误；2=警告；3=信息（默认）；4=追踪；5=调试。"
 
   - flag: verbose
-    subgroup: 日志
     subgroup: 日志
     label: 详细日志 (Verbose)
     type: Bool
@@ -2176,7 +1988,6 @@ params:
 
   - flag: perf
     subgroup: 注意力与性能
-    subgroup: 注意力与性能
     label: 性能分析
     type: Bool
     default: "true"
@@ -2185,7 +1996,6 @@ params:
     tooltip: "启用 llama-server 的 --perf 性能计时输出（PREFILL/EVAL t/s）。官方默认关闭；启动器默认开启以提供诊断信息，禁用可略微减少开销。"
 
   - flag: verbose-prompt
-    subgroup: 已废弃
     subgroup: 已废弃
     deprecated: true
     label: 详细 Prompt
@@ -2199,7 +2009,6 @@ params:
 
   - flag: log-colors
     subgroup: 日志
-    subgroup: 日志
     label: 彩色日志
     type: Combo
     default: "auto"
@@ -2211,7 +2020,6 @@ params:
 
   - flag: log-file
     subgroup: 日志
-    subgroup: 日志
     label: 日志文件
     type: String
     default: ""
@@ -2221,7 +2029,6 @@ params:
     tooltip: "将日志同时写入指定文件。留空=仅输出到控制台。"
 
   - flag: log-jsonl
-    subgroup: 日志
     subgroup: 日志
     label: JSONL 日志
     type: Bool
@@ -2233,7 +2040,6 @@ params:
 
   - flag: log-prefix
     subgroup: 日志
-    subgroup: 日志
     label: 日志前缀
     type: Bool
     default: "true"
@@ -2242,7 +2048,6 @@ params:
     tooltip: "日志消息是否带前缀（--log-prefix / --no-log-prefix）。官方默认开启。"
 
   - flag: log-timestamps
-    subgroup: 日志
     subgroup: 日志
     label: 日志时间戳
     type: Bool
@@ -2253,7 +2058,6 @@ params:
 
   - flag: log-disable
     subgroup: 日志
-    subgroup: 日志
     label: 禁用日志
     type: Bool
     default: "false"
@@ -2262,7 +2066,6 @@ params:
     tooltip: "完全禁用日志输出（--log-disable）。默认关闭。"
 
   - flag: log-prompts-dir
-    subgroup: 日志
     subgroup: 日志
     label: Prompt 日志目录
     type: String
@@ -2274,7 +2077,6 @@ params:
 
   - flag: reverse-prompt
     subgroup: 提示处理
-    subgroup: 提示处理
     label: 停止字符串
     type: String
     default: ""
@@ -2285,7 +2087,6 @@ params:
 
   - flag: special
     subgroup: 提示处理
-    subgroup: 提示处理
     label: 特殊 Token 输出
     type: Bool
     default: "false"
@@ -2294,7 +2095,6 @@ params:
     tooltip: "是否在输出中包含特殊 token（如 <|im_end|> 等）。默认禁用。调试时可能需要开启。"
 
   - flag: escape
-    subgroup: 注意力与性能
     subgroup: 注意力与性能
     label: 处理转义序列
     type: Bool
@@ -2306,7 +2106,6 @@ params:
 
   - flag: spm-infill
     subgroup: 提示处理
-    subgroup: 提示处理
     label: SPM Infill 模式
     type: Bool
     default: "false"
@@ -2315,7 +2114,6 @@ params:
     tooltip: "使用 Suffix/Prefix/Middle 模式做 infill（部分模型偏好，区别于默认的 Prefix/Suffix/Middle）。默认关闭。"
 
   - flag: no-display-prompt
-    subgroup: 已废弃
     subgroup: 已废弃
     deprecated: true
     label: 不显示 Prompt
@@ -2329,7 +2127,6 @@ params:
 
   - flag: tools
     subgroup: 工具与 MCP
-    subgroup: 工具与 MCP
     label: 工具调用
     type: String
     default: ""
@@ -2340,7 +2137,6 @@ params:
 
   - flag: agent
     subgroup: 工具与 MCP
-    subgroup: 工具与 MCP
     label: Agent 模式 (实验性)
     type: Bool
     default: "false"
@@ -2349,7 +2145,6 @@ params:
     tooltip: "启用 CORS 代理和全部内置工具（--agent）。请勿在不可信环境开启！开启后出于安全原因会把 cors-origins 限制为 localhost。默认关闭。"
 
   - flag: tools-runtime
-    subgroup: 工具与 MCP
     subgroup: 工具与 MCP
     label: 工具运行环境 (实验性)
     type: String
@@ -2361,7 +2156,6 @@ params:
 
   - flag: embedding
     subgroup: 嵌入与重排
-    subgroup: 嵌入与重排
     label: 启用 Embedding
     type: Bool
     default: "false"
@@ -2370,7 +2164,6 @@ params:
     tooltip: "启用 Embeddings API 端点（/embedding）。需要使用专门的 Embedding 模型。普通对话场景不要开启。"
 
   - flag: pooling
-    subgroup: 并行与槽位
     subgroup: 并行与槽位
     label: Embedding 池化
     type: Combo
@@ -2382,7 +2175,6 @@ params:
 
   - flag: embd-normalize
     subgroup: 嵌入与重排
-    subgroup: 嵌入与重排
     label: Embedding 归一化
     type: String
     default: ""
@@ -2392,7 +2184,6 @@ params:
 
   - flag: rerank
     subgroup: 嵌入与重排
-    subgroup: 嵌入与重排
     label: 启用 Rerank
     type: Bool
     default: "false"
@@ -2401,7 +2192,6 @@ params:
     tooltip: "启用 Rerank 端点 (/rerank)。用于文档重排序场景，需要专门的 rerank 模型（如 bge-reranker-v2-m3）+ --pooling rank。默认禁用。"
 
   - flag: metrics
-    subgroup: 服务管理
     subgroup: 服务管理
     label: 启用 Metrics
     role: metrics
@@ -2413,7 +2203,6 @@ params:
 
   - flag: slots
     subgroup: 服务管理
-    subgroup: 服务管理
     label: 显示槽位
     type: Bool
     default: "true"
@@ -2423,7 +2212,6 @@ params:
     offFlag: no-slots
 
   - flag: lora
-    subgroup: LoRA 与控制向量
     subgroup: LoRA 与控制向量
     label: LoRA
     type: String
@@ -2435,7 +2223,6 @@ params:
 
   - flag: lora-init-without-apply
     subgroup: LoRA 与控制向量
-    subgroup: LoRA 与控制向量
     label: LoRA 不立即应用
     type: Bool
     default: "false"
@@ -2444,7 +2231,6 @@ params:
     tooltip: "加载 LoRA 适配器但不立即应用（scale 初始化为 0），稍后通过 POST /lora-adapters 应用。默认关闭。"
 
   - flag: lora-scaled
-    subgroup: LoRA 与控制向量
     subgroup: LoRA 与控制向量
     label: LoRA (带比例)
     type: String
@@ -2456,7 +2242,6 @@ params:
 
   - flag: control-vector
     subgroup: LoRA 与控制向量
-    subgroup: LoRA 与控制向量
     label: 控制向量
     type: String
     default: ""
@@ -2466,7 +2251,6 @@ params:
     tooltip: "控制向量（Control Vector）路径。通过向量运算引导模型行为。"
 
   - flag: control-vector-scaled
-    subgroup: LoRA 与控制向量
     subgroup: LoRA 与控制向量
     label: 控制向量 (带比例)
     type: String
@@ -2478,7 +2262,6 @@ params:
 
   - flag: control-vector-layer-range
     subgroup: LoRA 与控制向量
-    subgroup: LoRA 与控制向量
     label: 控制向量层范围
     type: String
     default: ""
@@ -2489,7 +2272,6 @@ params:
 
   - flag: sleep-idle-seconds
     subgroup: 并行与槽位
-    subgroup: 并行与槽位
     label: 休眠空闲秒数
     type: String
     default: "-1"
@@ -2497,7 +2279,6 @@ params:
     tooltip: "空闲多少秒后服务器自动休眠（卸载模型释放显存）。-1=禁用（默认）。"
 
   - flag: props
-    subgroup: 服务管理
     subgroup: 服务管理
     label: 启用属性修改
     type: Bool
@@ -2528,7 +2309,6 @@ params:
 
   - flag: slot-save-path
     subgroup: 服务管理
-    subgroup: 服务管理
     label: Slot 缓存保存路径
     type: String
     default: ""
@@ -2538,7 +2318,6 @@ params:
     tooltip: "保存 slot KV 缓存的路径。默认禁用。用于持久化缓存，加速重启后的恢复。"
 
   - flag: models-dir
-    subgroup: 模型目录
     subgroup: 模型目录
     label: 模型目录 (Router)
     type: String
@@ -2550,7 +2329,6 @@ params:
 
   - flag: models-preset
     subgroup: 模型目录
-    subgroup: 模型目录
     label: 模型预设文件
     type: String
     default: ""
@@ -2561,7 +2339,6 @@ params:
 
   - flag: models-max
     subgroup: 模型目录
-    subgroup: 模型目录
     label: 最大同时加载模型数
     type: String
     default: "4"
@@ -2570,7 +2347,6 @@ params:
     tooltip: "Router 服务器最大同时加载模型数。0=无限制。默认 4。"
 
   - flag: models-autoload
-    subgroup: 模型目录
     subgroup: 模型目录
     label: 模型自动加载
     type: Bool
@@ -2612,3 +2388,39 @@ params:
     advanced: true
     aliases: [webui-mcp-proxy, webui-mcp]
     tooltip: "实验性：启用 MCP CORS 代理，让 WebUI 从浏览器访问远程 MCP 服务器。请勿在不可信环境中开启。旧参数名 --webui-mcp / --webui-mcp-proxy 已统一为 --ui-mcp-proxy。"
+
+  # ================================================================
+  # 2026-10-16 增补：llama-server 0.7.0-dev (b11675) --help 新增参数
+  # ================================================================
+  - flag: moe-cache-mib
+    subgroup: 后端与显存
+    label: MoE 专家 GPU 缓存 (MiB)
+    type: String
+    default: "0"
+    group: common
+    advanced: true
+    tooltip: "为留在 CPU 的 MoE 专家权重分配 GPU 缓存（MiB）。0=禁用（官方默认）。多 GPU 时按 --tensor-split 比例分摊。显存充裕的 MoE 模型可用它减少专家换入换出。"
+
+  - flag: spec-draft-n-ubatch
+    subgroup: 类型与草稿
+    label: 草稿物理批上限 (n-ubatch)
+    type: String
+    default: "0"
+    group: spec
+    advanced: true
+    requires:
+      - {flag: spec-type, op: "!=", value: none}
+    tooltip: "草稿上下文的物理最大批，调小可省显存。0=跟随 --n-ubatch（官方默认）。"
+
+  - flag: spec-draft-sampling
+    subgroup: 类型与草稿
+    label: 草稿采样方式
+    type: Combo
+    default: "greedy"
+    group: spec
+    enabled: true
+    offValue: "greedy"
+    requires:
+      - {flag: spec-type, op: "!=", value: none}
+    options: [greedy, probabilistic]
+    tooltip: "草稿 token 的采样方式。greedy=取 argmax（官方默认，最稳）；probabilistic=按分布采样并由目标模型拒绝采样校验，接受率更高但开销略大。"

@@ -28,7 +28,7 @@ using Microsoft.Win32;
 
 namespace LlamaDSH_Launcher;
 
-public partial class MainWindow : Window, IComponentConnector
+public partial class MainWindow : Window, IComponentConnector, IParamState
 {
 	private const string DSH_DIR = "%DSH%";
 
@@ -266,8 +266,7 @@ public partial class MainWindow : Window, IComponentConnector
 			foreach (IGrouping<string, ParamDefinition> sg in items.GroupBy((ParamDefinition p) => p.Subgroup ?? ""))
 			{
 				Grid grid = new Grid();
-				grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0, GridUnitType.Star) });
-				grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(12.0) });
+				// 一参数一行：单列布局，输入框可横跨整行（原先左右两列各塞一个参数，长值与下拉都过窄）
 				grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0, GridUnitType.Star) });
 				int idx = 0;
 				foreach (ParamDefinition item in sg)
@@ -322,7 +321,8 @@ public partial class MainWindow : Window, IComponentConnector
 							IsEditable = true,
 							ToolTip = item.Tooltip,
 							MinWidth = 70.0,
-							HorizontalAlignment = System.Windows.HorizontalAlignment.Stretch
+							MaxWidth = item.Wide ? double.PositiveInfinity : 420.0,
+							HorizontalAlignment = item.Wide ? System.Windows.HorizontalAlignment.Stretch : System.Windows.HorizontalAlignment.Left
 						};
 						foreach (string option in item.Options)
 						{
@@ -350,7 +350,8 @@ public partial class MainWindow : Window, IComponentConnector
 							Text = (item.DefaultValue.ToString() ?? ""),
 							ToolTip = item.Tooltip,
 							MinWidth = 70.0,
-							HorizontalAlignment = System.Windows.HorizontalAlignment.Stretch
+							MaxWidth = item.Wide ? double.PositiveInfinity : 420.0,
+							HorizontalAlignment = item.Wide ? System.Windows.HorizontalAlignment.Stretch : System.Windows.HorizontalAlignment.Left
 						};
 						control = obj;
 						checkBox2.Checked += delegate
@@ -554,42 +555,37 @@ public partial class MainWindow : Window, IComponentConnector
 	}
 
 
+	/// <summary>一参数一行：每个参数独占一行（原先两列每行塞两个，长值/下拉过窄）。wide 仅表达“值较长”，由控件 MaxWidth 决定铺满与否。</summary>
 	private static void PlaceParamRow(Grid g, UIElement el, ref int idx, bool wide = false)
 	{
-		if (wide)
+		while (g.RowDefinitions.Count <= idx)
 		{
-			// 通栏宽行: 对齐到行首, 横跨 3 列独占一行
-			if (idx % 2 != 0)
-			{
-				idx++;
-			}
-			while (g.RowDefinitions.Count <= idx / 2)
-			{
-				g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-			}
-			Grid.SetRow(el, idx / 2);
-			Grid.SetColumn(el, 0);
-			Grid.SetColumnSpan(el, 3);
-			idx += 2;
-			g.Children.Add(el);
-			return;
+			g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 		}
-		int num = idx / 2;
-		int value = idx % 2 * 2;
-		while (g.RowDefinitions.Count <= num)
-		{
-			g.RowDefinitions.Add(new RowDefinition
-			{
-				Height = GridLength.Auto
-			});
-		}
-		Grid.SetRow(el, num);
-		Grid.SetColumn(el, value);
+		Grid.SetRow(el, idx);
+		Grid.SetColumn(el, 0);
 		g.Children.Add(el);
 		idx++;
 	}
 
 	// ==================== 参数依赖引擎（配置驱动） ====================
+
+	// IParamState 显式实现：规则引擎（ParamRules）与 UI 状态之间的唯一接线点
+	// —— 参数面板的勾选/输入即状态源，规则判定本身不依赖 WPF，可单测。
+	bool IParamState.IsOn(ParamDefinition d)
+	{
+		return IsEffectivelyOn(d);
+	}
+
+	string IParamState.EffectiveValue(ParamDefinition d)
+	{
+		return EffectiveValue(d);
+	}
+
+	ParamDefinition? IParamState.ByFlag(string flag)
+	{
+		return _paramDefs.FirstOrDefault((ParamDefinition x) => x.Flag == flag);
+	}
 
 	/// <summary>参数是否处于"生效"状态：bool 已勾选；值参数已勾选且值非空。</summary>
 	private bool IsEffectivelyOn(ParamDefinition d)
@@ -645,39 +641,9 @@ public partial class MainWindow : Window, IComponentConnector
 		return !string.Equals(EffectiveValue(d), "none", StringComparison.OrdinalIgnoreCase);
 	}
 
-	private static bool CompareValues(string v, string op, string target)
-	{
-		bool isNumA = double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out double a);
-		bool isNumB = double.TryParse(target, NumberStyles.Float, CultureInfo.InvariantCulture, out double b);
-		int c = (isNumA && isNumB) ? a.CompareTo(b) : string.CompareOrdinal(v, target);
-		return op switch
-		{
-			"==" => c == 0,
-			"!=" => c != 0,
-			">" => c > 0,
-			"<" => c < 0,
-			">=" => c >= 0,
-			"<=" => c <= 0,
-			_ => true
-		};
-	}
-
 	private bool RuleMet(ParamRule r)
 	{
-		ParamDefinition? def = _paramDefs.FirstOrDefault((ParamDefinition x) => x.Flag == r.Flag);
-		if (def == null)
-		{
-			return true;
-		}
-		switch (r.Op)
-		{
-		case "enabled":
-			return IsEffectivelyOn(def);
-		case "disabled":
-			return !IsEffectivelyOn(def);
-		default:
-			return CompareValues(EffectiveValue(def), r.Op, r.Value);
-		}
+		return ParamRules.RuleMet(r, this);
 	}
 
 	/// <summary>按 role 查找参数定义（启动器内部逻辑的绑定入口）。</summary>
@@ -797,60 +763,7 @@ public partial class MainWindow : Window, IComponentConnector
 	/// <summary>单参数依赖/互斥/校验检查。返回 null=通过，否则返回剔除原因。</summary>
 	private string? CheckParam(ParamDefinition d, HashSet<string> on)
 	{
-		if (d.Requires is { Count: > 0 })
-		{
-			List<ParamRule> unmet = d.Requires.Where((ParamRule r) => !RuleMet(r)).ToList();
-			if (unmet.Count > 0)
-			{
-				return "前置不满足（" + string.Join(" 且 ", unmet.Select((ParamRule r) => r.Describe())) + "）";
-			}
-		}
-		if (d.Conflicts is { Count: > 0 })
-		{
-			string? hit = d.Conflicts.FirstOrDefault((string c) => on.Contains(c));
-			if (hit != null)
-			{
-				return "与 --" + hit + " 互斥";
-			}
-		}
-		if (d.Validate != null)
-		{
-			string v = (d.Type == ParamType.Bool) ? "true" : EffectiveValue(d);
-			ParamValidate val = d.Validate;
-			if (d.Type != ParamType.Bool)
-			{
-				string vn = NormTok(v);
-				bool isNum = double.TryParse(vn, NumberStyles.Float, CultureInfo.InvariantCulture, out double n);
-				if ((val.Min.HasValue || val.Max.HasValue) && !isNum)
-				{
-					return "值 '" + v + "' 不是数字";
-				}
-				if (val.Min.HasValue && isNum && n < val.Min.Value)
-				{
-					return "值 " + vn + " 小于下限 " + val.Min.Value;
-				}
-				if (val.Max.HasValue && isNum && n > val.Max.Value)
-				{
-					return "值 " + vn + " 大于上限 " + val.Max.Value;
-				}
-				if (val.Leq != null)
-				{
-					ParamDefinition? other = _paramDefs.FirstOrDefault((ParamDefinition x) => x.Flag == val.Leq);
-					if (other != null && on.Contains(other.Flag) && double.TryParse(NormTok(EffectiveValue(other)), NumberStyles.Float, CultureInfo.InvariantCulture, out double cap))
-					{
-						if (isNum && n > cap)
-						{
-							return "值 " + vn + " 超过 --" + other.Flag + " (" + cap + ")";
-						}
-					}
-				}
-				if (val.Regex != null && !Regex.IsMatch(v, val.Regex))
-				{
-					return "值 '" + v + "' 不匹配格式 " + val.Regex;
-				}
-			}
-		}
-		return null;
+		return ParamRules.CheckParam(d, on, this);
 	}
 
 	private void SetupTray()
@@ -1921,74 +1834,11 @@ public partial class MainWindow : Window, IComponentConnector
 		{
 			list.Add("--no-mmproj-offload");
 		}
-		// 参数依赖引擎：先收集所有"生效"参数，再逐个检查前置/互斥/校验，不通过则剔除并记录原因
-		_lastViolations = new List<string>();
-		HashSet<string> on = new HashSet<string>();
-		foreach (ParamDefinition d0 in _paramDefs)
-		{
-			if (!d0.Hidden && d0.Flag != "model" && d0.Flag != "model-draft" && IsEffectivelyOn(d0))
-			{
-				on.Add(d0.Flag);
-			}
-		}
-		foreach (ParamDefinition paramDef in _paramDefs)
-		{
-			string flag = paramDef.Flag;
-			if (flag == "model" || flag == "model-draft" || paramDef.Hidden)
-			{
-				continue;
-			}
-			if (!on.Contains(flag))
-			{
-				continue;
-			}
-			string? reject = CheckParam(paramDef, on);
-			if (reject != null)
-			{
-				_lastViolations.Add("--" + flag + "（" + reject + "）");
-				continue;
-			}
-			if (paramDef.Type == ParamType.Bool)
-			{
-				list.Add("--" + paramDef.Flag);
-			}
-			else
-			{
-				string text4 = EffectiveValue(paramDef);
-				if (paramDef.Role == "ctx_size")
-				{
-					text4 = NormTok(text4);
-				}
-				if (!string.IsNullOrEmpty(text4))
-				{
-					list.AddRange(new string[2]
-					{
-						"--" + paramDef.Flag,
-						text4
-					});
-				}
-			}
-		}
-		// "取消勾选=关闭"语义：对配置了 off 语义的参数，未勾选时显式发射关闭值/否定旗标，
-		// 覆盖 llama-server 默认值不是"关闭"的选项（如 --no-jinja、--flash-attn off、--spec-type none）
-		foreach (ParamDefinition paramDef in _paramDefs)
-		{
-			if (paramDef.Hidden || paramDef.Flag == "model" || paramDef.Flag == "model-draft" || on.Contains(paramDef.Flag))
-			{
-				continue;
-			}
-			if (paramDef.Type == ParamType.Bool)
-			{
-				if (!string.IsNullOrEmpty(paramDef.OffFlag))
-				{
-					list.Add("--" + paramDef.OffFlag);
-				}
-			}
-			else if (!string.IsNullOrEmpty(paramDef.OffValue))
-			{
-				list.AddRange(new string[2] { "--" + paramDef.Flag, paramDef.OffValue });
-			}
-		}
+		// 参数依赖引擎：纯逻辑在 ParamRules（可单测）。前置未满足的参数连 off 语义都不发射，
+		// 避免"前置已取消勾选、后置仍被注入启动行"（如 spec-type=none 时仍发 offFlag）。
+		ParamBuildResult paramBuild = ParamRules.Build(_paramDefs, this);
+		list.AddRange(paramBuild.Args);
+		_lastViolations = paramBuild.Violations;
 		return list;
 		static string Cl(string s)
 		{
@@ -2022,27 +1872,7 @@ public partial class MainWindow : Window, IComponentConnector
 
 	private static string NormTok(string v)
 	{
-		string text = v.Trim();
-		if (string.IsNullOrEmpty(text))
-		{
-			return text;
-		}
-		Match match = Regex.Match(text, "^(\\d+(?:\\.\\d+)?)\\s*([KkMm]?)$");
-		if (!match.Success)
-		{
-			return text;
-		}
-		double num = double.Parse(match.Groups[1].Value);
-		string text2 = match.Groups[2].Value.ToLowerInvariant();
-		if (text2 == "k")
-		{
-			num *= 1024.0;
-		}
-		else if (text2 == "m")
-		{
-			num *= 1048576.0;
-		}
-		return ((int)Math.Round(num)).ToString();
+		return ParamRules.NormTok(v);
 	}
 
 	private bool TryGetParamValue(string flag, out string value)

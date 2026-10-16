@@ -6,6 +6,7 @@ using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32;
 
 namespace LlamaDSH_Launcher.Services;
 
@@ -92,6 +93,13 @@ public static class FileSearcher
 				Emit("  [S1] Hit: " + text4.Trim('"'));
 				return text4.Trim('"');
 			}
+		}
+		Emit("  [S1b] Known install locations...");
+		string? knownLlama = ProbeKnownLlamaServer();
+		if (knownLlama != null)
+		{
+			Emit("  [S1b] Hit: " + knownLlama);
+			return knownLlama;
 		}
 		Emit("  [S2] Drive roots...");
 		string text5 = (Environment.GetEnvironmentVariable("SystemDrive") ?? "C:").ToUpperInvariant();
@@ -181,22 +189,19 @@ public static class FileSearcher
 	{
 		string value = "deepseek-harness";
 		Emit("Searching DSH project...");
-		string text = "%DSH%";
-		if (Directory.Exists(text))
+		Emit("  [S0] Known locations...");
+		string? knownDsh = ProbeKnownDshRoots();
+		if (knownDsh != null)
 		{
-			Emit("  [S0] Check: " + text);
-			if (IsDsh(text))
-			{
-				Emit("  [S0] Hit: " + text);
-				return text;
-			}
+			Emit("  [S0] Hit: " + knownDsh);
+			return knownDsh;
 		}
 		Emit("  [S1] Common dirs...");
 		List<(string, int)> list = new List<(string, int)>();
 		string[] drives = GetDrives();
 		foreach (string path in drives)
 		{
-			string[] array = new string[5] { "Program Files", "Program Files (x86)", "Projects", "dev", "code" };
+			string[] array = new string[10] { "Program Files", "Program Files (x86)", "Projects", "dev", "code", "src", "repos", "work", "git", "tools" };
 			foreach (string path2 in array)
 			{
 				string text2 = Path.Combine(path, path2);
@@ -207,7 +212,7 @@ public static class FileSearcher
 			}
 		}
 		string folderPath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-		drives = new string[5] { "Projects", "dev", "code", "repos", "src" };
+		drives = new string[9] { "Projects", "dev", "code", "repos", "src", "git", "github", "Documents", "source" };
 		foreach (string path3 in drives)
 		{
 			string text3 = Path.Combine(folderPath, path3);
@@ -229,7 +234,7 @@ public static class FileSearcher
 				drives = Directory.GetDirectories(item);
 				foreach (string text4 in drives)
 				{
-					if (Path.GetFileName(text4).ToLowerInvariant().Contains(value) && IsDsh(text4))
+					if (MatchKeyword(Path.GetFileName(text4)) && IsDsh(text4))
 					{
 						Emit("  [S1] Hit: " + text4);
 						return text4;
@@ -257,6 +262,12 @@ public static class FileSearcher
 		{
 			cb?.Invoke(msg);
 		}
+		static bool MatchKeyword(string name)
+		{
+			string n = name.ToLowerInvariant();
+			return n.Contains("deepseek") || n.Contains("dsh") || n.Contains("harness");
+		}
+
 		static bool IsDsh(string p)
 		{
 			try
@@ -433,6 +444,210 @@ public static class FileSearcher
 		if (text.StartsWith('.') && depth > 1)
 		{
 			return true;
+		}
+		return false;
+	}
+
+	/// <summary>
+	/// 已知安装位置的定向探测（不依赖本机布局）：注册表 App Paths → 包管理器(scoop/choco) →
+	/// LM Studio 内置后端 → 常见源码/构建/下载目录。命中即返回，避免只能靠全盘 BFS 撞运气。
+	/// </summary>
+	public static string? ProbeKnownLlamaServer()
+	{
+		try
+		{
+			foreach (RegistryKey root in new RegistryKey[2] { Registry.LocalMachine, Registry.CurrentUser })
+			{
+				foreach (string sub in new string[2]
+				{
+					"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\llama-server.exe",
+					"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths\\llama-server.exe"
+				})
+				{
+					try
+					{
+						using RegistryKey? key = root.OpenSubKey(sub);
+						if (key?.GetValue(null) is string exe && exe.Length > 0)
+						{
+							string? dir = Path.GetDirectoryName(exe);
+							if (dir != null && File.Exists(Path.Combine(dir, "llama-server.exe")))
+							{
+								return dir;
+							}
+						}
+					}
+					catch
+					{
+					}
+				}
+			}
+		}
+		catch
+		{
+		}
+		string folderPath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+		string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+		string roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+		string common = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+		foreach (string dir2 in new string[6]
+		{
+			Path.Combine(folderPath, "scoop", "apps", "llama.cpp", "current"),
+			Path.Combine(folderPath, "scoop", "apps", "llamacpp", "current"),
+			Path.Combine(local, "scoop", "apps", "llama.cpp", "current"),
+			Path.Combine(common, "chocolatey", "lib", "llama.cpp", "tools"),
+			Path.Combine(common, "chocolatey", "lib", "llamacpp", "tools"),
+			Path.Combine(common, "chocolatey", "bin")
+		})
+		{
+			if (File.Exists(Path.Combine(dir2, "llama-server.exe")))
+			{
+				return dir2;
+			}
+		}
+		List<string> bases = new List<string>();
+		bases.Add(folderPath);
+		bases.Add(Path.Combine(folderPath, "source", "repos"));
+		bases.Add(Path.Combine(folderPath, "Documents"));
+		bases.Add(Path.Combine(folderPath, "Desktop"));
+		bases.Add(Path.Combine(folderPath, "Downloads"));
+		bases.Add(Path.Combine(local, "Programs"));
+		bases.Add(local);
+		foreach (string drive in GetDrives())
+		{
+			bases.Add(drive);
+			bases.Add(Path.Combine(drive, "code"));
+			bases.Add(Path.Combine(drive, "dev"));
+			bases.Add(Path.Combine(drive, "Apps"));
+			bases.Add(Path.Combine(drive, "tools"));
+			bases.Add(Path.Combine(drive, "Program Files"));
+		}
+		string[] names = new string[4] { "llama.cpp", "llamacpp", "llama-cpp", "llama.cpp-master" };
+		string[] subs = new string[9] { "", "bin", "build", "build\\bin", "build\\bin\\Release", "build\\bin\\Debug", "Release", "windows", "llama.cpp" };
+		foreach (string text7 in bases)
+		{
+			if (File.Exists(Path.Combine(text7, "llama-server.exe")))
+			{
+				return text7;
+			}
+			foreach (string text8 in names)
+			{
+				string text9 = Path.Combine(text7, text8);
+				foreach (string text10 in subs)
+				{
+					string text11 = ((text10.Length == 0) ? text9 : Path.Combine(text9, text10));
+					if (File.Exists(Path.Combine(text11, "llama-server.exe")))
+					{
+						return text11;
+					}
+				}
+			}
+		}
+
+		// 兜底：LM Studio / 其它编辑器内置的 llama.cpp 后端（版本号由编辑器管理，优先级低于专用安装目录）
+		foreach (string backends in new string[4]
+		{
+			Path.Combine(folderPath, ".lmstudio", "extensions", "backends"),
+			Path.Combine(local, ".lmstudio", "extensions", "backends"),
+			Path.Combine(roaming, "LM Studio", "extensions", "backends"),
+			Path.Combine(local, "LM Studio", "extensions", "backends")
+		})
+		{
+			try
+			{
+				if (!Directory.Exists(backends))
+				{
+					continue;
+				}
+				foreach (string sub2 in Directory.GetDirectories(backends))
+				{
+					if (File.Exists(Path.Combine(sub2, "llama-server.exe")))
+					{
+						return sub2;
+					}
+				}
+			}
+			catch
+			{
+			}
+		}
+		return null;
+	}
+
+	/// <summary>DSH 检出目录的已知候选（不再写死本机路径）：家目录/常见代码目录/各盘根 + 关键词子目录。</summary>
+	public static string? ProbeKnownDshRoots()
+	{
+		string folderPath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+		string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+		List<string> list = new List<string>();
+		list.Add(Path.Combine(folderPath, "deepseek-harness"));
+		list.Add(Path.Combine(folderPath, "dsh"));
+		list.Add(Path.Combine(folderPath, "code", "deepseek-harness"));
+		list.Add(Path.Combine(folderPath, "source", "repos", "deepseek-harness"));
+		list.Add(Path.Combine(folderPath, "Documents", "deepseek-harness"));
+		list.Add(Path.Combine(local, "Programs", "deepseek-harness"));
+		foreach (string drive in GetDrives())
+		{
+			list.Add(Path.Combine(drive, "deepseek-harness"));
+			list.Add(Path.Combine(drive, "dsh"));
+			list.Add(Path.Combine(drive, "code", "deepseek-harness"));
+			list.Add(Path.Combine(drive, "dev", "deepseek-harness"));
+			list.Add(Path.Combine(drive, "src", "deepseek-harness"));
+			list.Add(Path.Combine(drive, "Program files", "deepseek-harness"));
+			list.Add(Path.Combine(drive, "Program Files", "deepseek-harness"));
+			try
+			{
+				foreach (string text12 in Directory.GetDirectories(drive))
+				{
+					string text13 = Path.GetFileName(text12).ToLowerInvariant();
+					if (text13.Contains("deepseek") || text13.Contains("dsh") || text13.Contains("harness"))
+					{
+						list.Add(text12);
+					}
+				}
+			}
+			catch
+			{
+			}
+		}
+		foreach (string text14 in list)
+		{
+			if (IsDshProjectDir(text14))
+			{
+				return text14;
+			}
+		}
+		return null;
+	}
+
+	/// <summary>DSH 检出目录判据（供定向探测复用；与 FindDshProject 内 IsDsh 同义）。</summary>
+	private static bool IsDshProjectDir(string p)
+	{
+		try
+		{
+			if (!Directory.Exists(p))
+			{
+				return false;
+			}
+			if (File.Exists(Path.Combine(p, "pnpm-workspace.yaml")))
+			{
+				return true;
+			}
+			if (File.Exists(Path.Combine(p, "apps", "cli", "package.json")) && Directory.Exists(Path.Combine(p, "packages")))
+			{
+				return true;
+			}
+			string text15 = Path.Combine(p, "package.json");
+			if (File.Exists(text15))
+			{
+				string text16 = (JsonDocument.Parse(File.ReadAllText(text15)).RootElement.GetProperty("name").GetString() ?? "").ToLowerInvariant();
+				if (text16.Contains("deepseek") || text16.Contains("dsh") || text16.Contains("harness"))
+				{
+					return true;
+				}
+			}
+		}
+		catch
+		{
 		}
 		return false;
 	}
