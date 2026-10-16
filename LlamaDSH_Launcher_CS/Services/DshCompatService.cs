@@ -2862,14 +2862,44 @@ process.stdout.write(JSON.stringify(out));
                 return (relinked, removed, failed);
         }
 
-        /// <summary>peer 与 DSH 不兼容的 registry 插件 → pnpm add @latest 一次性升级（需已停止 DSH）。</summary>
-        private static string RepairUpgradePlugins(DshCompatReport report, Action<string>? log)
+        /// <summary>
+        /// peer 与 DSH 不兼容的 registry 插件 → pnpm add @latest 一次性升级（需已停止 DSH）。
+        /// 升级前先过 discovery 预检：缓存显示最新版会被门禁拒绝的直接跳过，避免升完才发现失败。
+        /// </summary>
+        public static string RepairUpgradePlugins(DshCompatReport report, Action<string>? log)
         {
                 if (!report.PnpmOk)
                 {
                         return "pnpm 不可用，跳过插件升级（请确认 pnpm 在 PATH 中）";
                 }
-                List<string> names = report.PluginsToUpgrade;
+                List<string> names = new();
+                List<string> skipped = new();
+                foreach (string name in report.PluginsToUpgrade)
+                {
+                        string installed = report.Plugins.FirstOrDefault((DshPluginInfo x) => x.Name == name)?.Version ?? "";
+                        DshUpdatePreview? preview = null;
+                        try
+                        {
+                                preview = PreviewPluginUpdate(name, installed, report.DshDir, report.ProfileDir, report.DshVersion);
+                        }
+                        catch (Exception ex)
+                        {
+                                log?.Invoke("[兼容修复] 升级预检异常（按原样尝试升级）: " + name + " —— " + ex.Message);
+                        }
+                        if (preview != null && preview.GateBlocked)
+                        {
+                                skipped.Add(name + "（最新 " + preview.LatestVersion + " 的 " + preview.GateName + " = "
+                                        + preview.GateRange + "，当前 DSH " + report.DshVersion + " 不满足）");
+                                log?.Invoke("[兼容修复] 跳过升级 " + name + "：预检判定最新版会被门禁拒绝（"
+                                        + preview.GateName + " = " + preview.GateRange + "）");
+                                continue;
+                        }
+                        names.Add(name);
+                }
+                if (names.Count == 0)
+                {
+                        return "升级预检：跳过 " + skipped.Count + " 个插件（预判最新版会被门禁拒绝）—— " + string.Join("；", skipped);
+                }
                 string args = string.Join(" ", names.Select((string n) => n + "@latest"));
                 log?.Invoke("[兼容修复] pnpm add " + args + "（可能需要数分钟）...");
                 (int ExitCode, string StdOut, string StdErr)? r = RunCapture("cmd.exe",
@@ -2880,11 +2910,14 @@ process.stdout.write(JSON.stringify(out));
                         return "pnpm 启动失败，插件升级未执行";
                 }
                 string tail = Tail(r.Value.StdErr.Length > 0 ? r.Value.StdErr : r.Value.StdOut, 600);
+                string skipNote = skipped.Count > 0
+                        ? "；另跳过 " + skipped.Count + " 个（预判被门禁拒绝）：" + string.Join("；", skipped)
+                        : "";
                 if (r.Value.ExitCode != 0)
                 {
-                        return "插件升级失败（exit " + r.Value.ExitCode + "）：" + tail;
+                        return "插件升级失败（exit " + r.Value.ExitCode + "）：" + tail + skipNote;
                 }
-                return "插件已升级到最新: " + string.Join(", ", names);
+                return "插件已升级到最新: " + string.Join(", ", names) + skipNote;
         }
 
         /// <summary>把 DSH 安装内存在的缺失 peer 以 junction 补进共享 node_modules，使插件目录可解析。</summary>
