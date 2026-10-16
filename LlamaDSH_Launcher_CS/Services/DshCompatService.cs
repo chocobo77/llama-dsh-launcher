@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -669,7 +670,7 @@ public static class DshCompatService
             string dir = ResolveProfileDir(profile);
             log?.Invoke("[插件管理] pnpm add " + name + "@latest ...");
             (int ExitCode, string StdOut, string StdErr)? r = RunCapture("cmd.exe",
-                new[] { "/c", "pnpm", "add", name + "@latest" }, dir, 900);
+                new[] { "/c", "pnpm", "add", name + "@latest", PnpmFetchTimeoutArg }, dir, 900);
             if (r == null)
             {
                 return "pnpm 启动失败";
@@ -931,6 +932,9 @@ public static class DshCompatService
 
                         // 5) node_modules 失效链接
                         AuditLinks(r, log);
+
+                        // 6) dsh-market 日志：历史更新失败 / 回滚 / 反复停用失败
+                        AuditMarketLog(r, log);
 
                         log?.Invoke("[兼容] 检查完成：错误 " + r.ErrorCount + " · 警告 " + r.WarningCount + " · 可修复 " + r.RepairableCount);
                 }
@@ -2849,7 +2853,7 @@ process.stdout.write(JSON.stringify(out));
                 string args = string.Join(" ", names.Select((string n) => n + "@latest"));
                 log?.Invoke("[兼容修复] pnpm add " + args + "（可能需要数分钟）...");
                 (int ExitCode, string StdOut, string StdErr)? r = RunCapture("cmd.exe",
-                        new List<string> { "/c", "pnpm", "add" }.Concat(names.Select((string n) => n + "@latest")).ToArray(),
+                        new List<string> { "/c", "pnpm", "add" }.Concat(names.Select((string n) => n + "@latest")).Concat(new[] { PnpmFetchTimeoutArg }).ToArray(),
                         report.ProfileDir, 900);
                 if (r == null)
                 {
@@ -3318,6 +3322,196 @@ process.stdout.write(JSON.stringify(out));
                 {
                 }
                 return null;
+        }
+
+        /// <summary>pnpm fetch 超时常量：大包（含原生二进制）常被 pnpm 默认 per-request 超时中断（dsh-market 日志 2026-09-29 实证）。</summary>
+        public const string PnpmFetchTimeoutArg = "--config.fetchTimeout=600000";
+
+        /// <summary>
+        /// 分析 dsh-market 的 log.ndjson 文本：只看 nowUtc 往前 window 内的记录，归类可疑项
+        /// （错误、更新回滚、反复停用失败、fetch 超时重试、被会话阻塞的操作）。
+        /// </summary>
+        public static List<DshMarketLogFinding> AnalyzeMarketLog(string text, DateTime nowUtc, TimeSpan window)
+        {
+                List<DshMarketLogFinding> findings = new();
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                        return findings;
+                }
+                DateTime cutoff = nowUtc - window;
+                int errors = 0;
+                string lastErrorAt = "";
+                string lastErrorEvent = "";
+                string lastErrorDetail = "";
+                int rollbacks = 0;
+                string lastRollbackAt = "";
+                string lastRollbackDetail = "";
+                int fetchRetries = 0;
+                string lastFetchAt = "";
+                int blocked = 0;
+                string lastBlockedAt = "";
+                Dictionary<string, (int Count, string LastAt)> toggles = new(StringComparer.Ordinal);
+                foreach (string raw in text.Split('\n'))
+                {
+                        string line = raw.Trim();
+                        if (line.Length == 0)
+                        {
+                                continue;
+                        }
+                        JsonNode? node;
+                        try
+                        {
+                                node = JsonNode.Parse(line);
+                        }
+                        catch
+                        {
+                                continue; // 坏行忽略
+                        }
+                        if (node is not JsonObject o)
+                        {
+                                continue;
+                        }
+                        string at = o["at"]?.ToString() ?? "";
+                        DateTime atUtc;
+                        if (!DateTime.TryParse(at, CultureInfo.InvariantCulture,
+                                DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out atUtc))
+                        {
+                                continue;
+                        }
+                        if (atUtc < cutoff)
+                        {
+                                continue;
+                        }
+                        string level = o["level"]?.ToString() ?? "";
+                        string ev = o["event"]?.ToString() ?? "";
+                        string detail = o["detail"]?.ToString() ?? "";
+                        if (string.Equals(level, "error", StringComparison.Ordinal))
+                        {
+                                errors++;
+                                lastErrorAt = at;
+                                lastErrorEvent = ev;
+                                lastErrorDetail = detail;
+                        }
+                        else if (string.Equals(ev, "update-rollback", StringComparison.Ordinal))
+                        {
+                                rollbacks++;
+                                lastRollbackAt = at;
+                                lastRollbackDetail = detail;
+                        }
+                        else if (detail.Contains("fetchTimeout", StringComparison.OrdinalIgnoreCase)
+                                || detail.Contains("fetch timeout", StringComparison.OrdinalIgnoreCase))
+                        {
+                                fetchRetries++;
+                                lastFetchAt = at;
+                        }
+                        else if (ev.EndsWith("-blocked", StringComparison.Ordinal))
+                        {
+                                blocked++;
+                                lastBlockedAt = at;
+                        }
+                        else if (string.Equals(ev, "toggle", StringComparison.Ordinal) && detail.Contains("-> off", StringComparison.Ordinal))
+                        {
+                                if (toggles.TryGetValue(detail, out (int Count, string LastAt) cur))
+                                {
+                                        toggles[detail] = (cur.Count + 1, at);
+                                }
+                                else
+                                {
+                                        toggles[detail] = (1, at);
+                                }
+                        }
+                }
+                if (errors > 0)
+                {
+                        findings.Add(new DshMarketLogFinding
+                        {
+                                Kind = "error",
+                                Title = "市场日志有 " + errors + " 条错误记录",
+                                Detail = lastErrorEvent + ": " + Tail(lastErrorDetail, 300) + "（最近 " + lastErrorAt + "）",
+                                Count = errors,
+                                LastAt = lastErrorAt
+                        });
+                }
+                if (rollbacks > 0)
+                {
+                        findings.Add(new DshMarketLogFinding
+                        {
+                                Kind = "rollback",
+                                Title = "市场更新失败并已回滚 " + rollbacks + " 次",
+                                Detail = Tail(lastRollbackDetail, 300) + "（最近 " + lastRollbackAt + "）",
+                                Count = rollbacks,
+                                LastAt = lastRollbackAt
+                        });
+                }
+                foreach (KeyValuePair<string, (int Count, string LastAt)> kv in toggles
+                        .Where((KeyValuePair<string, (int Count, string LastAt)> k) => k.Value.Count >= 5)
+                        .OrderByDescending((KeyValuePair<string, (int Count, string LastAt)> k) => k.Value.Count))
+                {
+                        findings.Add(new DshMarketLogFinding
+                        {
+                                Kind = "toggle-loop",
+                                Title = "插件停用反复失败 " + kv.Value.Count + " 次",
+                                Detail = kv.Key + "（最近 " + kv.Value.LastAt + "；fiber 未退出，重启 DSH 后再试）",
+                                Count = kv.Value.Count,
+                                LastAt = kv.Value.LastAt
+                        });
+                }
+                if (fetchRetries > 0)
+                {
+                        findings.Add(new DshMarketLogFinding
+                        {
+                                Kind = "fetch-timeout",
+                                Title = "pnpm 下载曾因 fetch 超时中断 " + fetchRetries + " 次",
+                                Detail = "启动器执行 pnpm add 时会附带 " + PnpmFetchTimeoutArg + "（最近 " + lastFetchAt + "）",
+                                Count = fetchRetries,
+                                LastAt = lastFetchAt
+                        });
+                }
+                if (blocked > 0)
+                {
+                        findings.Add(new DshMarketLogFinding
+                        {
+                                Kind = "blocked",
+                                Title = "有 " + blocked + " 次操作因 agent 运行被拒绝",
+                                Detail = "属会话安全保护（最近 " + lastBlockedAt + "）；如需更新/卸载请先结束运行中的 agent",
+                                Count = blocked,
+                                LastAt = lastBlockedAt
+                        });
+                }
+                return findings;
+        }
+
+        /// <summary>dsh-market 日志检查：把历史更新失败/回滚/反复停用失败带进兼容报告（近 30 天）。</summary>
+        public static void AuditMarketLog(DshCompatReport r, Action<string>? log)
+        {
+                string path = Path.Combine(r.ProfileDir, ".dsh-market", "log.ndjson");
+                if (!File.Exists(path))
+                {
+                        log?.Invoke("[兼容] 市场日志: 未找到 " + path);
+                        return;
+                }
+                string text;
+                try
+                {
+                        FileInfo fi = new FileInfo(path);
+                        if (fi.Length > 32000000)
+                        {
+                                log?.Invoke("[兼容] 市场日志: 文件过大，跳过（" + fi.Length + " 字节）");
+                                return;
+                        }
+                        text = File.ReadAllText(path, Encoding.UTF8);
+                }
+                catch (Exception ex)
+                {
+                        log?.Invoke("[兼容] 市场日志: 读取失败 —— " + ex.Message);
+                        return;
+                }
+                List<DshMarketLogFinding> findings = AnalyzeMarketLog(text, DateTime.UtcNow, TimeSpan.FromDays(30));
+                foreach (DshMarketLogFinding f in findings)
+                {
+                        r.Add(DshCompatLevel.Warning, "市场日志", f.Title, f.Detail, false, "");
+                }
+                log?.Invoke("[兼容] 市场日志: 可疑记录 " + findings.Count + " 项（近 30 天）");
         }
 
         /// <summary>已知“永不解析”的服务名分类：是否命中、原因、替代服务（空=只能删除）。</summary>
@@ -3815,5 +4009,16 @@ public sealed class DshDeadPeerFix
         public string PluginName = "";
         public string PackageJsonPath = "";
         public string PeerName = "";
+}
+
+/// <summary>dsh-market 日志里的一条可疑记录（纯分析结果，便于测试）。</summary>
+public sealed class DshMarketLogFinding
+{
+        /// <summary>error / rollback / toggle-loop / fetch-timeout / blocked。</summary>
+        public string Kind = "";
+        public string Title = "";
+        public string Detail = "";
+        public int Count;
+        public string LastAt = "";
 }
 
