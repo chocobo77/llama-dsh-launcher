@@ -2559,10 +2559,24 @@ process.stdout.write(JSON.stringify(out));
                                 log?.Invoke("[兼容修复] " + msg);
                         }
 
-                        // 4c) 缺失 peer → 在共享 node_modules 建 junction（升级后重算一次，覆盖新装插件的缺失项）
+                        // 升级后重审一次：下面的 4b.2（死依赖）与 4c（缺失 peer junction）都基于这份新状态
                         DshCompatReport afterUpgrade = fresh.PluginsToUpgrade.Count > 0
                                 ? Audit(dir, prof, log, includeDumpConfig: false)
                                 : fresh;
+                        // 4b.2) 升级后的新版可能又带来死依赖声明（如最新版仍声明 dsh-invariants）：
+                        // 3d 清的是升级前那份清单，这里基于升级后重审再清一次，避免要等到下一次修复。
+                        if (fresh.PluginsToUpgrade.Count > 0 && afterUpgrade.DeadPeerFixes.Count > 0)
+                        {
+                                int dremoved2 = RepairDeadPeerFixes(afterUpgrade, log);
+                                if (dremoved2 > 0)
+                                {
+                                        res.DeadPeersRemoved += dremoved2;
+                                        string msg = "升级后死依赖清理: 移除 " + dremoved2 + " 条声明";
+                                        res.Messages.Add(msg);
+                                        log?.Invoke("[兼容修复] " + msg);
+                                }
+                        }
+                        // 4c) 缺失 peer → 在共享 node_modules 建 junction（覆盖新装插件的缺失项）
                         if (afterUpgrade.PeerJunctionFixes.Count > 0)
                         {
                                 (int linked, int jfailed) = RepairPeerJunctions(afterUpgrade, log);
