@@ -191,10 +191,44 @@ public partial class PluginManagerWindow : Window
 		{
 			return;
 		}
-		MessageBoxResult confirm = MessageBox.Show("将 \"" + p.Name + "\" 升级到最新版？\n（pnpm add " + p.Name + "@latest，可能需要数分钟）", "升级插件", MessageBoxButton.YesNo, MessageBoxImage.Question);
-		if (confirm != MessageBoxResult.Yes)
+		string pName = p.Name;
+		string pVersion = p.Version;
+		// 升级前预检：缓存里最新版的门禁/死依赖，避免升完才发现被拒（市场会 exit=1 后回滚）
+		string dshVersion = _report?.DshVersion ?? DshCompatService.GetDshVersion(_dshDir) ?? "";
+		DshUpdatePreview? preview = null;
+		try
 		{
-			return;
+			string profileDir = DshCompatService.ResolveProfileDir(_profile);
+			preview = await Task.Run(delegate { return DshCompatService.PreviewPluginUpdate(pName, pVersion, _dshDir, profileDir, dshVersion); });
+		}
+		catch (System.Exception ex)
+		{
+			Log("[升级预检] 跳过: " + ex.Message);
+		}
+		string upgradeHead = "将 \"" + pName + "\" 升级到最新版？\n（pnpm add " + pName + "@latest，可能需要数分钟）";
+		if (preview != null && preview.HasConcern)
+		{
+			MessageBoxResult risky = MessageBox.Show(
+				upgradeHead + "\n\n升级预检发现风险（最新 " + preview.LatestVersion + "，当前 DSH " + dshVersion + "）：\n"
+				+ preview.Describe() + "\n\n建议先不要升级。仍要继续吗？",
+				preview.GateBlocked ? "升级预检：可能被门禁拒绝" : "升级预检：最新版仍有已删除依赖",
+				MessageBoxButton.YesNo, MessageBoxImage.Warning);
+			Log("[升级预检] " + pName + " → " + preview.LatestVersion
+				+ (preview.GateBlocked ? "；门禁 " + preview.GateName + "=" + preview.GateRange + " 不满足" : "")
+				+ (preview.DeadPeers.Count > 0 ? "；死依赖 " + string.Join(",", preview.DeadPeers) : "")
+				+ "；用户" + (risky == MessageBoxResult.Yes ? "仍选择升级" : "取消升级"));
+			if (risky != MessageBoxResult.Yes)
+			{
+				return;
+			}
+		}
+		else
+		{
+			MessageBoxResult confirm = MessageBox.Show(upgradeHead, "升级插件", MessageBoxButton.YesNo, MessageBoxImage.Question);
+			if (confirm != MessageBoxResult.Yes)
+			{
+				return;
+			}
 		}
 		_busy = true;
 		string msg = await Task.Run(delegate { return DshCompatService.UpgradePlugin(_profile, p.Name, delegate (string m) { Log(m); }); });

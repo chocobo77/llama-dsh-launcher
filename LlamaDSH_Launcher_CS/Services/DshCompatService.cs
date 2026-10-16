@@ -3538,33 +3538,103 @@ process.stdout.write(JSON.stringify(out));
         /// 升级前预检：读市场 discovery 兼容缓存（.dsh-market/discovery-compatibility-v1.json），
         /// 对被装插件预测“升到缓存里的最新版会不会被门禁拒绝 / 带入已删除依赖”，避免升完才回滚。
         /// </summary>
-        public static void AuditUpdatePreview(DshCompatReport r, Action<string>? log)
+        private static string DiscoveryCachePath(string profileDir)
         {
-                string path = Path.Combine(r.ProfileDir, ".dsh-market", "discovery-compatibility-v1.json");
+                return Path.Combine(profileDir, ".dsh-market", "discovery-compatibility-v1.json");
+        }
+
+        /// <summary>读市场 discovery 缓存的 entries；文件不存在/过大/结构不认识返回 null。</summary>
+        private static JsonObject? ReadDiscoveryEntries(string profileDir)
+        {
+                string path = DiscoveryCachePath(profileDir);
                 if (!File.Exists(path))
                 {
-                        log?.Invoke("[兼容] 升级预检: 未找到 " + path);
-                        return;
+                        return null;
                 }
-                JsonNode? root;
                 try
                 {
                         FileInfo fi = new FileInfo(path);
                         if (fi.Length > 64000000)
                         {
-                                log?.Invoke("[兼容] 升级预检: 缓存过大，跳过（" + fi.Length + " 字节）");
-                                return;
+                                return null;
                         }
-                        root = JsonNode.Parse(File.ReadAllText(path, Encoding.UTF8));
+                        JsonNode? root = JsonNode.Parse(File.ReadAllText(path, Encoding.UTF8));
+                        return root?["entries"] as JsonObject;
                 }
-                catch (Exception ex)
+                catch
                 {
-                        log?.Invoke("[兼容] 升级预检: 读取/解析失败 —— " + ex.Message);
+                        return null;
+                }
+        }
+
+        /// <summary>对单条缓存 facts 求值；返回 null 表示无更新（已是最新/版本未知）。</summary>
+        private static DshUpdatePreview? EvaluateCandidate(string name, string installedVersion, JsonObject facts,
+                string dshDir, string profileDir, string dshVersion)
+        {
+                string latest = facts["version"]?.ToString() ?? "";
+                if (latest.Length == 0 || string.Equals(latest, installedVersion, StringComparison.Ordinal))
+                {
+                        return null;
+                }
+                DshUpdatePreview preview = new()
+                {
+                        PluginName = name,
+                        InstalledVersion = installedVersion,
+                        LatestVersion = latest,
+                        GateName = "engines.dsh"
+                };
+                string range = facts["enginesDsh"]?.ToString() ?? "";
+                if (range.Length == 0 && facts["peerDependencies"] is JsonObject peerOfDsh)
+                {
+                        range = peerOfDsh["@deepseek-ai/dsh"]?.ToString() ?? "";
+                        preview.GateName = "peer @deepseek-ai/dsh";
+                }
+                preview.GateRange = range;
+                preview.GateBlocked = range.Length > 0 && !SemverUtil.Satisfies(dshVersion, range);
+                if (facts["peerDependencies"] is JsonObject pdLatest)
+                {
+                        foreach (KeyValuePair<string, JsonNode?> kv in pdLatest)
+                        {
+                                if (kv.Key.StartsWith("@deepseek-ai/", StringComparison.Ordinal)
+                                        && IsDshPackageDead(kv.Key, dshDir, profileDir))
+                                {
+                                        preview.DeadPeers.Add(kv.Key);
+                                }
+                        }
+                }
+                return preview;
+        }
+
+        /// <summary>
+        /// 单个插件的升级预检（供"升级"按钮在动手前拦截）。
+        /// 缓存里没有该插件、或已是最新时返回 null。
+        /// </summary>
+        public static DshUpdatePreview? PreviewPluginUpdate(string name, string installedVersion, string dshDir,
+                string profileDir, string dshVersion)
+        {
+                JsonObject? entries = ReadDiscoveryEntries(profileDir);
+                if (entries?[name] is not JsonObject entry || entry["facts"] is not JsonObject facts)
+                {
+                        return null;
+                }
+                return EvaluateCandidate(name, installedVersion, facts, dshDir, profileDir, dshVersion);
+        }
+
+        /// <summary>
+        /// 升级前预检：读市场 discovery 兼容缓存（.dsh-market/discovery-compatibility-v1.json），
+        /// 对被装插件预测“升到缓存里的最新版会不会被门禁拒绝 / 带入已删除依赖”，避免升完才回滚。
+        /// </summary>
+        public static void AuditUpdatePreview(DshCompatReport r, Action<string>? log)
+        {
+                if (!File.Exists(DiscoveryCachePath(r.ProfileDir)))
+                {
+                        log?.Invoke("[兼容] 升级预检: 未找到 " + DiscoveryCachePath(r.ProfileDir));
                         return;
                 }
-                if (root?["entries"] is not JsonObject entries)
+                JsonObject? entries = ReadDiscoveryEntries(r.ProfileDir);
+                if (entries == null)
                 {
-                        log?.Invoke("[兼容] 升级预检: 缓存结构不认识（缺 entries）");
+                        log?.Invoke("[兼容] 升级预检: 缓存不可读或结构不认识");
                         return;
                 }
                 int inCache = 0;
@@ -3578,46 +3648,28 @@ process.stdout.write(JSON.stringify(out));
                                 continue;
                         }
                         inCache++;
-                        string latest = facts["version"]?.ToString() ?? "";
-                        if (latest.Length == 0 || string.Equals(latest, info.Version, StringComparison.Ordinal))
+                        DshUpdatePreview? preview = EvaluateCandidate(info.Name, info.Version, facts, r.DshDir, r.ProfileDir, r.DshVersion);
+                        if (preview == null)
                         {
-                                continue; // 已是最新（或版本未知）
+                                continue;
                         }
                         updates++;
-                        string range = facts["enginesDsh"]?.ToString() ?? "";
-                        string gateName = "engines.dsh";
-                        if (range.Length == 0 && facts["peerDependencies"] is JsonObject peerOfDsh)
-                        {
-                                range = peerOfDsh["@deepseek-ai/dsh"]?.ToString() ?? "";
-                                gateName = "peer @deepseek-ai/dsh";
-                        }
-                        if (range.Length > 0 && !SemverUtil.Satisfies(r.DshVersion, range))
+                        if (preview.GateBlocked)
                         {
                                 blocked++;
                                 r.Add(DshCompatLevel.Warning, "升级预检", "最新版会被门禁拒绝: " + info.Name,
-                                        "已装 " + info.Version + " → 最新 " + latest + "，其 " + gateName + " 为 " + range
-                                        + "，当前 DSH " + r.DshVersion + " 不满足；直接更新很可能 exit=1 并回滚",
+                                        "已装 " + info.Version + " → 最新 " + preview.LatestVersion + "，其 " + preview.GateName + " 为 "
+                                        + preview.GateRange + "，当前 DSH " + r.DshVersion + " 不满足；直接更新很可能 exit=1 并回滚",
                                         false, "");
                         }
-                        if (facts["peerDependencies"] is JsonObject pdLatest)
+                        if (preview.DeadPeers.Count > 0)
                         {
-                                List<string> dead = new();
-                                foreach (KeyValuePair<string, JsonNode?> kv in pdLatest)
-                                {
-                                        if (kv.Key.StartsWith("@deepseek-ai/", StringComparison.Ordinal)
-                                                && IsDshPackageDead(kv.Key, r.DshDir, r.ProfileDir))
-                                        {
-                                                dead.Add(kv.Key);
-                                        }
-                                }
-                                if (dead.Count > 0)
-                                {
-                                        deadPeers++;
-                                        r.Add(DshCompatLevel.Warning, "升级预检", "最新版仍声明已删除依赖: " + info.Name,
-                                                "最新 " + latest + " 的 peerDependencies 含已被 DSH 上游删除的 " + string.Join(", ", dead)
-                                                + "；升级不会解决该问题（升级后可由死依赖清理移除声明）",
-                                                false, "");
-                                }
+                                deadPeers++;
+                                r.Add(DshCompatLevel.Warning, "升级预检", "最新版仍声明已删除依赖: " + info.Name,
+                                        "最新 " + preview.LatestVersion + " 的 peerDependencies 含已被 DSH 上游删除的 "
+                                        + string.Join(", ", preview.DeadPeers)
+                                        + "；升级不会解决该问题（升级后可由死依赖清理移除声明）",
+                                        false, "");
                         }
                 }
                 if (updates > 0)
@@ -4124,6 +4176,39 @@ public sealed class DshDeadPeerFix
         public string PluginName = "";
         public string PackageJsonPath = "";
         public string PeerName = "";
+}
+
+/// <summary>单个插件的升级预检结论（兼容报告与插件管理窗口共用）。</summary>
+public sealed class DshUpdatePreview
+{
+        public string PluginName = "";
+        public string InstalledVersion = "";
+        public string LatestVersion = "";
+        /// <summary>门禁字段名（engines.dsh / peer @deepseek-ai/dsh）；无门禁信息时为空。</summary>
+        public string GateName = "";
+        public string GateRange = "";
+        /// <summary>true=最新版门禁范围不满足当前 DSH，直接升级很可能被拒绝。</summary>
+        public bool GateBlocked;
+        /// <summary>最新版仍声明、但已被 DSH 上游删除的包。</summary>
+        public List<string> DeadPeers = new();
+        public bool HasConcern => GateBlocked || DeadPeers.Count > 0;
+
+        /// <summary>面向对话框的多行说明；无风险返回空串。</summary>
+        public string Describe()
+        {
+                List<string> lines = new();
+                if (GateBlocked)
+                {
+                        lines.Add("· 最新版 " + LatestVersion + " 的 " + GateName + " = " + GateRange
+                                + "，当前 DSH 不满足 —— 直接更新很可能 exit=1 并回滚。");
+                }
+                if (DeadPeers.Count > 0)
+                {
+                        lines.Add("· 最新版仍声明已被 DSH 上游删除的 " + string.Join("、", DeadPeers)
+                                + " —— 升级不会解决该问题（升级后可由「死依赖清理」移除声明）。");
+                }
+                return lines.Count == 0 ? "" : string.Join("\n", lines);
+        }
 }
 
 /// <summary>dsh-market 日志里的一条可疑记录（纯分析结果，便于测试）。</summary>
