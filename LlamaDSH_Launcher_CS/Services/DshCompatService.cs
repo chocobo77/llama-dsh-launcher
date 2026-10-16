@@ -936,6 +936,9 @@ public static class DshCompatService
                         // 6) dsh-market 日志：历史更新失败 / 回滚 / 反复停用失败
                         AuditMarketLog(r, log);
 
+                        // 7) 升级预检：缓存里的最新版会不会被门禁拒绝 / 带入已删除依赖
+                        AuditUpdatePreview(r, log);
+
                         log?.Invoke("[兼容] 检查完成：错误 " + r.ErrorCount + " · 警告 " + r.WarningCount + " · 可修复 " + r.RepairableCount);
                 }
                 catch (Exception ex)
@@ -1569,7 +1572,11 @@ public static class DshCompatService
 
         private static readonly Dictionary<string, HashSet<string>> _shippedNamesCache = new();
 
-        /// <summary>DSH 源码树中仍存在的包名集合（packages/** 与 apps/** 下的嵌套 package.json，排除 node_modules/.pnpm）。</summary>
+        /// <summary>
+        /// DSH 源码树中仍存在的包名集合：覆盖 pnpm-workspace 的全部工作区根
+        /// （packages/*/*、apps/*、vendor/*、native/system*、benchmarks、website）+ 仓库根 package.json，
+        /// 排除 node_modules/.pnpm。只扫 packages/apps 会把 dsh-root、vendor 里的 cordis 系列等误判为死依赖。
+        /// </summary>
         public static HashSet<string> ShippedDshPackageNames(string dshDir)
         {
                 lock (_shippedNamesCache)
@@ -1580,7 +1587,20 @@ public static class DshCompatService
                                 return cached;
                         }
                         HashSet<string> names = new HashSet<string>(StringComparer.Ordinal);
-                        foreach (string root in new[] { Path.Combine(dshDir, "packages"), Path.Combine(dshDir, "apps") })
+                        string? rootName = TryReadManifest(Path.Combine(dshDir, "package.json"))?["name"]?.ToString();
+                        if (!string.IsNullOrEmpty(rootName))
+                        {
+                                names.Add(rootName!);
+                        }
+                        foreach (string root in new[]
+                        {
+                                Path.Combine(dshDir, "packages"),
+                                Path.Combine(dshDir, "apps"),
+                                Path.Combine(dshDir, "vendor"),
+                                Path.Combine(dshDir, "native"),
+                                Path.Combine(dshDir, "benchmarks"),
+                                Path.Combine(dshDir, "website")
+                        })
                         {
                                 if (!Directory.Exists(root))
                                 {
@@ -3512,6 +3532,101 @@ process.stdout.write(JSON.stringify(out));
                         r.Add(DshCompatLevel.Warning, "市场日志", f.Title, f.Detail, false, "");
                 }
                 log?.Invoke("[兼容] 市场日志: 可疑记录 " + findings.Count + " 项（近 30 天）");
+        }
+
+        /// <summary>
+        /// 升级前预检：读市场 discovery 兼容缓存（.dsh-market/discovery-compatibility-v1.json），
+        /// 对被装插件预测“升到缓存里的最新版会不会被门禁拒绝 / 带入已删除依赖”，避免升完才回滚。
+        /// </summary>
+        public static void AuditUpdatePreview(DshCompatReport r, Action<string>? log)
+        {
+                string path = Path.Combine(r.ProfileDir, ".dsh-market", "discovery-compatibility-v1.json");
+                if (!File.Exists(path))
+                {
+                        log?.Invoke("[兼容] 升级预检: 未找到 " + path);
+                        return;
+                }
+                JsonNode? root;
+                try
+                {
+                        FileInfo fi = new FileInfo(path);
+                        if (fi.Length > 64000000)
+                        {
+                                log?.Invoke("[兼容] 升级预检: 缓存过大，跳过（" + fi.Length + " 字节）");
+                                return;
+                        }
+                        root = JsonNode.Parse(File.ReadAllText(path, Encoding.UTF8));
+                }
+                catch (Exception ex)
+                {
+                        log?.Invoke("[兼容] 升级预检: 读取/解析失败 —— " + ex.Message);
+                        return;
+                }
+                if (root?["entries"] is not JsonObject entries)
+                {
+                        log?.Invoke("[兼容] 升级预检: 缓存结构不认识（缺 entries）");
+                        return;
+                }
+                int inCache = 0;
+                int updates = 0;
+                int blocked = 0;
+                int deadPeers = 0;
+                foreach (DshPluginInfo info in r.Plugins.Where((DshPluginInfo x) => x.Installed))
+                {
+                        if (entries[info.Name] is not JsonObject entry || entry["facts"] is not JsonObject facts)
+                        {
+                                continue;
+                        }
+                        inCache++;
+                        string latest = facts["version"]?.ToString() ?? "";
+                        if (latest.Length == 0 || string.Equals(latest, info.Version, StringComparison.Ordinal))
+                        {
+                                continue; // 已是最新（或版本未知）
+                        }
+                        updates++;
+                        string range = facts["enginesDsh"]?.ToString() ?? "";
+                        string gateName = "engines.dsh";
+                        if (range.Length == 0 && facts["peerDependencies"] is JsonObject peerOfDsh)
+                        {
+                                range = peerOfDsh["@deepseek-ai/dsh"]?.ToString() ?? "";
+                                gateName = "peer @deepseek-ai/dsh";
+                        }
+                        if (range.Length > 0 && !SemverUtil.Satisfies(r.DshVersion, range))
+                        {
+                                blocked++;
+                                r.Add(DshCompatLevel.Warning, "升级预检", "最新版会被门禁拒绝: " + info.Name,
+                                        "已装 " + info.Version + " → 最新 " + latest + "，其 " + gateName + " 为 " + range
+                                        + "，当前 DSH " + r.DshVersion + " 不满足；直接更新很可能 exit=1 并回滚",
+                                        false, "");
+                        }
+                        if (facts["peerDependencies"] is JsonObject pdLatest)
+                        {
+                                List<string> dead = new();
+                                foreach (KeyValuePair<string, JsonNode?> kv in pdLatest)
+                                {
+                                        if (kv.Key.StartsWith("@deepseek-ai/", StringComparison.Ordinal)
+                                                && IsDshPackageDead(kv.Key, r.DshDir, r.ProfileDir))
+                                        {
+                                                dead.Add(kv.Key);
+                                        }
+                                }
+                                if (dead.Count > 0)
+                                {
+                                        deadPeers++;
+                                        r.Add(DshCompatLevel.Warning, "升级预检", "最新版仍声明已删除依赖: " + info.Name,
+                                                "最新 " + latest + " 的 peerDependencies 含已被 DSH 上游删除的 " + string.Join(", ", dead)
+                                                + "；升级不会解决该问题（升级后可由死依赖清理移除声明）",
+                                                false, "");
+                                }
+                        }
+                }
+                if (updates > 0)
+                {
+                        r.Add(DshCompatLevel.Info, "升级预检", "待更新插件 " + updates + " 个（预判被拒 " + blocked + "）",
+                                "缓存内已装插件 " + inCache + " 个；预检只覆盖市场 discovery 缓存收录的包", false, "");
+                }
+                log?.Invoke("[兼容] 升级预检: 缓存内已装 " + inCache + " 个，待更新 " + updates
+                        + " 个，预判被拒 " + blocked + " 个，带入死依赖 " + deadPeers + " 个");
         }
 
         /// <summary>已知“永不解析”的服务名分类：是否命中、原因、替代服务（空=只能删除）。</summary>
