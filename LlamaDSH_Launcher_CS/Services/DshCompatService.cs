@@ -3320,6 +3320,68 @@ process.stdout.write(JSON.stringify(out));
                 return null;
         }
 
+        /// <summary>已知“永不解析”的服务名分类：是否命中、原因、替代服务（空=只能删除）。</summary>
+        private static bool TryResolveDeadService(string service, string dshVersion, out string reason, out string replacement)
+        {
+                reason = "";
+                replacement = "";
+                if (string.Equals(service, "logger", StringComparison.Ordinal))
+                {
+                        reason = "cordis 4 里 ctx.logger 是上下文普通属性、不是可注入服务（ctx.get('logger') 为 undefined）";
+                        return true;
+                }
+                if (string.Equals(service, "webRuntime", StringComparison.Ordinal)
+                        && SemverUtil.Satisfies(dshVersion, ">=0.2.1-alpha.1"))
+                {
+                        reason = "DSH " + dshVersion + " 起 Web profile 不再提供 webRuntime，改由 web-startup 行提供 webStartup";
+                        replacement = "webStartup";
+                        return true;
+                }
+                if (string.Equals(service, "invariants", StringComparison.Ordinal)
+                        && SemverUtil.Satisfies(dshVersion, ">=0.2.0-rc.2"))
+                {
+                        reason = "@deepseek-ai/dsh-invariants 与 invariants 服务自 DSH 0.2.0-rc.2 起已整包删除";
+                        return true;
+                }
+                return false;
+        }
+
+        /// <summary>匹配 ctx.<服务> 的运行时代码写法：ctx.svc / ctx?.svc / ctx['svc'] / ctx.get('svc')。</summary>
+        private static Regex CtxServiceAccessRegex(string service)
+        {
+                string esc = Regex.Escape(service);
+                string quotes = new string(new[] { (char)39, (char)34 }); // ' 与 "
+                return new Regex(
+                        "\\bctx\\??\\.(" + esc + ")\\b"
+                        + "|\\bctx\\??\\[\\s*(?<q>[" + quotes + "])(" + esc + ")\\k<q>\\s*\\]"
+                        + "|\\bctx\\??\\.get\\(\\s*(?<q>[" + quotes + "])(" + esc + ")\\k<q>\\s*\\)",
+                        RegexOptions.Compiled);
+        }
+
+        /// <summary>入口文件运行时代码里是否直接访问了 ctx.&lt;服务&gt;。</summary>
+        public static bool HasCtxServiceAccess(string text, string service)
+        {
+                return text.Length > 0 && service.Length > 0 && CtxServiceAccessRegex(service).IsMatch(text);
+        }
+
+        /// <summary>把入口文件里对 ctx.&lt;旧服务&gt; 的访问改写为 ctx.&lt;新服务&gt;，输出命中次数。</summary>
+        public static string RenameCtxServiceAccess(string text, string service, string replacement, out int count)
+        {
+                count = 0;
+                if (text.Length == 0 || service.Length == 0 || replacement.Length == 0)
+                {
+                        return text;
+                }
+                int n = 0;
+                string result = CtxServiceAccessRegex(service).Replace(text, (Match m) =>
+                {
+                        n++;
+                        return m.Value.Replace(service, replacement);
+                });
+                count = n;
+                return result;
+        }
+
         /// <summary>
         /// 逐行检查合成树里的 loader 行：入口文件 inject 里若声明了当前 DSH 永不解析的服务名，
         /// 该行会永久 pending（apply 从不执行）。logger 任何 cordis 4 版本都错；
@@ -3358,24 +3420,7 @@ process.stdout.write(JSON.stringify(out));
                         }
                         foreach (string service in ExtractInjectNames(text))
                         {
-                                string replacement = "";
-                                string reason;
-                                if (string.Equals(service, "logger", StringComparison.Ordinal))
-                                {
-                                        reason = "cordis 4 里 ctx.logger 是上下文普通属性、不是可注入服务（ctx.get('logger') 为 undefined）";
-                                }
-                                else if (string.Equals(service, "webRuntime", StringComparison.Ordinal)
-                                        && SemverUtil.Satisfies(r.DshVersion, ">=0.2.1-alpha.1"))
-                                {
-                                        reason = "DSH " + r.DshVersion + " 起 Web profile 不再提供 webRuntime，改由 web-startup 行提供 webStartup";
-                                        replacement = "webStartup";
-                                }
-                                else if (string.Equals(service, "invariants", StringComparison.Ordinal)
-                                        && SemverUtil.Satisfies(r.DshVersion, ">=0.2.0-rc.2"))
-                                {
-                                        reason = "@deepseek-ai/dsh-invariants 与 invariants 服务自 DSH 0.2.0-rc.2 起已整包删除";
-                                }
-                                else
+                                if (!TryResolveDeadService(service, r.DshVersion, out string reason, out string replacement))
                                 {
                                         continue;
                                 }
@@ -3399,6 +3444,41 @@ process.stdout.write(JSON.stringify(out));
                                         "行 id " + rowId + "（模块 " + moduleName + "）的入口 " + entry
                                         + " 把 " + service + " 列在 inject 中：" + reason
                                         + "，该行会一直 pending、插件永不生效（--dump-config 不报错）", true, fixHint);
+                        }
+                        // inject 之外：运行时代码直接访问 ctx.<已删除服务>。inject 改名修不到这里，
+                        // 市场把插件更新回 registry 版本后尤其容易残留（better-sidebar 0.26.0 实例）。
+                        foreach (string candidate in new[] { "webRuntime", "invariants" })
+                        {
+                                if (!TryResolveDeadService(candidate, r.DshVersion, out string ctxReason, out string ctxReplacement))
+                                {
+                                        continue;
+                                }
+                                if (!HasCtxServiceAccess(text, candidate))
+                                {
+                                        continue;
+                                }
+                                string ctxKey = entry.ToLowerInvariant() + "|" + candidate;
+                                if (!seen.Add(ctxKey))
+                                {
+                                        continue;
+                                }
+                                r.InjectFixes.Add(new DshInjectFix
+                                {
+                                        File = entry,
+                                        Service = candidate,
+                                        Replacement = ctxReplacement,
+                                        RowId = rowId,
+                                        Module = moduleName,
+                                        RuntimeAccess = true
+                                });
+                                bool ctxFixable = ctxReplacement.Length > 0;
+                                string ctxHint = ctxFixable
+                                        ? "把入口文件里对 ctx." + candidate + " 的访问改名为 ctx." + ctxReplacement + "（改前自动备份 .bak-compat-*）"
+                                        : "入口运行时代码仍在访问已删除的服务 ctx." + candidate + "，无替代服务，需人工处理";
+                                r.Add(DshCompatLevel.Error, "插件", "入口访问已删除的服务: " + rowId + " → ctx." + candidate,
+                                        "行 id " + rowId + "（模块 " + moduleName + "）的入口 " + entry + " 在运行时代码里访问 ctx." + candidate + "：" + ctxReason
+                                        + (ctxFixable ? "；inject 声明即使已经改对，这里仍会抛 TypeError" : "；该访问必然失败"),
+                                        ctxFixable, ctxHint);
                         }
                 }
                 log?.Invoke("[兼容] inject 检查: dump 行 " + dump.Rows.Count + " 个，定位入口 " + resolved
@@ -3558,8 +3638,8 @@ process.stdout.write(JSON.stringify(out));
                 log?.Invoke("[兼容] bundle 补丁裸 id 检查: 可疑 " + suspicious + " 条");
         }
 
-        /// <summary>按 inject 审计结论改写入口文件：删除永不解析的服务名（webRuntime 改名为 webStartup）。</summary>
-        private static string RepairInjectFixes(DshCompatReport report, Action<string>? log)
+        /// <summary>按 inject 审计结论改写入口文件：删除永不解析的服务名；改名（webRuntime→webStartup）时同步改写运行时代码里的 ctx.&lt;服务&gt; 访问。</summary>
+        public static string RepairInjectFixes(DshCompatReport report, Action<string>? log)
         {
                 int files = 0;
                 int changed = 0;
@@ -3581,6 +3661,12 @@ process.stdout.write(JSON.stringify(out));
                                 {
                                         text = RemoveFromInjectService(text, fix.Service, fix.Replacement, out int n);
                                         changed += n;
+                                        if (fix.Replacement.Length > 0)
+                                        {
+                                                // 只改 inject 声明会漏掉 ctx.<服务> 的运行时代码访问，必须一起改
+                                                text = RenameCtxServiceAccess(text, fix.Service, fix.Replacement, out int m);
+                                                changed += m;
+                                        }
                                 }
                                 if (string.Equals(text, original, StringComparison.Ordinal))
                                 {
@@ -3719,6 +3805,8 @@ public sealed class DshInjectFix
         public string Replacement = "";
         public string RowId = "";
         public string Module = "";
+        /// <summary>true=命中运行时代码里的 ctx.&lt;服务&gt; 访问（inject 数组本身可能已经是正确的）。</summary>
+        public bool RuntimeAccess;
 }
 
 /// <summary>一条可自动修复的死依赖：插件声明的 peer/依赖指向已被上游官方删除的 DSH 包（不可满足）。</summary>
