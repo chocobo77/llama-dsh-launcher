@@ -682,6 +682,17 @@ public static class DshCompatService
             return "已升级到最新版";
         }
 
+        /// <summary>
+        /// 修复后仍不兼容、且未被豁免的已装插件 —— 即“需要用户决定是否放行”的候选。
+        /// 工具不代替用户接受风险：修复只做能自动做的事，放行（写精确版本豁免）必须由用户逐次确认。
+        /// </summary>
+        public static List<DshPluginInfo> ExemptCandidates(DshCompatReport report)
+        {
+                return report.Plugins
+                        .Where((DshPluginInfo p) => p.Installed && p.Compatible == false && !p.Exempted)
+                        .ToList();
+        }
+
         /// <summary>写入版本豁免（compatibility.json）：name@version → dsh 版本。</summary>
         public static string ExemptPlugin(string profile, string name, string version, string dshVersion)
         {
@@ -704,8 +715,23 @@ public static class DshCompatService
                 versions.Add(dshVersion);
             }
             map[key] = versions;
+            // 放行是不可逆的授权动作：写入前必须留备份，备份失败就中止（不拿“写入成功”赌）
+            string backup = "";
+            if (File.Exists(path))
+            {
+                try
+                {
+                    backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                    File.Copy(path, backup, true);
+                }
+                catch (Exception ex)
+                {
+                    return "豁免写入已中止（无法备份 compatibility.json：" + ex.Message + "）";
+                }
+            }
             File.WriteAllText(path, JsonSerializer.Serialize(map, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }), new UTF8Encoding(false));
-            return "已豁免 " + key + " @ dsh " + dshVersion;
+            return "已豁免 " + key + " @ dsh " + dshVersion
+                + (backup.Length > 0 ? "（改前已备份 " + Path.GetFileName(backup) + "）" : "");
         }
 
         // ============================== 基础路径/工具 ==============================

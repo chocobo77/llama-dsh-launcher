@@ -1416,6 +1416,31 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		LogCompatReport(res.Report);
 		SetDshCompatBtn(false);
 		System.Windows.MessageBox.Show("兼容性修复完成。\n\n" + string.Join("\n", res.Messages) + "\n\n" + BuildCompatSummary(res.Report), "DSH 兼容性修复", MessageBoxButton.OK, res.Report.ErrorCount > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
+		// 修复后仍不兼容的插件：放行与否由用户逐次决定（工具不代替用户接受风险）
+		List<DshPluginInfo> stillBad = DshCompatService.ExemptCandidates(res.Report);
+		if (stillBad.Count > 0 && !string.IsNullOrEmpty(res.Report.DshVersion))
+		{
+			string list = string.Join("\n", stillBad.Select((DshPluginInfo p) => "  · " + p.Name + "@" + p.Version));
+			MessageBoxResult decide = System.Windows.MessageBox.Show(
+				"以下插件在本次修复后仍与 DSH " + res.Report.DshVersion + " 不兼容：\n" + list
+				+ "\n\n是否放行（写入精确版本豁免，允许其在当前 DSH 上运行）？\n"
+				+ "放行只跳过版本校验：若插件与当前运行时真实不兼容，仍可能崩溃或丢数据。\n"
+				+ "选“否”即保持现状，可稍后在插件管理窗口逐个放行或停用。",
+				"修复后放行确认", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+			if (decide == MessageBoxResult.Yes)
+			{
+				foreach (DshPluginInfo p in stillBad)
+				{
+					string ex = DshCompatService.ExemptPlugin(profile, p.Name, p.Version, res.Report.DshVersion);
+					Log("    [放行] " + ex);
+				}
+				System.Windows.MessageBox.Show("已放行 " + stillBad.Count + " 个插件（写入 compatibility.json）。\n下次兼容性检查将不再报其版本不兼容。", "修复后放行", MessageBoxButton.OK, MessageBoxImage.Information);
+			}
+			else
+			{
+				Log("    [放行] 用户选择不放行（保持现状）");
+			}
+		}
 	}
 
 	// ==================== 插件智能检测 / 修复 ====================
