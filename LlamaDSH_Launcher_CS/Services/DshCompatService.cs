@@ -1802,18 +1802,24 @@ public static class DshCompatService
                         // 死 peer（包已被 DSH 上游删除）：升级无法解决，不进升级列表，改为自动移除声明
                         bool hasDeadPeer = info.PeerIssues.Keys.Any((string k) =>
                                 r.DeadPeerFixes.Any((DshDeadPeerFix f) => f.PluginName == info.Name && f.PeerName == k));
-                        if (fromRegistry && !hasDeadPeer && !r.PluginsToUpgrade.Contains(info.Name, StringComparer.Ordinal))
+                        // registry 最新版 == 已装版本：pnpm add @latest 是空操作 —— 既不该报“已升级”，也不该进升级列表
+                        string? latestCached = fromRegistry ? LatestCachedVersion(info.Name, r.ProfileDir) : null;
+                        bool upToDate = latestCached != null && string.Equals(latestCached, info.Version, StringComparison.Ordinal);
+                        if (fromRegistry && !hasDeadPeer && !upToDate && !r.PluginsToUpgrade.Contains(info.Name, StringComparer.Ordinal))
                         {
                                 r.PluginsToUpgrade.Add(info.Name);
                         }
                         string suggestion = hasDeadPeer
                                 ? "peer 包已被 DSH 上游删除，属不可满足的死依赖：从插件 package.json 移除该声明（启动器可自动移除）"
-                                : fromRegistry
-                                        ? "升级该插件到兼容版本（启动器可自动执行 pnpm add " + info.Name + "@latest）；或显式接受风险: dsh plugin --profile " + r.Profile + " allow-version " + info.Name + "@" + info.Version + " --dsh-version " + r.DshVersion + " --accept-risk"
-                                        : "本地/源码安装（" + (info.Spec.Length > 0 ? info.Spec : "未知来源") + "），请在源码项目放宽 peerDependencies 并重新构建安装；或显式 allow-version 接受风险";
+                                : upToDate
+                                        ? "registry 最新版就是当前已装的 " + latestCached + "，其 peer 声明不含当前 DSH " + r.DshVersion + "：升级无法解决（需插件作者发版）；如需继续使用请显式接受风险: dsh plugin --profile " + r.Profile + " allow-version " + info.Name + "@" + info.Version + " --dsh-version " + r.DshVersion + " --accept-risk"
+                                        : fromRegistry
+                                                ? "升级该插件到兼容版本（启动器可自动执行 pnpm add " + info.Name + "@latest）；或显式接受风险: dsh plugin --profile " + r.Profile + " allow-version " + info.Name + "@" + info.Version + " --dsh-version " + r.DshVersion + " --accept-risk"
+                                                : "本地/源码安装（" + (info.Spec.Length > 0 ? info.Spec : "未知来源") + "），请在源码项目放宽 peerDependencies 并重新构建安装；或显式 allow-version 接受风险";
+                        bool canAutoFix = fromRegistry && !hasDeadPeer && !upToDate;
                         r.Add(DshCompatLevel.Error, "插件", "插件与 DSH 不兼容: " + info.Name,
-                                "已安装 " + info.Name + "@" + info.Version + "，peer " + peers + "；" + suggestion, fromRegistry && !hasDeadPeer,
-                                hasDeadPeer ? "移除死依赖声明（先停止 DSH）" : (fromRegistry ? "pnpm add " + info.Name + "@latest（先停止 DSH）" : ""));
+                                "已安装 " + info.Name + "@" + info.Version + "，peer " + peers + "；" + suggestion, canAutoFix,
+                                hasDeadPeer ? "移除死依赖声明（先停止 DSH）" : (canAutoFix ? "pnpm add " + info.Name + "@latest（先停止 DSH）" : ""));
                 }
                 // 不影响兼容性的死依赖声明（仅 devDependencies）：提示并给出自动移除
                 foreach (DshDeadPeerFix fix in r.DeadPeerFixes)
@@ -2888,6 +2894,7 @@ process.stdout.write(JSON.stringify(out));
                 }
                 List<string> names = new();
                 List<string> skipped = new();
+                List<string> noUpdate = new();
                 foreach (string name in report.PluginsToUpgrade)
                 {
                         string installed = report.Plugins.FirstOrDefault((DshPluginInfo x) => x.Name == name)?.Version ?? "";
@@ -2908,11 +2915,30 @@ process.stdout.write(JSON.stringify(out));
                                         + preview.GateName + " = " + preview.GateRange + "）");
                                 continue;
                         }
+                        // registry 最新版 == 已装版本 → pnpm add @latest 拿不到任何东西：不能当成“已升级”上报
+                        string? latestCached = LatestCachedVersion(name, report.ProfileDir);
+                        if (latestCached != null && string.Equals(latestCached, installed, StringComparison.Ordinal))
+                        {
+                                noUpdate.Add(name + "@" + installed + "（registry 已是最新；其 peer 声明不含当前 DSH "
+                                        + report.DshVersion + "，需上游发版）");
+                                log?.Invoke("[兼容修复] " + name + " 已是最新 " + installed
+                                        + "，registry 无更新版本 → 跳过 pnpm add（不兼容来自上游 peer 范围）");
+                                continue;
+                        }
                         names.Add(name);
                 }
                 if (names.Count == 0)
                 {
-                        return "升级预检：跳过 " + skipped.Count + " 个插件（预判最新版会被门禁拒绝）—— " + string.Join("；", skipped);
+                        List<string> parts = new();
+                        if (skipped.Count > 0)
+                        {
+                                parts.Add("门禁预判被拒 " + skipped.Count + " 个（" + string.Join("；", skipped) + "）");
+                        }
+                        if (noUpdate.Count > 0)
+                        {
+                                parts.Add("registry 无更新 " + noUpdate.Count + " 个（" + string.Join("；", noUpdate) + "）");
+                        }
+                        return "插件升级：未执行 pnpm add —— " + string.Join("，", parts);
                 }
                 string args = string.Join(" ", names.Select((string n) => n + "@latest"));
                 log?.Invoke("[兼容修复] pnpm add " + args + "（可能需要数分钟）...");
@@ -2924,9 +2950,16 @@ process.stdout.write(JSON.stringify(out));
                         return "pnpm 启动失败，插件升级未执行";
                 }
                 string tail = Tail(r.Value.StdErr.Length > 0 ? r.Value.StdErr : r.Value.StdOut, 600);
-                string skipNote = skipped.Count > 0
-                        ? "；另跳过 " + skipped.Count + " 个（预判被门禁拒绝）：" + string.Join("；", skipped)
-                        : "";
+                List<string> notes = new();
+                if (skipped.Count > 0)
+                {
+                        notes.Add("另跳过 " + skipped.Count + " 个（预判被门禁拒绝）：" + string.Join("；", skipped));
+                }
+                if (noUpdate.Count > 0)
+                {
+                        notes.Add("另 " + noUpdate.Count + " 个 registry 已是最新（需上游发版）：" + string.Join("；", noUpdate));
+                }
+                string skipNote = notes.Count > 0 ? "；" + string.Join("；", notes) : "";
                 if (r.Value.ExitCode != 0)
                 {
                         return "插件升级失败（exit " + r.Value.ExitCode + "）：" + tail + skipNote;
@@ -3585,6 +3618,18 @@ process.stdout.write(JSON.stringify(out));
         /// 升级前预检：读市场 discovery 兼容缓存（.dsh-market/discovery-compatibility-v1.json），
         /// 对被装插件预测“升到缓存里的最新版会不会被门禁拒绝 / 带入已删除依赖”，避免升完才回滚。
         /// </summary>
+        /// <summary>市场 discovery 缓存里该插件的最新版本号；缓存无此条目返回 null。</summary>
+        public static string? LatestCachedVersion(string name, string profileDir)
+        {
+                JsonObject? entries = ReadDiscoveryEntries(profileDir);
+                if (entries?[name] is not JsonObject entry || entry["facts"] is not JsonObject facts)
+                {
+                        return null;
+                }
+                string v = facts["version"]?.ToString() ?? "";
+                return v.Length > 0 ? v : null;
+        }
+
         private static string DiscoveryCachePath(string profileDir)
         {
                 return Path.Combine(profileDir, ".dsh-market", "discovery-compatibility-v1.json");
