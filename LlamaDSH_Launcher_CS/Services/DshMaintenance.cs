@@ -90,26 +90,19 @@ public static class DshMaintenance
 			{
 				return null;
 			}
-			ProcessStartInfo psi = new ProcessStartInfo
-			{
-				FileName = git,
-				WorkingDirectory = repoDir,
-				RedirectStandardOutput = true,
-				RedirectStandardError = true,
-				UseShellExecute = false,
-				CreateNoWindow = true
-			};
-			psi.ArgumentList.Add("rev-parse");
-			psi.ArgumentList.Add("HEAD");
-			psi.Environment["GIT_TERMINAL_PROMPT"] = "0";
-			using Process? p = Process.Start(psi);
-			if (p == null)
+			// 统一走 ProcessRunner：内部同时异步读两流并带 8s 超时，避免“先读后等”让超时失效。
+			ProcessResult result = ProcessRunner.Run(
+				git,
+				new[] { "rev-parse", "HEAD" },
+				8000,
+				repoDir,
+				psi => psi.Environment["GIT_TERMINAL_PROMPT"] = "0");
+			if (!result.Started || result.TimedOut)
 			{
 				return null;
 			}
-			string output = p.StandardOutput.ReadToEnd().Trim();
-			p.WaitForExit(8000);
-			return (p.HasExited && p.ExitCode == 0 && output.Length == 40) ? output : null;
+			string output = result.StdOut.Trim();
+			return (result.ExitCode == 0 && output.Length == 40) ? output : null;
 		}
 		catch
 		{
@@ -143,8 +136,10 @@ public static class DshMaintenance
 			var obj = new { head, builtAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") };
 			File.WriteAllText(BuildStatePath, System.Text.Json.JsonSerializer.Serialize(obj));
 		}
-		catch
+		catch (Exception ex)
 		{
+			// 行为不变：写基线失败不抛出，只记录一次错误日志便于排查。
+			AppLog.WriteError("写入 DSH 重建基线失败: " + ex.Message);
 		}
 	}
 }

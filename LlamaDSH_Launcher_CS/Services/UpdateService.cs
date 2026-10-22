@@ -93,22 +93,13 @@ public static class UpdateService
 			{
 				return null;
 			}
-			ProcessStartInfo psi = new ProcessStartInfo
-			{
-				FileName = exe,
-				Arguments = "--version",
-				RedirectStandardOutput = true,
-				RedirectStandardError = true,
-				UseShellExecute = false,
-				CreateNoWindow = true
-			};
-			using Process? p = Process.Start(psi);
-			if (p == null)
+			// 统一走 ProcessRunner：内部同时异步读两流并带 8s 超时，避免“先读后等”让超时失效。
+			ProcessResult result = ProcessRunner.Run(exe, new[] { "--version" }, 8000);
+			if (!result.Started)
 			{
 				return null;
 			}
-			string output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
-			p.WaitForExit(8000);
+			string output = result.StdOut + result.StdErr;
 			Match m = Regex.Match(output, @"build\s+(\d+)", RegexOptions.IgnoreCase);
 			return m.Success ? int.Parse(m.Groups[1].Value) : null;
 		}

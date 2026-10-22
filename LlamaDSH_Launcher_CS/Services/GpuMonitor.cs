@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -7,6 +7,7 @@ using System.Management;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Win32;
 
 namespace LlamaDSH_Launcher.Services;
@@ -223,30 +224,16 @@ public class GpuMonitor
 	{
 		try
 		{
-			using Process process = Process.Start(new ProcessStartInfo
-			{
-				FileName = "nvidia-smi",
-				Arguments = "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits",
-				RedirectStandardOutput = true,
-				UseShellExecute = false,
-				CreateNoWindow = true
-			});
-			if (process == null)
+			// 统一走 ProcessRunner（同时异步读两流 + 5s 超时），避免首行阻塞时超时失效；仍只取第一行。
+			ProcessResult runResult = ProcessRunner.Run(
+				"nvidia-smi",
+				new[] { "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits" },
+				5000);
+			if (!runResult.Started || runResult.TimedOut)
 			{
 				return false;
 			}
-			string text = process.StandardOutput.ReadLine();
-			if (!process.WaitForExit(5000))
-			{
-				try
-				{
-					process.Kill();
-				}
-				catch
-				{
-				}
-				return false;
-			}
+			string text = runResult.StdOut.Split('\n')[0].TrimEnd('\r');
 			if (string.IsNullOrWhiteSpace(text))
 			{
 				return false;
@@ -289,31 +276,16 @@ public class GpuMonitor
 	{
 		try
 		{
-			using Process process = Process.Start(new ProcessStartInfo
-			{
-				FileName = "amd-smi.exe",
-				Arguments = "metric --temperature --gpu-utilization --vram-usage",
-				RedirectStandardOutput = true,
-				RedirectStandardError = true,
-				UseShellExecute = false,
-				CreateNoWindow = true
-			});
-			if (process == null)
+			// 统一走 ProcessRunner（同时异步读两流 + 5s 超时），避免“先读后等”让超时失效。
+			ProcessResult runResult = ProcessRunner.Run(
+				"amd-smi.exe",
+				new[] { "metric", "--temperature", "--gpu-utilization", "--vram-usage" },
+				5000);
+			if (!runResult.Started || runResult.TimedOut)
 			{
 				return false;
 			}
-			string text = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
-			if (!process.WaitForExit(5000))
-			{
-				try
-				{
-					process.Kill();
-				}
-				catch
-				{
-				}
-				return false;
-			}
+			string text = runResult.StdOut + runResult.StdErr;
 			if (string.IsNullOrWhiteSpace(text))
 			{
 				return false;
@@ -350,31 +322,13 @@ public class GpuMonitor
 	{
 		try
 		{
-			using Process process = Process.Start(new ProcessStartInfo
-			{
-				FileName = "xpu-smi.exe",
-				Arguments = "stats",
-				RedirectStandardOutput = true,
-				RedirectStandardError = true,
-				UseShellExecute = false,
-				CreateNoWindow = true
-			});
-			if (process == null)
+			// 统一走 ProcessRunner（同时异步读两流 + 5s 超时），避免“先读后等”让超时失效。
+			ProcessResult runResult = ProcessRunner.Run("xpu-smi.exe", new[] { "stats" }, 5000);
+			if (!runResult.Started || runResult.TimedOut)
 			{
 				return false;
 			}
-			string text = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
-			if (!process.WaitForExit(5000))
-			{
-				try
-				{
-					process.Kill();
-				}
-				catch
-				{
-				}
-				return false;
-			}
+			string text = runResult.StdOut + runResult.StdErr;
 			if (string.IsNullOrWhiteSpace(text))
 			{
 				return false;
@@ -614,7 +568,27 @@ public class GpuMonitor
 		{
 			while (_gpuTempProc != null && !_gpuTempProc.HasExited)
 			{
-				string text = _gpuTempProc.StandardOutput.ReadLine();
+				// 常驻进程（--loop）不能整体等待退出：用首行看门狗，8s 内没有输出即判定数据源不可用。
+				Task<string?> readTask = _gpuTempProc.StandardOutput.ReadLineAsync();
+				Task completed = Task.WhenAny(readTask, Task.Delay(8000)).GetAwaiter().GetResult();
+				if (completed != readTask)
+				{
+					try
+					{
+						_gpuTempProc.Kill(true);
+					}
+					catch
+					{
+					}
+					lock (_lock)
+					{
+						_cachedGpuTemp = null;
+						_cachedGpuTempSrc = null;
+					}
+					AppLog.WriteError("gputemp --loop 连续 8 秒无输出，已终止该采样（gpu_temp 数据源不可用）。");
+					break;
+				}
+				string? text = readTask.GetAwaiter().GetResult();
 				if (text == null)
 				{
 					break;
@@ -712,20 +686,15 @@ public class GpuMonitor
 		}
 		try
 		{
-			using Process process = Process.Start(new ProcessStartInfo
-			{
-				FileName = text,
-				RedirectStandardOutput = true,
-				UseShellExecute = false,
-				CreateNoWindow = true
-			});
-			if (process == null)
+			// 一次性采样：ProcessRunner 同时异步读流并带 8s 超时；原 WaitForExit(8000) 已由其超时机制取代。
+			ProcessResult result = ProcessRunner.Run(text, timeoutMs: 8000);
+			if (!result.Started)
 			{
 				return (temp: null, src: null);
 			}
-			string input;
-			while ((input = process.StandardOutput.ReadLine()) != null)
+			foreach (string line in result.StdOut.Split('\n'))
 			{
+				string input = line.TrimEnd('\r');
 				Match match = Regex.Match(input, "\\[(Gpu\\w+)\\]\\s+([^=]+?)\\s*=\\s*([\\d.]+)");
 				if (!match.Success)
 				{
@@ -744,7 +713,6 @@ public class GpuMonitor
 				{
 				}
 			}
-			process.WaitForExit(8000);
 		}
 		catch
 		{
@@ -767,29 +735,16 @@ public class GpuMonitor
 				}
 				_psScriptFile = text2;
 			}
-			using Process process = Process.Start(new ProcessStartInfo
-			{
-				FileName = "powershell.exe",
-				Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + text2 + "\"",
-				RedirectStandardOutput = true,
-				UseShellExecute = false,
-				CreateNoWindow = true
-			});
-			if (process == null)
+			// 统一走 ProcessRunner（同时异步读两流 + 10s 超时），避免“先读后等”让超时失效。
+			ProcessResult psResult = ProcessRunner.Run(
+				"powershell.exe",
+				new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", text2 },
+				10000);
+			if (!psResult.Started)
 			{
 				return;
 			}
-			string text3 = process.StandardOutput.ReadToEnd();
-			if (!process.WaitForExit(10000))
-			{
-				try
-				{
-					process.Kill();
-				}
-				catch
-				{
-				}
-			}
+			string text3 = psResult.StdOut;
 			string[] array = text3.Split('\n', StringSplitOptions.RemoveEmptyEntries);
 			for (int i = 0; i < array.Length; i++)
 			{

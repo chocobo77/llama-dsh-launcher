@@ -1,12 +1,16 @@
 # =====================================================================
 # LlamaDSH 启动器 · llama.cpp 启动参数配置（唯一升级入口）
 # 加载顺序: 内置默认 → 本文件(优先) → ~/.llamadsh/params_override.yml(差异覆盖)
-# 最后更新: 2026-10-16 (基于 llama-server 0.7.0-dev / build 11675 的 --help 复核)
+# 最后更新: 2026-10-22 (基于 llama-server 0.7.0-dev / build 11680, commit b797b9ca8 的 --help 全量比对)
+# 比对结论: --help 共 332 个选项名(含别名)，本文件 241 个参数 + aliases 覆盖全部功能型选项；
+#           未覆盖的 26 个均为 CLI/元选项(help/version/completion-bash/list-devices/cache-list)、
+#           已移除参数的旧名(draft/draft-min/spec-ngram-*/…)与示例模型快捷方式(fim-*/gpt-oss-*/vision-gemma-*)。
+# 复核方法: llama-server.exe --help > help.txt，与本文件逐项 diff（flag + aliases 任一命中即视为已覆盖）。
 # 核心功能: 思考强度控制 (reasoning / reasoning-effort / reasoning-budget / reasoning-preserve)
 # =====================================================================
 meta:
   schema: 7
-  adapt: "llama-server 0.7.0-dev (build 11675, 2851b3bcb) 实测对齐 · schema v7（2026-10-16 按 --help 复核：7 个 <0|1> 参数 Bool→Combo、numa 去掉非法 disabled、折叠重复 subgroup；<0|1> 裸旗标会 invalid stoul argument）"
+  adapt: "llama-server 0.7.0-dev (build 11680, b797b9ca8) 实测对齐 · schema v7（2026-10-22 全量比对 --help：332 个选项名 / 241 个参数，功能型选项无缺口；7 个 <0|1> 参数仍为 Combo、numa 无非法 disabled；<0|1> 裸旗标会 invalid stoul argument）"
   notes: >
     llama.cpp 更新时的维护方法（改完点启动器"⟳ 重载参数配置"即时生效）:
     1. 新增参数: 在 params 下加一条, 必填 flag/label/type/default/group

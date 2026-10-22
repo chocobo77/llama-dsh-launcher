@@ -62,6 +62,27 @@
           </Setter.Value>
         </Setter>
       </Style>
+      <Style x:Key="BrowserTab" TargetType="{x:Type Button}">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="Foreground" Value="#8b949e" />
+        <Setter Property="FontSize" Value="13" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Cursor" Value="Hand" />
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="{x:Type Button}">
+              <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="8,8,0,0" Padding="16,9" Margin="3,4,2,0">
+                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+              </Border>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                  <Setter TargetName="bd" Property="Background" Value="#ffffff14" />
+                </Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
     </ResourceDictionary>
   </FrameworkElement.Resources>
   <Grid>
@@ -69,34 +90,52 @@
       <ColumnDefinition Width="1.1*" />
       <ColumnDefinition Width="1*" />
     </Grid.ColumnDefinitions>
-    <ScrollViewer Name="LeftScroll" Grid.Column="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="8">
-      <StackPanel Name="LeftPanel">
-        <WrapPanel Margin="0,0,0,8">
-          <Button Content="💾 保存配置" Margin="0,0,6,0" ToolTip="保存当前配置到默认路径" Click="QuickSave_Click" />
-          <Button Content="📤 另存为" Margin="0,0,6,0" Click="SaveAs_Click" />
-          <Button Content="📥 加载配置" Margin="0,0,6,0" Click="LoadConfig_Click" />
-          <Button Content="📁 更改路径" ToolTip="自定义配置文件存放目录" Click="ChangeConfigPath_Click" />
-        </WrapPanel>
-        <Grid Margin="0,0,0,8">
-          <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="Auto" />
-            <ColumnDefinition Width="*" />
-            <ColumnDefinition Width="Auto" />
-            <ColumnDefinition Width="Auto" />
-            <ColumnDefinition Width="Auto" />
-            <ColumnDefinition Width="Auto" />
-          </Grid.ColumnDefinitions>
-          <Label Content="方案:" VerticalAlignment="Center" Foreground="#e0e0e0" />
-          <local:NoScrollComboBox x:Name="ComboProfile" SelectionChanged="ProfileChanged" Grid.Column="1" Margin="4,0" />
-          <Button Name="BtnSaveProfile" Content="💾 保存" Grid.Column="2" Margin="4,0,0,0" Click="SaveProfile_Click" />
-          <Button Content="✏️ 重命名" Grid.Column="3" Margin="4,0,0,0" Click="RenameProfile_Click" />
-          <Button Content="➕ 新建" Grid.Column="4" Margin="4,0,0,0" Click="NewProfile_Click" />
-          <Button Name="BtnDeleteProfile" Content="🗑 删除" Grid.Column="5" Margin="4,0,0,0" Click="DeleteProfile_Click" />
-        </Grid>
-        <GroupBox Header="📂 路径配置">
-          <StackPanel>
+    <ScrollViewer Name="LeftScroll" Grid.Column="0" VerticalScrollBarVisibility="Disabled" HorizontalScrollBarVisibility="Disabled" Padding="8">
+      <DockPanel Name="LeftPanel">
+        <!-- ── 配置文件级操作：作用于磁盘上的配置文件（区别于下面"方案"作用于单套参数） ── -->
+        <Border DockPanel.Dock="Top" Margin="0,0,0,8" Background="#161b22" BorderBrush="#30363d" BorderThickness="1" CornerRadius="6" Padding="10,7">
+          <DockPanel>
+            <TextBlock DockPanel.Dock="Left" Text="配置文件" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" Margin="0,0,12,0" />
+            <WrapPanel>
+              <Button Content="💾 保存到文件" Margin="0,0,6,0" ToolTip="把全部方案写回当前配置文件" Click="QuickSave_Click" />
+              <Button Content="📤 另存为…" Margin="0,0,6,0" ToolTip="把当前配置另存为一个新文件" Click="SaveAs_Click" />
+              <Button Content="📥 从文件加载" Margin="0,0,6,0" ToolTip="用磁盘上的配置文件覆盖当前配置" Click="LoadConfig_Click" />
+              <Button Content="📁 配置目录" ToolTip="自定义配置文件存放目录" Click="ChangeConfigPath_Click" />
+            </WrapPanel>
+          </DockPanel>
+        </Border>
+        <!-- ── 方案级操作：一套可切换的参数集合（存在配置文件内部，不单独落盘） ── -->
+        <Border DockPanel.Dock="Top" Margin="0,0,0,8" Background="#161b22" BorderBrush="#30363d" BorderThickness="1" CornerRadius="6" Padding="10,7">
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto" />
+              <ColumnDefinition Width="*" />
+              <ColumnDefinition Width="Auto" />
+              <ColumnDefinition Width="Auto" />
+              <ColumnDefinition Width="Auto" />
+              <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock Text="方案" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" Margin="0,0,12,0" />
+            <local:NoScrollComboBox x:Name="ComboProfile" SelectionChanged="ProfileChanged" Grid.Column="1" Margin="4,0" />
+            <Button Name="BtnSaveProfile" Content="💾 保存方案" Grid.Column="2" Margin="4,0,0,0" Click="SaveProfile_Click" ToolTip="把当前界面的参数存进选中的方案" />
+            <Button Content="✏️ 重命名" Grid.Column="3" Margin="4,0,0,0" Click="RenameProfile_Click" ToolTip="重命名当前方案" />
+            <Button Content="➕ 新建" Grid.Column="4" Margin="4,0,0,0" Click="NewProfile_Click" ToolTip="基于当前参数新建一个方案" />
+            <Button Name="BtnDeleteProfile" Content="🗑 删除" Grid.Column="5" Margin="4,0,0,0" Click="DeleteProfile_Click" ToolTip="删除当前方案（不可恢复）" />
+          </Grid>
+        </Border>
+        <!-- ── 浏览器式选项卡：路径配置 / 参数配置 / 命令预览 ─────────────── -->
+        <Border DockPanel.Dock="Top" Margin="0,8,0,0" Background="#0d1117" BorderBrush="#30363d" BorderThickness="1,1,1,0" CornerRadius="8,8,0,0">
+          <StackPanel Orientation="Horizontal" Margin="4,2,0,0">
+            <Button x:Name="TabBtnPath" Style="{StaticResource BrowserTab}" Content="📂 运行环境" Tag="path" Click="SwitchSection_Click" />
+            <Button x:Name="TabBtnParam" Style="{StaticResource BrowserTab}" Content="⚙️ 参数配置" Tag="param" Click="SwitchSection_Click" />
+            <Button x:Name="TabBtnCmd" Style="{StaticResource BrowserTab}" Content="📋 命令预览" Tag="cmd" Click="SwitchSection_Click" />
+          </StackPanel>
+        </Border>
+        <Border Background="#161b22" BorderBrush="#30363d" BorderThickness="1,0,1,1" CornerRadius="0,0,8,8">
+          <Grid Margin="10,8">
+            <StackPanel x:Name="SecPath">
             <!-- ── 模型文件 ─────────────────────────────── -->
-            <TextBlock Text="模型文件" Foreground="#8b949e" FontWeight="Bold" FontSize="12" Margin="0,0,0,6" />
+            <TextBlock Text="📄 模型文件" Foreground="#8b949e" FontWeight="Bold" FontSize="12" Margin="0,0,0,6" ToolTip="选择 GGUF 模型文件；分片模型自动取第一片" />
             <DockPanel Margin="0,0,0,6">
               <Label Content="主模型路径:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
               <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
@@ -125,7 +164,7 @@
             </DockPanel>
 
             <!-- ── 程序目录 ─────────────────────────────── -->
-            <TextBlock Text="程序目录" Foreground="#8b949e" FontWeight="Bold" FontSize="12" Margin="0,8,0,6" />
+            <TextBlock Text="📁 程序目录" Foreground="#8b949e" FontWeight="Bold" FontSize="12" Margin="0,8,0,6" ToolTip="llama.cpp 与 DeepSeek Harness 的安装位置" />
             <DockPanel Margin="0,0,0,6">
               <Label Content="Llama 程序目录:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
               <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
@@ -146,7 +185,7 @@
             </DockPanel>
 
             <!-- ── DSH 选项 ─────────────────────────────── -->
-            <TextBlock Text="DSH 选项" Foreground="#8b949e" FontWeight="Bold" FontSize="12" Margin="0,8,0,6" />
+            <TextBlock Text="⚙️ DSH 选项" Foreground="#8b949e" FontWeight="Bold" FontSize="12" Margin="0,8,0,6" />
             <DockPanel Margin="0,0,0,6">
               <Label Content="启动模式:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
               <CheckBox Name="ChkDshAdmin" Content="以管理员身份启动" IsChecked="True" DockPanel.Dock="Right" VerticalAlignment="Center" Foreground="#c9d1d9" ToolTip="以管理员身份启动 DSH（静默提权，无 UAC 弹窗）：子进程为高完整性，可读取游戏进程内存（如 Elite Dangerous）。需先停止再启动才生效；取消勾选恢复普通方式启动。" />
@@ -163,14 +202,30 @@
                 <Button Name="BtnPluginManager" Content="🗂 插件管理" Margin="4,0,0,0" ToolTip="打开插件管理窗口：查看全部插件状态，支持 停用并锁定/启用、升级、版本豁免、卸载（锁定停用可对抗 DSH 网页端/市场插件的自动写回）" Click="OpenPluginManager_Click" />
               </StackPanel>
             </DockPanel>
+
+            <!-- ── Node 环境（傻瓜式安装/更新/配置，供 DSH 启动/重建使用）─────────────── -->
+            <TextBlock Text="🔧 Node 环境" Foreground="#8b949e" FontWeight="Bold" FontSize="12" Margin="0,8,0,6" />
+            <Border Background="#0d1117" BorderBrush="#30363d" BorderThickness="1" CornerRadius="6" Padding="12,10" Margin="0,0,0,6">
+              <StackPanel>
+                <TextBlock x:Name="LblNodeStatus" Text="正在检测 Node 环境..." Foreground="#e0e0e0" FontSize="12" />
+                <TextBlock x:Name="LblPnpmStatus" Margin="0,4,0,0" Foreground="#e0e0e0" FontSize="12" TextWrapping="Wrap" />
+                <TextBlock x:Name="LblLatestStatus" Margin="0,4,0,0" Foreground="#8b949e" FontSize="12" TextWrapping="Wrap" />
+              </StackPanel>
+            </Border>
+            <DockPanel Margin="0,0,0,6">
+              <Button Name="BtnInstallNodeEnv" Content="📦 一键安装/更新 Node + pnpm" DockPanel.Dock="Left" ToolTip="自动检测现状：下载最新 v24.x Node（MSI 静默装到 C:\Program Files\nodejs，安装器自动配置机器 PATH），再用 npm 全局安装 pnpm。如弹出 UAC 窗口请点“是”。" Click="InstallNodeEnv_Click" />
+              <Button Name="BtnCopyNodeDiag" Content="📋 复制诊断" DockPanel.Dock="Right" Margin="6,0,0,0" ToolTip="复制当前 Node 日志、最近错误日志与环境信息到剪贴板，便于排查或反馈" Click="CopyDiagInfo_Click" />
+              <Button Name="BtnRefreshNodeEnv" Content="🔄 刷新状态" DockPanel.Dock="Right" Margin="6,0,0,0" ToolTip="重新检测 node/pnpm 版本与最新 v24.x 版本号" Click="RefreshNodeEnv_Click" />
+            </DockPanel>
+            <TextBox x:Name="NodeLog" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" MinHeight="80" MaxHeight="150" Background="#0d1117" Foreground="#c9d1d9" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" BorderBrush="#30363d" BorderThickness="1" Margin="0,0,0,6" />
           </StackPanel>
-        </GroupBox>
-        <DockPanel Margin="0,6,0,0">
+            <DockPanel x:Name="SecParam" Visibility="Collapsed">
+              <DockPanel DockPanel.Dock="Top" Margin="0,6,0,0">
           <Button Name="BtnClearParamFilter" Content="✕" DockPanel.Dock="Right" Width="26" Margin="4,0,0,0" Visibility="Collapsed" Click="ClearParamFilter_Click" ToolTip="清除过滤，显示全部参数" />
           <Label Content="🔍 过滤参数:" DockPanel.Dock="Left" Width="86" VerticalAlignment="Center" Foreground="#8b949e" Padding="0" />
           <TextBox Name="InputParamFilter" ToolTip="输入关键词即时过滤参数，跨所有分类匹配名称/说明/分组（如: kv、量化、推测、flash）" />
         </DockPanel>
-        <Border Margin="0,6,0,0" BorderBrush="#30363d" BorderThickness="1" CornerRadius="6" Background="#0d1117" Height="560">
+        <Border Margin="0,6,0,0" BorderBrush="#30363d" BorderThickness="1" CornerRadius="6" Background="#0d1117">
           <Grid>
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="215" />
@@ -191,29 +246,41 @@
             </Grid>
           </Grid>
         </Border>
-        <Expander Header="📋 命令预览（点击折叠）" IsExpanded="True" Margin="0,6,0,0">
-          <StackPanel>
-            <TextBox Name="CmdPreview" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" MinHeight="200" MaxHeight="500" Background="#0d1117" Foreground="#7ee787" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" BorderBrush="#30363d" BorderThickness="1" />
-            <TextBlock Name="CmdCustomPreview" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" Foreground="#ffa657" Margin="0,4,0,0" Visibility="Collapsed" />
-            <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+            </DockPanel>
+            <Grid x:Name="SecCmd" Visibility="Collapsed">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+              </Grid.RowDefinitions>
+              <TextBox Name="CmdPreview" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" MinHeight="200" Background="#0d1117" Foreground="#7ee787" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" BorderBrush="#30363d" BorderThickness="1" />
+              <TextBlock Name="CmdCustomPreview" Grid.Row="1" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" Foreground="#ffa657" Margin="0,4,0,0" Visibility="Collapsed" />
+              <StackPanel Orientation="Horizontal" Grid.Row="2" Margin="0,6,0,0">
               <Button Content="🔄 刷新命令" Margin="0,0,6,0" Click="RefreshCmd_Click" />
                 <Button Content="⟳ 重载参数配置" Margin="0,0,6,0" Click="ReloadSchema_Click" ToolTip="修改 llama_params.yml 或 params_override.yml 后点此即时生效，无需重启启动器" />
               <Button Content="📋 复制命令" Margin="0,0,6,0" Click="CopyCmd_Click" />
               <Button Name="BtnEditCmd" Content="✏ 编辑命令（仅追加自定义参数）" Margin="0,0,6,0" Click="EditCmd_Click" ToolTip="进入编辑后只能在命令末尾追加自定义参数；已勾选的配置参数由上方配置区管理，不能被这里修改或删除。自定义参数显示为橙色。" />
               <Button Name="BtnCancelCmd" Content="↩ 取消编辑" Visibility="Collapsed" Click="CancelCmd_Click" />
             </StackPanel>
-          </StackPanel>
-        </Expander>
-      </StackPanel>
+            </Grid>
+          </Grid>
+        </Border>
+      </DockPanel>
     </ScrollViewer>
     <Grid Column="1" Margin="8">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto" />
         <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
         <RowDefinition Height="*" />
       </Grid.RowDefinitions>
-      <CheckBox Name="ChkMinimizeToTray" Content="📌 关闭时最小化到托盘" Grid.Row="0" IsChecked="True" HorizontalAlignment="Right" Margin="0,0,0,8" Foreground="#c9d1d9" />
-      <GroupBox Header="⚡ 服务与性能" Grid.Row="1">
+      <Border Grid.Row="0" Background="#161b22" BorderBrush="#30363d" BorderThickness="1" CornerRadius="6" Padding="10,7" Margin="0,0,0,8">
+        <CheckBox Name="ChkMinimizeToTray" Content="📌 关闭窗口时最小化到托盘（不退出）" IsChecked="True"
+                  Foreground="#e0e0e0" VerticalAlignment="Center"
+                  ToolTip="勾选后点关闭只会隐藏窗口；从托盘图标右键菜单可真正退出" />
+      </Border>
+      <!-- ── 运行控制：启动/停止 Llama 与 DSH，只含"动作" ── -->
+      <GroupBox Header="▶ 运行控制" Grid.Row="1">
         <StackPanel>
           <Grid>
             <Grid.ColumnDefinitions>
@@ -235,7 +302,13 @@
               <TextBlock Name="LblDshStatus" Text="● 已停止" Foreground="#8b949e" HorizontalAlignment="Center" FontSize="12" />
             </StackPanel>
           </Grid>
-          <Border Background="#0d1117" CornerRadius="6" Padding="8" Margin="0,10,0,0" BorderBrush="#30363d" BorderThickness="1">
+         </StackPanel>
+      </GroupBox>
+
+      <!-- ── 监控与保护：只读指标 + 显存熔断策略，不含启动动作 ── -->
+      <GroupBox Header="📊 监控与保护" Grid.Row="2" Margin="0,6,0,0">
+         <StackPanel>
+          <Border Background="#0d1117" CornerRadius="6" Padding="8" Margin="0,0,0,0" BorderBrush="#30363d" BorderThickness="1">
             <UniformGrid Rows="2" Columns="4">
               <StackPanel HorizontalAlignment="Center" Margin="4">
                 <TextBlock Text="🖥 CPU" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
@@ -284,7 +357,7 @@
           </Border>
         </StackPanel>
       </GroupBox>
-      <GroupBox Header="📝 运行日志" Grid.Row="2" Margin="0,6,0,0">
+      <GroupBox Header="📝 运行日志" Grid.Row="3" Margin="0,6,0,0">
         <Grid>
           <Grid.RowDefinitions>
             <RowDefinition Height="*" />
@@ -299,6 +372,18 @@
         </Grid>
       </GroupBox>
     </Grid>
+
+    <!-- 非模态提示条：替代阻塞式 MessageBox（信息类）。8s（错误 12s）后自动隐藏，也可手动关闭。 -->
+    <Border Name="NoticeBar" Grid.ColumnSpan="2" VerticalAlignment="Bottom" HorizontalAlignment="Stretch"
+            Margin="8,0,8,8" Padding="10,8" CornerRadius="6" Panel.ZIndex="99"
+            Background="#1f2937" BorderBrush="#3d444d" BorderThickness="1" Visibility="Collapsed">
+      <DockPanel>
+        <Button DockPanel.Dock="Right" Content="✕" Width="24" Height="22" Margin="8,0,0,0" Padding="0"
+                Background="Transparent" BorderThickness="0" Foreground="#8b949e"
+                ToolTip="关闭提示" Click="CloseNotice_Click" />
+        <TextBlock Name="NoticeText" TextWrapping="Wrap" Foreground="#e6edf3" FontSize="12" VerticalAlignment="Center" />
+      </DockPanel>
+    </Border>
   </Grid>
 </Window
 >

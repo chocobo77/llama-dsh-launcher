@@ -14,6 +14,16 @@ public class ParamRule
 
 	public string Value { get; set; } = "";
 
+	/// <summary>Op 是否受支持（与 ParamRules 的实际 switch 分支保持一致；非法算子由加载校验跳过）。</summary>
+	public static bool IsSupportedOp(string? op)
+	{
+		return op switch
+		{
+			"enabled" or "disabled" or "==" or "!=" or ">" or "<" or ">=" or "<=" => true,
+			_ => false
+		};
+	}
+
 	public string Describe()
 	{
 		return Op switch

@@ -126,9 +126,24 @@ public static class ParamRules
 						return "值 " + vn + " 超过 --" + other.Flag + " (" + cap + ")";
 					}
 				}
-				if (val.Regex != null && !Regex.IsMatch(v, val.Regex))
+				if (val.Regex != null)
 				{
-					return "值 '" + v + "' 不匹配格式 " + val.Regex;
+					bool matched;
+					try
+					{
+						matched = Regex.IsMatch(v, val.Regex);
+					}
+					catch (ArgumentException ex)
+					{
+						// 兜底：即使加载期校验没跑到，也不让坏正则把刷新/启动打断
+						LlamaDSH_Launcher.AppLog.WriteError("正则无效：" + d.Flag + " -> " + val.Regex + "（" + ex.Message + "），该参数已改为不校验");
+						val.Regex = null;
+						matched = true;
+					}
+					if (!matched)
+					{
+						return "值 '" + v + "' 不匹配格式 " + val.Regex;
+					}
 				}
 			}
 		}

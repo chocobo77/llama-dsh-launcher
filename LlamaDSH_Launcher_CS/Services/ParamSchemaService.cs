@@ -481,6 +481,8 @@ public static class ParamSchemaService
 		// 排序：组 order 升序 → 组内保持 yaml 原顺序
 		doc.Groups.Sort((a, b) => a.Order.CompareTo(b.Order));
 		result.Groups = doc.Groups;
+		// 加载期静态校验（只记日志并降级，绝不抛）：正则无法编译 / flag 为空或重复 / requires 里的非法算子。
+		ParamDefinition.ValidateSchema(doc.Params);
 		result.Defs = doc.Params;
 	}
 

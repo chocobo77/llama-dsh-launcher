@@ -145,6 +145,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private NotifyIcon? _trayIcon;
 
+	/// <summary>提示条自动隐藏计时器（懒创建，见 ShowNotice）。</summary>
+	private System.Windows.Threading.DispatcherTimer? _noticeTimer;
+
+	/// <summary>本次点击"启动"后是否已经尝试过"重连 node_modules 链接"自愈，避免反复触发。</summary>
+	private bool _dshModuleHealTried;
+
 	private List<ParamDefinition> _paramDefs;
 
 	private ParamSchemaLoadResult _paramSchema = new();
@@ -225,7 +231,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			string schemaMsg = string.Join("\n", _paramSchema.Errors.Concat(_paramSchema.Warnings));
 			Dispatcher.BeginInvoke(new Action(delegate
 			{
-				System.Windows.MessageBox.Show(schemaMsg, "参数配置提示", MessageBoxButton.OK, MessageBoxImage.Warning);
+				ShowNotice(schemaMsg, isError: true);
 			}));
 		}
 		LoadConfigDirFromFile();
@@ -241,6 +247,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			_logAutoFollow = false;
 		};
 		BuildParamGroups();
+		ShowSection("path");
 		SetupTray();
 		WireLiveRefresh();
 		RefreshCmd();
@@ -478,6 +485,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			ParamContent.Children.Add(panel);
 		}
+		LogParamFilter("SelectSubgroup", grpId + "|" + sub, "panelFound=" + (panel != null));
 		int count = _navItems.FirstOrDefault(n => n.GrpId == grpId && n.Sub == sub).Count;
 		ParamBreadcrumb.Text = (grpTitle ?? grpId) + "  ▸  " + sub + "   ·   " + count + " 个参数";
 		foreach (var n in _navItems)
@@ -504,12 +512,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		string q = (InputParamFilter.Text ?? "").Trim();
 		bool filtering = q.Length > 0;
+		LogParamFilter("Apply", DescribeText(q), "filtering=" + filtering);
 		BtnClearParamFilter.Visibility = filtering ? Visibility.Visible : Visibility.Collapsed;
 		if (!filtering)
 		{
 			foreach (var r in _paramRows)
 			{
 				r.Row.Visibility = Visibility.Visible;
+			}
+			foreach (var n in _navItems)
+			{
+				n.Item.Opacity = 1;
+				n.Badge.Text = n.Count.ToString();
 			}
 			if (_currentSub.HasValue)
 			{
@@ -567,12 +581,32 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void InputParamFilter_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
 	{
+		LogParamFilter("TextChanged", DescribeText(InputParamFilter.Text));
 		ApplyParamFilter();
 	}
 
 	private void ClearParamFilter_Click(object sender, RoutedEventArgs e)
 	{
 		InputParamFilter.Clear();
+	}
+
+	/// <summary>诊断日志：记录过滤框文本变化（含字符码，用于排查不可见残留/输入法组合态）。写入 %TEMP%\llamads_paramfilter_debug.log。</summary>
+	static string DescribeText(string? t)
+	{
+		if (string.IsNullOrEmpty(t)) return "len=0";
+		var sb = new StringBuilder("len=").Append(t.Length).Append(" chars=[");
+		foreach (var c in t) sb.Append((int)c).Append(',');
+		return sb.Append(']').ToString();
+	}
+
+	static void LogParamFilter(string what, string? detail1, string? detail2 = null)
+	{
+		try
+		{
+			File.AppendAllText(Path.Combine(Path.GetTempPath(), "llamads_paramfilter_debug.log"),
+				DateTime.Now.ToString("HH:mm:ss.fff") + "  " + what + (detail1 != null ? "  " + detail1 : "") + (detail2 != null ? "  " + detail2 : "") + Environment.NewLine);
+		}
+		catch { }
 	}
 
 
@@ -926,14 +960,29 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void BrowseModelDir_Click(object s, RoutedEventArgs e)
 	{
-		using (System.Windows.Forms.FolderBrowserDialog folderBrowserDialog = new System.Windows.Forms.FolderBrowserDialog())
+		string? dir = PickFolder("选择模型目录：分片 GGUF 自动取第一片，safetensors 需先转 GGUF", InputModelPath.Text);
+		if (dir != null)
 		{
-			folderBrowserDialog.Description = "选择模型目录：分片 GGUF 自动取第一片，safetensors 需先转 GGUF";
-			if (folderBrowserDialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
-			{
-				InputModelPath.Text = folderBrowserDialog.SelectedPath;
-			}
+			InputModelPath.Text = dir;
 		}
+	}
+
+	/// <summary>
+	/// 用 WPF 原生目录选择器（.NET 8 自带 Microsoft.Win32.OpenFolderDialog），
+	/// 取代 WinForms 的 FolderBrowserDialog——后者是 Win95 风格弹窗，且会引入 WinForms 依赖。
+	/// 返回 null 表示用户取消。
+	/// </summary>
+	private static string? PickFolder(string title, string? initialDir)
+	{
+		Microsoft.Win32.OpenFolderDialog dialog = new Microsoft.Win32.OpenFolderDialog
+		{
+			Title = title
+		};
+		if (!string.IsNullOrWhiteSpace(initialDir) && Directory.Exists(initialDir))
+		{
+			dialog.InitialDirectory = initialDir;
+		}
+		return dialog.ShowDialog() == true ? dialog.FolderName : null;
 	}
 
 	private void BrowseMtp_Click(object s, RoutedEventArgs e)
@@ -962,19 +1011,19 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void BrowseLlama_Click(object s, RoutedEventArgs e)
 	{
-		FolderBrowserDialog folderBrowserDialog = new FolderBrowserDialog();
-		if (folderBrowserDialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+		string? dir = PickFolder("选择 llama.cpp 程序目录（含 llama-server.exe）", InputLlamaDir.Text);
+		if (dir != null)
 		{
-			InputLlamaDir.Text = folderBrowserDialog.SelectedPath;
+			InputLlamaDir.Text = dir;
 		}
 	}
 
 	private void BrowseDsh_Click(object s, RoutedEventArgs e)
 	{
-		FolderBrowserDialog folderBrowserDialog = new FolderBrowserDialog();
-		if (folderBrowserDialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+		string? dir = PickFolder("选择 DeepSeek Harness 目录（含 apps/cli）", InputDshDir.Text);
+		if (dir != null)
 		{
-			InputDshDir.Text = folderBrowserDialog.SelectedPath;
+			InputDshDir.Text = dir;
 		}
 	}
 
@@ -1262,7 +1311,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				if (fromButton)
 				{
-					System.Windows.MessageBox.Show("Llama 服务正在运行，请先停止再更新。", "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Warning);
+					ShowNotice("Llama 服务正在运行，请先停止再更新。", isError: true);
 				}
 				else
 				{
@@ -1275,7 +1324,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				if (fromButton)
 				{
-					System.Windows.MessageBox.Show("未找到 llama-server.exe，请先在“Llama 程序目录”填写实际路径。", "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Warning);
+					ShowNotice("未找到 llama-server.exe，请先在“Llama 程序目录”填写实际路径。", isError: true);
 				}
 				return;
 			}
@@ -1287,7 +1336,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				if (fromButton)
 				{
-					System.Windows.MessageBox.Show("无法获取 llama.cpp 最新版本（网络/GitHub 不可达）。", "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Warning);
+					ShowNotice("无法获取 llama.cpp 最新版本（网络/GitHub 不可达）。", isError: true);
 				}
 				return;
 			}
@@ -1299,7 +1348,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				Log("[更新] llama.cpp 已是最新: build " + local.Value + "（上游 " + upstream + "）");
 				if (fromButton)
 				{
-					System.Windows.MessageBox.Show("llama.cpp 已是最新版本。\n当前: build " + local.Value + "\n上游: " + upstream, "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Information);
+					ShowNotice("llama.cpp 已是最新版本。\n当前: build " + local.Value + "\n上游: " + upstream);
 				}
 				return;
 			}
@@ -1325,11 +1374,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			Log("[更新] " + m);
 			if (ok)
 			{
-				System.Windows.MessageBox.Show(m + "\n\n可点“⟳ 重载参数配置”加载新版本参数。", "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Information);
+				ShowNotice(m + "\n\n可点“⟳ 重载参数配置”加载新版本参数。");
 			}
 			else
 			{
-				System.Windows.MessageBox.Show("更新失败:\n" + m, "更新 llama.cpp", MessageBoxButton.OK, MessageBoxImage.Warning);
+				ShowNotice("更新失败:\n" + m, isError: true);
 			}
 		}
 		catch (Exception ex)
@@ -1351,7 +1400,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				if (fromButton)
 				{
-					System.Windows.MessageBox.Show("当前为 npx 一键部署模式，无法 git 更新。请切换到“编译版”模式。", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+					ShowNotice("当前为 npx 一键部署模式，无法 git 更新。请切换到“编译版”模式。", isError: true);
 				}
 				return;
 			}
@@ -1359,7 +1408,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				if (fromButton)
 				{
-					System.Windows.MessageBox.Show("DSH 正在运行，请先停止再更新。", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+					ShowNotice("DSH 正在运行，请先停止再更新。", isError: true);
 				}
 				else
 				{
@@ -1372,7 +1421,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				if (fromButton)
 				{
-					System.Windows.MessageBox.Show("未找到 deepseek-harness 安装目录。\n\n请点“🔍 自动检索”，或在“DSH 项目目录”填写实际源码路径。", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+					ShowNotice("未找到 deepseek-harness 安装目录。\n\n请点“🔍 自动检索”，或在“DSH 项目目录”填写实际源码路径。", isError: true);
 				}
 				return;
 			}
@@ -1380,7 +1429,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				if (fromButton)
 				{
-					System.Windows.MessageBox.Show("DSH 目录不是 git 仓库: " + dir + "\n请先在“DSH 项目目录”填写实际仓库路径。", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+					ShowNotice("DSH 目录不是 git 仓库: " + dir + "\n请先在“DSH 项目目录”填写实际仓库路径。", isError: true);
 				}
 				return;
 			}
@@ -1397,9 +1446,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				Log("[更新] DSH 上游检查失败: " + checkError);
 				if (fromButton)
 				{
-					System.Windows.MessageBox.Show("无法检查 DSH 上游：\n" + checkError
-						+ "\n\n启动器已自动尝试直连与 gh-proxy 镜像；若仍失败，请检查网络/代理，或先手动 git fetch 验证。",
-						"更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+					ShowNotice("无法检查 DSH 上游：\n" + checkError
+						+ "\n\n启动器已自动尝试直连与 gh-proxy 镜像；若仍失败，请检查网络/代理，或先手动 git fetch 验证。", isError: true);
 				}
 				return;
 			}
@@ -1411,7 +1459,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				if (fromButton)
 				{
-					System.Windows.MessageBox.Show("本地领先上游 " + info.Ahead + " 个提交（存在本地改动），为避免冲突不会自动更新。\n请自行处理本地提交后重试。", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+					ShowNotice("本地领先上游 " + info.Ahead + " 个提交（存在本地改动），为避免冲突不会自动更新。\n请自行处理本地提交后重试。", isError: true);
 				}
 				else
 				{
@@ -1424,7 +1472,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				Log("[更新] DSH 已是最新: " + info.LocalHead.Substring(0, 7) + "（分支 " + info.Branch + "）");
 				if (fromButton)
 				{
-					System.Windows.MessageBox.Show("deepseek-harness 已是最新。\n当前: " + info.LocalHead.Substring(0, 7) + " (" + info.Branch + ")", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Information);
+					ShowNotice("deepseek-harness 已是最新。\n当前: " + info.LocalHead.Substring(0, 7) + " (" + info.Branch + ")");
 				}
 				return;
 			}
@@ -1443,7 +1491,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				SetDshUpdBtn(false);
 				Log("[更新] DSH git pull 失败: " + m);
-				System.Windows.MessageBox.Show("git pull 失败:\n" + m + "\n\n（可能有本地未提交改动，或上游历史已改写。请手动处理。）", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+				ShowNotice("git pull 失败:\n" + m + "\n\n（可能有本地未提交改动，或上游历史已改写。请手动处理。）", isError: true);
 				return;
 			}
 			SetDshUpdBtn(false);
@@ -1557,7 +1605,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			SetDshCompatBtn(false);
 			if (!report.HasRepairable)
 			{
-				System.Windows.MessageBox.Show(BuildCompatSummary(report) + "\n\n未发现可自动修复的问题。", "DSH 兼容性检查", MessageBoxButton.OK, report.ErrorCount > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
+				ShowNotice(BuildCompatSummary(report) + "\n\n未发现可自动修复的问题。", isError: true);
 				return;
 			}
 			if (System.Windows.MessageBox.Show(BuildCompatSummary(report) + "\n\n是否立即执行自动修复？\n（会先备份 package.json / cordis.patch.yml）", "DSH 兼容性修复", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
@@ -1582,7 +1630,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		if (IsDshRunning())
 		{
-			System.Windows.MessageBox.Show("DSH 正在运行，无法写入修复。\n\n请先在启动器中停止 DSH，再执行自动修复。", "DSH 兼容性修复", MessageBoxButton.OK, MessageBoxImage.Warning);
+			ShowNotice("DSH 正在运行，无法写入修复。\n\n请先在启动器中停止 DSH，再执行自动修复。", isError: true);
 			Log("[兼容] DSH 正在运行，已取消自动修复。");
 			return;
 		}
@@ -1605,7 +1653,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			? "兼容性修复完成：复检无错误、无待修复项。"
 			: "自动修复已执行，但复检仍有 错误 " + res.RemainingErrors + " · 可修复 " + res.RemainingRepairable + "。\n"
 				+ "可修复项会在下次启动/再次修复时重试；上游 peer 不兼容需插件作者发版或显式放行。";
-		System.Windows.MessageBox.Show(verdict + "\n\n" + string.Join("\n", res.Messages) + "\n\n" + BuildCompatSummary(res.Report), "DSH 兼容性修复", MessageBoxButton.OK, res.Report.ErrorCount > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
+		ShowNotice(verdict + "\n\n" + string.Join("\n", res.Messages) + "\n\n" + BuildCompatSummary(res.Report), isError: true);
 		// 修复后仍不兼容的插件：放行与否由用户逐次决定（工具不代替用户接受风险）
 		List<DshPluginInfo> stillBad = DshCompatService.ExemptCandidates(res.Report);
 		if (stillBad.Count > 0 && !string.IsNullOrEmpty(res.Report.DshVersion))
@@ -1624,7 +1672,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					string ex = DshCompatService.ExemptPlugin(profile, p.Name, p.Version, res.Report.DshVersion);
 					Log("    [放行] " + ex);
 				}
-				System.Windows.MessageBox.Show("已放行 " + stillBad.Count + " 个插件（写入 compatibility.json）。\n下次兼容性检查将不再报其版本不兼容。", "修复后放行", MessageBoxButton.OK, MessageBoxImage.Information);
+				ShowNotice("已放行 " + stillBad.Count + " 个插件（写入 compatibility.json）。\n下次兼容性检查将不再报其版本不兼容。");
 			}
 			else
 			{
@@ -2599,7 +2647,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			_cmdEditing = false;
 			LogError(ex, "进入命令编辑");
-			System.Windows.MessageBox.Show("无法进入命令编辑: " + ex.Message, "命令预览", MessageBoxButton.OK, MessageBoxImage.Warning);
+			ShowNotice("无法进入命令编辑: " + ex.Message, isError: true);
 		}
 	}
 
@@ -2623,23 +2671,22 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		catch (Exception ex)
 		{
-			System.Windows.MessageBox.Show("命令解析失败: " + ex.Message, "命令预览", MessageBoxButton.OK, MessageBoxImage.Warning);
+			ShowNotice("命令解析失败: " + ex.Message, isError: true);
 			return;
 		}
 		if (!TokensStartWith(tokens, _cmdEditBase))
 		{
-			System.Windows.MessageBox.Show(
+			ShowNotice(
 				"不能修改或删除上方已配置的参数。\n\n" +
 				"这里只允许在基础命令末尾追加自定义参数：请保留前面的配置参数不变，把新增内容写在最后。\n" +
-				"配置参数请回到上方“参数配置”区勾选/修改。",
-				"命令预览", MessageBoxButton.OK, MessageBoxImage.Warning);
+				"配置参数请回到上方“参数配置”区勾选/修改。", isError: true);
 			return;
 		}
 		List<string> custom = tokens.Skip(_cmdEditBase.Count).ToList();
 		string? invalid = ValidateCustomArgs(custom);
 		if (invalid != null)
 		{
-			System.Windows.MessageBox.Show(invalid, "自定义参数", MessageBoxButton.OK, MessageBoxImage.Warning);
+			ShowNotice(invalid, isError: true);
 			return;
 		}
 		_customArgs = custom;
@@ -2766,13 +2813,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			Log("[参数] 配置已重载，来源: " + r.Source + "，参数 " + r.Defs.Count + " 项 / 组 " + r.Groups.Count + " 个");
 			if (r.Errors.Count > 0 || r.Warnings.Count > 0)
 			{
-				System.Windows.MessageBox.Show(string.Join("\n", r.Errors.Concat(r.Warnings)), "参数配置提示", MessageBoxButton.OK, MessageBoxImage.Warning);
+				ShowNotice(string.Join("\n", r.Errors.Concat(r.Warnings)), isError: true);
 			}
 		}
 		catch (Exception ex)
 		{
 			LogError(ex, "重载参数配置失败");
-			System.Windows.MessageBox.Show("重载失败: " + ex.Message);
+			ShowNotice("重载失败: " + ex.Message, isError: true);
 		}
 	}
 
@@ -3350,7 +3397,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		//IL_0242: Expected O, but got Unknown
 		if (_llamaProc != null && !_llamaProc.HasExited)
 		{
-			System.Windows.MessageBox.Show("Already running");
+			ShowNotice("Already running");
 			return;
 		}
 		_vramBreakerTriggered = false;
@@ -3394,12 +3441,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		catch (Exception ex)
 		{
 			LogError(ex, "命令构建失败");
-			System.Windows.MessageBox.Show("Build failed:" + ex.Message);
+			ShowNotice("Build failed:" + ex.Message, isError: true);
 			return;
 		}
 		if (list.Count == 0)
 		{
-			System.Windows.MessageBox.Show("Empty");
+			ShowNotice("Empty");
 			return;
 		}
 		// 参数依赖/校验弹窗确认（用户选择：不满足时列出并确认，而非静默剔除）
@@ -3607,6 +3654,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void StartDsh_Click(object s, RoutedEventArgs e)
 	{
+		// 每次手动点击启动都允许重新尝试一次"链接自愈"
+		_dshModuleHealTried = false;
 		int? existing = ProcessHelper.FindProcessByPort(3080);
 		if (existing.HasValue)
 		{
@@ -3625,13 +3674,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		if (ComboDshMode.SelectedIndex != 0)
 		{
-			System.Windows.MessageBox.Show("仅本地目录模式支持重建。", "重建 DSH");
+			ShowNotice("仅本地目录模式支持重建。");
 			return;
 		}
 		string dshDir = EffectiveDshDir();
 		if (!Directory.Exists(Path.Combine(dshDir, "apps", "cli")))
 		{
-			System.Windows.MessageBox.Show("DSH 目录无效: " + dshDir, "重建 DSH");
+			ShowNotice("DSH 目录无效: " + dshDir);
 			return;
 		}
 		string? head = null;
@@ -3645,7 +3694,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		if (head == null)
 		{
-			System.Windows.MessageBox.Show("无法读取仓库 git HEAD，请确认是 deepseek-harness 的 git checkout。", "重建 DSH", MessageBoxButton.OK, MessageBoxImage.Warning);
+			ShowNotice("无法读取仓库 git HEAD，请确认是 deepseek-harness 的 git checkout。", isError: true);
 			return;
 		}
 		string msg = "将执行全量重建:\n  1/3 pnpm clean\n  2/3 pnpm build:lib\n  3/3 build:web (vite)\n"
@@ -3670,7 +3719,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				BtnRebuildDsh.IsEnabled = true;
 				LblDshStatus.Text = "已停止";
-				System.Windows.MessageBox.Show("DSH 进程未完全退出，请手动结束后再点重建。", "重建 DSH", MessageBoxButton.OK, MessageBoxImage.Warning);
+				ShowNotice("DSH 进程未完全退出，请手动结束后再点重建。", isError: true);
 				return;
 			}
 		}
@@ -3744,7 +3793,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			if (nodeExe == null)
 			{
 				string anyNode = Toolchain.ResolveNodeExe(require24: false) ?? "(未找到)";
-				System.Windows.MessageBox.Show("未找到 node v24+（当前: " + anyNode + "）\n"
+				ShowNotice("未找到 node v24+（当前: " + anyNode + "）\n"
 					+ "DSH 重建必须使用 node24。请安装 node24，或把它的目录加入 PATH。\n\n无法自动重建，将直接启动。");
 				BtnRebuildDsh.IsEnabled = true;
 				StartDsh();
@@ -3753,7 +3802,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			string? pnpmExe = Toolchain.ResolvePnpmExe();
 			if (pnpmExe == null)
 			{
-				System.Windows.MessageBox.Show("未找到 pnpm：无法执行 pnpm clean/build:lib。\n请安装 pnpm（或 corepack enable）后重试。");
+				ShowNotice("未找到 pnpm：无法执行 pnpm clean/build:lib。\n请安装 pnpm（或 corepack enable）后重试。");
 				BtnRebuildDsh.IsEnabled = true;
 				return;
 			}
@@ -3943,7 +3992,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 						Log("--- [DSH重建] ❌ 重建失败 (EXITCODE=1)，请查看上方日志 ---");
 						LblDshStatus.Text = "Rebuild failed";
 						LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(248, 81, 73));
-						System.Windows.MessageBox.Show("DSH 重建失败，详见启动器日志。\n\n常见原因: node24/pnpm 不可用、依赖安装网络问题、TS 编译错误。", "DSH 重建失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+						ShowNotice("DSH 重建失败，详见启动器日志。\n\n常见原因: node24/pnpm 不可用、依赖安装网络问题、TS 编译错误。", isError: true);
 					}
 					return;
 				}
@@ -3976,11 +4025,28 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		StopDsh();
 	}
 
+	/// <summary>启动日志里是否出现模块缺失（pnpm workspace 链接悬空的典型症状）。</summary>
+	private bool DshBootLogHasModuleMissing()
+	{
+		try
+		{
+			if (_dshBootLogPath == null || !File.Exists(_dshBootLogPath))
+			{
+				return false;
+			}
+			return File.ReadAllText(_dshBootLogPath).Contains("ERR_MODULE_NOT_FOUND", StringComparison.Ordinal);
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
 	private void StartDsh()
 	{
 		if (HasDsh())
 		{
-			System.Windows.MessageBox.Show("Already running");
+			ShowNotice("Already running");
 			return;
 		}
 		try
@@ -3993,7 +4059,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				dshDir = EffectiveDshDir();
 				if (string.IsNullOrEmpty(dshDir))
 				{
-					System.Windows.MessageBox.Show("未找到 DSH 安装目录。\n\n请点“🔍 自动检索”或手动选择 deepseek-harness 目录。", "启动 DSH", MessageBoxButton.OK, MessageBoxImage.Warning);
+					ShowNotice("未找到 DSH 安装目录。\n\n请点“🔍 自动检索”或手动选择 deepseek-harness 目录。", isError: true);
 					return;
 				}
 				text3 = ((File.Exists(Path.Combine(dshDir, "apps", "cli", "lib", "bin.js")) && _dshRetriesLeft > 0) ? "compiled-js" : "compiled-tsx");
@@ -4007,15 +4073,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				if (Toolchain.ResolveNode24Exe() == null)
 				{
 					string anyNode = Toolchain.ResolveNodeExe(require24: false) ?? "(未找到)";
-					System.Windows.MessageBox.Show("未找到 node v24+（当前: " + anyNode + "）。\n\n"
-						+ "DSH 必须使用 node24。请安装 node24 或把它的目录加入 PATH；也可点“🔍 自动检索”确认目录。",
-						"启动 DSH", MessageBoxButton.OK, MessageBoxImage.Warning);
+					ShowNotice("未找到 node v24+（当前: " + anyNode + "）。\n\n"
+						+ "DSH 必须使用 node24。请安装 node24 或把它的目录加入 PATH；也可点“🔍 自动检索”确认目录。", isError: true);
 					return;
 				}
 				if (text3 == "compiled-tsx" && Toolchain.ResolvePnpmExe() == null)
 				{
-					System.Windows.MessageBox.Show("编译产物不存在，需要 pnpm 以 compiled-tsx 方式启动，但未找到 pnpm。\n\n"
-						+ "请安装 pnpm（或 corepack enable）后重试。", "启动 DSH", MessageBoxButton.OK, MessageBoxImage.Warning);
+					ShowNotice("编译产物不存在，需要 pnpm 以 compiled-tsx 方式启动，但未找到 pnpm。\n\n"
+						+ "请安装 pnpm（或 corepack enable）后重试。", isError: true);
 					return;
 				}
 			}
@@ -4386,6 +4451,39 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				Log(flag ? "DSH failed (启动日志报错)" : "DSH failed (启动超时)");
 				StopDshLogTailer();
 				_dshTracker = null;
+
+				// 模块缺失自愈：pnpm 的 workspace 链接存的是绝对路径，DSH 目录搬家/复制后全部悬空，
+				// 表现为 "Cannot find package '@deepseek-ai/xxx'"。这里只重连链接并重试一次，
+				// 比直接回落 compiled-tsx（会触发 pnpm install 直到超时）快得多，也不会改动源码。
+				if (!_dshModuleHealTried && DshBootLogHasModuleMissing())
+				{
+					_dshModuleHealTried = true;
+					LblDshStatus.Text = "● 修复 node_modules 链接…";
+					LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(210, 168, 83));
+					Log("--- 启动日志出现 ERR_MODULE_NOT_FOUND：尝试重连 node_modules 失效链接 ---");
+					string healDir = EffectiveDshDir();
+					string healProfile = _currentProfile;
+					Task.Run(() => DshCompatService.RepairBrokenLinksOnly(healDir, healProfile)).ContinueWith(t =>
+					{
+						Dispatcher.BeginInvoke((Action)(() =>
+						{
+							if (t.IsFaulted)
+							{
+								Log("[自愈] 重连链接失败: " + t.Exception?.GetBaseException().Message);
+							}
+							else
+							{
+								(int Detected, int Relinked, int Removed, int Failed) r = t.Result;
+								Log("[自愈] 失效链接 " + r.Detected + " 条 → 重连 " + r.Relinked + " / 清理 " + r.Removed + " / 失败 " + r.Failed);
+							}
+							_dshRetriesLeft = 2;
+							Log("--- 修复后重新启动 DSH ---");
+							StartDsh();
+						}));
+					});
+					return;
+				}
+
 				if (_dshRetriesLeft > 0)
 				{
 					_dshRetriesLeft--;
@@ -4958,6 +5056,67 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		catch
 		{
 		}
+	}
+
+	/// <summary>
+	/// 把"当前 Node 日志 + 最近错误/崩溃日志尾部 + 环境信息"一次性复制到剪贴板。
+	/// 剪贴板可能被其它进程短暂占用，这里重试 3 次而不是直接失败。
+	/// </summary>
+	private void CopyDiagInfo_Click(object sender, RoutedEventArgs e)
+	{
+		string text = AppLog.BuildDiagnostics(NodeLog.Text);
+		Exception? last = null;
+		for (int attempt = 0; attempt < 3; attempt++)
+		{
+			try
+			{
+				System.Windows.Clipboard.SetText(text);
+				NodeLogLine("📋 诊断信息已复制到剪贴板（" + text.Length + " 字符），可直接粘贴给维护者。");
+				return;
+			}
+			catch (Exception ex)
+			{
+				last = ex;
+				System.Threading.Thread.Sleep(120);
+			}
+		}
+		NodeLogLine("复制到剪贴板失败：" + (last == null ? "未知错误" : last.Message) + "。可点【日志】按钮打开日志目录手动复制。");
+	}
+
+	/// <summary>非模态提示条：不阻塞调用流（finally 能立刻执行），到期自动隐藏。</summary>
+	private void ShowNotice(string message, bool isError = false)
+	{
+		if (!Dispatcher.CheckAccess())
+		{
+			Dispatcher.BeginInvoke((Action)(() => ShowNotice(message, isError)));
+			return;
+		}
+		NoticeText.Text = message;
+		NoticeBar.Background = new SolidColorBrush(isError
+			? System.Windows.Media.Color.FromRgb(0x4a, 0x1f, 0x1f)
+			: System.Windows.Media.Color.FromRgb(0x1f, 0x29, 0x37));
+		NoticeBar.BorderBrush = new SolidColorBrush(isError
+			? System.Windows.Media.Color.FromRgb(0x8b, 0x2d, 0x2d)
+			: System.Windows.Media.Color.FromRgb(0x3d, 0x44, 0x4d));
+		NoticeBar.Visibility = Visibility.Visible;
+		if (_noticeTimer == null)
+		{
+			_noticeTimer = new System.Windows.Threading.DispatcherTimer();
+			_noticeTimer.Tick += (_, _) =>
+			{
+				_noticeTimer?.Stop();
+				NoticeBar.Visibility = Visibility.Collapsed;
+			};
+		}
+		_noticeTimer.Stop();
+		_noticeTimer.Interval = TimeSpan.FromSeconds(isError ? 12 : 8);
+		_noticeTimer.Start();
+	}
+
+	private void CloseNotice_Click(object s, RoutedEventArgs e)
+	{
+		_noticeTimer?.Stop();
+		NoticeBar.Visibility = Visibility.Collapsed;
 	}
 
 	private void OpenLogDir_Click(object s, RoutedEventArgs e)
@@ -5688,13 +5847,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void ChangeConfigPath_Click(object s, RoutedEventArgs e)
 	{
-		FolderBrowserDialog folderBrowserDialog = new FolderBrowserDialog
+		string? dir = PickFolder("选择配置文件存放目录", _configDir);
+		if (dir != null)
 		{
-			SelectedPath = _configDir
-		};
-		if (folderBrowserDialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
-		{
-			_configDir = folderBrowserDialog.SelectedPath;
+			_configDir = dir;
 			SaveConfigDirToFile();
 			Log("Config dir:" + _configDir);
 		}
@@ -5832,7 +5988,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		catch (Exception ex)
 		{
 			LogError(ex, "保存配置失败");
-			System.Windows.MessageBox.Show("Save failed:" + ex.Message);
+			ShowNotice("Save failed:" + ex.Message, isError: true);
 		}
 	}
 
@@ -5975,7 +6131,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			catch (Exception ex)
 			{
 				LogError(ex, "导出配置失败");
-				System.Windows.MessageBox.Show("Export failed:" + ex.Message);
+				ShowNotice("Export failed:" + ex.Message, isError: true);
 			}
 		}
 	}
@@ -6028,7 +6184,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		catch (Exception ex2)
 		{
 			LogError(ex2, "加载配置失败");
-			System.Windows.MessageBox.Show("Load failed:" + ex2.Message);
+			ShowNotice("Load failed:" + ex2.Message, isError: true);
 		}
 	}
 
@@ -6130,7 +6286,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			string text = textBox.Text.Trim();
 			if (_profiles.ContainsKey(text))
 			{
-				System.Windows.MessageBox.Show("已存在同名方案", "提示");
+				ShowNotice("已存在同名方案");
 				return;
 			}
 			_profiles[text] = BuildConfig();
@@ -6208,7 +6364,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			if (_profiles.ContainsKey(text))
 			{
-				System.Windows.MessageBox.Show("已存在同名方案", "提示");
+				ShowNotice("已存在同名方案");
 				return;
 			}
 			_profiles[text] = _profiles[currentProfile];
@@ -6224,7 +6380,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		if (_profiles.Count <= 1)
 		{
-			System.Windows.MessageBox.Show("至少需要保留一个方案", "提示");
+			ShowNotice("至少需要保留一个方案");
 		}
 		else if (System.Windows.MessageBox.Show("确定删除方案 \"" + _currentProfile + "\"？", "确认删除", MessageBoxButton.YesNo) == MessageBoxResult.Yes)
 		{
@@ -6238,6 +6394,223 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			SaveConfigFile();
 			Log("已删除方案: " + currentProfile + ", 当前: " + _currentProfile);
+		}
+	}
+
+	// ── 浏览器式选项卡：路径配置 / 参数配置 / 命令预览 ───────────────
+
+	private void SwitchSection_Click(object sender, RoutedEventArgs e)
+	{
+		ShowSection((sender as System.Windows.Controls.Button)?.Tag as string ?? "path");
+	}
+
+	private void ShowSection(string which)
+	{
+		SecPath.Visibility = which == "path" ? Visibility.Visible : Visibility.Collapsed;
+		SecParam.Visibility = which == "param" ? Visibility.Visible : Visibility.Collapsed;
+		SecCmd.Visibility = which == "cmd" ? Visibility.Visible : Visibility.Collapsed;
+		StyleTabButton(TabBtnPath, which == "path");
+		StyleTabButton(TabBtnParam, which == "param");
+		StyleTabButton(TabBtnCmd, which == "cmd");
+	}
+
+	private static void StyleTabButton(System.Windows.Controls.Button b, bool active)
+	{
+		b.Background = active ? new SolidColorBrush(System.Windows.Media.Color.FromRgb(22, 27, 34)) : System.Windows.Media.Brushes.Transparent;
+		b.Foreground = active ? System.Windows.Media.Brushes.White : new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
+	}
+
+	// ── Node 环境：傻瓜式安装/更新/配置（一键部署，供 DSH 启动/重建使用）───────────────
+
+	private bool _nodeEnvBusy;
+
+	private void SetNodeEnvBusy(bool busy)
+	{
+		_nodeEnvBusy = busy;
+		BtnInstallNodeEnv.IsEnabled = !busy;
+		BtnRefreshNodeEnv.IsEnabled = !busy;
+	}
+
+	private void NodeLogLine(string line)
+	{
+		Dispatcher.BeginInvoke((Action)(() =>
+		{
+			NodeLog.Text += "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + line + Environment.NewLine;
+			NodeLog.CaretIndex = NodeLog.Text.Length;
+		}));
+	}
+
+	private async void RefreshNodeEnv_Click(object sender, RoutedEventArgs e)
+	{
+		if (_nodeEnvBusy) return;
+		SetNodeEnvBusy(true);
+		try { await DoRefreshNodeStatus(); }
+		catch (Exception ex)
+		{
+			// async void 漏掉 catch 会逃逸成 Dispatcher 未处理异常（弹崩溃框），这里必须兜住
+			AppLog.WriteError("刷新 Node 状态失败: " + ex);
+			NodeLogLine("状态刷新失败：" + ex.Message);
+		}
+		finally { SetNodeEnvBusy(false); }
+	}
+
+	private async Task RefreshNodeStatusAsync()
+	{
+		if (_nodeEnvBusy) return;
+		SetNodeEnvBusy(true);
+		try { await DoRefreshNodeStatus(); }
+		catch (Exception ex) { LblNodeStatus.Text = "检测失败: " + ex.Message; }
+		finally { SetNodeEnvBusy(false); }
+	}
+
+	private async Task DoRefreshNodeStatus()
+	{
+		var status = await Task.Run(() => NodeSetup.Detect());
+		string latest = await NodeSetup.GetLatestV24Async();
+		UpdateNodeLabels(status, latest);
+	}
+
+	private void UpdateNodeLabels(NodeSetup.NodeStatus st, string latest)
+	{
+		if (st.MeetsRequirement)
+		{
+			string extra = (latest != "" && st.Node24Version != latest) ? "  ·  ⬆ 可更新" : "";
+			LblNodeStatus.Text = "✅ Node " + st.Node24Version + extra + " — " + st.Node24Exe;
+		}
+		else if (st.AnyNodeExe != null)
+		{
+			LblNodeStatus.Text = "⚠️ 当前 node " + st.AnyNodeVersion + " 不满足要求（DSH 需要 v24+）— " + st.AnyNodeExe;
+		}
+		else
+		{
+			LblNodeStatus.Text = "❌ 未找到 Node（DSH 启动/重建必需）";
+		}
+		if (st.PnpmExe != null)
+		{
+			LblPnpmStatus.Text = "✅ pnpm " + st.PnpmVersion + " — " + st.PnpmExe;
+		}
+		else
+		{
+			LblPnpmStatus.Text = "❌ 未找到 pnpm（插件安装/升级必需，可用下方按钮一并安装）";
+		}
+		if (latest != "")
+		{
+			bool upToDate = st.MeetsRequirement && st.Node24Version == latest;
+			LblLatestStatus.Text = "最新 v24.x: " + latest + (upToDate ? "  ·  当前已是最新" : "");
+		}
+		else
+		{
+			LblLatestStatus.Text = "未能查询最新 v24.x 版本号（网络不可用或镜像不可达）";
+		}
+	}
+
+	private async void InstallNodeEnv_Click(object sender, RoutedEventArgs e)
+	{
+		if (_nodeEnvBusy) return;
+		SetNodeEnvBusy(true);
+		NodeLog.Text = "";
+		// 必须在 UI 线程取（EffectiveDshDir 会读控件），后台线程只消费字符串
+		string dshDirForLinks = EffectiveDshDir();
+		try
+		{
+			await Task.Run(async () =>
+			{
+				Action<string> log = s => NodeLogLine(s);
+				log("── 开始安装/更新 Node 环境 ──");
+				string latest = await NodeSetup.GetLatestV24Async();
+				if (latest == "") throw new Exception("无法查询最新 v24.x 版本号：网络不可用或镜像不可达，请检查网络后重试。");
+
+				var st = NodeSetup.Detect();
+				bool needNode = !st.MeetsRequirement || st.Node24Version != latest;
+				bool needPnpm = st.PnpmExe == null;
+
+				if (!needNode && !needPnpm)
+				{
+					log("当前环境已是最新（node " + latest + " + pnpm），无需操作。");
+					return;
+				}
+
+				string tempDir = Path.Combine(Path.GetTempPath(), "dsh_node_install");
+				Directory.CreateDirectory(tempDir);
+
+				if (needNode)
+				{
+					string currentDesc = st.Node24Exe != null ? st.Node24Version : (st.AnyNodeExe != null ? st.AnyNodeVersion + "（不满足要求）" : "未安装");
+					log("目标版本: " + latest + "  当前: " + currentDesc);
+					string? msi = await NodeSetup.DownloadMsiAsync(latest, tempDir, log);
+					if (msi == null) throw new Exception("MSI 下载失败：所有源均不可达。也可手动到 https://nodejs.org 下载安装。");
+					try
+					{
+						if (!NodeSetup.InstallMsi(msi, log, out bool needReboot)) throw new Exception("安装器未成功完成（见上方退出码）。");
+						if (needReboot)
+						{
+							// 3010/1641：安装已成功但重启前 node 尚未生效，继续 Detect→InstallPnpm 只会必然失败，这里直接收尾（不是失败）。
+							log("Node 已安装完成，但需要重启 Windows 后才能生效；请重启后再次点击【安装/更新 Node 环境】完成 pnpm 安装。");
+							return;
+						}
+					}
+					finally
+					{
+						// 安装结束后（成功/失败/超时）都清掉临时包，避免残留占空间
+						try { File.Delete(msi); } catch { /* ignore */ }
+					}
+				}
+
+				var st2 = NodeSetup.Detect();
+				if (st2.PnpmExe == null)
+				{
+					if (!NodeSetup.InstallPnpm(log)) throw new Exception("pnpm 安装失败。也可在 node 目录手动运行 npm install -g pnpm。");
+				}
+
+				var st3 = NodeSetup.Detect();
+				if (st3.MeetsRequirement && st3.PnpmExe != null)
+				{
+					log("✅ 完成: node " + st3.Node24Version + " + pnpm " + st3.PnpmVersion);
+					log("PATH 已由安装器自动配置，新开的终端立即生效。");
+
+					// Node 换版本/换机器后，DSH 的 node_modules 里 pnpm workspace 链接可能悬空
+					// （绝对路径残留），顺手重连一次，避免用户点"启动 DSH"才发现 Cannot find package。
+					if (!string.IsNullOrEmpty(dshDirForLinks))
+					{
+						try
+						{
+							log("检查 DSH 的 node_modules 链接…");
+							(int Detected, int Relinked, int Removed, int Failed) link =
+								DshCompatService.RepairBrokenLinksOnly(dshDirForLinks, _currentProfile);
+							if (link.Detected == 0)
+							{
+								log("DSH node_modules 链接正常。");
+							}
+							else
+							{
+								log("失效链接 " + link.Detected + " 条 → 重连 " + link.Relinked + " / 清理 " + link.Removed
+									+ (link.Failed > 0 ? " / 失败 " + link.Failed : ""));
+							}
+						}
+						catch (Exception linkEx)
+						{
+							log("链接自检跳过：" + linkEx.Message);
+						}
+					}
+				}
+				else
+				{
+					throw new Exception("安装完成但校验未通过，请点“刷新状态”查看详情。");
+				}
+			});
+
+			await DoRefreshNodeStatus();
+		}
+		catch (Exception ex)
+		{
+			NodeLogLine("❌ " + ex.Message);
+			AppLog.WriteError("InstallNodeEnv_Click: " + ex);
+			NodeLogLine("💡 可点【📋 复制诊断】把本次错误与环境信息复制出来。");
+			ShowNotice("Node 环境安装失败：" + ex.Message, isError: true);
+		}
+		finally
+		{
+			SetNodeEnvBusy(false);
 		}
 	}
 
@@ -6260,6 +6633,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 		}
 		StartBackgroundUpdateCheck();
+		// Node 环境状态：后台异步刷新，不阻塞启动。
+		_ = RefreshNodeStatusAsync();
 	}
 
 	private void ClampToWorkArea()

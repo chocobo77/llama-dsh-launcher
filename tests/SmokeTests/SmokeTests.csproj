@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    零依赖冒烟测试：不引用 WPF 主工程、不引入任何 NuGet 包，
+    直接以源码方式编译被测文件（它们只依赖 BCL），因此可离线运行。
+    用法：dotnet run 指定本 csproj 即可（见 README 或主 README 的验证章节）。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>LauncherSmokeTests</RootNamespace>
+    <AssemblyName>SmokeTests</AssemblyName>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\LlamaDSH_Launcher_CS\Services\ProcessRunner.cs" Link="src\ProcessRunner.cs" />
+    <Compile Include="..\..\LlamaDSH_Launcher_CS\Logging.cs" Link="src\Logging.cs" />
+    <Compile Include="..\..\LlamaDSH_Launcher_CS\Services\AuthenticodeVerifier.cs" Link="src\AuthenticodeVerifier.cs" />
+  </ItemGroup>
+
+</Project>

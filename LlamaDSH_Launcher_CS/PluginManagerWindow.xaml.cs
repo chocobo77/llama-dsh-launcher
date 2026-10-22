@@ -31,7 +31,7 @@ public partial class PluginManagerWindow : Window
 		_profile = profile;
 		_isDshRunning = isDshRunning;
 		_hostLog = hostLog;
-		_ = RefreshAsync();
+		SafeRefreshAsync();
 	}
 
 	private void Log(string msg)
@@ -61,10 +61,10 @@ public partial class PluginManagerWindow : Window
 			return;
 		}
 		_busy = true;
-		BtnRefresh.IsEnabled = false;
-		TxtHeader.Text = "正在审计插件状态（含 dump-config 与探针，约十几秒）...";
 		try
 		{
+			BtnRefresh.IsEnabled = false;
+			TxtHeader.Text = "正在审计插件状态（含 dump-config 与探针，约十几秒）...";
 			_report = await Task.Run(delegate
 			{
 				return DshCompatService.Audit(_dshDir, _profile, delegate (string m) { Log(m); });
@@ -96,6 +96,27 @@ public partial class PluginManagerWindow : Window
 			BtnRefresh.IsEnabled = true;
 			UpdateButtons();
 		}
+	}
+
+	// fire-and-forget 刷新入口：构造/事件里不能直接丢弃 RefreshAsync() 返回的 Task，
+	// 否则 RefreshAsync 在异常处理范围外抛异常时会变成未观察任务异常。
+	private async void SafeRefreshAsync()
+	{
+		try
+		{
+			await RefreshAsync();
+		}
+		catch (Exception ex)
+		{
+			ShowStatus("刷新失败: " + ex.Message);
+		}
+	}
+
+	// 统一把错误显示到窗口状态栏并写入日志（复用现有 TxtHeader / MgrLog，不新增控件）
+	private void ShowStatus(string msg)
+	{
+		Log(msg);
+		TxtHeader.Text = msg;
 	}
 
 	private DshPluginInfo? Selected()
@@ -137,8 +158,10 @@ public partial class PluginManagerWindow : Window
 		{
 			Process.Start(new ProcessStartInfo("explorer.exe", "\"" + dir + "\"") { UseShellExecute = true });
 		}
-		catch
+		catch (Exception ex)
 		{
+			// 仅“打开目录”失败，记录日志即可，不打断用户操作
+			AppLog.WriteError("打开插件目录失败: " + dir + " -> " + ex.Message);
 		}
 	}
 
@@ -148,7 +171,10 @@ public partial class PluginManagerWindow : Window
 		{
 			return true;
 		}
-		MessageBox.Show("该操作需要先停止 DSH（会运行 pnpm 修改插件目录）。", "插件管理", MessageBoxButton.OK, MessageBoxImage.Warning);
+		// 这里是"拒绝执行"而不是"通知"：必须让用户明确知道操作被挡下了，
+		// 否则点了按钮只会静默无反应。因此这一处刻意保留模态框。
+		MessageBox.Show("该操作需要先停止 DSH（会运行 pnpm 修改插件目录）。", "插件管理",
+			MessageBoxButton.OK, MessageBoxImage.Warning);
 		return false;
 	}
 
@@ -176,11 +202,23 @@ public partial class PluginManagerWindow : Window
 				return;
 			}
 		}
+		// 用 try/finally 保证任何异常（含 Task.Run 内抛出）都会复位 _busy，
+		// 否则窗口会被永久锁死在“忙碌”状态而静默忽略后续点击。
 		_busy = true;
-		string msg = await Task.Run(delegate { return DshCompatService.SetBundleActive(_profile, p.Name, activating, delegate (string m) { Log(m); }); });
-		Log("[操作] " + p.Name + " → " + msg);
-		_hostLog?.Invoke("[插件管理] " + p.Name + " → " + msg);
-		_busy = false;
+		try
+		{
+			string msg = await Task.Run(delegate { return DshCompatService.SetBundleActive(_profile, p.Name, activating, delegate (string m) { Log(m); }); });
+			Log("[操作] " + p.Name + " → " + msg);
+			_hostLog?.Invoke("[插件管理] " + p.Name + " → " + msg);
+		}
+		catch (Exception ex)
+		{
+			ShowStatus("停用/启用失败: " + ex.Message);
+		}
+		finally
+		{
+			_busy = false;
+		}
 		await RefreshAsync();
 	}
 
@@ -231,10 +269,20 @@ public partial class PluginManagerWindow : Window
 			}
 		}
 		_busy = true;
-		string msg = await Task.Run(delegate { return DshCompatService.UpgradePlugin(_profile, p.Name, delegate (string m) { Log(m); }); });
-		Log("[操作] " + p.Name + " → " + msg);
-		_hostLog?.Invoke("[插件管理] " + p.Name + " 升级: " + msg);
-		_busy = false;
+		try
+		{
+			string msg = await Task.Run(delegate { return DshCompatService.UpgradePlugin(_profile, p.Name, delegate (string m) { Log(m); }); });
+			Log("[操作] " + p.Name + " → " + msg);
+			_hostLog?.Invoke("[插件管理] " + p.Name + " 升级: " + msg);
+		}
+		catch (Exception ex)
+		{
+			ShowStatus("升级失败: " + ex.Message);
+		}
+		finally
+		{
+			_busy = false;
+		}
 		await RefreshAsync();
 	}
 
@@ -255,7 +303,7 @@ public partial class PluginManagerWindow : Window
 		string msg = DshCompatService.ExemptPlugin(_profile, p.Name, p.Version, _report.DshVersion);
 		Log("[操作] " + msg);
 		_hostLog?.Invoke("[插件管理] " + msg);
-		_ = RefreshAsync();
+		SafeRefreshAsync();
 	}
 
 	private async void Uninstall_Click(object sender, RoutedEventArgs e)
@@ -273,10 +321,20 @@ public partial class PluginManagerWindow : Window
 			return;
 		}
 		_busy = true;
-		string msg = await Task.Run(delegate { return DshCompatService.UninstallPlugin(_profile, p.Name, delegate (string m) { Log(m); }); });
-		Log("[操作] " + p.Name + " → " + msg);
-		_hostLog?.Invoke("[插件管理] " + p.Name + " 卸载: " + msg);
-		_busy = false;
+		try
+		{
+			string msg = await Task.Run(delegate { return DshCompatService.UninstallPlugin(_profile, p.Name, delegate (string m) { Log(m); }); });
+			Log("[操作] " + p.Name + " → " + msg);
+			_hostLog?.Invoke("[插件管理] " + p.Name + " 卸载: " + msg);
+		}
+		catch (Exception ex)
+		{
+			ShowStatus("卸载失败: " + ex.Message);
+		}
+		finally
+		{
+			_busy = false;
+		}
 		await RefreshAsync();
 	}
 
@@ -312,15 +370,16 @@ public partial class PluginManagerWindow : Window
 		string? source = null;
 		if (kind == MessageBoxResult.Yes)
 		{
-			using System.Windows.Forms.FolderBrowserDialog dlg = new()
+			// WPF 原生目录选择器（.NET 8 自带），取代 WinForms 的 FolderBrowserDialog
+			Microsoft.Win32.OpenFolderDialog dlg = new()
 			{
-				Description = "选择包含 package.json 的插件目录",
-				SelectedPath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-				ShowNewFolderButton = false
+				Title = "选择包含 package.json 的插件目录",
+				InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+				Multiselect = false
 			};
-			if (dlg.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+			if (dlg.ShowDialog() == true)
 			{
-				source = dlg.SelectedPath;
+				source = dlg.FolderName;
 			}
 		}
 		else
@@ -342,22 +401,21 @@ public partial class PluginManagerWindow : Window
 			return;
 		}
 		_busy = true;
-		Log("[安装] 开始安装本地插件: " + source);
 		try
 		{
+			Log("[安装] 开始安装本地插件: " + source);
 			string msg = await Task.Run(delegate
 			{
 				return DshCompatService.InstallLocalPlugin(_profile, source, delegate (string m) { Log(m); });
 			});
 			Log("[安装] " + msg);
 			_hostLog?.Invoke("[插件管理] " + msg);
-			MessageBox.Show(msg, "安装本地插件", MessageBoxButton.OK,
-				msg.StartsWith("已安装", StringComparison.Ordinal) ? MessageBoxImage.Information : MessageBoxImage.Warning);
+			ShowStatus(msg);
 		}
 		catch (Exception ex)
 		{
 			Log("[安装] 失败: " + ex.Message);
-			MessageBox.Show("安装失败: " + ex.Message, "安装本地插件", MessageBoxButton.OK, MessageBoxImage.Warning);
+			ShowStatus("安装失败: " + ex.Message);
 		}
 		finally
 		{

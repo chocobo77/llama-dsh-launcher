@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Text.Json.Serialization;
 
 namespace LlamaDSH_Launcher.Models;
 
@@ -29,6 +30,8 @@ public class ProfileConfig
 
 	public Dictionary<string, ValueParamData> ValueParams { get; set; } = new Dictionary<string, ValueParamData>();
 
+	/// <summary>命令预览是派生数据（ApplyConfig 后由 RefreshCmd 重算），不写入配置；旧文件中的该字段读取时忽略。</summary>
+	[JsonIgnore]
 	public string CmdPreview { get; set; } = "";
 
 	/// <summary>命令预览里手动追加的自定义参数（橙色显示，原样追加到 llama-server 命令行末尾）。</summary>

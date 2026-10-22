@@ -1064,7 +1064,10 @@ public static class DshCompatService
                                 {
                                         continue;
                                 }
-                                using JsonDocument doc = JsonDocument.Parse(stream);
+                                // .tgz 里的 package.json 也可能带 BOM；JsonDocument.Parse(Stream) 不做 BOM 检测，
+                                // 必须经 StreamReader（detectEncodingFromByteOrderMarks）中转一次。
+                                using StreamReader sr = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, leaveOpen: true);
+                                using JsonDocument doc = JsonDocument.Parse(sr.ReadToEnd());
                                 string name = doc.RootElement.TryGetProperty("name", out JsonElement ne) ? (ne.GetString() ?? "") : "";
                                 string version = doc.RootElement.TryGetProperty("version", out JsonElement ve) ? (ve.GetString() ?? "") : "";
                                 return (name, version);
@@ -1688,14 +1691,30 @@ public static class DshCompatService
 
         // ============================== manifest / bundle ==============================
 
+        /// <summary>
+        /// 读取 JSON 文本并去掉 BOM。某些工具（含部分编辑器/打包步骤）写出的 package.json 带 UTF-8 BOM，
+        /// System.Text.Json 会直接报 "0xEF is an invalid start of a value"，看起来像文件损坏，实际只是多了 3 个字节。
+        /// </summary>
+        private static string ReadJsonText(string path)
+        {
+                string text = File.ReadAllText(path, Encoding.UTF8);
+                if (text.Length > 0 && text[0] == '\uFEFF')
+                {
+                        text = text.Substring(1);
+                }
+                return text;
+        }
+
         private static JsonNode? TryReadManifest(string path)
         {
                 try
                 {
-                        return File.Exists(path) ? JsonNode.Parse(File.ReadAllText(path, Encoding.UTF8)) : null;
+                        return File.Exists(path) ? JsonNode.Parse(ReadJsonText(path)) : null;
                 }
-                catch
+                catch (Exception ex)
                 {
+                        // 以前这里裸吞异常，上层只会看到"name 为空"这类误导性结论；至少把真实原因留在日志里。
+                        LlamaDSH_Launcher.AppLog.WriteError("读取 manifest 失败: " + path + " -> " + ex.Message);
                         return null;
                 }
         }
@@ -1843,7 +1862,7 @@ public static class DshCompatService
                 JsonNode? root;
                 try
                 {
-                        root = JsonNode.Parse(File.ReadAllText(r.ProfileManifestPath, Encoding.UTF8));
+                        root = JsonNode.Parse(ReadJsonText(r.ProfileManifestPath));
                 }
                 catch (Exception ex)
                 {
@@ -3170,6 +3189,25 @@ process.stdout.write(JSON.stringify(out));
         /// 执行自动修复：bundle 激活表 → 失效补丁 → 失效链接，全部先备份再写入，
         /// 完成后重新审计并返回结果。
         /// </summary>
+        /// <summary>
+        /// 只重连/清理 node_modules 失效链接，不碰 bundle 激活表与补丁。
+        /// 用于"DSH 启动失败且日志出现 ERR_MODULE_NOT_FOUND"时的快速自愈：
+        /// pnpm 的 workspace 链接存的是绝对路径，DSH 目录被移动/复制后全部悬空，
+        /// 表现为 Cannot find package '@deepseek-ai/...'。
+        /// includeDumpConfig=false 可跳过跑 node 的探针，扫描快很多。
+        /// </summary>
+        public static (int Detected, int Relinked, int Removed, int Failed) RepairBrokenLinksOnly(string dshDir, string profile, Action<string>? log = null)
+        {
+                DshCompatReport report = Audit(dshDir, profile, log, includeDumpConfig: false);
+                int detected = report.LinkIssues.Count;
+                if (detected == 0)
+                {
+                        return (0, 0, 0, 0);
+                }
+                (int relinked, int removed, int failed) = RepairLinks(report, log);
+                return (detected, relinked, removed, failed);
+        }
+
         public static DshCompatRepairResult Repair(string dshDir, string profile, DshCompatReport report, Action<string>? log = null)
         {
                 DshCompatRepairResult res = new DshCompatRepairResult();

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
 
 namespace LlamaDSH_Launcher.Models;
 
@@ -72,4 +73,91 @@ public class ParamDefinition
 
 	/// <summary>已废弃参数（仅提示，仍可使用）。</summary>
 	public bool Deprecated { get; set; }
+
+	/// <summary>
+	/// 参数定义加载后的静态校验（只记日志并降级，绝不抛异常）：
+	/// 1) Regex 无法编译 → 记日志并把该校验规则置为不校验；
+	/// 2) Flag 为空或重复 → 记日志，重复项保留第一个并跳过后续项（集合只读时无法移除，仅记录）；
+	/// 3) Requires 里的 ParamRule.Op 不在白名单 → 记日志并跳过该规则。
+	/// 建议在参数定义集合构造完成后只调用一次（如 ParamSchemaService.Finalize 末尾）。
+	/// </summary>
+	public static void ValidateSchema(IList<ParamDefinition> defs)
+	{
+		if (defs == null)
+		{
+			return;
+		}
+		HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+		for (int i = 0; i < defs.Count; i++)
+		{
+			ParamDefinition? d = defs[i];
+			if (d == null)
+			{
+				if (!defs.IsReadOnly)
+				{
+					defs.RemoveAt(i);
+					i--;
+				}
+				continue;
+			}
+			if (string.IsNullOrWhiteSpace(d.Flag))
+			{
+				if (defs.IsReadOnly)
+				{
+					LlamaDSH_Launcher.AppLog.WriteError("[参数定义] flag 为空（集合为只读，无法移除，仅记录）: " + d.Label);
+					continue;
+				}
+				LlamaDSH_Launcher.AppLog.WriteError("[参数定义] flag 为空，已跳过该参数: " + d.Label);
+				defs.RemoveAt(i);
+				i--;
+				continue;
+			}
+			if (!seen.Add(d.Flag))
+			{
+				if (defs.IsReadOnly)
+				{
+					LlamaDSH_Launcher.AppLog.WriteError("[参数定义] flag 重复（集合为只读，无法移除，仅记录）: --" + d.Flag);
+					continue;
+				}
+				LlamaDSH_Launcher.AppLog.WriteError("[参数定义] flag 重复，保留第一个并跳过重复项: --" + d.Flag);
+				defs.RemoveAt(i);
+				i--;
+				continue;
+			}
+
+			// 正则字符串在此提前编译校验，避免用户输入时才抛 ArgumentException
+			string? pattern = d.Validate?.Regex;
+			if (!string.IsNullOrEmpty(pattern))
+			{
+				try
+				{
+					_ = new Regex(pattern);
+				}
+				catch (ArgumentException ex)
+				{
+					LlamaDSH_Launcher.AppLog.WriteError("正则无效：" + d.Flag + " -> " + pattern + "（" + ex.Message + "），该参数已改为不校验");
+					d.Validate!.Regex = null;
+				}
+			}
+
+			// 算子白名单：与 ParamRules.RuleMet / CompareValues 的实际分支保持一致
+			if (d.Requires != null)
+			{
+				for (int j = d.Requires.Count - 1; j >= 0; j--)
+				{
+					ParamRule? rule = d.Requires[j];
+					if (rule == null)
+					{
+						d.Requires.RemoveAt(j);
+						continue;
+					}
+					if (!ParamRule.IsSupportedOp(rule.Op))
+					{
+						LlamaDSH_Launcher.AppLog.WriteError("[参数规则] 算子无效，已跳过: --" + d.Flag + " requires --" + rule.Flag + " op=" + rule.Op);
+						d.Requires.RemoveAt(j);
+					}
+				}
+			}
+		}
+	}
 }

@@ -58,17 +58,41 @@ public partial class App : System.Windows.Application
         // DPI 适配
         try { SetProcessDpiAwareness(2); } catch { }
 
-        // 单实例检查
+        // 单实例检查（M6）：经 explorer 重启自身时，旧实例可能尚未释放 mutex，
+        // 新实例只尝试一次会误判“已在运行”后退出（表现为双击没反应）。
+        // 因此最多重试 3 次、每次间隔 300ms，全部失败才提示重复启动。
         const string mutexName = "LlamaDSH_Launcher_SingleInstance_Mutex";
-        _mutex = new Mutex(true, mutexName, out bool createdNew);
+        Mutex? mutex = null;
+        bool createdNew = false;
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            mutex = new Mutex(true, mutexName, out createdNew);
+            if (createdNew)
+            {
+                if (attempt > 1)
+                {
+                    AppLog.WriteInfo($"单实例 mutex 第 {attempt} 次尝试获取成功（旧实例正在退出）");
+                }
+                break;
+            }
+            // 未拿到所有权：先释放本句柄，避免自己持有内核对象导致后续重试始终失败
+            mutex.Dispose();
+            mutex = null;
+            if (attempt < 3)
+            {
+                Thread.Sleep(300);
+            }
+        }
         if (!createdNew)
         {
+            mutex?.Dispose();
             MessageBoxW(IntPtr.Zero,
                 "LlamaDSH Launcher 已经在运行中。\n请检查系统托盘图标。",
                 "重复启动", 0x40);
             Shutdown();
             return;
         }
+        _mutex = mutex;
 
         // 全局未捕获异常兜底（B4）：写入 crash.log，避免后台线程静默崩溃无痕
         DispatcherUnhandledException += (_, ev) =>
