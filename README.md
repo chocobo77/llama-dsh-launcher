@@ -2,6 +2,8 @@
 
 Windows 上跑 llama.cpp 和 DeepSeek Harness 的桌面程序。把平时要敲的命令行、要记的参数、要盯的进程，收进一个窗口里。
 
+![主界面](docs/images/main-window.png)
+
 ## 为什么写它
 
 llama-server 的启动参数有两百多个，改一个值就要重敲一遍命令。DSH 依赖 node 24 和 pnpm，换台机器就得重装。插件目录搬过家之后 pnpm 的软链会悬空，报错只有一句 ERR_MODULE_NOT_FOUND。这些坑每次部署都要踩一遍，所以单独写个程序把它们收起来。
@@ -75,3 +77,7 @@ DSH 目录搬过家，pnpm 的软链还指着旧路径。点「兼容性修复�
 ## 参数表
 
 当前对齐 llama-server 0.7.0-dev build 11680。升级 llama.cpp 之后建议把新版 --help 存成文件，和 llama_params.yml 逐条对一遍，方法写在文件开头。
+
+## 许可证
+
+MIT，见 LICENSE。改完想怎么用都行，留着版权声明就好。
