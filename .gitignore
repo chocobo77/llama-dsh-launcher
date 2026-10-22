@@ -33,3 +33,6 @@ Desktop.ini
 # Archived review/audit artifacts (keep out of repo; delete or commit deliberately if needed)
 _archive/
 LlamaDSH_Launcher_CS/installer_staging_linux/
+
+# 本地修复记录，不公开
+/docs/
