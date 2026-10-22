@@ -18,8 +18,13 @@ public static class DshMaintenance
 	public static string BuildStatePath => Path.Combine(
 		Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".llamadsh_dsh_build.json");
 
-	/// <summary>系统真实 node24（PATH 中的沙箱 node v20 不能用于 DSH/pnpm11）。</summary>
-	public static string Node24Path => "C:\\Program Files\\nodejs\\node.exe";
+	/// <summary>系统真实 node24（PATH 中的沙箱 node v20 不能用于 DSH/pnpm11）。
+	/// 不同机器 node 可能装在 Program Files / nvm / scoop / winget；这里委托 Toolchain 动态解析，
+	/// 只有完全找不到时才回退到常见路径，避免把某个人的安装路径写死。</summary>
+	public static string Node24Path => Toolchain.ResolveNode24Exe() ?? "C:\\Program Files\\nodejs\\node.exe";
+
+	/// <summary>是否真正解析到 node v24+（Node24Path 的回退字符串不代表可用）。</summary>
+	public static bool Node24Available => Toolchain.ResolveNode24Exe() != null;
 
 	/// <summary>
 	/// 是否存在残留锁：锁文件存在，且端口无监听、且无 cmdline 带 DSH 特征的 node 进程。
@@ -80,16 +85,23 @@ public static class DshMaintenance
 			{
 				return null;
 			}
+			string? git = Toolchain.ResolveGitExe();
+			if (git == null)
+			{
+				return null;
+			}
 			ProcessStartInfo psi = new ProcessStartInfo
 			{
-				FileName = "cmd.exe",
-				Arguments = "/c git rev-parse HEAD",
+				FileName = git,
 				WorkingDirectory = repoDir,
 				RedirectStandardOutput = true,
 				RedirectStandardError = true,
 				UseShellExecute = false,
 				CreateNoWindow = true
 			};
+			psi.ArgumentList.Add("rev-parse");
+			psi.ArgumentList.Add("HEAD");
+			psi.Environment["GIT_TERMINAL_PROMPT"] = "0";
 			using Process? p = Process.Start(psi);
 			if (p == null)
 			{

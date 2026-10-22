@@ -31,6 +31,9 @@ public class ProfileConfig
 
 	public string CmdPreview { get; set; } = "";
 
+	/// <summary>命令预览里手动追加的自定义参数（橙色显示，原样追加到 llama-server 命令行末尾）。</summary>
+	public List<string> CustomArgs { get; set; } = new List<string>();
+
 	public bool VramBreakerEnabled { get; set; }
 
 	public int VramBreakerType { get; set; }

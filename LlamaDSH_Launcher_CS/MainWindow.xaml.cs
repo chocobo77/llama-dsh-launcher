@@ -30,8 +30,6 @@ namespace LlamaDSH_Launcher;
 
 public partial class MainWindow : Window, IComponentConnector, IParamState
 {
-	private const string DSH_DIR = "%DSH%";
-
 	private static readonly string CFG_DIR = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Personal));
 
 	private const string CFG_FILE = "LlamaDSH_Launcher_config.json";
@@ -80,6 +78,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private bool _dshCompatRunning;
 	private bool _dshPluginsRunning;
+	private bool _dirSearchRunning;
 
 	private DispatcherTimer? _dshVerifyTimer;
 
@@ -121,6 +120,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private string _currentProfile;
 
 	private string _lastCmd;
+
+	/// <summary>命令预览里手动追加的自定义参数（橙色显示，实际启动时追加到末尾）。</summary>
+	private List<string> _customArgs = new();
+
+	/// <summary>命令预览是否处于编辑态；编辑期间 RefreshCmd 不覆盖用户输入。</summary>
+	private bool _cmdEditing;
+
+	/// <summary>进入编辑态时的基础命令 token（自定义参数只能是它后面的追加部分）。</summary>
+	private List<string> _cmdEditBase = new();
+
+	/// <summary>日志是否跟随到底部：用户向上滚动后置 false，滚回底部再置 true。</summary>
+	private bool _logAutoFollow = true;
 
 	private readonly DispatcherTimer _healthTimer;
 
@@ -219,6 +230,16 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		LoadConfigDirFromFile();
 		InitializeComponent();
+		LogArea.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler(LogArea_ScrollChanged));
+		ChkAutoScroll.Checked += delegate
+		{
+			_logAutoFollow = true;
+			LogArea.ScrollToEnd();
+		};
+		ChkAutoScroll.Unchecked += delegate
+		{
+			_logAutoFollow = false;
+		};
 		BuildParamGroups();
 		SetupTray();
 		WireLiveRefresh();
@@ -697,23 +718,43 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					}
 				}
 			}
-			foreach (ParamDefinition d in _paramDefs)
+			// 多轮收敛：A 依赖 B、B 又依赖 C 时，一轮可能只清掉一层。
+			for (int pass = 0; pass < 4; pass++)
 			{
-				if (d.Hidden || d.Requires == null || d.Requires.Count == 0)
+				bool changed = false;
+				foreach (ParamDefinition d in _paramDefs)
 				{
-					continue;
+					if (d.Hidden || d.Requires == null || d.Requires.Count == 0)
+					{
+						continue;
+					}
+					bool ok = d.Requires.All(RuleMet);
+					if (_pbw.TryGetValue(d.Flag, out System.Windows.Controls.CheckBox bcb))
+					{
+						if (!ok && bcb.IsChecked == true)
+						{
+							// 前置未满足时后置参数必须失效：清掉勾选，避免“灰显但仍被注入命令行”。
+							bcb.IsChecked = false;
+							changed = true;
+						}
+						bcb.IsEnabled = ok;
+						bcb.ToolTip = ok ? d.Tooltip : d.Tooltip + "\n⚠ 前置未满足: " + string.Join(" 且 ", d.Requires.Select((ParamRule r) => r.Describe()));
+					}
+					if (_pw.TryGetValue(d.Flag, out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) pair))
+					{
+						if (!ok && pair.Item1.IsChecked == true)
+						{
+							pair.Item1.IsChecked = false;
+							changed = true;
+						}
+						pair.Item1.IsEnabled = ok;
+						pair.Item2.IsEnabled = ok;
+						pair.Item2.ToolTip = ok ? d.Tooltip : d.Tooltip + "\n⚠ 前置未满足: " + string.Join(" 且 ", d.Requires.Select((ParamRule r) => r.Describe()));
+					}
 				}
-				bool ok = d.Requires.All(RuleMet);
-				if (_pbw.TryGetValue(d.Flag, out System.Windows.Controls.CheckBox bcb))
+				if (!changed)
 				{
-					bcb.IsEnabled = ok;
-					bcb.ToolTip = ok ? d.Tooltip : d.Tooltip + "\n⚠ 前置未满足: " + string.Join(" 且 ", d.Requires.Select((ParamRule r) => r.Describe()));
-				}
-				if (_pw.TryGetValue(d.Flag, out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) pair))
-				{
-					pair.Item1.IsEnabled = ok;
-					pair.Item2.IsEnabled = ok;
-					pair.Item2.ToolTip = ok ? d.Tooltip : d.Tooltip + "\n⚠ 前置未满足: " + string.Join(" 且 ", d.Requires.Select((ParamRule r) => r.Describe()));
+					break;
 				}
 			}
 		}
@@ -1013,14 +1054,139 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private string EffectiveLlamaDir()
 	{
-		string dir = InputLlamaDir.Text.Trim().Trim('"');
-		return string.IsNullOrEmpty(dir) ? "D:\\llama.cpp" : dir;
+		string dir = Toolchain.NormalizeDir(InputLlamaDir.Text);
+		// 不同机器可能装在任意盘符/目录：配置为空或失效时按已知位置快速探测，不写死 D:\llama.cpp。
+		string resolved = Toolchain.ResolveLlamaDir(dir) ?? dir;
+		// 统一返回“llama-server.exe 所在目录”，兼容 exe 直填和 bin/ 子目录布局；更新时只覆盖该目录。
+		string? exe = UpdateService.FindLlamaServerExe(resolved);
+		if (exe != null)
+		{
+			return Path.GetDirectoryName(exe) ?? resolved;
+		}
+		if (File.Exists(resolved))
+		{
+			return Path.GetDirectoryName(resolved) ?? resolved;
+		}
+		return resolved;
 	}
 
 	private string EffectiveDshDir()
 	{
-		string dir = InputDshDir.Text.Trim().Trim('"');
-		return string.IsNullOrEmpty(dir) ? "%DSH%" : dir;
+		string dir = Toolchain.NormalizeDir(InputDshDir.Text);
+		// 不同机器安装路径不同：优先用配置，失效时按状态/Running 进程/profile junction/常见位置探测。
+		return Toolchain.ResolveDshDir(dir) ?? dir;
+	}
+
+	/// <summary>
+	/// 启动时校正目录：配置为空/失效时先快速探测（状态文件、运行进程、profile junction、常见位置），
+	/// 仍找不到再后台全盘检索；找到后写回输入框。不同电脑安装路径不同也不会卡在写死路径上。
+	/// </summary>
+	private void EnsureDirsDetected()
+	{
+		try
+		{
+			string dsh = Toolchain.NormalizeDir(InputDshDir.Text);
+			if (!Toolchain.IsDshDir(dsh))
+			{
+				string? found = Toolchain.ResolveDshDir(dsh);
+				if (found != null && !string.Equals(found, dsh, StringComparison.OrdinalIgnoreCase))
+				{
+					InputDshDir.Text = found;
+					Log("[目录] 自动定位 DSH 安装目录: " + found);
+				}
+				else
+				{
+					Log("[目录] 未找到 DSH 安装目录，后台全盘检索中（也可点“🔍 自动检索”）...");
+					StartBackgroundDshSearch();
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "自动定位 DSH 目录");
+		}
+		try
+		{
+			string llama = Toolchain.NormalizeDir(InputLlamaDir.Text);
+			if (!Toolchain.IsLlamaDir(llama))
+			{
+				string? found = Toolchain.ResolveLlamaDir(llama);
+				if (found != null && !string.Equals(found, llama, StringComparison.OrdinalIgnoreCase))
+				{
+					InputLlamaDir.Text = found;
+					Log("[目录] 自动定位 llama.cpp 目录: " + found);
+				}
+				else
+				{
+					Log("[目录] 未找到 llama-server.exe，后台全盘检索中（也可点“🔍 自动检索”）...");
+					StartBackgroundLlamaSearch();
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "自动定位 llama.cpp 目录");
+		}
+	}
+
+	private void StartBackgroundDshSearch()
+	{
+		if (_dirSearchRunning)
+		{
+			return;
+		}
+		_dirSearchRunning = true;
+		Task.Run(delegate
+		{
+			string? found = null;
+			try
+			{
+				found = FileSearcher.FindDshProject(delegate (string m)
+				{
+					Dispatcher.BeginInvoke((Action)delegate { Log(m); }, Array.Empty<object>());
+				});
+			}
+			catch (Exception ex)
+			{
+				Dispatcher.BeginInvoke((Action)delegate { LogError(ex, "后台检索 DSH 目录"); }, Array.Empty<object>());
+			}
+			Dispatcher.BeginInvoke((Action)delegate
+			{
+				_dirSearchRunning = false;
+				if (found != null && !Toolchain.IsDshDir(InputDshDir.Text))
+				{
+					InputDshDir.Text = found;
+					Log("[目录] 后台检索到 DSH 安装目录: " + found);
+				}
+			}, Array.Empty<object>());
+		});
+	}
+
+	private void StartBackgroundLlamaSearch()
+	{
+		Task.Run(delegate
+		{
+			string? found = null;
+			try
+			{
+				found = FileSearcher.FindLlamaServer(delegate (string m)
+				{
+					Dispatcher.BeginInvoke((Action)delegate { Log(m); }, Array.Empty<object>());
+				});
+			}
+			catch (Exception ex)
+			{
+				Dispatcher.BeginInvoke((Action)delegate { LogError(ex, "后台检索 llama.cpp 目录"); }, Array.Empty<object>());
+			}
+			Dispatcher.BeginInvoke((Action)delegate
+			{
+				if (found != null && !Toolchain.IsLlamaDir(InputLlamaDir.Text))
+				{
+					InputLlamaDir.Text = found;
+					Log("[目录] 后台检索到 llama.cpp 目录: " + found);
+				}
+			}, Array.Empty<object>());
+		});
 	}
 
 	private bool IsLlamaRunning()
@@ -1202,6 +1368,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				return;
 			}
 			string dir = EffectiveDshDir();
+			if (string.IsNullOrEmpty(dir))
+			{
+				if (fromButton)
+				{
+					System.Windows.MessageBox.Show("未找到 deepseek-harness 安装目录。\n\n请点“🔍 自动检索”，或在“DSH 项目目录”填写实际源码路径。", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+				}
+				return;
+			}
 			if (!Directory.Exists(Path.Combine(dir, ".git")))
 			{
 				if (fromButton)
@@ -1211,15 +1385,27 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				return;
 			}
 			SetDshUpdBtn(true, "⏳ 检查中...");
-			Services.UpdateService.DshUpdateInfo? info = await Task.Run(() => UpdateService.CheckDshUpdate(dir));
+			Services.UpdateService.DshUpdateInfo? info = null;
+			string checkError = "";
+			await Task.Run(delegate
+			{
+				info = UpdateService.CheckDshUpdate(dir, out checkError);
+			});
 			SetDshUpdBtn(false);
 			if (info == null)
 			{
+				Log("[更新] DSH 上游检查失败: " + checkError);
 				if (fromButton)
 				{
-					System.Windows.MessageBox.Show("无法检查 DSH 上游（git 或网络不可达）。", "更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
+					System.Windows.MessageBox.Show("无法检查 DSH 上游：\n" + checkError
+						+ "\n\n启动器已自动尝试直连与 gh-proxy 镜像；若仍失败，请检查网络/代理，或先手动 git fetch 验证。",
+						"更新 deepseek-harness", MessageBoxButton.OK, MessageBoxImage.Warning);
 				}
 				return;
+			}
+			if (!string.Equals(info.Mirror, "origin", StringComparison.OrdinalIgnoreCase))
+			{
+				Log("[更新] 直连 GitHub 失败，已通过镜像获取上游: " + info.Mirror);
 			}
 			if (info.Ahead > 0)
 			{
@@ -1252,7 +1438,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				return;
 			}
 			SetDshUpdBtn(true, "⏳ 拉取中...");
-			(bool ok, string m) = await Task.Run(() => UpdateService.PullDsh(dir));
+			(bool ok, string m) = await Task.Run(() => UpdateService.PullDsh(dir, delegate (string msg) { Log(msg); }));
 			if (!ok)
 			{
 				SetDshUpdBtn(false);
@@ -1415,7 +1601,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		LogCompatReport(res.Report);
 		SetDshCompatBtn(false);
-		System.Windows.MessageBox.Show("兼容性修复完成。\n\n" + string.Join("\n", res.Messages) + "\n\n" + BuildCompatSummary(res.Report), "DSH 兼容性修复", MessageBoxButton.OK, res.Report.ErrorCount > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
+		string verdict = res.Completed
+			? "兼容性修复完成：复检无错误、无待修复项。"
+			: "自动修复已执行，但复检仍有 错误 " + res.RemainingErrors + " · 可修复 " + res.RemainingRepairable + "。\n"
+				+ "可修复项会在下次启动/再次修复时重试；上游 peer 不兼容需插件作者发版或显式放行。";
+		System.Windows.MessageBox.Show(verdict + "\n\n" + string.Join("\n", res.Messages) + "\n\n" + BuildCompatSummary(res.Report), "DSH 兼容性修复", MessageBoxButton.OK, res.Report.ErrorCount > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
 		// 修复后仍不兼容的插件：放行与否由用户逐次决定（工具不代替用户接受风险）
 		List<DshPluginInfo> stillBad = DshCompatService.ExemptCandidates(res.Report);
 		if (stillBad.Count > 0 && !string.IsNullOrEmpty(res.Report.DshVersion))
@@ -1821,9 +2011,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		return raw;
 	}
 
-	private List<string> BuildCmd()
+	private List<string> BuildCmd(bool includeCustomArgs = true)
 	{
-		string text = InputLlamaDir.Text.Trim().Trim('"');
+		string text = EffectiveLlamaDir();
 		if (string.IsNullOrEmpty(text))
 		{
 			return new List<string>();
@@ -1864,6 +2054,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		ParamBuildResult paramBuild = ParamRules.Build(_paramDefs, this);
 		list.AddRange(paramBuild.Args);
 		_lastViolations = paramBuild.Violations;
+		if (includeCustomArgs && _customArgs.Count > 0)
+		{
+			list.AddRange(_customArgs);
+		}
 		return list;
 		static string Cl(string s)
 		{
@@ -2325,12 +2519,36 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void RefreshCmd()
 	{
+		// EvaluateDepUI 内部会改勾选状态并触发 Checked/Unchecked；此时不要递归重建命令。
+		if (_inDepEval)
+		{
+			return;
+		}
+		if (_cmdEditing)
+		{
+			// 编辑期间不要用配置区状态覆盖用户正在改的文本；保存/取消时再刷新。
+			return;
+		}
 		EvaluateDepUI();
 		try
 		{
-			List<string> list = BuildCmd();
-			_lastCmd = string.Join(" ", list.Select(QA));
-			CmdPreview.Text = FmtCmd(list);
+			// baseList 严格来自配置区；自定义参数只追加在末尾，绝不参与配置参数的增删改。
+			List<string> baseList = BuildCmd(includeCustomArgs: false);
+			List<string> allArgs = new List<string>(baseList);
+			allArgs.AddRange(_customArgs);
+			_lastCmd = string.Join(" ", allArgs.Select(QA));
+			CmdPreview.Text = FmtCmd(baseList);
+			if (_customArgs.Count > 0)
+			{
+				CmdCustomPreview.Text = "# 自定义参数（橙色，追加到命令末尾）:" + Environment.NewLine
+					+ "  " + string.Join(" ", _customArgs.Select(QA));
+				CmdCustomPreview.Visibility = Visibility.Visible;
+			}
+			else
+			{
+				CmdCustomPreview.Text = "";
+				CmdCustomPreview.Visibility = Visibility.Collapsed;
+			}
 			// qwen35 部分卸载风险：只显示在命令预览，不刷日志（避免每次击键刷屏）
 			string? qw = Qwen35PartialOffloadWarning();
 			if (qw != null)
@@ -2342,6 +2560,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			_lastCmd = "";
 			CmdPreview.Text = "Error:" + ex.Message;
+			CmdCustomPreview.Text = "";
+			CmdCustomPreview.Visibility = Visibility.Collapsed;
 			LogError(ex, "命令构建失败");
 		}
 	}
@@ -2349,6 +2569,184 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private void RefreshCmd_Click(object s, RoutedEventArgs e)
 	{
 		RefreshCmd();
+	}
+
+	/// <summary>进入/退出命令预览编辑态。编辑只允许在基础命令后追加自定义参数。</summary>
+	private void EditCmd_Click(object s, RoutedEventArgs e)
+	{
+		if (_cmdEditing)
+		{
+			ApplyCmdEdit();
+			return;
+		}
+		try
+		{
+			_cmdEditBase = BuildCmd(includeCustomArgs: false);
+			_cmdEditing = true;
+			CmdPreview.IsReadOnly = false;
+			CmdPreview.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(230, 237, 243));
+			CmdPreview.Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(22, 27, 34));
+			List<string> allArgs = new List<string>(_cmdEditBase);
+			allArgs.AddRange(_customArgs);
+			CmdPreview.Text = string.Join(" ", allArgs.Select(QA));
+			CmdPreview.CaretIndex = CmdPreview.Text.Length;
+			CmdPreview.Focus();
+			CmdCustomPreview.Visibility = Visibility.Collapsed;
+			BtnEditCmd.Content = "✅ 保存自定义参数";
+			BtnCancelCmd.Visibility = Visibility.Visible;
+		}
+		catch (Exception ex)
+		{
+			_cmdEditing = false;
+			LogError(ex, "进入命令编辑");
+			System.Windows.MessageBox.Show("无法进入命令编辑: " + ex.Message, "命令预览", MessageBoxButton.OK, MessageBoxImage.Warning);
+		}
+	}
+
+	private void CancelCmd_Click(object s, RoutedEventArgs e)
+	{
+		_cmdEditing = false;
+		CmdPreview.IsReadOnly = true;
+		CmdPreview.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(126, 231, 135));
+		CmdPreview.Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(13, 17, 23));
+		BtnEditCmd.Content = "✏ 编辑命令（仅追加自定义参数）";
+		BtnCancelCmd.Visibility = Visibility.Collapsed;
+		RefreshCmd();
+	}
+
+	private void ApplyCmdEdit()
+	{
+		List<string> tokens;
+		try
+		{
+			tokens = SplitCommandLine(CmdPreview.Text);
+		}
+		catch (Exception ex)
+		{
+			System.Windows.MessageBox.Show("命令解析失败: " + ex.Message, "命令预览", MessageBoxButton.OK, MessageBoxImage.Warning);
+			return;
+		}
+		if (!TokensStartWith(tokens, _cmdEditBase))
+		{
+			System.Windows.MessageBox.Show(
+				"不能修改或删除上方已配置的参数。\n\n" +
+				"这里只允许在基础命令末尾追加自定义参数：请保留前面的配置参数不变，把新增内容写在最后。\n" +
+				"配置参数请回到上方“参数配置”区勾选/修改。",
+				"命令预览", MessageBoxButton.OK, MessageBoxImage.Warning);
+			return;
+		}
+		List<string> custom = tokens.Skip(_cmdEditBase.Count).ToList();
+		string? invalid = ValidateCustomArgs(custom);
+		if (invalid != null)
+		{
+			System.Windows.MessageBox.Show(invalid, "自定义参数", MessageBoxButton.OK, MessageBoxImage.Warning);
+			return;
+		}
+		_customArgs = custom;
+		_cmdEditing = false;
+		CmdPreview.IsReadOnly = true;
+		CmdPreview.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(126, 231, 135));
+		CmdPreview.Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(13, 17, 23));
+		BtnEditCmd.Content = "✏ 编辑命令（仅追加自定义参数）";
+		BtnCancelCmd.Visibility = Visibility.Collapsed;
+		RefreshCmd();
+	}
+
+	/// <summary>自定义参数不能使用配置区已管理的旗标（含旧别名/否定旗标），防止从这里覆盖配置。</summary>
+	private string? ValidateCustomArgs(List<string> args)
+	{
+		foreach (string token in args)
+		{
+			if (!token.StartsWith("--", StringComparison.Ordinal))
+			{
+				continue;
+			}
+			string name = token.Substring(2);
+			int eq = name.IndexOf('=');
+			if (eq >= 0)
+			{
+				name = name.Substring(0, eq);
+			}
+			foreach (ParamDefinition d in _paramDefs)
+			{
+				bool managed = string.Equals(d.Flag, name, StringComparison.OrdinalIgnoreCase)
+					|| (d.Aliases != null && d.Aliases.Any((string a) => string.Equals(a, name, StringComparison.OrdinalIgnoreCase)))
+					|| string.Equals(d.OffFlag, name, StringComparison.OrdinalIgnoreCase);
+				if (managed)
+				{
+					return "自定义参数不能包含 --" + name + "：该参数由上方配置区管理，请在那里勾选/修改，避免重复或冲突。";
+				}
+			}
+		}
+		return null;
+	}
+
+	private static bool TokensStartWith(List<string> tokens, List<string> prefix)
+	{
+		if (tokens.Count < prefix.Count)
+		{
+			return false;
+		}
+		for (int i = 0; i < prefix.Count; i++)
+		{
+			if (!string.Equals(tokens[i], prefix[i], StringComparison.Ordinal))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/// <summary>按 Windows 命令行习惯拆分：空格分隔，支持单/双引号；反斜杠只在引号/反斜杠前作为转义。</summary>
+	private static List<string> SplitCommandLine(string text)
+	{
+		List<string> result = new List<string>();
+		StringBuilder current = new StringBuilder();
+		bool inQuote = false;
+		char quoteChar = '\0';
+		for (int i = 0; i < text.Length; i++)
+		{
+			char c = text[i];
+			if (c == '\\' && i + 1 < text.Length && (text[i + 1] == '"' || text[i + 1] == '\\'))
+			{
+				current.Append(text[i + 1]);
+				i++;
+				continue;
+			}
+			if (inQuote)
+			{
+				if (c == quoteChar)
+				{
+					inQuote = false;
+				}
+				else
+				{
+					current.Append(c);
+				}
+				continue;
+			}
+			if (c == '"' || c == '\'')
+			{
+				inQuote = true;
+				quoteChar = c;
+				continue;
+			}
+			if (char.IsWhiteSpace(c))
+			{
+				if (current.Length > 0)
+				{
+					result.Add(current.ToString());
+					current.Clear();
+				}
+				continue;
+			}
+			current.Append(c);
+		}
+		if (current.Length > 0)
+		{
+			result.Add(current.ToString());
+		}
+		return result;
 	}
 
 	// 重载参数配置（llama_params.yml / override 修改后即时生效，无需重启启动器）
@@ -2380,7 +2778,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void CopyCmd_Click(object s, RoutedEventArgs e)
 	{
-		string text = CmdPreview.Text;
+		string text = string.IsNullOrEmpty(_lastCmd) ? CmdPreview.Text : _lastCmd;
 		if (!string.IsNullOrEmpty(text))
 		{
 			System.Windows.Clipboard.SetText(text);
@@ -2395,6 +2793,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void StopLlama_Click(object s, RoutedEventArgs e)
 	{
+		if (!IsLlamaRunning())
+		{
+			return;
+		}
+		if (System.Windows.MessageBox.Show("确定要停止 Llama 服务吗？\n\n正在生成的内容会中断，模型加载/推理进度将丢失。",
+			"停止 Llama", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+		{
+			return;
+		}
 		StopLlama();
 	}
 
@@ -3130,17 +3537,71 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void StopLlama()
 	{
-		if (_llamaProc != null)
+		if (_llamaProc == null && !IsLlamaRunning())
 		{
-			Log("--- 正在停止 Llama ---");
-			ProcessHelper.KillProcessTree(_llamaProc.Id);
-			DisposeProc(ref _llamaProc);
-			BtnLlamaStart.IsEnabled = true;
-			BtnLlamaStop.IsEnabled = false;
-			LblLlamaStatus.Text = "● 已停止";
-			LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
-			Log("--- 已停止 ---");
-			ClearStateFor("llama");
+			return;
+		}
+		int? pid = _llamaProc?.Id ?? ProcessHelper.FindProcessByPort(GetLlamaPort());
+		Log("--- 正在停止 Llama ---");
+		// 进程彻底退出前不允许再点启动，避免端口/显存还没释放就重复拉起。
+		BtnLlamaStart.IsEnabled = false;
+		BtnLlamaStop.IsEnabled = false;
+		LblLlamaStatus.Text = "● 停止中...";
+		LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(240, 136, 62));
+		if (pid.HasValue)
+		{
+			ProcessHelper.KillProcessTree(pid.Value);
+		}
+		DisposeProc(ref _llamaProc);
+		ClearStateFor("llama");
+		_ = FinishStopLlamaAsync(pid);
+	}
+
+	/// <summary>等待 llama 进程和端口都真正释放后再恢复启动按钮。</summary>
+	private async Task FinishStopLlamaAsync(int? pid)
+	{
+		try
+		{
+			for (int i = 0; i < 100; i++)
+			{
+				bool processAlive = false;
+				if (pid.HasValue)
+				{
+					try
+					{
+						using Process p = Process.GetProcessById(pid.Value);
+						processAlive = !p.HasExited;
+					}
+					catch
+					{
+					}
+				}
+				if (!processAlive && !IsLlamaRunning())
+				{
+					break;
+				}
+				await Task.Delay(200);
+			}
+			if (!IsLlamaRunning())
+			{
+				BtnLlamaStart.IsEnabled = true;
+				BtnLlamaStop.IsEnabled = false;
+				LblLlamaStatus.Text = "● 已停止";
+				LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
+				Log("--- Llama 已彻底停止 ---");
+			}
+			else
+			{
+				BtnLlamaStart.IsEnabled = false;
+				BtnLlamaStop.IsEnabled = true;
+				LblLlamaStatus.Text = "● 停止失败/仍在运行";
+				LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
+				Log("--- Llama 进程未在 20 秒内退出，启动按钮保持禁用；可再次点停止或手动结束进程 ---");
+			}
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "等待 Llama 退出");
 		}
 	}
 
@@ -3167,11 +3628,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			System.Windows.MessageBox.Show("仅本地目录模式支持重建。", "重建 DSH");
 			return;
 		}
-		string dshDir = InputDshDir.Text.Trim().Trim('"');
-		if (string.IsNullOrEmpty(dshDir))
-		{
-			dshDir = "%DSH%";
-		}
+		string dshDir = EffectiveDshDir();
 		if (!Directory.Exists(Path.Combine(dshDir, "apps", "cli")))
 		{
 			System.Windows.MessageBox.Show("DSH 目录无效: " + dshDir, "重建 DSH");
@@ -3194,7 +3651,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		string msg = "将执行全量重建:\n  1/3 pnpm clean\n  2/3 pnpm build:lib\n  3/3 build:web (vite)\n"
 				+ (HasDsh() ? "\nDSH 正在运行，会先停止 DSH。" : "")
 				+ "\n重建完成后自动做兼容性检查并启动 DSH。\n继续？";
-		if (System.Windows.MessageBox.Show(msg, "重建 DSH", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+		if (System.Windows.MessageBox.Show(msg, "重建 DSH", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
 		{
 			return;
 		}
@@ -3205,11 +3662,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			StopDsh();
 			DateTime stopDeadline = DateTime.Now.AddSeconds(20.0);
-			while (HasDsh() && DateTime.Now < stopDeadline)
+			while ((HasDsh() || ProcessHelper.FindProcessByPort(3080).HasValue) && DateTime.Now < stopDeadline)
 			{
 				System.Threading.Thread.Sleep(500);
 			}
-			if (HasDsh())
+			if (HasDsh() || ProcessHelper.FindProcessByPort(3080).HasValue)
 			{
 				BtnRebuildDsh.IsEnabled = true;
 				LblDshStatus.Text = "已停止";
@@ -3244,11 +3701,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			try
 			{
-				string dshDir = InputDshDir.Text.Trim().Trim('"');
-				if (string.IsNullOrEmpty(dshDir))
-				{
-					dshDir = "%DSH%";
-				}
+				string dshDir = EffectiveDshDir();
 				string? head = DshMaintenance.GetGitHead(dshDir);
 				(string? builtHead, string? builtAt) = DshMaintenance.LoadBuildState();
 				if (head != null && builtHead != null && builtHead != head)
@@ -3287,20 +3740,32 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		try
 		{
-			if (!File.Exists(DshMaintenance.Node24Path))
+			string? nodeExe = Toolchain.ResolveNode24Exe();
+			if (nodeExe == null)
 			{
-				System.Windows.MessageBox.Show("未找到 node24: " + DshMaintenance.Node24Path + "\n无法自动重建，将直接启动。");
+				string anyNode = Toolchain.ResolveNodeExe(require24: false) ?? "(未找到)";
+				System.Windows.MessageBox.Show("未找到 node v24+（当前: " + anyNode + "）\n"
+					+ "DSH 重建必须使用 node24。请安装 node24，或把它的目录加入 PATH。\n\n无法自动重建，将直接启动。");
 				BtnRebuildDsh.IsEnabled = true;
 				StartDsh();
 				return;
 			}
+			string? pnpmExe = Toolchain.ResolvePnpmExe();
+			if (pnpmExe == null)
+			{
+				System.Windows.MessageBox.Show("未找到 pnpm：无法执行 pnpm clean/build:lib。\n请安装 pnpm（或 corepack enable）后重试。");
+				BtnRebuildDsh.IsEnabled = true;
+				return;
+			}
 			string logPath = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_rebuild.log");
 			string cmdPath = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_rebuild.cmd");
-			string nodeDir = Path.GetDirectoryName(DshMaintenance.Node24Path) ?? "C:\\Program Files\\nodejs";
+			string nodeDir = Path.GetDirectoryName(nodeExe) ?? "";
+			string pnpmDir = Path.GetDirectoryName(pnpmExe) ?? "";
+			string pathPrefix = string.Join(";", new[] { nodeDir, pnpmDir }.Where(delegate (string x) { return !string.IsNullOrEmpty(x); }));
 			string q = "\"";
 			string redirect = " >> " + q + logPath + q + " 2>&1";
 			string cmdText = "@echo off" + Environment.NewLine
-				+ "set \"PATH=" + nodeDir + ";%PATH%\"" + Environment.NewLine
+				+ "set \"PATH=" + pathPrefix + ";%PATH%\"" + Environment.NewLine
 				+ "cd /d " + q + dshDir + q + Environment.NewLine
 				+ "echo [REBUILD] 1/3 pnpm clean" + redirect + Environment.NewLine
 				+ "call pnpm clean" + redirect + Environment.NewLine
@@ -3310,7 +3775,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				+ "if errorlevel 1 goto :fail" + Environment.NewLine
 				+ "echo [REBUILD] 3/3 build:web (node24 vite)" + redirect + Environment.NewLine
 				+ "cd /d " + q + dshDir + "\\apps\\web" + q + Environment.NewLine
-				+ q + DshMaintenance.Node24Path + q + " node_modules\\vite\\bin\\vite.js build" + redirect + Environment.NewLine
+				+ q + nodeExe + q + " node_modules\\vite\\bin\\vite.js build" + redirect + Environment.NewLine
 				+ "if errorlevel 1 goto :fail" + Environment.NewLine
 				+ "echo EXITCODE:0" + redirect + Environment.NewLine
 				+ "exit /b 0" + Environment.NewLine
@@ -3499,6 +3964,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void StopDsh_Click(object s, RoutedEventArgs e)
 	{
+		if (!HasDsh() && !ProcessHelper.FindProcessByPort(3080).HasValue)
+		{
+			return;
+		}
+		if (System.Windows.MessageBox.Show("确定要停止 DSH Web 吗？\n\n正在运行的任务/会话会中断。",
+			"停止 DSH Web", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+		{
+			return;
+		}
 		StopDsh();
 	}
 
@@ -3516,16 +3990,34 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			string dshDir = "";
 			if (ComboDshMode.SelectedIndex == 0)
 			{
-				dshDir = InputDshDir.Text.Trim().Trim('"');
+				dshDir = EffectiveDshDir();
 				if (string.IsNullOrEmpty(dshDir))
 				{
-					dshDir = "%DSH%";
+					System.Windows.MessageBox.Show("未找到 DSH 安装目录。\n\n请点“🔍 自动检索”或手动选择 deepseek-harness 目录。", "启动 DSH", MessageBoxButton.OK, MessageBoxImage.Warning);
+					return;
 				}
 				text3 = ((File.Exists(Path.Combine(dshDir, "apps", "cli", "lib", "bin.js")) && _dshRetriesLeft > 0) ? "compiled-js" : "compiled-tsx");
 			}
 			else
 			{
 				text3 = "npx";
+			}
+			if (ComboDshMode.SelectedIndex == 0)
+			{
+				if (Toolchain.ResolveNode24Exe() == null)
+				{
+					string anyNode = Toolchain.ResolveNodeExe(require24: false) ?? "(未找到)";
+					System.Windows.MessageBox.Show("未找到 node v24+（当前: " + anyNode + "）。\n\n"
+						+ "DSH 必须使用 node24。请安装 node24 或把它的目录加入 PATH；也可点“🔍 自动检索”确认目录。",
+						"启动 DSH", MessageBoxButton.OK, MessageBoxImage.Warning);
+					return;
+				}
+				if (text3 == "compiled-tsx" && Toolchain.ResolvePnpmExe() == null)
+				{
+					System.Windows.MessageBox.Show("编译产物不存在，需要 pnpm 以 compiled-tsx 方式启动，但未找到 pnpm。\n\n"
+						+ "请安装 pnpm（或 corepack enable）后重试。", "启动 DSH", MessageBoxButton.OK, MessageBoxImage.Warning);
+					return;
+				}
 			}
 			BtnDshStart.IsEnabled = false;
 			BtnDshStop.IsEnabled = true;
@@ -3538,9 +4030,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			// 管理员提权启动（runas 静默提权）：子进程拿到 admin 令牌 + 高完整性，可读游戏内存。
 			// WMI 分离路径不能用于提权（Win32_Process.Create 继承调用者非提权上下文），故走 ShellExecute runas；
 			// 提权失败不静默回退普通启动——那会让管理员模式名存实亡。
+			string? nodeExe = Toolchain.ResolveNode24Exe();
+			string? pnpmExe = Toolchain.ResolvePnpmExe();
+			string nodeCmd = string.IsNullOrEmpty(nodeExe) ? "node" : "\"" + nodeExe + "\"";
+			string pnpmCmd = string.IsNullOrEmpty(pnpmExe) ? "pnpm" : "\"" + pnpmExe + "\"";
 			if (ChkDshAdmin.IsChecked == true)
 			{
-				string innerCmd = ((ComboDshMode.SelectedIndex == 0) ? (((text3 == "compiled-js") ? "node apps/cli/lib/bin.js web" : "pnpm dsh web")) : "npx --yes @deepseek-ai/dsh web");
+				string innerCmd = ((ComboDshMode.SelectedIndex == 0) ? (((text3 == "compiled-js") ? nodeCmd + " apps/cli/lib/bin.js web" : pnpmCmd + " dsh web")) : "npx --yes @deepseek-ai/dsh web");
 				if (TryStartDshElevated(dshDir, innerCmd))
 				{
 					_dshProc = null;
@@ -3572,7 +4068,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				if (text3 == "compiled-js")
 				{
-					text2 = "cd /d \"" + dshDir + "\" && node apps/cli/lib/bin.js web";
+					text2 = "cd /d \"" + dshDir + "\" && " + nodeCmd + " apps/cli/lib/bin.js web";
 				}
 				else
 				{
@@ -3580,7 +4076,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					{
 						Log("--- 编译版连续启动失败，本次回退到 pnpm dsh web ---");
 					}
-					text2 = "cd /d \"" + dshDir + "\" && pnpm dsh web";
+					text2 = "cd /d \"" + dshDir + "\" && " + pnpmCmd + " dsh web";
 				}
 			}
 			else
@@ -3597,6 +4093,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				UseShellExecute = false,
 				CreateNoWindow = true
 			};
+			Toolchain.AugmentPath(startInfo);
 			_dshProc = Process.Start(startInfo);
 			if (_dshProc == null)
 			{
@@ -3633,7 +4130,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		try
 		{
-			string text = ((modeLabel == "compiled-js") ? "node apps/cli/lib/bin.js web" : "pnpm dsh web");
+			string? detNode = Toolchain.ResolveNode24Exe();
+			string? detPnpm = Toolchain.ResolvePnpmExe();
+			string detNodeCmd = string.IsNullOrEmpty(detNode) ? "node" : "\"" + detNode + "\"";
+			string detPnpmCmd = string.IsNullOrEmpty(detPnpm) ? "pnpm" : "\"" + detPnpm + "\"";
+			string text = ((modeLabel == "compiled-js") ? detNodeCmd + " apps/cli/lib/bin.js web" : detPnpmCmd + " dsh web");
 			string text2 = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_boot.log");
 			try
 			{
@@ -3645,7 +4146,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			_dshBootLogPath = text2;
 			bool elevated = new System.Security.Principal.WindowsPrincipal(System.Security.Principal.WindowsIdentity.GetCurrent()).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
 			File.AppendAllText(text2, "[diag] launcher elevated=" + elevated + " temp=" + Path.GetTempPath() + "\r\n");
-			string text3 = "cmd.exe /c cd /d \"" + dshDir + "\" & echo ===CHILD-ENV=== >> \"" + text2 + "\" 2>&1 & set >> \"" + text2 + "\" 2>&1 & where node >> \"" + text2 + "\" 2>&1 & node -v >> \"" + text2 + "\" 2>&1 & echo ===BOOT=== >> \"" + text2 + "\" 2>&1 & " + text + " >> \"" + text2 + "\" 2>&1";
+			string detPrefix = Toolchain.PathPrefix;
+			string detSetPath = string.IsNullOrEmpty(detPrefix) ? "" : ("set \"PATH=" + detPrefix + ";%PATH%\" & ");
+			string text3 = "cmd.exe /c " + detSetPath + "cd /d \"" + dshDir + "\" & echo ===CHILD-ENV=== >> \"" + text2 + "\" 2>&1 & set >> \"" + text2 + "\" 2>&1 & where node >> \"" + text2 + "\" 2>&1 & " + detNodeCmd + " -v >> \"" + text2 + "\" 2>&1 & echo ===BOOT=== >> \"" + text2 + "\" 2>&1 & " + text + " >> \"" + text2 + "\" 2>&1";
 			using (System.Management.ManagementClass managementClass = new System.Management.ManagementClass("Win32_Process"))
 			{
 				System.Management.ManagementBaseObject methodParameters = managementClass.GetMethodParameters("Create");
@@ -3743,7 +4246,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			bool elevated = new System.Security.Principal.WindowsPrincipal(System.Security.Principal.WindowsIdentity.GetCurrent()).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
 			// 启动前先用探针确认高完整性进程能否打开游戏进程句柄（探针文件缺失则跳过，不影响启动）
 			string text2 = ExtractGameAccessProbe();
-			string text3 = (string.IsNullOrEmpty(dshDir) ? "" : ("cd /d \"" + dshDir + "\" & "));
+			string elevPrefix = Toolchain.PathPrefix;
+			string elevSetPath = string.IsNullOrEmpty(elevPrefix) ? "" : ("set \"PATH=" + elevPrefix + ";%PATH%\" & ");
+			string text3 = elevSetPath + (string.IsNullOrEmpty(dshDir) ? "" : ("cd /d \"" + dshDir + "\" & "));
 			string text4 = ((text2 != null) ? ("powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" + text2 + "\" >> \"" + text + "\" 2>&1 & ") : "");
 			File.AppendAllText(text, "[diag] launcher elevated=" + elevated + " admin-mode=True temp=" + Path.GetTempPath() + "\r\n");
 			ProcessStartInfo processStartInfo = new ProcessStartInfo
@@ -3917,11 +4422,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return;
 		}
 		int id = _dshProc.Id;
-		string text = ((ComboDshMode.SelectedIndex == 0) ? InputDshDir.Text.Trim().Trim('"') : "");
-		if (string.IsNullOrEmpty(text))
-		{
-			text = "%DSH%";
-		}
+		string text = EffectiveDshDir();
 		int? num = ResolveDshPid(id, text);
 		if (num.HasValue)
 		{
@@ -3966,7 +4467,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		if (HasDsh())
 		{
 			int num = _dshProc?.Id ?? _dshTracker?.Pid ?? 0;
-			string dd = ((ComboDshMode.SelectedIndex == 0) ? InputDshDir.Text.Trim().Trim('"') : "%DSH%");
+			string dd = EffectiveDshDir();
 			int? num2 = ResolveDshPid(num, dd);
 			if (num2.HasValue && num2.Value != num)
 			{
@@ -3993,10 +4494,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void StopDsh()
 	{
+		if (!HasDsh() && !ProcessHelper.FindProcessByPort(3080).HasValue)
+		{
+			return;
+		}
 		StopDshVerifyLoop();
 		StopDshLogTailer();
+		BtnDshStart.IsEnabled = false;
+		BtnDshStop.IsEnabled = false;
+		LblDshStatus.Text = "● 停止中...";
+		LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(240, 136, 62));
 		// 提权模式下 _dshProc 恒为 null，被托管的 pid 在 _dshTracker 里；先记下来供 UIPI 回退使用
-		int? adminKillPid = (_dshTracker?.Pid ?? _dshProc?.Id); // 接管来的提权进程同样需要 UIPI 回退
+		int? adminKillPid = (_dshTracker?.Pid ?? _dshProc?.Id ?? ProcessHelper.FindProcessByPort(3080)); // 接管来的提权/外部进程同样需要 UIPI 回退
 		if (_dshProc != null)
 		{
 			Log("--- 正在停止 DSH ---");
@@ -4051,13 +4560,66 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		_dshAdminMode = false;
 		DisposeProc(ref _dshProc);
 		_dshTracker = null;
-		BtnDshStart.IsEnabled = true;
-		BtnDshStop.IsEnabled = false;
 		BtnOpenDsh.IsEnabled = false;
-		LblDshStatus.Text = "● 已停止";
-		LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
-		Log("--- 已停止 DSH ---");
+		Log("--- 已下发停止 DSH 指令，等待进程彻底退出 ---");
 		ClearStateFor("dsh");
+		_ = FinishStopDshAsync(adminKillPid);
+	}
+
+	/// <summary>等待 3080 端口/DSH 进程真正退出后再恢复启动按钮；提权 taskkill 是异步的。</summary>
+	private static bool IsProcessAlive(int? pid)
+	{
+		if (!pid.HasValue)
+		{
+			return false;
+		}
+		try
+		{
+			using Process p = Process.GetProcessById(pid.Value);
+			return !p.HasExited;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	private async Task FinishStopDshAsync(int? pid)
+	{
+		try
+		{
+			for (int i = 0; i < 150; i++)
+			{
+				if (!ProcessHelper.FindProcessByPort(3080).HasValue && !HasDsh() && !IsProcessAlive(pid))
+				{
+					break;
+				}
+				await Task.Delay(200);
+			}
+			bool stillAlive = ProcessHelper.FindProcessByPort(3080).HasValue || HasDsh() || IsProcessAlive(pid);
+			if (!stillAlive)
+			{
+				// 重建期间 StartDshRebuild 已锁住启动按钮，停止收尾任务不能把它重新打开。
+				BtnDshStart.IsEnabled = _dshRebuildTimer == null;
+				BtnDshStop.IsEnabled = false;
+				BtnOpenDsh.IsEnabled = false;
+				LblDshStatus.Text = "● 已停止";
+				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
+				Log("--- DSH 已彻底停止 ---");
+			}
+			else
+			{
+				BtnDshStart.IsEnabled = false;
+				BtnDshStop.IsEnabled = true;
+				LblDshStatus.Text = "● 停止失败/仍在运行";
+				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
+				Log("--- DSH 进程未在 30 秒内退出，启动按钮保持禁用；可再次点停止或手动结束进程 ---");
+			}
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "等待 DSH 退出");
+		}
 	}
 
 	private static void DisposeProc(ref Process? p)
@@ -4222,12 +4784,44 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		if (stringBuilder.Length != 0)
 		{
+			bool follow = ShouldAutoScroll();
+			double keepOffset = LogArea.VerticalOffset;
 			LogArea.AppendText(stringBuilder.ToString());
 			TruncateLogIfNeeded();
-			if (ChkAutoScroll.IsChecked == true)
+			if (follow)
 			{
 				LogArea.ScrollToEnd();
 			}
+			else
+			{
+				// 用户正在向上翻看：保持原滚动位置，不让新日志把视口拉回底部。
+				LogArea.ScrollToVerticalOffset(keepOffset);
+			}
+		}
+	}
+
+	/// <summary>日志跟随开关：勾选自动滚动且用户当前没有向上翻看时才滚到底部。</summary>
+	private bool ShouldAutoScroll()
+	{
+		return ChkAutoScroll.IsChecked == true && _logAutoFollow;
+	}
+
+	/// <summary>用户向上滚动后暂停自动跟随；滚回底部（或内容不足一屏）时恢复。</summary>
+	private void LogArea_ScrollChanged(object sender, ScrollChangedEventArgs e)
+	{
+		if (e.ExtentHeight <= e.ViewportHeight)
+		{
+			_logAutoFollow = true;
+			return;
+		}
+		bool atBottom = e.VerticalOffset + e.ViewportHeight >= e.ExtentHeight - 4.0;
+		if (atBottom)
+		{
+			_logAutoFollow = true;
+		}
+		else if (e.VerticalChange < 0.0)
+		{
+			_logAutoFollow = false;
 		}
 	}
 
@@ -4388,12 +4982,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		if (!string.IsNullOrWhiteSpace(text) && (!(text == _lastLogLine) || text.StartsWith("[Perf] Error")))
 		{
 			_lastLogLine = text;
+			bool follow = ShouldAutoScroll();
+			double keepOffset = LogArea.VerticalOffset;
 			LogArea.AppendText(text + Environment.NewLine);
 			AppendRunLog($"[{DateTime.Now:HH:mm:ss}] {text}");
 			TruncateLogIfNeeded();
-			if (ChkAutoScroll.IsChecked == true)
+			if (follow)
 			{
 				LogArea.ScrollToEnd();
+			}
+			else
+			{
+				LogArea.ScrollToVerticalOffset(keepOffset);
 			}
 		}
 	}
@@ -4802,7 +5402,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		if (_dshProc != null && !IsAlive(_dshProc))
 		{
 			int id = _dshProc.Id;
-			string dd = ((ComboDshMode.SelectedIndex == 0) ? InputDshDir.Text.Trim().Trim('"') : "%DSH%");
+			string dd = EffectiveDshDir();
 			int? num = ResolveDshPid(id, dd);
 			if (num.HasValue && num.Value != id)
 			{
@@ -4901,10 +5501,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				LogError(ex2, "接管 Llama 进程失败");
 			}
 		}
-		string dd = stateFile?.DshDir ?? InputDshDir.Text.Trim().Trim('"');
+		string dd = stateFile?.DshDir ?? EffectiveDshDir();
 		if (string.IsNullOrEmpty(dd))
 		{
-			dd = "%DSH%";
+			dd = EffectiveDshDir();
 		}
 		StateFile stRef = stateFile;
 		Task.Run(delegate
@@ -5132,6 +5732,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			};
 		}
 		profileConfig.CmdPreview = (string.IsNullOrEmpty(_lastCmd) ? CmdPreview.Text : _lastCmd);
+		profileConfig.CustomArgs = new List<string>(_customArgs);
 		profileConfig.VramBreakerEnabled = ChkVramBreaker?.IsChecked == true;
 		profileConfig.VramBreakerType = ComboVramBreakerType?.SelectedIndex ?? 0;
 		double vramBreakerValue;
@@ -5150,6 +5751,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void ApplyConfig(ProfileConfig c)
 	{
+		// 切换方案时退出命令编辑态，并恢复该方案自己的自定义参数。
+		_cmdEditing = false;
+		CmdPreview.IsReadOnly = true;
+		CmdPreview.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(126, 231, 135));
+		CmdPreview.Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(13, 17, 23));
+		BtnEditCmd.Content = "✏ 编辑命令（仅追加自定义参数）";
+		BtnCancelCmd.Visibility = Visibility.Collapsed;
+		_customArgs = c.CustomArgs != null ? new List<string>(c.CustomArgs) : new List<string>();
 		// llama.cpp 参数改名后，旧 profile 里旧 flag 键的值自动迁移到新 flag
 		ParamSchemaService.MigrateProfileFlags(c, _paramDefs);
 		InputModelPath.Text = c.ModelPath;
@@ -5635,6 +6244,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private void Window_Loaded(object sender, RoutedEventArgs e)
 	{
 		AutoLoadConfig();
+		// 目录探测可能涉及 WMI/磁盘扫描：先让窗口画出来，再在 UI 空闲时执行。
+		Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, (Action)EnsureDirsDetected);
 		ClampToWorkArea();
 		string text = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Resources", "app.ico");
 		if (File.Exists(text))

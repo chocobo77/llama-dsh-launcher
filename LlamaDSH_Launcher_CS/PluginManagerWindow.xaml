@@ -68,13 +68,14 @@
         </GridView>
       </ListView.View>
     </ListView>
-    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,8,0,4">
+    <WrapPanel Grid.Row="2" Margin="0,8,0,4">
       <Button Name="BtnToggle" Content="⏻ 停用并锁定" Width="120" Margin="0,0,6,0" Click="Toggle_Click" ToolTip="从 dsh.profile.bundles 移除并锁定：即使被 DSH 网页端/市场插件写回，启动器也会自动移除。再次点击为重新启用并解锁。" />
       <Button Name="BtnUpgrade" Content="⬆ 升级到最新" Width="110" Margin="0,0,6,0" Click="Upgrade_Click" ToolTip="pnpm add 插件@latest（需先停止 DSH）" />
       <Button Name="BtnExempt" Content="⚖ 版本豁免" Width="100" Margin="0,0,6,0" Click="Exempt_Click" ToolTip="为当前插件版本写入 compatibility.json 豁免（明确接受 peer 版本风险）。注意：豁免不会让构建期模块表漂移的 client 插件可用。" />
       <Button Name="BtnUninstall" Content="🗑 卸载" Width="80" Margin="0,0,6,0" Click="Uninstall_Click" ToolTip="从激活表移除并 pnpm remove 卸载插件包（需先停止 DSH）" />
       <Button Name="BtnOpenDir" Content="📁 打开目录" Width="96" Click="OpenDir_Click" />
-    </StackPanel>
+      <Button Name="BtnInstallLocal" Content="📦 安装本地插件" Width="140" Margin="8,0,0,0" Click="InstallLocal_Click" ToolTip="从本地目录（自动打包为 tgz）或 .tgz 安装任意插件；安装后若声明 dsh.bundle 会自动加入 profile。需先停止 DSH。" />
+    </WrapPanel>
     <TextBox Grid.Row="3" Name="MgrLog" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
              Background="#0d1117" Foreground="#c9d1d9" FontFamily="Consolas" FontSize="11"
              BorderBrush="#30363d" BorderThickness="1" Margin="0,4,0,0" />

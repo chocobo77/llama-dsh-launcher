@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Formats.Tar;
 using System.Globalization;
+using System.IO.Compression;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -70,8 +72,59 @@ public sealed class DshPluginInfo
         /// <summary>从插件目录无法解析的依赖/peer。</summary>
         public List<string> MissingSpecs = new();
         public List<string> Errors = new();
+        /// <summary>registry 查询到的最新版本（查询失败时为空）。</summary>
+        public string LatestVersion = "";
+        /// <summary>registry 最新版的 DSH 门禁是否拒绝当前运行时。</summary>
+        public bool LatestGateBlocked;
+        public string LatestGateName = "";
+        public string LatestGateRange = "";
+        /// <summary>是否成功查询过 registry（区分“确实最新”和“网络失败”）。</summary>
+        public bool RegistryChecked;
 
         public bool Ok => Installed && (Compatible != false) && MissingSpecs.Count == 0 && Errors.Count == 0;
+}
+
+/// <summary>npm registry 上某插件最新版的元数据（用于升级判定，避免只信市场缓存）。</summary>
+public sealed class RegistryPackageInfo
+{
+        public string Name = "";
+        public string Version = "";
+        public string GateName = "";
+        public string GateRange = "";
+        public bool GateBlocked;
+        public Dictionary<string, string> PeerDependencies = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// 用当前 DSH 版本评估插件最新版的 peer 门禁。DSH 插件通常不声明单个 @deepseek-ai/dsh，
+        /// 而是逐个声明 dsh-llm / dsh-agent / dsh-tools…，因此要把所有 dsh-* peer 都检查一遍。
+        /// 任一范围不满足 → 升级后会被 DSH 门禁拒绝。
+        /// </summary>
+        public (bool Blocked, string Name, string Range) EvaluateGate(string dshVersion)
+        {
+                string v = (dshVersion ?? "").Trim().TrimStart('v', 'V');
+                if (v.Length == 0 || !char.IsDigit(v[0]))
+                {
+                        // 版本未知（如 "(未知)"）时不做门禁判断，避免把所有插件误判为会被拒绝。
+                        return (false, "", "");
+                }
+                if (GateRange.Length > 0 && GateName == "engines.dsh" && !SemverUtil.Satisfies(v, GateRange))
+                {
+                        return (true, GateName, GateRange);
+                }
+                foreach (KeyValuePair<string, string> kv in PeerDependencies)
+                {
+                        string key = kv.Key;
+                        if (!(key == "@deepseek-ai/dsh" || key.StartsWith("@deepseek-ai/dsh-", StringComparison.Ordinal)))
+                        {
+                                continue;
+                        }
+                        if (!SemverUtil.Satisfies(v, kv.Value))
+                        {
+                                return (true, "peer " + key, kv.Value);
+                        }
+                }
+                return (false, "", "");
+        }
 }
 
 /// <summary>cordis.patch.yml 中一条失效/需迁移的补丁条目。</summary>
@@ -187,6 +240,11 @@ public sealed class DshCompatRepairResult
         public int DeadPeersRemoved;
         /// <summary>从 compatibility.json 移除的陈旧豁免条目数量。</summary>
         public int StaleExemptionsRemoved;
+        /// <summary>复检后仍存在的错误数（0 表示真正修复完成）。</summary>
+        public int RemainingErrors;
+        /// <summary>复检后仍可自动修复的项数（0 表示没有待重试的自动修复项）。</summary>
+        public int RemainingRepairable;
+        public bool Completed => RemainingErrors == 0 && RemainingRepairable == 0;
 }
 
 
@@ -460,6 +518,18 @@ internal static class SemverUtil
                 }
                 return new Ver { Major = hi.Major, Minor = hi.Minor, Patch = hi.Patch + 1, HasMinor = true, HasPatch = true };
         }
+
+        /// <summary>比较两个版本号：a&gt;b 返回正数，a&lt;b 返回负数，无法解析返回 0（调用方按“不更新”处理）。</summary>
+        public static int CompareVersions(string? a, string? b)
+        {
+                Ver? va = Ver.Parse(a);
+                Ver? vb = Ver.Parse(b);
+                if (va == null || vb == null)
+                {
+                        return 0;
+                }
+                return va.CompareTo(vb);
+        }
 }
 
 
@@ -479,6 +549,10 @@ internal static class SemverUtil
 public static class DshCompatService
 {
         public const string DefaultProfile = "web";
+
+        private static readonly object RegistryCacheLock = new();
+        private static readonly Dictionary<string, (DateTime At, RegistryPackageInfo? Info)> RegistryCache =
+                new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>已知补丁 id 改名：旧 id → 新 id + 配置键映射。</summary>
         private static readonly Dictionary<string, (string NewId, Dictionary<string, string> Keys)> PatchAliases =
@@ -665,21 +739,531 @@ public static class DshCompatService
         }
 
         /// <summary>升级插件到最新版（需已停止 DSH）。</summary>
+        /// <summary>升级插件到最新版（需已停止 DSH）。先查 registry，升级后读回实际版本，避免“exit 0 但没变”。</summary>
         public static string UpgradePlugin(string profile, string name, Action<string>? log = null)
         {
-            string dir = ResolveProfileDir(profile);
-            log?.Invoke("[插件管理] pnpm add " + name + "@latest ...");
-            (int ExitCode, string StdOut, string StdErr)? r = RunCapture("cmd.exe",
-                new[] { "/c", "pnpm", "add", name + "@latest", PnpmFetchTimeoutArg }, dir, 900);
-            if (r == null)
-            {
-                return "pnpm 启动失败";
-            }
-            if (r.Value.ExitCode != 0)
-            {
-                return "升级失败: " + Tail(r.Value.StdErr.Length > 0 ? r.Value.StdErr : r.Value.StdOut, 500);
-            }
-            return "已升级到最新版";
+                if (Toolchain.ResolvePnpmExe() == null)
+                {
+                        return "未找到 pnpm：无法执行插件升级（已查找 PATH/PNPM_HOME/%APPDATA%\\npm/%LOCALAPPDATA%\\pnpm/node 目录）";
+                }
+                string dir = ResolveProfileDir(profile);
+                string before = ReadInstalledPluginVersion(dir, name) ?? "";
+                RegistryPackageInfo? reg = QueryRegistryPackage(name, dir, 30, force: true);
+                if (reg == null)
+                {
+                        return "无法查询 npm registry 最新版（网络异常或 registry 不可达），未执行升级";
+                }
+                if (reg.GateRange.Length > 0)
+                {
+                        string dshVersion = GetDshVersion(Toolchain.ResolveDshDir("", allowFullSearch: false) ?? "") ?? "";
+                        if (dshVersion.Length > 0 && !SemverUtil.Satisfies(dshVersion, reg.GateRange))
+                        {
+                                return "最新版 " + reg.Version + " 的 " + reg.GateName + " = " + reg.GateRange
+                                        + " 不含当前 DSH " + dshVersion + "，升级会被门禁拒绝";
+                        }
+                }
+                if (before.Length > 0 && SemverUtil.CompareVersions(reg.Version, before) <= 0)
+                {
+                        return "已是最新版本 " + before + "（registry 无更新）";
+                }
+                log?.Invoke("[插件管理] pnpm add " + name + "@latest（registry 最新 " + reg.Version + "）...");
+                (int ExitCode, string StdOut, string StdErr)? r = RunCapture("cmd.exe",
+                        new[] { "/c", "pnpm", "add", name + "@latest", PnpmFetchTimeoutArg }, dir, 900);
+                if (r == null || r.Value.ExitCode != 0)
+                {
+                        log?.Invoke("[插件管理] 默认 registry 失败，改用 registry.npmmirror.com 重试 ...");
+                        (int ExitCode, string StdOut, string StdErr)? r2 = RunCapture("cmd.exe",
+                                new[] { "/c", "pnpm", "add", name + "@latest", PnpmFetchTimeoutArg,
+                                        "--registry=https://registry.npmmirror.com" }, dir, 900);
+                        if (r2 == null || r2.Value.ExitCode != 0)
+                        {
+                                string tail = Tail((r?.StdErr?.Length ?? 0) > 0 ? r!.Value.StdErr : (r?.StdOut ?? ""), 500);
+                                if (string.IsNullOrEmpty(tail) && r2 != null)
+                                {
+                                        tail = Tail(r2.Value.StdErr.Length > 0 ? r2.Value.StdErr : r2.Value.StdOut, 500);
+                                }
+                                return "升级失败（默认 registry 与 npmmirror 均失败）: " + tail;
+                        }
+                        r = r2;
+                }
+                string after = ReadInstalledPluginVersion(dir, name) ?? "";
+                if (after.Length == 0)
+                {
+                        return "升级命令已执行，但读不到安装版本（node_modules 可能未生成）";
+                }
+                if (before.Length > 0 && string.Equals(after, before, StringComparison.Ordinal))
+                {
+                        return "升级未生效：pnpm 返回成功，但版本仍为 " + after + "（请检查 registry/缓存）";
+                }
+                return "已升级 " + (before.Length > 0 ? before + " → " : "→ ") + after;
+        }
+
+        /// <summary>
+        /// 安装本地插件：支持“目录”与“.tgz”两种来源。
+        /// 目录会先 pnpm pack 到 ~/.dsh/packages（稳定快照，避免依赖开发目录）；失败则回退直接 file: 目录。
+        /// 安装成功后，若包声明了 dsh.bundle，则自动加入 profile 的 bundles 激活表。
+        /// 全程使用解析到的 pnpm / profile 目录，不依赖固定盘符，其他电脑同样可用。
+        /// </summary>
+        public static string InstallLocalPlugin(string profile, string sourcePath, Action<string>? log = null)
+        {
+                if (Toolchain.ResolvePnpmExe() == null)
+                {
+                        return "未找到 pnpm：无法安装本地插件（已查找 PATH/PNPM_HOME/%APPDATA%\\npm/%LOCALAPPDATA%\\pnpm/node 目录）";
+                }
+                string src = (sourcePath ?? "").Trim().Trim('"');
+                if (src.Length == 0)
+                {
+                        return "未选择插件目录或 .tgz 文件";
+                }
+                try
+                {
+                        src = Path.GetFullPath(src);
+                }
+                catch (Exception ex)
+                {
+                        return "路径无效: " + ex.Message;
+                }
+                bool isDir = Directory.Exists(src);
+                bool isTgz = File.Exists(src) && (src.EndsWith(".tgz", StringComparison.OrdinalIgnoreCase)
+                        || src.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase));
+                if (!isDir && !isTgz)
+                {
+                        return "本地插件不存在或不是目录/.tgz: " + src;
+                }
+
+                string dir = ResolveProfileDir(profile);
+                string packagesDir = Path.Combine(ResolveDshHome(), "packages");
+                string? packTemp = null;
+                string spec;
+                string? packageName = null;
+                string? packageVersion = null;
+                try
+                {
+                        if (isDir)
+                        {
+                                (string? n, string? v) = ReadPackageIdentity(src);
+                                if (string.IsNullOrEmpty(n))
+                                {
+                                        return "插件目录缺少可读的 package.json（name 为空）: " + src;
+                                }
+                                packageName = n;
+                                packageVersion = v;
+                                string safeName = n.Replace('/', '-').Replace('\\', '-');
+                                packTemp = Path.Combine(Path.GetTempPath(), "LlamaDSH_pack_" + Guid.NewGuid().ToString("N"));
+                                Directory.CreateDirectory(packTemp);
+                                log?.Invoke("[插件安装] 打包 " + n + "@" + (v ?? "?") + " ...");
+                                (int ExitCode, string StdOut, string StdErr)? pack = RunCapture("cmd.exe",
+                                        new[] { "/c", "pnpm", "pack", "--pack-destination", packTemp }, src, 600);
+                                string? tgz = null;
+                                try
+                                {
+                                        tgz = Directory.GetFiles(packTemp, "*.tgz").OrderByDescending(File.GetLastWriteTimeUtc).FirstOrDefault();
+                                }
+                                catch
+                                {
+                                }
+                                if (pack == null || pack.Value.ExitCode != 0 || tgz == null)
+                                {
+                                        // 常见于另一台电脑没有安装 devDependencies：prepack 里的 tsc 不存在。
+                                        // 不退化成“直接 file: 目录”（会踩 profile 里旧 tgz 缺失/再次触发 build），
+                                        // 而是复制一份源码、去掉 prepack/prepare 后用 pnpm pack 生成稳定 tgz。
+                                        log?.Invoke("[插件安装] pnpm pack 失败，尝试无构建脚本打包: " + Tail(pack?.StdErr ?? "", 300));
+                                        try
+                                        {
+                                                if (Directory.Exists(packTemp))
+                                                {
+                                                        foreach (string f in Directory.GetFiles(packTemp))
+                                                        {
+                                                                File.Delete(f);
+                                                        }
+                                                }
+                                        }
+                                        catch
+                                        {
+                                        }
+                                        tgz = TryPackStagedPackage(src, packTemp, n, v, log);
+                                }
+                                if (tgz == null)
+                                {
+                                        // 最后兜底：直接安装目录。若 profile 里已有同名旧声明，下面的 remove 会先清掉。
+                                        string? missingEntry = MissingBuildEntry(src);
+                                        if (missingEntry != null)
+                                        {
+                                                return "插件目录缺少构建产物 " + missingEntry + "：请先在源目录执行 pnpm install && pnpm build，再重新安装。";
+                                        }
+                                        log?.Invoke("[插件安装] 无构建脚本打包仍失败，回退直接安装目录");
+                                        spec = "file:" + src.Replace('\\', '/');
+                                }
+                                else
+                                {
+                                        Directory.CreateDirectory(packagesDir);
+                                        string version = string.IsNullOrWhiteSpace(v) ? "0.0.0" : v;
+                                        string dest = Path.Combine(packagesDir, safeName + "-" + version + ".tgz");
+                                        File.Copy(tgz, dest, true);
+                                        spec = "file:" + dest.Replace('\\', '/');
+                                        log?.Invoke("[插件安装] 已生成稳定安装包: " + dest);
+                                }
+                        }
+                        else
+                        {
+                                (string? n, string? v) = ReadTarballIdentity(src);
+                                packageName = n;
+                                packageVersion = v;
+                                Directory.CreateDirectory(packagesDir);
+                                string dest = Path.Combine(packagesDir, Path.GetFileName(src));
+                                if (!string.Equals(Path.GetFullPath(src), Path.GetFullPath(dest), StringComparison.OrdinalIgnoreCase))
+                                {
+                                        File.Copy(src, dest, true);
+                                }
+                                spec = "file:" + dest.Replace('\\', '/');
+                                log?.Invoke("[插件安装] 使用本地包: " + dest);
+                        }
+
+                        string manifest = Path.Combine(dir, "package.json");
+                        string lockFile = Path.Combine(dir, "pnpm-lock.yaml");
+                        string manifestBackup = File.Exists(manifest) ? File.ReadAllText(manifest) : "";
+                        string lockBackup = File.Exists(lockFile) ? File.ReadAllText(lockFile) : "";
+                        Dictionary<string, string> before = ReadDependencies(dir);
+
+                        // 关键：profile 里可能残留指向已删除旧 tgz 的同名依赖（另一台电脑的实测 ENOENT）。
+                        // 同名旧 spec 与新 spec 不一致时先 pnpm remove，再 add，避免 pnpm 解析旧 tarball。
+                        if (!string.IsNullOrEmpty(packageName)
+                                && before.TryGetValue(packageName, out string? oldSpec)
+                                && !string.Equals(oldSpec, spec, StringComparison.OrdinalIgnoreCase))
+                        {
+                                log?.Invoke("[插件安装] 清理同名旧依赖 " + packageName + "（原 " + oldSpec + "）...");
+                                (int ExitCode, string StdOut, string StdErr)? rm = RunCapture("cmd.exe",
+                                        new[] { "/c", "pnpm", "remove", packageName }, dir, 300);
+                                if (rm == null || rm.Value.ExitCode != 0)
+                                {
+                                        log?.Invoke("[插件安装] 清理旧依赖失败: " + Tail(rm?.StdErr ?? "", 300));
+                                }
+                                before = ReadDependencies(dir);
+                        }
+
+                        log?.Invoke("[插件安装] pnpm add " + spec + " ...");
+                        (int ExitCode, string StdOut, string StdErr)? r = RunCapture("cmd.exe",
+                                new[] { "/c", "pnpm", "add", spec, PnpmFetchTimeoutArg }, dir, 900);
+                        if (r == null || r.Value.ExitCode != 0)
+                        {
+                                // 失败回滚 package.json / lock，避免留下半安装状态。
+                                try
+                                {
+                                        if (manifestBackup.Length > 0) File.WriteAllText(manifest, manifestBackup);
+                                        if (lockBackup.Length > 0) File.WriteAllText(lockFile, lockBackup);
+                                }
+                                catch
+                                {
+                                }
+                                string tail = Tail(r?.StdErr ?? "", 600);
+                                if (string.IsNullOrEmpty(tail)) tail = Tail(r?.StdOut ?? "", 600);
+                                return "本地插件安装失败: " + tail;
+                        }
+
+                        Dictionary<string, string> after = ReadDependencies(dir);
+                        string? installed = packageName;
+                        if (string.IsNullOrEmpty(installed))
+                        {
+                                // 同名插件升级时依赖键不变，但 spec 会变；两者任一变化都算本次安装目标。
+                                installed = after.FirstOrDefault((KeyValuePair<string, string> kv) =>
+                                        !before.ContainsKey(kv.Key) || !string.Equals(before[kv.Key], kv.Value, StringComparison.Ordinal)).Key;
+                        }
+                        if (string.IsNullOrEmpty(installed))
+                        {
+                                return "安装命令成功，但未识别出新增/变化的包名（可能已安装同一版本）。请在插件列表点刷新确认。";
+                        }
+
+                        string installedPj = Path.Combine(dir, "node_modules",
+                                installed.Replace('/', Path.DirectorySeparatorChar), "package.json");
+                        bool hasBundle = false;
+                        string installedVersion = "";
+                        try
+                        {
+                                if (File.Exists(installedPj))
+                                {
+                                        using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(installedPj, Encoding.UTF8));
+                                        installedVersion = doc.RootElement.TryGetProperty("version", out JsonElement ve) ? (ve.GetString() ?? "") : "";
+                                        hasBundle = doc.RootElement.TryGetProperty("dsh", out JsonElement dsh)
+                                                && dsh.TryGetProperty("bundle", out _);
+                                }
+                        }
+                        catch
+                        {
+                        }
+
+                        string bundleMsg;
+                        if (hasBundle)
+                        {
+                                bundleMsg = SetBundleActive(profile, installed, true, log);
+                        }
+                        else
+                        {
+                                bundleMsg = "已作为普通依赖安装，但包内没有 dsh.bundle，未加入 profile bundles";
+                        }
+                        log?.Invoke("[插件安装] " + installed + " 完成: " + bundleMsg);
+                        return "已安装 " + installed + (installedVersion.Length > 0 ? "@" + installedVersion : "")
+                                + "（" + spec + "）；" + bundleMsg + "。请重启 DSH 生效。";
+                }
+                catch (Exception ex)
+                {
+                        return "本地插件安装异常: " + ex.Message;
+                }
+                finally
+                {
+                        if (packTemp != null)
+                        {
+                                try { Directory.Delete(packTemp, true); } catch { }
+                        }
+                }
+        }
+
+        private static (string? Name, string? Version) ReadPackageIdentity(string dir)
+        {
+                try
+                {
+                        string pj = Path.Combine(dir, "package.json");
+                        if (!File.Exists(pj))
+                        {
+                                return (null, null);
+                        }
+                        using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(pj, Encoding.UTF8));
+                        string name = doc.RootElement.TryGetProperty("name", out JsonElement ne) ? (ne.GetString() ?? "") : "";
+                        string version = doc.RootElement.TryGetProperty("version", out JsonElement ve) ? (ve.GetString() ?? "") : "";
+                        return (name, version);
+                }
+                catch
+                {
+                        return (null, null);
+                }
+        }
+
+        /// <summary>读取 .tgz 内 package/package.json 的 name/version；用于旧依赖清理与安装结果识别。</summary>
+        private static (string? Name, string? Version) ReadTarballIdentity(string tgzPath)
+        {
+                try
+                {
+                        using FileStream fs = File.OpenRead(tgzPath);
+                        using GZipStream gz = new(fs, CompressionMode.Decompress);
+                        using TarReader reader = new(gz);
+                        TarEntry? entry;
+                        while ((entry = reader.GetNextEntry()) != null)
+                        {
+                                string entryName = entry.Name.Replace('\\', '/');
+                                if (!entryName.EndsWith("package.json", StringComparison.OrdinalIgnoreCase)
+                                        || (entryName != "package.json" && !entryName.EndsWith("/package.json", StringComparison.OrdinalIgnoreCase)))
+                                {
+                                        continue;
+                                }
+                                // 只接受包根目录的 package.json（package/package.json），忽略嵌套示例。
+                                if (entryName.Count((char c) => c == '/') > 1)
+                                {
+                                        continue;
+                                }
+                                using Stream? stream = entry.DataStream;
+                                if (stream == null)
+                                {
+                                        continue;
+                                }
+                                using JsonDocument doc = JsonDocument.Parse(stream);
+                                string name = doc.RootElement.TryGetProperty("name", out JsonElement ne) ? (ne.GetString() ?? "") : "";
+                                string version = doc.RootElement.TryGetProperty("version", out JsonElement ve) ? (ve.GetString() ?? "") : "";
+                                return (name, version);
+                        }
+                }
+                catch
+                {
+                }
+                return (null, null);
+        }
+
+        /// <summary>目录插件的 package.json main 指向的文件是否存在（用于提前发现未 build 的源码）。</summary>
+        private static string? MissingBuildEntry(string dir)
+        {
+                try
+                {
+                        string pj = Path.Combine(dir, "package.json");
+                        if (!File.Exists(pj))
+                        {
+                                return null;
+                        }
+                        using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(pj, Encoding.UTF8));
+                        if (!doc.RootElement.TryGetProperty("main", out JsonElement me))
+                        {
+                                return null;
+                        }
+                        string main = me.GetString() ?? "";
+                        if (string.IsNullOrWhiteSpace(main))
+                        {
+                                return null;
+                        }
+                        string full = Path.Combine(dir, main.Replace('/', Path.DirectorySeparatorChar));
+                        return File.Exists(full) ? null : main;
+                }
+                catch
+                {
+                        return null;
+                }
+        }
+
+        private static readonly HashSet<string> PackIgnoredNames = new(StringComparer.OrdinalIgnoreCase)
+        {
+                "node_modules", ".git", ".pnpm", ".pnpm-store", ".svn", "tests", "test", "docs", "scripts",
+                ".github", ".vscode", ".idea", "coverage", "__pycache__", "pnpm-lock.yaml", "pnpm-workspace.yaml",
+                ".npmrc", ".gitignore"
+        };
+
+        /// <summary>
+        /// 没有 devDependencies（另一台电脑常见）时，pnpm pack 会在 prepack 的 tsc 处失败。
+        /// 复制一份插件运行所需文件到临时目录，去掉 prepack/prepare/postinstall 后再 pack，
+        /// 从而保留 dist 等已构建产物，得到可安装的稳定 tgz。
+        /// </summary>
+        private static string? TryPackStagedPackage(string sourceDir, string outDir, string name, string? version, Action<string>? log)
+        {
+                string stage = Path.Combine(Path.GetTempPath(), "LlamaDSH_packstage_" + Guid.NewGuid().ToString("N"));
+                try
+                {
+                        Directory.CreateDirectory(stage);
+                        Directory.CreateDirectory(outDir);
+                        string sourcePj = Path.Combine(sourceDir, "package.json");
+                        JsonNode? rootNode = JsonNode.Parse(File.ReadAllText(sourcePj, Encoding.UTF8));
+                        if (rootNode is not JsonObject root)
+                        {
+                                return null;
+                        }
+                        string? missingEntry = MissingBuildEntry(sourceDir);
+                        if (missingEntry != null)
+                        {
+                                log?.Invoke("[插件安装] 插件目录缺少构建产物 " + missingEntry + "，无法在没有 devDependencies 的机器上打包；请先在源目录执行 pnpm install && pnpm build");
+                                return null;
+                        }
+                        List<string> entries = new();
+                        if (root["files"] is JsonArray files)
+                        {
+                                foreach (JsonNode? f in files)
+                                {
+                                        string item = f?.ToString() ?? "";
+                                        if (item.Length > 0)
+                                        {
+                                                entries.Add(item.Replace('\\', '/').TrimStart('.', '/'));
+                                        }
+                                }
+                        }
+                        else
+                        {
+                                foreach (string entry in Directory.GetFileSystemEntries(sourceDir))
+                                {
+                                        string leaf = Path.GetFileName(entry);
+                                        if (!PackIgnoredNames.Contains(leaf))
+                                        {
+                                                entries.Add(leaf);
+                                        }
+                                }
+                        }
+                        foreach (string entry in entries.Distinct(StringComparer.OrdinalIgnoreCase))
+                        {
+                                CopyPath(Path.Combine(sourceDir, entry), Path.Combine(stage, entry), PackIgnoredNames);
+                        }
+                        // package.json 与 bundle patch 必须在，即使 files 没列。
+                        CopyPath(sourcePj, Path.Combine(stage, "package.json"), null);
+                        string? patch = root["dsh"]?["bundle"]?["patch"]?.ToString();
+                        if (!string.IsNullOrEmpty(patch))
+                        {
+                                string rel = patch.Replace('\\', '/').TrimStart('.', '/');
+                                CopyPath(Path.Combine(sourceDir, rel), Path.Combine(stage, rel), PackIgnoredNames);
+                        }
+
+                        JsonNode? stagedNode = JsonNode.Parse(File.ReadAllText(Path.Combine(stage, "package.json"), Encoding.UTF8));
+                        if (stagedNode is JsonObject staged && staged["scripts"] is JsonObject scripts)
+                        {
+                                foreach (string script in new[] { "prepack", "prepare", "postinstall" })
+                                {
+                                        scripts.Remove(script);
+                                }
+                                if (scripts.Count == 0)
+                                {
+                                        staged.Remove("scripts");
+                                }
+                                File.WriteAllText(Path.Combine(stage, "package.json"),
+                                        staged.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
+                        }
+                        log?.Invoke("[插件安装] 无构建脚本打包 " + name + "@" + (version ?? "?") + " ...");
+                        (int ExitCode, string StdOut, string StdErr)? pack = RunCapture("cmd.exe",
+                                new[] { "/c", "pnpm", "pack", "--pack-destination", outDir }, stage, 300);
+                        if (pack == null || pack.Value.ExitCode != 0)
+                        {
+                                log?.Invoke("[插件安装] 无构建脚本打包失败: " + Tail(pack?.StdErr ?? "", 300));
+                                return null;
+                        }
+                        return Directory.GetFiles(outDir, "*.tgz").OrderByDescending(File.GetLastWriteTimeUtc).FirstOrDefault();
+                }
+                catch (Exception ex)
+                {
+                        log?.Invoke("[插件安装] 无构建脚本打包异常: " + ex.Message);
+                        return null;
+                }
+                finally
+                {
+                        try { Directory.Delete(stage, true); } catch { }
+                }
+        }
+
+        private static void CopyPath(string source, string dest, HashSet<string>? ignored)
+        {
+                try
+                {
+                        if (File.Exists(source))
+                        {
+                                string? parent = Path.GetDirectoryName(dest);
+                                if (!string.IsNullOrEmpty(parent))
+                                {
+                                        Directory.CreateDirectory(parent);
+                                }
+                                File.Copy(source, dest, true);
+                                return;
+                        }
+                        if (!Directory.Exists(source))
+                        {
+                                return;
+                        }
+                        Directory.CreateDirectory(dest);
+                        foreach (string entry in Directory.GetFileSystemEntries(source))
+                        {
+                                string leaf = Path.GetFileName(entry);
+                                if (ignored != null && ignored.Contains(leaf))
+                                {
+                                        continue;
+                                }
+                                CopyPath(entry, Path.Combine(dest, leaf), ignored);
+                        }
+                }
+                catch
+                {
+                }
+        }
+
+        private static Dictionary<string, string> ReadDependencies(string profileDir)
+        {
+                Dictionary<string, string> map = new(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                        string pj = Path.Combine(profileDir, "package.json");
+                        if (!File.Exists(pj))
+                        {
+                                return map;
+                        }
+                        using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(pj, Encoding.UTF8));
+                        if (doc.RootElement.TryGetProperty("dependencies", out JsonElement deps) && deps.ValueKind == JsonValueKind.Object)
+                        {
+                                foreach (JsonProperty p in deps.EnumerateObject())
+                                {
+                                        map[p.Name] = p.Value.GetString() ?? "";
+                                }
+                        }
+                }
+                catch
+                {
+                }
+                return map;
         }
 
         /// <summary>
@@ -752,6 +1336,26 @@ public static class DshCompatService
                 return Path.Combine(ResolveDshHome(), "profiles", name);
         }
 
+        /// <summary>读取 profile 的 node_modules 里插件实际安装版本（升级后用于校验 exit 0 是否真的生效）。</summary>
+        public static string? ReadInstalledPluginVersion(string profileDir, string name)
+        {
+                try
+                {
+                        string pj = Path.Combine(profileDir, "node_modules",
+                                name.Replace('/', Path.DirectorySeparatorChar), "package.json");
+                        if (!File.Exists(pj))
+                        {
+                                return null;
+                        }
+                        using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(pj, Encoding.UTF8));
+                        return doc.RootElement.TryGetProperty("version", out JsonElement v) ? v.GetString() : null;
+                }
+                catch
+                {
+                        return null;
+                }
+        }
+
         public static string? GetDshVersion(string dshDir)
         {
                 foreach (string candidate in new[]
@@ -785,35 +1389,8 @@ public static class DshCompatService
 
         public static string? ResolveNodeExe()
         {
-                try
-                {
-                        if (File.Exists(DshMaintenance.Node24Path))
-                        {
-                                return DshMaintenance.Node24Path;
-                        }
-                }
-                catch
-                {
-                }
-                string? path = Environment.GetEnvironmentVariable("PATH");
-                if (!string.IsNullOrEmpty(path))
-                {
-                        foreach (string dir in path.Split(';', StringSplitOptions.RemoveEmptyEntries))
-                        {
-                                try
-                                {
-                                        string exe = Path.Combine(dir.Trim(), "node.exe");
-                                        if (File.Exists(exe))
-                                        {
-                                                return exe;
-                                        }
-                                }
-                                catch
-                                {
-                                }
-                        }
-                }
-                return null;
+                // 统一由 Toolchain 解析：Program Files / nvm / scoop / winget / PATH 都覆盖，且校验 v24+。
+                return Toolchain.ResolveNode24Exe();
         }
 
         private static (int ExitCode, string StdOut, string StdErr)? RunCapture(string fileName, IEnumerable<string> args, string? workDir, int timeoutSec)
@@ -838,6 +1415,8 @@ public static class DshCompatService
                         {
                                 psi.ArgumentList.Add(a);
                         }
+                        // 不同机器 node/pnpm/git 不在 PATH 时，cmd /c pnpm 会直接失败；这里统一补齐。
+                        Toolchain.AugmentPath(psi);
                         using Process? p = Process.Start(psi);
                         if (p == null)
                         {
@@ -887,7 +1466,8 @@ public static class DshCompatService
                 };
                 if (r.DshDir.Length == 0)
                 {
-                        r.DshDir = "%DSH%";
+                        // 不写死盘符：按状态文件/Running 进程/profile junction/常见位置快速探测。
+                        r.DshDir = Toolchain.ResolveDshDir("", allowFullSearch: false) ?? "";
                 }
                 r.ProfileDir = ResolveProfileDir(r.Profile);
                 r.ProfileManifestPath = Path.Combine(r.ProfileDir, "package.json");
@@ -898,7 +1478,15 @@ public static class DshCompatService
                         r.DshDirExists = Directory.Exists(r.DshDir);
                         if (!r.DshDirExists)
                         {
-                                r.Add(DshCompatLevel.Error, "环境", "DSH 目录不存在", r.DshDir);
+                                if (r.DshDir.Length == 0)
+                                {
+                                        r.Add(DshCompatLevel.Error, "环境", "未找到 DSH 安装目录",
+                                                "请在“DSH 项目目录”填写实际路径，或点“🔍 自动检索”（启动器也会按状态文件/运行进程/profile 链接/常见位置探测）");
+                                }
+                                else
+                                {
+                                        r.Add(DshCompatLevel.Error, "环境", "DSH 目录不存在", r.DshDir);
+                                }
                                 return r;
                         }
                         log?.Invoke("[兼容] DSH 目录: " + r.DshDir);
@@ -906,8 +1494,8 @@ public static class DshCompatService
                         r.DshVersion = GetDshVersion(r.DshDir) ?? "(未知)";
                         r.Head = DshMaintenance.GetGitHead(r.DshDir) ?? "";
                         r.BinBuilt = File.Exists(Path.Combine(r.DshDir, "apps", "cli", "lib", "bin.js"));
-                        r.Node24Ok = ResolveNodeExe() != null;
-                        r.PnpmOk = CommandAvailable("pnpm --version", r.DshDir);
+                        r.Node24Ok = Toolchain.ResolveNode24Exe() != null;
+                        r.PnpmOk = Toolchain.ResolvePnpmExe() != null && CommandAvailable("pnpm --version", r.DshDir);
                         log?.Invoke("[兼容] 版本 " + r.DshVersion + " · HEAD " + Short(r.Head) + " · node24=" + (r.Node24Ok ? "OK" : "缺失") + " · pnpm=" + (r.PnpmOk ? "OK" : "缺失") + " · 编译产物=" + (r.BinBuilt ? "OK" : "缺失"));
 
                         if (!r.GitRepo)
@@ -916,11 +1504,15 @@ public static class DshCompatService
                         }
                         if (!r.Node24Ok)
                         {
-                                r.Add(DshCompatLevel.Error, "环境", "未找到 node24", DshMaintenance.Node24Path + "（DSH/pnpm11 必须使用 node24）");
+                                r.Add(DshCompatLevel.Error, "环境", "未找到 node24",
+                                        Toolchain.ResolveNodeExe(require24: false) is string anyNode
+                                                ? "当前 node: " + anyNode + "（DSH/pnpm11 必须使用 v24+；请安装 node24 或把它加入 PATH）"
+                                                : "已查找 Program Files / nvm / scoop / winget / PATH，均未找到 node.exe（DSH/pnpm11 必须使用 v24+）");
                         }
                         if (!r.PnpmOk)
                         {
-                                r.Add(DshCompatLevel.Warning, "环境", "pnpm 不可用", "无法安装/修复插件依赖；请确认 pnpm 在 PATH 中", false, "");
+                                r.Add(DshCompatLevel.Warning, "环境", "pnpm 不可用",
+                                        "无法安装/修复插件依赖；请安装 pnpm 或把它加入 PATH（启动器也会查找 %APPDATA%\\npm、%LOCALAPPDATA%\\pnpm、node 目录）", false, "");
                         }
                         if (!r.BinBuilt)
                         {
@@ -1828,25 +2420,104 @@ public static class DshCompatService
                         // 死 peer（包已被 DSH 上游删除）：升级无法解决，不进升级列表，改为自动移除声明
                         bool hasDeadPeer = info.PeerIssues.Keys.Any((string k) =>
                                 r.DeadPeerFixes.Any((DshDeadPeerFix f) => f.PluginName == info.Name && f.PeerName == k));
-                        // registry 最新版 == 已装版本：pnpm add @latest 是空操作 —— 既不该报“已升级”，也不该进升级列表
+                        // registry 最新版：市场 discovery 缓存可能过期（实测 dsh-pua 缓存 0.3.28、registry 已 1.0.1），
+                        // 因此以实时查询为准，缓存仅作查询失败时的回退。
+                        RegistryPackageInfo? reg = (fromRegistry && !hasDeadPeer)
+                                ? QueryRegistryPackage(info.Name, r.ProfileDir, 25)
+                                : null;
+                        if (reg != null)
+                        {
+                                info.RegistryChecked = true;
+                                info.LatestVersion = reg.Version;
+                                (bool evalBlocked, string evalName, string evalRange) = reg.EvaluateGate(r.DshVersion);
+                                info.LatestGateBlocked = evalBlocked;
+                                info.LatestGateName = evalName;
+                                info.LatestGateRange = evalRange;
+                        }
                         string? latestCached = fromRegistry ? LatestCachedVersion(info.Name, r.ProfileDir) : null;
-                        bool upToDate = latestCached != null && string.Equals(latestCached, info.Version, StringComparison.Ordinal);
-                        if (fromRegistry && !hasDeadPeer && !upToDate && !r.PluginsToUpgrade.Contains(info.Name, StringComparer.Ordinal))
+                        string? latest = reg?.Version ?? latestCached;
+                        bool hasNewer = latest != null && SemverUtil.CompareVersions(latest, info.Version) > 0;
+                        bool upToDate = latest != null && !hasNewer;
+                        bool gateBlocked = info.LatestGateBlocked;
+                        bool canAutoFix = fromRegistry && !hasDeadPeer && hasNewer && !gateBlocked;
+                        if (canAutoFix && !r.PluginsToUpgrade.Contains(info.Name, StringComparer.Ordinal))
                         {
                                 r.PluginsToUpgrade.Add(info.Name);
                         }
-                        string suggestion = hasDeadPeer
-                                ? "peer 包已被 DSH 上游删除，属不可满足的死依赖：从插件 package.json 移除该声明（启动器可自动移除）"
-                                : upToDate
-                                        ? "registry 最新版就是当前已装的 " + latestCached + "，其 peer 声明不含当前 DSH " + r.DshVersion + "：升级无法解决（需插件作者发版）；如需继续使用请显式接受风险: dsh plugin --profile " + r.Profile + " allow-version " + info.Name + "@" + info.Version + " --dsh-version " + r.DshVersion + " --accept-risk"
-                                        : fromRegistry
-                                                ? "升级该插件到兼容版本（启动器可自动执行 pnpm add " + info.Name + "@latest）；或显式接受风险: dsh plugin --profile " + r.Profile + " allow-version " + info.Name + "@" + info.Version + " --dsh-version " + r.DshVersion + " --accept-risk"
-                                                : "本地/源码安装（" + (info.Spec.Length > 0 ? info.Spec : "未知来源") + "），请在源码项目放宽 peerDependencies 并重新构建安装；或显式 allow-version 接受风险";
-                        bool canAutoFix = fromRegistry && !hasDeadPeer && !upToDate;
+                        string suggestion;
+                        if (hasDeadPeer)
+                        {
+                                suggestion = "peer 包已被 DSH 上游删除，属不可满足的死依赖：从插件 package.json 移除该声明（启动器可自动移除）";
+                        }
+                        else if (!fromRegistry)
+                        {
+                                suggestion = "本地/源码安装（" + (info.Spec.Length > 0 ? info.Spec : "未知来源") + "），请在源码项目放宽 peerDependencies 并重新构建安装；或显式 allow-version 接受风险";
+                        }
+                        else if (latest == null)
+                        {
+                                suggestion = "无法查询 npm registry 最新版（网络异常或 registry 不可达）；可稍后在“插件管理”里点升级重试，或显式接受风险: dsh plugin --profile " + r.Profile + " allow-version " + info.Name + "@" + info.Version + " --dsh-version " + r.DshVersion + " --accept-risk";
+                        }
+                        else if (gateBlocked)
+                        {
+                                suggestion = "registry 最新版 " + latest + " 的 " + info.LatestGateName + " = " + info.LatestGateRange + " 不含当前 DSH " + r.DshVersion + "：升级会被门禁拒绝（需插件作者发版）；如需继续使用请显式接受风险: dsh plugin --profile " + r.Profile + " allow-version " + info.Name + "@" + info.Version + " --dsh-version " + r.DshVersion + " --accept-risk";
+                        }
+                        else if (upToDate)
+                        {
+                                suggestion = "registry 最新版就是当前已装的 " + latest + "，其 peer 声明不含当前 DSH " + r.DshVersion + "：升级无法解决（需插件作者发版）；如需继续使用请显式接受风险: dsh plugin --profile " + r.Profile + " allow-version " + info.Name + "@" + info.Version + " --dsh-version " + r.DshVersion + " --accept-risk";
+                        }
+                        else
+                        {
+                                suggestion = "升级该插件到 " + latest + "（启动器可自动执行 pnpm add " + info.Name + "@latest）；或显式接受风险: dsh plugin --profile " + r.Profile + " allow-version " + info.Name + "@" + info.Version + " --dsh-version " + r.DshVersion + " --accept-risk";
+                        }
                         r.Add(DshCompatLevel.Error, "插件", "插件与 DSH 不兼容: " + info.Name,
                                 "已安装 " + info.Name + "@" + info.Version + "，peer " + peers + "；" + suggestion, canAutoFix,
                                 hasDeadPeer ? "移除死依赖声明（先停止 DSH）" : (canAutoFix ? "pnpm add " + info.Name + "@latest（先停止 DSH）" : ""));
                 }
+                // 已豁免但仍停留在旧版的插件：若 registry 最新版兼容当前 DSH，优先升级（升级后旧豁免键自然失效）。
+                foreach (DshPluginInfo info in r.Plugins.Where((DshPluginInfo x) => x.Installed && x.Exempted))
+                {
+                        bool fromRegistry = info.Spec.Length > 0
+                                && !info.Spec.StartsWith("file:", StringComparison.OrdinalIgnoreCase)
+                                && !info.Spec.StartsWith("link:", StringComparison.OrdinalIgnoreCase)
+                                && !info.Spec.StartsWith("workspace:", StringComparison.OrdinalIgnoreCase)
+                                && !Path.IsPathRooted(info.Spec);
+                        if (!fromRegistry)
+                        {
+                                continue;
+                        }
+                        RegistryPackageInfo? reg = QueryRegistryPackage(info.Name, r.ProfileDir, 20);
+                        if (reg == null)
+                        {
+                                continue;
+                        }
+                        info.RegistryChecked = true;
+                        info.LatestVersion = reg.Version;
+                        (bool evalBlocked, string evalName, string evalRange) = reg.EvaluateGate(r.DshVersion);
+                        info.LatestGateBlocked = evalBlocked;
+                        info.LatestGateName = evalName;
+                        info.LatestGateRange = evalRange;
+                        if (evalBlocked)
+                        {
+                                r.Add(DshCompatLevel.Info, "插件", "已豁免，最新版仍不兼容: " + info.Name,
+                                        "当前 " + info.Version + " 通过 compatibility.json 豁免；registry 最新 " + reg.Version
+                                        + " 的 " + evalName + " = " + evalRange + " 仍不含当前 DSH " + r.DshVersion + "，保持豁免即可",
+                                        false, "");
+                                continue;
+                        }
+                        if (SemverUtil.CompareVersions(reg.Version, info.Version) <= 0)
+                        {
+                                continue;
+                        }
+                        if (!r.PluginsToUpgrade.Contains(info.Name, StringComparer.Ordinal))
+                        {
+                                r.PluginsToUpgrade.Add(info.Name);
+                        }
+                        r.Add(DshCompatLevel.Warning, "插件", "已豁免但存在兼容新版: " + info.Name,
+                                "当前 " + info.Version + " 通过 compatibility.json 豁免；registry 最新 " + reg.Version
+                                + " 与 DSH " + r.DshVersion + " 兼容，建议升级（升级后旧豁免键自然失效）",
+                                true, "pnpm add " + info.Name + "@latest（先停止 DSH）");
+                }
+
                 // 不影响兼容性的死依赖声明（仅 devDependencies）：提示并给出自动移除
                 foreach (DshDeadPeerFix fix in r.DeadPeerFixes)
                 {
@@ -2624,6 +3295,8 @@ process.stdout.write(JSON.stringify(out));
                         log?.Invoke("[兼容修复] 修复完成，重新检查 ...");
                         res.Report = Audit(dir, prof, log, includeDumpConfig: true);
                         res.Messages.Add("复检：错误 " + res.Report.ErrorCount + " · 警告 " + res.Report.WarningCount + " · 可修复 " + res.Report.RepairableCount);
+                        res.RemainingErrors = res.Report.ErrorCount;
+                        res.RemainingRepairable = res.Report.RepairableCount;
                 }
                 catch (Exception ex)
                 {
@@ -2635,6 +3308,8 @@ process.stdout.write(JSON.stringify(out));
                         catch
                         {
                         }
+                        res.RemainingErrors = Math.Max(1, res.Report.ErrorCount);
+                        res.RemainingRepairable = res.Report.RepairableCount;
                 }
                 return res;
         }
@@ -2914,36 +3589,48 @@ process.stdout.write(JSON.stringify(out));
         /// </summary>
         public static string RepairUpgradePlugins(DshCompatReport report, Action<string>? log)
         {
-                if (!report.PnpmOk)
+                if (!report.PnpmOk || Toolchain.ResolvePnpmExe() == null)
                 {
-                        return "pnpm 不可用，跳过插件升级（请确认 pnpm 在 PATH 中）";
+                        return "pnpm 不可用，跳过插件升级（已查找 PATH/PNPM_HOME/%APPDATA%\\npm/%LOCALAPPDATA%\\pnpm/node 目录）";
                 }
                 List<string> names = new();
                 List<string> skipped = new();
                 List<string> noUpdate = new();
+                List<string> unknown = new();
                 foreach (string name in report.PluginsToUpgrade)
                 {
-                        string installed = report.Plugins.FirstOrDefault((DshPluginInfo x) => x.Name == name)?.Version ?? "";
-                        DshUpdatePreview? preview = null;
-                        try
+                        DshPluginInfo? info = report.Plugins.FirstOrDefault((DshPluginInfo x) => x.Name == name);
+                        string installed = info?.Version ?? "";
+                        // 审计阶段已实时查过 registry；若没有（网络抖动），这里再强制查一次，避免拿过期缓存做决定。
+                        if (info != null && !info.RegistryChecked)
                         {
-                                preview = PreviewPluginUpdate(name, installed, report.DshDir, report.ProfileDir, report.DshVersion);
+                                RegistryPackageInfo? reg = QueryRegistryPackage(name, report.ProfileDir, 25, force: true);
+                                if (reg != null)
+                                {
+                                        info.RegistryChecked = true;
+                                        info.LatestVersion = reg.Version;
+                                        (bool evalBlocked, string evalName, string evalRange) = reg.EvaluateGate(report.DshVersion);
+                                        info.LatestGateBlocked = evalBlocked;
+                                        info.LatestGateName = evalName;
+                                        info.LatestGateRange = evalRange;
+                                }
                         }
-                        catch (Exception ex)
+                        string latest = info?.LatestVersion ?? "";
+                        if (latest.Length == 0)
                         {
-                                log?.Invoke("[兼容修复] 升级预检异常（按原样尝试升级）: " + name + " —— " + ex.Message);
-                        }
-                        if (preview != null && preview.GateBlocked)
-                        {
-                                skipped.Add(name + "（最新 " + preview.LatestVersion + " 的 " + preview.GateName + " = "
-                                        + preview.GateRange + "，当前 DSH " + report.DshVersion + " 不满足）");
-                                log?.Invoke("[兼容修复] 跳过升级 " + name + "：预检判定最新版会被门禁拒绝（"
-                                        + preview.GateName + " = " + preview.GateRange + "）");
+                                unknown.Add(name + "@" + installed + "（registry 查询失败）");
+                                log?.Invoke("[兼容修复] 跳过升级 " + name + "：无法查询 registry 最新版（网络异常）");
                                 continue;
                         }
-                        // registry 最新版 == 已装版本 → pnpm add @latest 拿不到任何东西：不能当成“已升级”上报
-                        string? latestCached = LatestCachedVersion(name, report.ProfileDir);
-                        if (latestCached != null && string.Equals(latestCached, installed, StringComparison.Ordinal))
+                        if (info != null && info.LatestGateBlocked)
+                        {
+                                skipped.Add(name + "（最新 " + latest + " 的 " + info.LatestGateName + " = "
+                                        + info.LatestGateRange + "，当前 DSH " + report.DshVersion + " 不满足）");
+                                log?.Invoke("[兼容修复] 跳过升级 " + name + "：最新版会被门禁拒绝（"
+                                        + info.LatestGateName + " = " + info.LatestGateRange + "）");
+                                continue;
+                        }
+                        if (SemverUtil.CompareVersions(latest, installed) <= 0)
                         {
                                 noUpdate.Add(name + "@" + installed + "（registry 已是最新；其 peer 声明不含当前 DSH "
                                         + report.DshVersion + "，需上游发版）");
@@ -2964,13 +3651,32 @@ process.stdout.write(JSON.stringify(out));
                         {
                                 parts.Add("registry 无更新 " + noUpdate.Count + " 个（" + string.Join("；", noUpdate) + "）");
                         }
+                        if (unknown.Count > 0)
+                        {
+                                parts.Add("registry 查询失败 " + unknown.Count + " 个（" + string.Join("；", unknown) + "）");
+                        }
                         return "插件升级：未执行 pnpm add —— " + string.Join("，", parts);
                 }
                 string args = string.Join(" ", names.Select((string n) => n + "@latest"));
                 log?.Invoke("[兼容修复] pnpm add " + args + "（可能需要数分钟）...");
-                (int ExitCode, string StdOut, string StdErr)? r = RunCapture("cmd.exe",
-                        new List<string> { "/c", "pnpm", "add" }.Concat(names.Select((string n) => n + "@latest")).Concat(new[] { PnpmFetchTimeoutArg }).ToArray(),
-                        report.ProfileDir, 900);
+                List<string> addArgs = new List<string> { "/c", "pnpm", "add" };
+                addArgs.AddRange(names.Select((string n) => n + "@latest"));
+                addArgs.Add(PnpmFetchTimeoutArg);
+                (int ExitCode, string StdOut, string StdErr)? r = RunCapture("cmd.exe", addArgs, report.ProfileDir, 900);
+                if (r == null || r.Value.ExitCode != 0)
+                {
+                        // 默认 registry 超时/被墙时，用国内镜像重试一次（不改本机 .npmrc）。
+                        log?.Invoke("[兼容修复] 默认 registry 升级失败，改用 registry.npmmirror.com 重试 ...");
+                        List<string> mirrorArgs = new List<string> { "/c", "pnpm", "add" };
+                        mirrorArgs.AddRange(names.Select((string n) => n + "@latest"));
+                        mirrorArgs.Add(PnpmFetchTimeoutArg);
+                        mirrorArgs.Add("--registry=https://registry.npmmirror.com");
+                        (int ExitCode, string StdOut, string StdErr)? r2 = RunCapture("cmd.exe", mirrorArgs, report.ProfileDir, 900);
+                        if (r2 != null && r2.Value.ExitCode == 0)
+                        {
+                                r = r2;
+                        }
+                }
                 if (r == null)
                 {
                         return "pnpm 启动失败，插件升级未执行";
@@ -2985,12 +3691,37 @@ process.stdout.write(JSON.stringify(out));
                 {
                         notes.Add("另 " + noUpdate.Count + " 个 registry 已是最新（需上游发版）：" + string.Join("；", noUpdate));
                 }
+                if (unknown.Count > 0)
+                {
+                        notes.Add("另 " + unknown.Count + " 个 registry 查询失败：" + string.Join("；", unknown));
+                }
                 string skipNote = notes.Count > 0 ? "；" + string.Join("；", notes) : "";
                 if (r.Value.ExitCode != 0)
                 {
-                        return "插件升级失败（exit " + r.Value.ExitCode + "）：" + tail + skipNote;
+                        return "插件升级失败（exit " + r.Value.ExitCode + "，默认 registry 与 npmmirror 均失败）：" + tail + skipNote;
                 }
-                return "插件已升级到最新: " + string.Join(", ", names) + skipNote;
+                // 不信任 exit 0：读回实际安装版本，确认真的变了（pnpm 有时会“成功但没装”）。
+                List<string> done = new();
+                List<string> unchanged = new();
+                foreach (string name in names)
+                {
+                        string before = report.Plugins.FirstOrDefault((DshPluginInfo x) => x.Name == name)?.Version ?? "";
+                        string after = ReadInstalledPluginVersion(report.ProfileDir, name) ?? "";
+                        if (after.Length > 0 && !string.Equals(after, before, StringComparison.Ordinal))
+                        {
+                                done.Add(name + " " + before + " → " + after);
+                        }
+                        else
+                        {
+                                unchanged.Add(name + (after.Length > 0 ? " 仍为 " + after : " 未安装"));
+                        }
+                }
+                if (done.Count == 0)
+                {
+                        return "插件升级未生效（pnpm exit 0 但版本未变化）：" + string.Join("；", unchanged) + skipNote;
+                }
+                return "插件已升级: " + string.Join(", ", done)
+                        + (unchanged.Count > 0 ? "；未变化：" + string.Join("；", unchanged) : "") + skipNote;
         }
 
         /// <summary>把 DSH 安装内存在的缺失 peer 以 junction 补进共享 node_modules，使插件目录可解析。</summary>
@@ -3450,8 +4181,10 @@ process.stdout.write(JSON.stringify(out));
                 return null;
         }
 
-        /// <summary>pnpm fetch 超时常量：大包（含原生二进制）常被 pnpm 默认 per-request 超时中断（dsh-market 日志 2026-09-29 实证）。</summary>
-        public const string PnpmFetchTimeoutArg = "--config.fetchTimeout=600000";
+        /// <summary>pnpm fetch 超时常量：大包（含原生二进制）常被 pnpm 默认 per-request 超时中断（dsh-market 日志 2026-09-29 实证）。
+        /// 注意必须用 kebab-case --fetch-timeout：pnpm 11 下 --config.fetchTimeout 会被解析成带换行的字符串，
+        /// 真正触发下载时抛 "delay argument must be number"，导致所有 pnpm add 必然失败（2026-10-19 实测）。</summary>
+        public const string PnpmFetchTimeoutArg = "--fetch-timeout=600000";
 
         /// <summary>
         /// 分析 dsh-market 的 log.ndjson 文本：只看 nowUtc 往前 window 内的记录，归类可疑项
@@ -3525,7 +4258,8 @@ process.stdout.write(JSON.stringify(out));
                                 lastRollbackDetail = detail;
                         }
                         else if (detail.Contains("fetchTimeout", StringComparison.OrdinalIgnoreCase)
-                                || detail.Contains("fetch timeout", StringComparison.OrdinalIgnoreCase))
+                                || detail.Contains("fetch timeout", StringComparison.OrdinalIgnoreCase)
+                                || detail.Contains("fetch-timeout", StringComparison.OrdinalIgnoreCase))
                         {
                                 fetchRetries++;
                                 lastFetchAt = at;
@@ -3644,6 +4378,112 @@ process.stdout.write(JSON.stringify(out));
         /// 升级前预检：读市场 discovery 兼容缓存（.dsh-market/discovery-compatibility-v1.json），
         /// 对被装插件预测“升到缓存里的最新版会不会被门禁拒绝 / 带入已删除依赖”，避免升完才回滚。
         /// </summary>
+        /// <summary>
+        /// 直接查询 npm registry 的最新版与 peer/engines 门禁，避免市场 discovery 缓存过期
+        /// 导致“明明有兼容新版却判定已是最新/升级无法解决”。查询失败返回 null（由调用方回退缓存）。
+        /// </summary>
+        public static RegistryPackageInfo? QueryRegistryPackage(string name, string profileDir, int timeoutSec = 30, bool force = false)
+        {
+                string key = name.Trim();
+                if (key.Length == 0)
+                {
+                        return null;
+                }
+                lock (RegistryCacheLock)
+                {
+                        if (!force && RegistryCache.TryGetValue(key, out var hit))
+                        {
+                                TimeSpan ttl = hit.Info == null ? TimeSpan.FromMinutes(2) : TimeSpan.FromMinutes(10);
+                                if (DateTime.UtcNow - hit.At < ttl)
+                                {
+                                        return hit.Info;
+                                }
+                        }
+                }
+                if (Toolchain.ResolvePnpmExe() == null)
+                {
+                        return null;
+                }
+                string workDir = Directory.Exists(profileDir) ? profileDir : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                // 优先 npm view：它支持 --fetch-timeout/--fetch-retries，断网时能快速失败而不是卡 60s；
+                // 没有 npm 时再退回 pnpm view。
+                (int ExitCode, string StdOut, string StdErr)? r = RunCapture("cmd.exe",
+                        new[] { "/c", "npm", "view", key, "version", "peerDependencies", "engines", "--json",
+                                "--fetch-timeout=20000", "--fetch-retries=0" }, workDir, timeoutSec);
+                if (r == null || r.Value.ExitCode != 0 || string.IsNullOrWhiteSpace(r.Value.StdOut))
+                {
+                        r = RunCapture("cmd.exe",
+                                new[] { "/c", "pnpm", "view", key, "version", "peerDependencies", "engines", "--json" }, workDir, timeoutSec);
+                }
+                if (r == null || r.Value.ExitCode != 0 || string.IsNullOrWhiteSpace(r.Value.StdOut))
+                {
+                        // 默认 registry 被墙/超时时，用国内镜像再查一次（只读操作，不改本机配置）。
+                        r = RunCapture("cmd.exe",
+                                new[] { "/c", "npm", "view", key, "version", "peerDependencies", "engines", "--json",
+                                        "--fetch-timeout=20000", "--fetch-retries=0",
+                                        "--registry=https://registry.npmmirror.com" }, workDir, timeoutSec);
+                }
+                RegistryPackageInfo? info = null;
+                if (r != null && r.Value.ExitCode == 0 && !string.IsNullOrWhiteSpace(r.Value.StdOut))
+                {
+                        info = ParseRegistryPackage(key, r.Value.StdOut);
+                }
+                lock (RegistryCacheLock)
+                {
+                        RegistryCache[key] = (DateTime.UtcNow, info);
+                }
+                return info;
+        }
+
+        private static RegistryPackageInfo? ParseRegistryPackage(string name, string json)
+        {
+                try
+                {
+                        string text = json.Trim();
+                        JsonNode? root = JsonNode.Parse(text);
+                        if (root is JsonArray arr && arr.Count > 0)
+                        {
+                                root = arr[arr.Count - 1];
+                        }
+                        if (root is not JsonObject obj)
+                        {
+                                return null;
+                        }
+                        string version = obj["version"]?.ToString() ?? "";
+                        if (version.Length == 0)
+                        {
+                                return null;
+                        }
+                        RegistryPackageInfo info = new() { Name = name, Version = version };
+                        if (obj["peerDependencies"] is JsonObject peers)
+                        {
+                                foreach (KeyValuePair<string, JsonNode?> kv in peers)
+                                {
+                                        string val = kv.Value?.ToString() ?? "";
+                                        if (val.Length > 0)
+                                        {
+                                                info.PeerDependencies[kv.Key] = val;
+                                        }
+                                }
+                        }
+                        if (info.PeerDependencies.TryGetValue("@deepseek-ai/dsh", out string? v))
+                        {
+                                info.GateName = "peer @deepseek-ai/dsh";
+                                info.GateRange = v;
+                        }
+                        else if (obj["engines"] is JsonObject engines && engines["dsh"] is JsonNode dshGate)
+                        {
+                                info.GateName = "engines.dsh";
+                                info.GateRange = dshGate.ToString();
+                        }
+                        return info;
+                }
+                catch
+                {
+                        return null;
+                }
+        }
+
         /// <summary>市场 discovery 缓存里该插件的最新版本号；缓存无此条目返回 null。</summary>
         public static string? LatestCachedVersion(string name, string profileDir)
         {
@@ -3730,6 +4570,36 @@ process.stdout.write(JSON.stringify(out));
         public static DshUpdatePreview? PreviewPluginUpdate(string name, string installedVersion, string dshDir,
                 string profileDir, string dshVersion)
         {
+                // 先查 registry：市场 discovery 缓存可能过期（dsh-pua 0.3.28 vs registry 1.0.1 实测）。
+                RegistryPackageInfo? reg = QueryRegistryPackage(name, profileDir, 20);
+                if (reg != null)
+                {
+                        if (installedVersion.Length > 0 && SemverUtil.CompareVersions(reg.Version, installedVersion) <= 0)
+                        {
+                                return null;
+                        }
+                        DshUpdatePreview live = new DshUpdatePreview
+                        {
+                                PluginName = name,
+                                InstalledVersion = installedVersion,
+                                LatestVersion = reg.Version,
+                                GateName = reg.GateName,
+                                GateRange = reg.GateRange
+                        };
+                        (bool evalBlocked, string evalName, string evalRange) = reg.EvaluateGate(dshVersion);
+                        live.GateBlocked = evalBlocked;
+                        live.GateName = evalName;
+                        live.GateRange = evalRange;
+                        foreach (KeyValuePair<string, string> kv in reg.PeerDependencies)
+                        {
+                                if (kv.Key.StartsWith("@deepseek-ai/", StringComparison.Ordinal)
+                                        && IsDshPackageDead(kv.Key, dshDir, profileDir))
+                                {
+                                        live.DeadPeers.Add(kv.Key);
+                                }
+                        }
+                        return live;
+                }
                 JsonObject? entries = ReadDiscoveryEntries(profileDir);
                 if (entries?[name] is not JsonObject entry || entry["facts"] is not JsonObject facts)
                 {

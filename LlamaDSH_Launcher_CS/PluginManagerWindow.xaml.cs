@@ -288,4 +288,81 @@ public partial class PluginManagerWindow : Window
 			OpenDir(p.Dir);
 		}
 	}
+
+	/// <summary>
+	/// 安装本地插件：可选“插件目录”（自动 pnpm pack 成稳定 tgz）或“已打包 .tgz”。
+	/// 安装逻辑在 DshCompatService.InstallLocalPlugin，路径全部动态解析，换电脑无需改配置。
+	/// </summary>
+	private async void InstallLocal_Click(object sender, RoutedEventArgs e)
+	{
+		if (_busy || !RequireDshStopped())
+		{
+			return;
+		}
+		MessageBoxResult kind = MessageBox.Show(
+			"选择本地插件来源：\n\n" +
+			"是 = 选择插件目录（推荐，自动打包成 .tgz 后安装）\n" +
+			"否 = 选择已打包的 .tgz / .tar.gz\n" +
+			"取消 = 返回",
+			"安装本地插件", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+		if (kind == MessageBoxResult.Cancel)
+		{
+			return;
+		}
+		string? source = null;
+		if (kind == MessageBoxResult.Yes)
+		{
+			using System.Windows.Forms.FolderBrowserDialog dlg = new()
+			{
+				Description = "选择包含 package.json 的插件目录",
+				SelectedPath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+				ShowNewFolderButton = false
+			};
+			if (dlg.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+			{
+				source = dlg.SelectedPath;
+			}
+		}
+		else
+		{
+			Microsoft.Win32.OpenFileDialog dlg = new()
+			{
+				Title = "选择本地插件包",
+				Filter = "插件包 (*.tgz;*.tar.gz)|*.tgz;*.tar.gz|所有文件 (*.*)|*.*",
+				CheckFileExists = true,
+				Multiselect = false
+			};
+			if (dlg.ShowDialog() == true)
+			{
+				source = dlg.FileName;
+			}
+		}
+		if (string.IsNullOrWhiteSpace(source))
+		{
+			return;
+		}
+		_busy = true;
+		Log("[安装] 开始安装本地插件: " + source);
+		try
+		{
+			string msg = await Task.Run(delegate
+			{
+				return DshCompatService.InstallLocalPlugin(_profile, source, delegate (string m) { Log(m); });
+			});
+			Log("[安装] " + msg);
+			_hostLog?.Invoke("[插件管理] " + msg);
+			MessageBox.Show(msg, "安装本地插件", MessageBoxButton.OK,
+				msg.StartsWith("已安装", StringComparison.Ordinal) ? MessageBoxImage.Information : MessageBoxImage.Warning);
+		}
+		catch (Exception ex)
+		{
+			Log("[安装] 失败: " + ex.Message);
+			MessageBox.Show("安装失败: " + ex.Message, "安装本地插件", MessageBoxButton.OK, MessageBoxImage.Warning);
+		}
+		finally
+		{
+			_busy = false;
+		}
+		await RefreshAsync();
+	}
 }
