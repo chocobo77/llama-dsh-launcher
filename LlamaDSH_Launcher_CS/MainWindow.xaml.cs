@@ -170,6 +170,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>"测试加载"触发的试探性启动：拿到实测值就自动停止。</summary>
 	private bool _vramTestMode;
 
+	/// <summary>llama 自己报了 failed to fit params：说明当前参数实际适配不进可用显存。</summary>
+	private bool _vramFitFailed;
+
 	/// <summary>测试按钮发起的启动：跳过显存预估弹窗，避免"测试前先被问一次"。</summary>
 	private bool _skipVramConfirm;
 
@@ -2678,17 +2681,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return false;
 		}
 		(double estBytes, double modelBytes, double kvBytes, double availBytes, string detail) = est.Value;
-		// 静态占用只是加载完那一刻的数。预填充（ubatch 1024）会瞬时拉高计算图与激活值，
-		// 这部分 llama 只在真正推理时才分配、测不到，所以判定必须留出余量，否则结论会过于乐观。
-		double reserve = 2048.0 * 1048576.0;
-		string reserveNote = "\n预留峰值余量: 2.00 GiB（预填充瞬时占用不可测，ubatch 调大时还需更多）";
-		detail += reserveNote;
+		// 不留经验余量：判定只比 llama 自己报的数与设备可用显存，
+		// 是否真的适配不下由 llama 的 failed to fit params 告警判定（见 _vramFitFailed）。
+		double reserve = 0.0;
 
 		// 公式估算出来的数字只是预测：先告诉用户预测值，并给"先测一次"的选项。
 		if (detail.Contains("公式粗算"))
 		{
 			// 在安全范围内也照常弹：用户要能看到预计占用是多少，而不是"够用就不吭声"。
-			string verdict = (availBytes > 0.0 && estBytes + reserve <= availBytes)
+			string verdict = (availBytes > 0.0 && estBytes <= availBytes)
 				? "判断: 在可用范围内（预计 " + (estBytes / 1073741824.0).ToString("F1") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）"
 				: (availBytes > 0.0
 					? "判断: 超出可用范围（预计 " + (estBytes / 1073741824.0).ToString("F1") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）"
@@ -3844,6 +3845,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return;
 		}
 		_vramTestMode = true;
+		_vramFitFailed = false;
 		_skipVramConfirm = true;
 		_vramAccumMiB = 0.0;
 		// 只为这一次测试启动临时打开 --log-verbose：不打开的话 llama.cpp 不打 buffer size，
@@ -4340,6 +4342,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			// llama 自己说"适配不下"时，说明当前参数已超出可用显存，静态占用再好看也没用。
 			if (text.Contains("failed to fit params", StringComparison.OrdinalIgnoreCase))
 			{
+				_vramFitFailed = true;
 				Log("[显存] llama 报告无法把参数适配进可用显存（failed to fit params）：实际上已经超了，建议调小 ubatch 或把更多专家放到 CPU");
 			}
 			if (text.Contains("loading model '", StringComparison.Ordinal))
@@ -4386,7 +4389,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 								System.Windows.MessageBox.Show(
 									"模型: " + Path.GetFileName(ResolveModelPath(throwOnError: false) ?? "") + "\n"
 									+ "上下文: " + ctxNow + " token" + (total0 > 0 ? " (" + (total0 / 1024) + "K)" : "") + "\n"
-									+ "实测显存占用: " + (bd / 1024.0).ToString("F2") + " GiB\n\n"
+									+ "实测显存占用: " + (bd / 1024.0).ToString("F2") + " GiB\n"
+									+ (_vramFitFailed
+										? "\n⚠ llama 报告 failed to fit params：当前参数实际适配不进可用显存，\n"
+										  + "这个静态占用不能当作安全结论，请调小 ubatch 或把更多专家放到 CPU 后重测。\n"
+										: "")
+									+ "\n"
 									+ "已记入当前方案，之后启动按这个值判断。",
 									"测试完成", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
 							}));
