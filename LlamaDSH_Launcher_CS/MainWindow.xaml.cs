@@ -4006,6 +4006,20 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				Log("[实测] 上下文已还原为 " + ctxOrigT + "（探针用 8192 跑）");
 			}
 		}
+		// 兜底：万一没等到 listening（端口不通、日志格式变化），10 分钟后强制收工，
+		// 免得测试模式把 llama 一直挂在那里。
+		_ = Task.Delay(TimeSpan.FromMinutes(10)).ContinueWith(_ =>
+		{
+			if (_vramTestMode)
+			{
+				Dispatcher.BeginInvoke((Action)(() =>
+				{
+					_vramTestMode = false;
+					Log("[实测] 测试超时（10 分钟未完成），强制停止 Llama");
+					StopLlama();
+				}));
+			}
+		});
 	}
 
 	private void StopLlama()
@@ -4534,12 +4548,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					try { File.AppendAllText(_vramTestLogPath, diag + Environment.NewLine); } catch { }
 				}
+				// 测试模式不在这里停：等 llama 打印 listening 后跑一次预填充探针，用峰值作为实测值。
 				if (_vramTestMode)
 				{
-					// 不管解析成没成功，测试模式到了 model loaded 一律停止，避免一直挂着。
-					_vramTestMode = false;
-					Log("--- 测试加载完成（累计 " + total.ToString("F0") + " MiB），正在停止 Llama ---");
-					StopLlama();
+					Log("[实测] 静态占用 " + total.ToString("F0") + " MiB，等待 listening 后跑峰值探针");
 				}
 				if (_vramTestMode || total <= 0.0 || !hasProfile)
 				{
