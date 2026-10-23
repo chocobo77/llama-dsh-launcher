@@ -157,6 +157,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>其中来自 "model buffer size" 的部分；为 0 说明权重走 mmap，没进设备缓冲。</summary>
 	private double _vramModelBufferMiB;
 
+	/// <summary>llama.cpp 自己打印的进程显存占用（memory breakdown 的 self 列），权威值。</summary>
+	private double _vramBreakdownMiB;
+
 	/// <summary>"测试加载"触发的试探性启动：拿到实测值就自动停止。</summary>
 	private bool _vramTestMode;
 
@@ -2393,6 +2396,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				return null;
 			}
+			// 没有实测值就不给数字。公式里的计算图基准、固定开销、MoE 折算比例全是经验值，
+			// 已经证明会把 12GB 显卡上的 9GB 模型判成 18GB，宁可说"未实测"也不报假数。
+			if (_profiles == null || !_profiles.TryGetValue(_currentProfile, out ProfileConfig? preCfg)
+				|| preCfg.VramMeasuredMiB <= 0.0
+				|| !string.Equals(preCfg.VramMeasuredModel, modelPath, StringComparison.OrdinalIgnoreCase))
+			{
+				return null;
+			}
 			double modelBytes = new FileInfo(modelPath).Length;
 			if (modelBytes <= 0.0)
 			{
@@ -2415,7 +2426,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				double availM = Math.Max(0.0, measTotal - measUsed);
 				// 打印出来的 buffer 之和比实际占用来得小（实测 8569 vs 9249 MiB，差的是一部分
 				// 未单独打印的图/流水线分配），补 7% 免得低估。
-				double estBytesM = measuredCfg.VramMeasuredMiB * 1048576.0 * 1.07;
+				double estBytesM = measuredCfg.VramMeasuredMiB * 1048576.0;
 				string detailM = "数据来源: 上次启动时 llama.cpp 实测（精确）\n"
 					+ "实测显存占用: " + (estBytesM / 1073741824.0).ToString("F2") + " GiB\n"
 					+ "可用显存: " + (availM / 1073741824.0).ToString("F2") + " GiB";
@@ -4235,10 +4246,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			if (text.Contains("model loaded", StringComparison.Ordinal))
 			{
-				double total = _vramAccumMiB;
+				double total = _vramBreakdownMiB > 0.0 ? _vramBreakdownMiB : _vramAccumMiB;
 				// 权重走 mmap 时设备侧 model buffer 报 0，这块不进 total，用文件大小按比例补回，
 				// 否则实测值会低一个数量级（实测 MoE+repack 下设备侧约占文件 39%）。
-				if (_vramModelBufferMiB < 1.0)
+				if (_vramBreakdownMiB <= 0.0 && _vramModelBufferMiB < 1.0)
 				{
 					try
 					{
