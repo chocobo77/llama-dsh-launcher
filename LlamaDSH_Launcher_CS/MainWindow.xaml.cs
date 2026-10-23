@@ -154,6 +154,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>本次已加载中，llama.cpp 报告的设备侧显存累计（MiB）。</summary>
 	private double _vramAccumMiB;
 
+	/// <summary>本次会话最近一次实测值的内存兜底：即使方案对象被重建，也能立刻用上。</summary>
+	private double _measuredMemMiB;
+
+	private string _measuredMemModel = "";
+
+	private string _measuredMemFp = "";
+
 	/// <summary>其中来自 "model buffer size" 的部分；为 0 说明权重走 mmap，没进设备缓冲。</summary>
 	private double _vramModelBufferMiB;
 
@@ -2407,11 +2414,24 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			// 有实测值就直接用。公式在 MoE + Vulkan/repack 这类组合上误差能到两倍，
 			// 而 llama.cpp 自己打印的 buffer size 是权威值。
-			if (_profiles != null && _profiles.TryGetValue(_currentProfile, out ProfileConfig? measuredCfg)
+			string fpNow = VramFingerprint();
+			double measuredMiB = 0.0;
+			if (_measuredMemMiB > 0.0
+				&& string.Equals(_measuredMemModel, modelPath, StringComparison.OrdinalIgnoreCase)
+				&& (string.IsNullOrEmpty(_measuredMemFp) || _measuredMemFp == fpNow))
+			{
+				measuredMiB = _measuredMemMiB;
+			}
+			else if (_profiles != null && _profiles.TryGetValue(_currentProfile, out ProfileConfig? measuredCfg)
 				&& measuredCfg.VramMeasuredMiB > 0.0
 				&& string.Equals(measuredCfg.VramMeasuredModel, modelPath, StringComparison.OrdinalIgnoreCase)
-				&& (string.IsNullOrEmpty(measuredCfg.VramMeasuredFp) || measuredCfg.VramMeasuredFp == VramFingerprint()))
+				&& (string.IsNullOrEmpty(measuredCfg.VramMeasuredFp) || measuredCfg.VramMeasuredFp == fpNow))
 			{
+				measuredMiB = measuredCfg.VramMeasuredMiB;
+			}
+			if (measuredMiB > 0.0)
+			{
+				Log("[显存] 采用实测值 " + measuredMiB.ToString("F0") + " MiB（fp=" + fpNow + "）");
 				double measTotal = 0.0;
 				double measUsed = 0.0;
 				Dictionary<string, string> gpuM = _gpuMonitor.QueryGpu();
@@ -2423,7 +2443,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				double availM = Math.Max(0.0, measTotal - measUsed);
 				// 打印出来的 buffer 之和比实际占用来得小（实测 8569 vs 9249 MiB，差的是一部分
 				// 未单独打印的图/流水线分配），补 7% 免得低估。
-				double estBytesM = measuredCfg.VramMeasuredMiB * 1048576.0;
+				double estBytesM = measuredMiB * 1048576.0;
 				string detailM = "数据来源: 上次启动时 llama.cpp 实测（精确）\n"
 					+ "实测显存占用: " + (estBytesM / 1073741824.0).ToString("F2") + " GiB\n"
 					+ "可用显存: " + (availM / 1073741824.0).ToString("F2") + " GiB";
@@ -4343,6 +4363,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 									pc0.VramMeasuredMiB = bd;
 									pc0.VramMeasuredModel = ResolveModelPath(throwOnError: false) ?? "";
 									pc0.VramMeasuredFp = VramFingerprint();
+									_measuredMemMiB = bd;
+									_measuredMemModel = pc0.VramMeasuredModel;
+									_measuredMemFp = pc0.VramMeasuredFp;
 									try { SaveConfigFile(); } catch { }
 								}
 								StopLlama();
@@ -4406,6 +4429,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					cfg.VramMeasuredMiB = total;
 					cfg.VramMeasuredModel = measuredModel;
 					cfg.VramMeasuredFp = VramFingerprint();
+					_measuredMemMiB = total;
+					_measuredMemModel = measuredModel;
+					_measuredMemFp = cfg.VramMeasuredFp;
 					try
 					{
 						SaveConfigFile();
