@@ -2190,6 +2190,16 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		public int HeadDim;
 		public long ContextLen;
 		public string Architecture = "";
+		/// <summary>隐藏层维度，用于估算计算图缓冲大小。</summary>
+		public long Embed;
+		/// <summary>注意力头数，key_length 缺失时用来反推 head_dim。</summary>
+		public int HeadCount;
+		/// <summary>滑动窗口长度，0 表示没有 SWA。</summary>
+		public int SlidingWindow;
+		/// <summary>每隔多少层出现一个全注意力层（混合架构模型才有），0 表示全是全注意力。</summary>
+		public int FullAttentionInterval;
+		/// <summary>内置 MTP 头层数，大于 0 表示模型自带多 token 预测。</summary>
+		public int NextNPredictLayers;
 	}
 
 	private static GgufArchInfo ReadGgufArch(string modelPath)
@@ -2229,6 +2239,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					else if (key.EndsWith(".attention.head_count", StringComparison.Ordinal))
 					{
 						heads = (int)v;
+						r.HeadCount = (int)v;
 					}
 					else if (key.EndsWith(".attention.key_length", StringComparison.Ordinal))
 					{
@@ -2241,10 +2252,23 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					else if (key.EndsWith(".embedding_length", StringComparison.Ordinal))
 					{
 						embed = (int)v;
+						r.Embed = v;
 					}
 					else if (key.EndsWith(".context_length", StringComparison.Ordinal))
 					{
 						r.ContextLen = v;
+					}
+					else if (key.EndsWith(".sliding_window", StringComparison.Ordinal))
+					{
+						r.SlidingWindow = (int)v;
+					}
+					else if (key.EndsWith(".full_attention_interval", StringComparison.Ordinal))
+					{
+						r.FullAttentionInterval = (int)v;
+					}
+					else if (key.EndsWith(".nextn_predict_layers", StringComparison.Ordinal))
+					{
+						r.NextNPredictLayers = (int)v;
 					}
 					break;
 				}
@@ -2413,17 +2437,71 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				modelBytes *= moeFactor;
 			}
-			double kvPerToken;
-			if (gi.Ok)
+			// KV 缓存按层算：全注意力层随 ctx 线性增长，滑动窗口层只保留一个窗口，超出后不再增长。
+			// 混合架构（线性注意力 / SWA）的线性项远小于 block_count × ctx，统一按全层算会高估两三倍。
+			// 少数模型不写 key_length，用 embedding_length / head_count 反推，都没有就按 128 兜底，
+			// 免得 HeadDim 为 0 时算出"KV 不占显存"这种危险结论。
+			int kvHeadDim = gi.HeadDim;
+			if (kvHeadDim <= 0 && gi.Embed > 0 && gi.HeadCount > 0)
 			{
-				kvPerToken = (double)gi.KvHeads * gi.HeadDim * (bytesK + bytesV) * gi.Layers;
+				kvHeadDim = (int)(gi.Embed / gi.HeadCount);
+			}
+			if (kvHeadDim <= 0)
+			{
+				kvHeadDim = 128;
+			}
+			double perTokPerLayer = gi.Ok
+				? (double)gi.KvHeads * kvHeadDim * (bytesK + bytesV)
+				: 64.0 * kvHeadDim * (bytesK + bytesV);
+			int totalLayers = gi.Ok ? gi.Layers : 0;
+			int fullLayers = totalLayers;
+			if (totalLayers > 0 && gi.FullAttentionInterval > 0)
+			{
+				fullLayers = Math.Max(1, (int)Math.Ceiling(totalLayers / (double)gi.FullAttentionInterval));
+			}
+			int swaLayers = Math.Max(0, totalLayers - fullLayers);
+			// 非全注意力层的 KV 形态有两种：滑窗层只保留一个窗口；线性注意力层只留一份固定大小的状态。
+			// 两种都不会随 ctx 线性增长，按全层算会高估三倍以上（本例 64 层里只有 16 层全注意力）。
+			double swaLayerTokens = 0.0;
+			if (swaLayers > 0 && gi.SlidingWindow > 0)
+			{
+				swaLayerTokens = Math.Min(ctx, gi.SlidingWindow);
+			}
+			double kvBytes;
+			if (totalLayers > 0)
+			{
+				kvBytes = gpuFrac * perTokPerLayer * (fullLayers * ctx + swaLayers * swaLayerTokens);
 			}
 			else
 			{
-				kvPerToken = 64.0 * 8.0 * 128.0 * (bytesK + bytesV);
+				kvBytes = gpuFrac * perTokPerLayer * ctx;
 			}
-			double kvBytes = kvPerToken * ctx * gpuFrac;
-			double bufferBytes = 1.5 * 1073741824.0;
+			// 实测比理论值高约 12%（q8_0：理论 34 vs 实测 38.26 KiB/tok，块量化元数据与对齐开销），
+			// 这里加一成余量，宁可略保守也不要让用户按太低的值开长上下文。
+			kvBytes *= 1.1;
+
+			// 计算图缓冲：开 Flash Attention 时主要由 n_ubatch 和隐藏维决定。
+			// 以 30B 模型、ubatch 512 实测约 85 MiB 为基准，按这两个量线性缩放。
+			double ubatch = 512.0;
+			if (RoleText("ubatch_size", out string ubStr) && double.TryParse(ubStr, out double ubVal) && ubVal > 0.0)
+			{
+				ubatch = ubVal;
+			}
+			double embedDim = gi.Embed > 0 ? gi.Embed : 5120.0;
+			double computeBytes = 85.0 * 1024 * 1024 * (ubatch / 512.0) * Math.Max(0.5, embedDim / 5120.0);
+
+			// 固定开销：CUDA context（120~550 MiB）+ host 缓冲 + 驱动与碎片余量，实测合计 1~2 GiB。
+			// 线性注意力层另有一份与 ctx 无关的递归状态（实测约 48 MiB）。
+			double fixedBytes = (300.0 + 64.0 + 640.0) * 1024 * 1024;
+			if (swaLayers > 0 && gi.SlidingWindow <= 0)
+			{
+				fixedBytes += 48.0 * 1024 * 1024;
+			}
+
+			// 内置 MTP 头额外占一份权重，实测约 668 MiB。
+			double mtpBytes = gi.NextNPredictLayers > 0 ? 668.0 * 1024 * 1024 : 0.0;
+
+			double bufferBytes = computeBytes + fixedBytes + mtpBytes;
 			double estVram = modelBytes * gpuFrac + kvBytes + bufferBytes;
 			double total = 0.0;
 			double used = 0.0;
@@ -2439,8 +2517,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			long safeCtx = 0;
 			// 部分卸载时 GPU 上只承载 kvPerToken*gpuFrac 的 KV，分母必须同步缩放，
 			// 否则 safeCtx 会被低估 ~1/gpuFrac 倍；gpuFrac=0 时显存不是瓶颈，跳过该提示
-			double gpuKvPerToken = kvPerToken * gpuFrac;
-			if (gpuFrac > 0.0 && gpuKvPerToken > 0.0 && avail > 0.0)
+			double gpuKvPerToken = perTokPerLayer * fullLayers * gpuFrac;
+			// 有滑窗层时 KV 不随 ctx 线性增长，反推安全上下文没有意义，跳过这条建议。
+			if (swaLayers == 0 && gpuFrac > 0.0 && gpuKvPerToken > 0.0 && avail > 0.0)
 			{
 				safeCtx = (long)((avail - modelBytes * gpuFrac - bufferBytes) / gpuKvPerToken);
 				if (safeCtx < 0)
@@ -2451,7 +2530,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			string detail = "模型文件: " + (modelFileBytes / 1073741824.0).ToString("F1") + " GiB\n"
 				+ "上下文: " + ctx + " token (" + (ctx / 1024L) + "K)\n"
-				+ "KV 缓存(按当前缓存类型估算): " + (kvBytes / 1073741824.0).ToString("F2") + " GiB\n"
+				+ "KV 缓存: " + (kvBytes / 1073741824.0).ToString("F2") + " GiB"
+				+ (swaLayers > 0 ? "（" + fullLayers + " 层全注意力 + " + swaLayers + " 层滑窗）" : "") + "\n"
+				+ "计算图 " + (computeBytes / 1048576.0).ToString("F0") + " MiB + 固定开销 " + ((fixedBytes + mtpBytes) / 1048576.0).ToString("F0") + " MiB\n"
 				+ "预计总占用: " + (estVram / 1073741824.0).ToString("F1") + " GiB\n"
 				+ "可用显存: " + (avail / 1073741824.0).ToString("F1") + " GiB";
 			if (moeFactor < 1.0)

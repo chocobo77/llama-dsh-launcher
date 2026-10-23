@@ -36,3 +36,6 @@ LlamaDSH_Launcher_CS/installer_staging_linux/
 
 # 本地修复记录，不公开
 /docs/
+
+# 个人整理的参考资料，不入库
+/显存占用计算指南.md
