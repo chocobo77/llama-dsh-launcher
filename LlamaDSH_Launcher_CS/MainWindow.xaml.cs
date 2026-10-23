@@ -163,6 +163,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>"测试加载"触发的试探性启动：拿到实测值就自动停止。</summary>
 	private bool _vramTestMode;
 
+	/// <summary>测试按钮发起的启动：跳过显存预估弹窗，避免"测试前先被问一次"。</summary>
+	private bool _skipVramConfirm;
+
 	/// <summary>测试启动时临时打开了 --log-verbose，停止后需要还原。</summary>
 	private bool _vramTestVerboseRestore;
 
@@ -2624,6 +2627,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private bool ConfirmVramFit()
 	{
+		// 测试按钮本身就是为了拿数，没必要先弹一个预估窗再问"要不要测"。
+		if (_skipVramConfirm)
+		{
+			_skipVramConfirm = false;
+			return true;
+		}
 		(double, double, double, double, string)? est = EstimateVramNeeded();
 		if (!est.HasValue)
 		{
@@ -3799,6 +3808,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return;
 		}
 		_vramTestMode = true;
+		_skipVramConfirm = true;
 		_vramAccumMiB = 0.0;
 		// 只为这一次测试启动临时打开 --log-verbose：不打开的话 llama.cpp 不打 buffer size，
 		// 打开后日志很详尽、影响生成性能，所以测完立刻还原，绝不污染正常启动。
