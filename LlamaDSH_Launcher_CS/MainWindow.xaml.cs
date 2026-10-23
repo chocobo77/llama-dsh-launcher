@@ -3972,21 +3972,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		_vramFitFailed = false;
 		_skipVramConfirm = true;
 		_vramAccumMiB = 0.0;
-		// 探针只压"可精确量化"的 ctx：8K 下预填充只要一两秒，峰值再按 KV 每 token 字节数回推。
+		// 按真实 ctx 跑：压到 8K 时 KV 只有真实配置的一小部分，峰值永远够不到显存上限，
+		// 那样测出来的"通过"没有意义。宁可慢，也要让峰值真实发生。
 		_vramProbeCtx = 0;
 		_vramRealCtx = 0;
-		string ctxFlagT = RoleDef("ctx_size")?.Flag ?? "";
+		string ctxFlagT = "";
 		string ctxOrigT = "";
-		if (ctxFlagT.Length > 0
-			&& _pw.TryGetValue(ctxFlagT, out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) pairCtx)
-			&& pairCtx.Item2 is System.Windows.Controls.TextBox tbCtxT
-			&& int.TryParse(NormTok(tbCtxT.Text), out int realCtxT) && realCtxT > 8192)
-		{
-			ctxOrigT = tbCtxT.Text;
-			_vramRealCtx = realCtxT;
-			_vramProbeCtx = 8192;
-			tbCtxT.Text = "8192";
-		}
 		// 严格版测试：把全部层推到 GPU（-ngl 99）、关掉 --fit，
 		// 让 llama 不去"自动缩容遮掩问题"，峰值能不能装下就一目了然。测完原样还原。
 		List<(System.Windows.Controls.Control Ctl, string Orig)> testOverrides = new List<(System.Windows.Controls.Control, string)>();
