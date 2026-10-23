@@ -2409,7 +2409,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			// 而 llama.cpp 自己打印的 buffer size 是权威值。
 			if (_profiles != null && _profiles.TryGetValue(_currentProfile, out ProfileConfig? measuredCfg)
 				&& measuredCfg.VramMeasuredMiB > 0.0
-				&& string.Equals(measuredCfg.VramMeasuredModel, modelPath, StringComparison.OrdinalIgnoreCase))
+				&& string.Equals(measuredCfg.VramMeasuredModel, modelPath, StringComparison.OrdinalIgnoreCase)
+				&& (string.IsNullOrEmpty(measuredCfg.VramMeasuredFp) || measuredCfg.VramMeasuredFp == VramFingerprint()))
 			{
 				double measTotal = 0.0;
 				double measUsed = 0.0;
@@ -2597,7 +2598,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			string detail = "数据来源: 按公式粗算（这个模型还没成功跑过，跑一次之后会改用实测值）\n"
 				+ "模型文件: " + (modelFileBytes / 1073741824.0).ToString("F1") + " GiB\n"
 				+ "上下文: " + ctx + " token (" + (ctx / 1024L) + "K)\n"
-				+ "KV 缓存: " + (kvBytes / 1073741824.0).ToString("F2") + " GiB"
+				+ "KV 缓存: " + (kvBytes / 1073741824.0).ToString("F2") + " GiB（K=" + ck + " V=" + cv + "）"
 				+ (swaLayers > 0 ? "（" + fullLayers + " 层全注意力 + " + swaLayers + " 层滑窗）" : "") + "\n"
 				+ "计算图 " + (computeBytes / 1048576.0).ToString("F0") + " MiB + 固定开销 " + ((fixedBytes + mtpBytes) / 1048576.0).ToString("F0") + " MiB\n"
 				+ "预计总占用: " + (estVram / 1073741824.0).ToString("F1") + " GiB\n"
@@ -2623,6 +2624,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			return null;
 		}
+	}
+
+	/// <summary>实测值的适用条件：K/V 缓存精度 + 上下文长度。这两项一变，KV 占用就变了，旧实测值作废。</summary>
+	private string VramFingerprint()
+	{
+		string ck = RoleText("cache_type_k", out string v1) ? v1 : "";
+		string cv = RoleText("cache_type_v", out string v2) ? v2 : "";
+		string ctxNow = RoleText("ctx_size", out string v3) ? NormTok(v3) : "";
+		return ck + "/" + cv + "@" + ctxNow;
 	}
 
 	private bool ConfirmVramFit()
@@ -4332,6 +4342,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 								{
 									pc0.VramMeasuredMiB = bd;
 									pc0.VramMeasuredModel = ResolveModelPath(throwOnError: false) ?? "";
+									pc0.VramMeasuredFp = VramFingerprint();
 									try { SaveConfigFile(); } catch { }
 								}
 								StopLlama();
@@ -4394,6 +4405,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					cfg.VramMeasuredMiB = total;
 					cfg.VramMeasuredModel = measuredModel;
+					cfg.VramMeasuredFp = VramFingerprint();
 					try
 					{
 						SaveConfigFile();

@@ -46,6 +46,9 @@ public class ProfileConfig
 	/// <summary>上面那个实测值对应的模型路径。</summary>
 	public string VramMeasuredModel { get; set; } = "";
 
+	/// <summary>实测时的 K/V 缓存精度与上下文长度，例如 "q8_0/q8_0@65536"；变了实测值就作废。</summary>
+	public string VramMeasuredFp { get; set; } = "";
+
 	public bool VramBreakerEnabled { get; set; }
 
 	public int VramBreakerType { get; set; }
