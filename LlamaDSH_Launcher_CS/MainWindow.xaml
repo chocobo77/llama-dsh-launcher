@@ -290,7 +290,6 @@
             </Grid.ColumnDefinitions>
             <StackPanel Grid.Column="0">
               <Button Name="BtnLlamaStart" Content="▶ 启动 Llama" Background="#238636" Foreground="#FFFFFFFF" Margin="0,0,0,4" FontSize="13" Click="StartLlama_Click" />
-              <Button Name="BtnLlamaTest" Content="🧪 测试加载" Margin="0,0,0,4" ToolTip="加载当前配置的模型，读到真实显存占用后自动停止，把预估从粗算变成实测" Click="TestLlamaLoad_Click" />
               <Button Name="BtnLlamaStop" Content="⏹ 停止 Llama" Background="#da3633" Foreground="#FFFFFFFF" IsEnabled="False" Margin="0,0,0,4" FontSize="13" Click="StopLlama_Click" />
               <TextBlock Name="LblLlamaStatus" Text="● 已停止" Foreground="#8b949e" HorizontalAlignment="Center" FontSize="12" />
             </StackPanel>

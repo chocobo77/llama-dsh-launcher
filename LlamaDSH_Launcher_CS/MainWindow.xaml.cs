@@ -2415,239 +2415,83 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				return null;
 			}
-			// 没有实测值时走公式预测：数字只作参考，弹窗里会标明"预测值"并建议先测一次。
-			double modelBytes = new FileInfo(modelPath).Length;
-			if (modelBytes <= 0.0)
+			double fileBytes = new FileInfo(modelPath).Length;
+			if (fileBytes <= 0.0)
 			{
 				return null;
 			}
-			// 有实测值就直接用。公式在 MoE + Vulkan/repack 这类组合上误差能到两倍，
-			// 而 llama.cpp 自己打印的 buffer size 是权威值。
-			string fpNow = VramFingerprint();
-			double measuredMiB = 0.0;
-			if (_measuredMemMiB > 0.0
-				&& string.Equals(_measuredMemModel, modelPath, StringComparison.OrdinalIgnoreCase)
-				&& (string.IsNullOrEmpty(_measuredMemFp) || _measuredMemFp == fpNow))
-			{
-				measuredMiB = _measuredMemMiB;
-			}
-			else if (_profiles != null && _profiles.TryGetValue(_currentProfile, out ProfileConfig? measuredCfg)
-				&& measuredCfg.VramMeasuredMiB > 0.0
-				&& string.Equals(measuredCfg.VramMeasuredModel, modelPath, StringComparison.OrdinalIgnoreCase)
-				&& (string.IsNullOrEmpty(measuredCfg.VramMeasuredFp) || measuredCfg.VramMeasuredFp == fpNow))
-			{
-				measuredMiB = measuredCfg.VramMeasuredMiB;
-			}
-			if (measuredMiB > 0.0)
-			{
-				Log("[显存] 采用实测值 " + measuredMiB.ToString("F0") + " MiB（fp=" + fpNow + "）");
-				double measTotal = 0.0;
-				double measUsed = 0.0;
-				Dictionary<string, string> gpuM = _gpuMonitor.QueryGpu();
-				if (gpuM.TryGetValue("vram_total", out string tsM) && double.TryParse(tsM, NumberStyles.Float, CultureInfo.InvariantCulture, out measTotal) && measTotal > 0.0
-					&& gpuM.TryGetValue("vram_used", out string usM))
-				{
-					double.TryParse(usM, NumberStyles.Float, CultureInfo.InvariantCulture, out measUsed);
-				}
-				double availM = Math.Max(0.0, measTotal - measUsed);
-				// 打印出来的 buffer 之和比实际占用来得小（实测 8569 vs 9249 MiB，差的是一部分
-				// 未单独打印的图/流水线分配），补 7% 免得低估。
-				double estBytesM = measuredMiB * 1048576.0;
-				string detailM = "数据来源: 上次启动时 llama.cpp 实测（精确）\n"
-					+ "实测显存占用: " + (estBytesM / 1073741824.0).ToString("F2") + " GiB\n"
-					+ "可用显存: " + (availM / 1073741824.0).ToString("F2") + " GiB";
-				return (estBytesM, estBytesM, 0.0, availM, detailM);
-			}
-			Match shm2 = Regex.Match(Path.GetFileName(modelPath), "-(\\d{5})-of-(\\d{5})\\.gguf$", RegexOptions.IgnoreCase);
-			if (shm2.Success)
-			{
-				string sdir = Path.GetDirectoryName(modelPath) ?? "";
-				string sbase = Path.GetFileName(modelPath);
-				int dashIdx = sbase.LastIndexOf("-" + shm2.Groups[1].Value, StringComparison.OrdinalIgnoreCase);
-				if (dashIdx > 0)
-				{
-					sbase = sbase.Substring(0, dashIdx);
-					string[] shards = Directory.GetFiles(sdir, sbase + "-*-of-*.gguf");
-					foreach (string sh in shards)
-					{
-						if (!string.Equals(sh, modelPath, StringComparison.OrdinalIgnoreCase))
-						{
-							modelBytes += new FileInfo(sh).Length;
-						}
-					}
-				}
-			}
-			string mmpp = InputMmprojPath.Text.Trim().Trim('"');
-			bool mmCpu = (ChkNoMmprojOffload.IsChecked == true);
 			double mmprojBytes = 0.0;
-			if (!mmCpu && !string.IsNullOrEmpty(mmpp) && File.Exists(mmpp))
+			string mmpp = InputMmprojPath.Text.Trim().Trim('"');
+			if (ChkNoMmprojOffload.IsChecked != true && !string.IsNullOrEmpty(mmpp) && File.Exists(mmpp))
 			{
 				mmprojBytes = new FileInfo(mmpp).Length;
-				modelBytes += mmprojBytes;
 			}
-			long ctx = 0;
+			GgufArchInfo gi = ReadGgufArch(modelPath);
+			int layers = gi.Layers;
+			int headDim = gi.HeadDim > 0 ? gi.HeadDim : (gi.Embed > 0 && gi.HeadCount > 0 ? (int)(gi.Embed / gi.HeadCount) : 128);
+			int fullLayers = layers;
+			if (layers > 0 && gi.FullAttentionInterval > 0)
+			{
+				fullLayers = Math.Max(1, (int)Math.Ceiling(layers / (double)gi.FullAttentionInterval));
+			}
+			// 权重：MoE 的 --n-cpu-moe 线性削减专家权重；ngl 决定上 GPU 的层比例
+			double weights = fileBytes;
+			double ncmV = 0.0;
+			bool hasNcm = RoleText("n_cpu_moe", out string ncmStr) && double.TryParse(ncmStr, out ncmV) && ncmV > 0.0;
+			if (gi.Experts > 0 && hasNcm)
+			{
+				weights *= Math.Clamp(1.0 - ncmV / gi.Experts, 0.02, 1.0);
+			}
+			else if (RoleBool("cpu_moe"))
+			{
+				weights *= 0.12;
+			}
+			double gpuFrac = 1.0;
+			if (RoleText("ngl", out string nglStr) && double.TryParse(nglStr, out double nglV) && nglV >= 0.0 && layers > 0)
+			{
+				gpuFrac = Math.Clamp(nglV / layers, 0.0, 1.0);
+			}
+			double gpuWeights = weights * gpuFrac;
+			// KV：只有全注意力层随上下文线性增长
+			string ck = RoleText("cache_type_k", out string ckv) && !string.IsNullOrEmpty(ckv) ? ckv : "f16";
+			string cv = RoleText("cache_type_v", out string cvv) && !string.IsNullOrEmpty(cvv) ? cvv : "f16";
+			long ctx = 0L;
 			if (RoleText("ctx_size", out string ctxStr))
 			{
-				ctxStr = NormTok(ctxStr);
-				if (!long.TryParse(ctxStr, out ctx))
-				{
-					ctx = 0;
-				}
+				long.TryParse(NormTok(ctxStr), out ctx);
 			}
-			string ck = (RoleText("cache_type_k", out string ckv) && !string.IsNullOrEmpty(ckv)) ? ckv : "f16";
-			string cv = (RoleText("cache_type_v", out string cvv) && !string.IsNullOrEmpty(cvv)) ? cvv : "f16";
-			double bytesK = CacheBytesPerElem(ck);
-			double bytesV = CacheBytesPerElem(cv);
-			GgufArchInfo gi = ReadGgufArch(modelPath);
-			double gpuFrac = 1.0;
-			if (RoleText("ngl", out string ngl) && double.TryParse(ngl, out double nglV) && nglV >= 0.0 && gi.Ok && gi.Layers > 0)
-			{
-				gpuFrac = Math.Clamp(nglV / gi.Layers, 0.0, 1.0);
-			}
-			// MoE 专家在 CPU 时按经验系数折算显存中的模型占用(注意力+共享权重约占 12%)
-			// MoE：显存里只留稠密部分 + 没下放到 CPU 的专家。
-			// 优先按 --n-cpu-moe N 算比例（需要 GGUF 的 expert_count）；只有 --cpu-moe 时按专家全在 CPU 处理。
-			// 旧实现用 0.12 + 0.88×(N/层数) 的公式，量纲是错的——N 是每层专家数，不是层数。
-			bool cpuMoeOn = RoleBool("cpu_moe");
-			double moeFactor = 1.0;
-			double ncmV = 0.0;
-			bool hasNcm = RoleText("n_cpu_moe", out string ncm) && double.TryParse(ncm, out ncmV) && ncmV > 0.0;
-			if (hasNcm && gi.Ok && gi.Experts > 0)
-			{
-				moeFactor = Math.Clamp(1.0 - ncmV / gi.Experts, 0.02, 1.0);
-			}
-			else if (cpuMoeOn || hasNcm)
-			{
-				moeFactor = 0.12;
-			}
-			double modelFileBytes = modelBytes;
-			// 视觉编码器不参与 MoE 折算，也不随 ngl 缩放：开了 --mmproj-offload 就整块在显存里。
-			double denseWeights = Math.Max(0.0, modelBytes - mmprojBytes);
-			if (moeFactor < 1.0)
-			{
-				denseWeights *= moeFactor;
-			}
-			double estWeights = denseWeights * gpuFrac + mmprojBytes;
-			// KV 缓存按层算：全注意力层随 ctx 线性增长，滑动窗口层只保留一个窗口，超出后不再增长。
-			// 混合架构（线性注意力 / SWA）的线性项远小于 block_count × ctx，统一按全层算会高估两三倍。
-			// 少数模型不写 key_length，用 embedding_length / head_count 反推，都没有就按 128 兜底，
-			// 免得 HeadDim 为 0 时算出"KV 不占显存"这种危险结论。
-			int kvHeadDim = gi.HeadDim;
-			if (kvHeadDim <= 0 && gi.Embed > 0 && gi.HeadCount > 0)
-			{
-				kvHeadDim = (int)(gi.Embed / gi.HeadCount);
-			}
-			if (kvHeadDim <= 0)
-			{
-				kvHeadDim = 128;
-			}
-			double perTokPerLayer = gi.Ok
-				? (double)gi.KvHeads * kvHeadDim * (bytesK + bytesV)
-				: 64.0 * kvHeadDim * (bytesK + bytesV);
-			int totalLayers = gi.Ok ? gi.Layers : 0;
-			int fullLayers = totalLayers;
-			if (totalLayers > 0 && gi.FullAttentionInterval > 0)
-			{
-				fullLayers = Math.Max(1, (int)Math.Ceiling(totalLayers / (double)gi.FullAttentionInterval));
-			}
-			int swaLayers = Math.Max(0, totalLayers - fullLayers);
-			// 非全注意力层的 KV 形态有两种：滑窗层只保留一个窗口；线性注意力层只留一份固定大小的状态。
-			// 两种都不会随 ctx 线性增长，按全层算会高估三倍以上（本例 64 层里只有 16 层全注意力）。
-			double swaLayerTokens = 0.0;
-			if (swaLayers > 0 && gi.SlidingWindow > 0)
-			{
-				swaLayerTokens = Math.Min(ctx, gi.SlidingWindow);
-			}
-			double kvBytes;
-			if (totalLayers > 0)
-			{
-				kvBytes = gpuFrac * perTokPerLayer * (fullLayers * ctx + swaLayers * swaLayerTokens);
-			}
-			else
-			{
-				kvBytes = gpuFrac * perTokPerLayer * ctx;
-			}
-			// 实测比理论值高约 12%（q8_0：理论 34 vs 实测 38.26 KiB/tok，块量化元数据与对齐开销），
-			// 这里加一成余量，宁可略保守也不要让用户按太低的值开长上下文。
-			kvBytes *= 1.1;
-
-			// 计算图缓冲：开 Flash Attention 时主要由 n_ubatch 和隐藏维决定。
-			// 实测基准：稠密 30B / ubatch 512 约 85 MiB；MoE（35B-A3B，ubatch 1024，Vulkan）实测 628 MiB，
-			// 专家路由会明显抬高这一项，所以分两档取基准，再按 ubatch 与隐藏维线性缩放。
+			double kvPerTok = fullLayers * gi.KvHeads * headDim * (CacheBytesPerElem(ck) + CacheBytesPerElem(cv));
+			double kvBytes = kvPerTok * ctx * gpuFrac;
+			// 计算图：n_ubatch × n_embd × 280B，再乘 1.15 安全边际
 			double ubatch = 512.0;
 			if (RoleText("ubatch_size", out string ubStr) && double.TryParse(ubStr, out double ubVal) && ubVal > 0.0)
 			{
 				ubatch = ubVal;
 			}
-			double embedDim = gi.Embed > 0 ? gi.Embed : 5120.0;
-			// 220 → 300：按 35B-A3B / ubatch 1024 实测 628 MiB 反推，300×2×(5120/5120)=600 最贴近。
-			// 样本只有一个，稠密模型仍用 85，别把这条经验值套到非 MoE 上。
-			double computeBaseMiB = (gi.Experts > 0) ? 300.0 : 85.0;
-			double computeBytes = computeBaseMiB * 1024 * 1024 * (ubatch / 512.0) * Math.Max(0.5, embedDim / 5120.0);
-
-			// 固定开销：后端 context（CUDA 120~550 MiB / Vulkan 类似量级）+ host 缓冲 + 驱动与碎片余量。
-			// host 缓冲实测 177 MiB（Vulkan_Host），旧值 64 MiB 是按 CUDA 拍的。
-			// 线性注意力层另有一份与 ctx 无关的递归状态（实测约 48 MiB）。
-			double fixedBytes = (300.0 + 176.0 + 640.0) * 1024 * 1024;
-			if (swaLayers > 0 && gi.SlidingWindow <= 0)
-			{
-				fixedBytes += 48.0 * 1024 * 1024;
-			}
-
-			// 内置 MTP 头额外占一份权重，实测约 668 MiB。
-			double mtpBytes = gi.NextNPredictLayers > 0 ? 668.0 * 1024 * 1024 : 0.0;
-
-			double bufferBytes = computeBytes + fixedBytes + mtpBytes;
-			double estVram = estWeights + kvBytes + bufferBytes;
-			double total = 0.0;
-			double used = 0.0;
+			double embed = gi.Embed > 0 ? gi.Embed : 4096.0;
+			double computeBytes = ubatch * embed * 280.0 * 1.15;
+			// 固定开销：CUDA context + host + 框架基线 1 GiB + 7.6% 权重
+			double runtimeBytes = (550.0 + 90.0) * 1048576.0 + 1073741824.0 + gpuWeights * 0.076;
+			double total = gpuWeights + kvBytes + computeBytes + runtimeBytes + mmprojBytes;
+			double totalVram = 0.0;
+			double usedVram = 0.0;
 			Dictionary<string, string> g = _gpuMonitor.QueryGpu();
-			if (g.TryGetValue("vram_total", out string ts) && double.TryParse(ts, NumberStyles.Float, CultureInfo.InvariantCulture, out total) && total > 0.0)
+			if (g.TryGetValue("vram_total", out string ts) && double.TryParse(ts, NumberStyles.Float, CultureInfo.InvariantCulture, out totalVram) && totalVram > 0.0
+				&& g.TryGetValue("vram_used", out string us))
 			{
-				if (g.TryGetValue("vram_used", out string us))
-				{
-					double.TryParse(us, NumberStyles.Float, CultureInfo.InvariantCulture, out used);
-				}
+				double.TryParse(us, NumberStyles.Float, CultureInfo.InvariantCulture, out usedVram);
 			}
-			double avail = Math.Max(0.0, total - used);
-			long safeCtx = 0;
-			// 部分卸载时 GPU 上只承载 kvPerToken*gpuFrac 的 KV，分母必须同步缩放，
-			// 否则 safeCtx 会被低估 ~1/gpuFrac 倍；gpuFrac=0 时显存不是瓶颈，跳过该提示
-			double gpuKvPerToken = perTokPerLayer * fullLayers * gpuFrac;
-			// 有滑窗层时 KV 不随 ctx 线性增长，反推安全上下文没有意义，跳过这条建议。
-			if (swaLayers == 0 && gpuFrac > 0.0 && gpuKvPerToken > 0.0 && avail > 0.0)
-			{
-				safeCtx = (long)((avail - estWeights - bufferBytes) / gpuKvPerToken);
-				if (safeCtx < 0)
-				{
-					safeCtx = 0;
-				}
-				safeCtx = (safeCtx / 1024L) * 1024L;
-			}
-			string detail = "数据来源: 按公式粗算（这个模型还没成功跑过，跑一次之后会改用实测值）\n"
-				+ "模型文件: " + (modelFileBytes / 1073741824.0).ToString("F1") + " GiB\n"
-				+ "上下文: " + ctx + " token (" + (ctx / 1024L) + "K)\n"
-				+ "KV 缓存: " + (kvBytes / 1073741824.0).ToString("F2") + " GiB（K=" + ck + " V=" + cv + "）"
-				+ (swaLayers > 0 ? "（" + fullLayers + " 层全注意力 + " + swaLayers + " 层滑窗）" : "") + "\n"
-				+ "计算图 " + (computeBytes / 1048576.0).ToString("F0") + " MiB + 固定开销 " + ((fixedBytes + mtpBytes) / 1048576.0).ToString("F0") + " MiB\n"
-				+ "预计总占用: " + (estVram / 1073741824.0).ToString("F1") + " GiB\n"
-				+ "可用显存: " + (avail / 1073741824.0).ToString("F1") + " GiB";
-			if (moeFactor < 1.0)
-			{
-				detail += "\nMoE 专家在 CPU: 显存按系数 " + moeFactor.ToString("F2") + " 折算";
-			}
-			if (safeCtx > 0)
-			{
-				detail += "\n建议: 当前显存下安全上下文约 " + safeCtx + " token (" + (safeCtx / 1024L) + "K)";
-			}
-			// 极限占用：把当前命令行下的上下文长度用满，且所有层都按全注意力算 KV（最坏情况）。
-			// 滑窗/线性注意力实际会更省，所以这是上限，不是预计值。
-			double kvPeak = perTokPerLayer * Math.Max(1, totalLayers) * ctx;
-			double peakVram = estWeights + kvPeak + bufferBytes;
-			detail += "\n极限占用(满上下文 " + (ctx / 1024L) + "K + 全部 " + Math.Max(1, totalLayers) + " 层按全注意力): "
-				+ (peakVram / 1073741824.0).ToString("F2") + " GiB"
-				+ "\n其中 KV 上限 " + (kvPeak / 1073741824.0).ToString("F2") + " GiB";
-			return (estVram, modelBytes, kvBytes, avail, detail);
+			double avail = Math.Max(0.0, totalVram - usedVram);
+			string detail = "显存预算（公式）\n"
+				+ "权重(GPU): " + (gpuWeights / 1073741824.0).ToString("F2") + " GiB"
+				+ (gi.Experts > 0 && hasNcm ? "（MoE 保留 " + ncmV.ToString("F0") + "/" + gi.Experts + " 专家在 CPU）" : "") + "\n"
+				+ "KV(" + ck + "/" + cv + ", " + fullLayers + " 层全注意力): " + (kvBytes / 1073741824.0).ToString("F2") + " GiB\n"
+				+ "计算图(ubatch " + ubatch.ToString("F0") + "): " + (computeBytes / 1048576.0).ToString("F0") + " MiB\n"
+				+ "固定开销: " + (runtimeBytes / 1048576.0).ToString("F0") + " MiB\n"
+				+ (mmprojBytes > 0 ? "视觉编码器: " + (mmprojBytes / 1048576.0).ToString("F0") + " MiB\n" : "")
+				+ "预计总占用: " + (total / 1073741824.0).ToString("F2") + " GiB\n"
+				+ "可用显存: " + (avail / 1073741824.0).ToString("F2") + " GiB";
+			return (total, fileBytes, kvBytes, avail, detail);
 		}
 		catch
 		{
@@ -2656,124 +2500,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	}
 
 	/// <summary>实测值的适用条件：K/V 缓存精度 + 上下文长度。这两项一变，KV 占用就变了，旧实测值作废。</summary>
-	/// <summary>测试用：对服务发一段约 1200 token 的提示，跑满一个 ubatch，采样真实峰值显存。</summary>
-	private async Task ProbePeakAsync()
-	{
-		double baseMiB = _vramBreakdownMiB > 0.0 ? _vramBreakdownMiB : _vramAccumMiB;
-		long peak = (long)baseMiB;
-		string port = RoleText("port", out string pv) && !string.IsNullOrWhiteSpace(pv) ? pv.Trim() : "1234";
-		// 峰值与 ubatch 直接相关：提示长度必须至少覆盖一个完整 ubatch，
-		// 否则根本跑不到峰值。取 2×ubatch，并受上下文长度限制。
-		int ub = 512;
-		if (RoleText("ubatch_size", out string ubs) && int.TryParse(NormTok(ubs), out int ubi) && ubi > 0) { ub = ubi; }
-		int ctxLimit = 8192;
-		if (RoleText("ctx_size", out string csx) && int.TryParse(NormTok(csx), out int cxi) && cxi > 0) { ctxLimit = cxi; }
-		int wantTokens = Math.Min(Math.Max(ub * 2, 1024), ctxLimit);
-		StringBuilder sb = new StringBuilder();
-		for (int i = 0; i < wantTokens; i++) sb.Append("test ");
-		Log("[实测] 探针长度 " + wantTokens + " token（ubatch=" + ub + "，ctx=" + ctxLimit + "）");
-		string body = "{\"prompt\":\"" + sb + "\",\"n_predict\":1,\"temperature\":0,\"cache_prompt\":false}";
-		Log("[实测] 开始预填充探针，采样峰值显存…");
-		using HttpClient http = new HttpClient { Timeout = TimeSpan.FromMinutes(8) };
-		using CancellationTokenSource cts = new CancellationTokenSource();
-		Task sampler = Task.Run(async () =>
-		{
-			while (!cts.IsCancellationRequested)
-			{
-				try
-				{
-					Dictionary<string, string> g = _gpuMonitor.QueryGpu();
-					if (g.TryGetValue("vram_used", out string us) && long.TryParse(us, out long used))
-					{
-						long mib = used / 1048576L;
-						if (mib > peak) { peak = mib; }
-					}
-				}
-				catch
-				{
-				}
-				await Task.Delay(200).ConfigureAwait(false);
-			}
-		});
-		try
-		{
-			await http.PostAsync("http://127.0.0.1:" + port + "/completion", new StringContent(body, Encoding.UTF8, "application/json")).ConfigureAwait(false);
-		}
-		catch (Exception ex)
-		{
-			Log("[实测] 探针请求失败: " + ex.Message);
-		}
-		cts.Cancel();
-		try { await sampler.ConfigureAwait(false); } catch { }
-		// 按 KV 每 token 字节数把 8K 探针的峰值精确回推到真实上下文：只有 KV 项是算出来的，
-		// 权重/计算图/驱动开销全部沿用实测，不用任何经验系数。
-		if (_vramProbeCtx > 0 && _vramRealCtx > _vramProbeCtx)
-		{
-			try
-			{
-				GgufArchInfo giP = ReadGgufArch(ResolveModelPath(throwOnError: false) ?? "");
-				int hdP = giP.HeadDim > 0 ? giP.HeadDim : 128;
-				int fullP = giP.Layers > 0
-					? (giP.FullAttentionInterval > 0 ? (int)Math.Ceiling(giP.Layers / (double)giP.FullAttentionInterval) : giP.Layers)
-					: 0;
-				string ckP = RoleText("cache_type_k", out string a1) ? a1 : "f16";
-				string cvP = RoleText("cache_type_v", out string a2) ? a2 : "f16";
-				double kvTok = giP.KvHeads * hdP * (CacheBytesPerElem(ckP) + CacheBytesPerElem(cvP)) * Math.Max(1, fullP);
-				double addMiB = kvTok * (_vramRealCtx - _vramProbeCtx) / 1048576.0;
-				if (kvTok > 0 && addMiB > 0)
-				{
-					Log("[实测] 探针峰值 " + peak.ToString("F0") + " MiB + KV 回推 " + addMiB.ToString("F0")
-						+ " MiB（" + (kvTok / 1024.0).ToString("F2") + " KiB/token × " + (_vramRealCtx - _vramProbeCtx) + "）= " + (peak + (long)addMiB) + " MiB");
-					peak += (long)addMiB;
-				}
-			}
-			catch
-			{
-			}
-		}
-		double fin = peak;
-		Dispatcher.BeginInvoke((Action)(() =>
-		{
-			Log("[实测] 预填充峰值 " + fin.ToString("F0") + " MiB（静态 " + baseMiB.ToString("F0") + " MiB）");
-			if (_profiles != null && _profiles.TryGetValue(_currentProfile, out ProfileConfig? pc))
-			{
-				pc.VramMeasuredMiB = fin;
-				pc.VramMeasuredModel = ResolveModelPath(throwOnError: false) ?? "";
-				pc.VramMeasuredFp = VramFingerprint();
-				_measuredMemMiB = fin;
-				_measuredMemModel = pc.VramMeasuredModel;
-				_measuredMemFp = pc.VramMeasuredFp;
-				try { SaveConfigFile(); } catch { }
-			}
-			StopLlama();
-			// 上限按显卡总显存的 90% 计：系统/桌面本身要占一部分，留 10% 才不会被抢。
-			double capMiB = 0.0;
-			try
-			{
-				Dictionary<string, string> gT = _gpuMonitor.QueryGpu();
-				if (gT.TryGetValue("vram_total", out string tsT) && long.TryParse(tsT, out long tbT) && tbT > 0)
-				{
-					capMiB = tbT / 1048576.0 * 0.9;
-				}
-			}
-			catch
-			{
-			}
-			string verdictP = capMiB <= 0.0
-				? "判断: 没读到显卡总显存，未做上限判断"
-				: (fin <= capMiB
-					? "判断: 峰值 " + fin.ToString("F0") + " MiB ≤ 上限 90%（" + capMiB.ToString("F0") + " MiB）"
-					: "判断: 峰值 " + fin.ToString("F0") + " MiB 超过上限 90%（" + capMiB.ToString("F0") + " MiB），实际使用会 OOM 或被挤到共享内存");
-			System.Windows.MessageBox.Show(
-				"测试参数: ngl=99, fit=off（其余沿用当前配置）\n"
-				+ "静态占用: " + baseMiB.ToString("F0") + " MiB\n"
-				+ "预填充峰值: " + fin.ToString("F0") + " MiB（" + (fin / 1024.0).ToString("F2") + " GiB）\n"
-				+ verdictP + "\n\n"
-				+ "已按峰值记入当前方案，之后启动按峰值判断。",
-				"测试完成", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
-		}));
-	}
-
 	private string VramFingerprint()
 	{
 		string ck = RoleText("cache_type_k", out string v1) ? v1 : "";
@@ -2782,92 +2508,24 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		return ck + "/" + cv + "@" + ctxNow;
 	}
 
+	/// <summary>启动前的显存判断：装得下直接走，装不下才问。</summary>
 	private bool ConfirmVramFit()
 	{
-		// 测试按钮本身就是为了拿数，没必要先弹一个预估窗再问"要不要测"。
-		if (_skipVramConfirm)
-		{
-			_skipVramConfirm = false;
-			return true;
-		}
 		(double, double, double, double, string)? est = EstimateVramNeeded();
 		if (!est.HasValue)
 		{
-			// 没有实测值：不再用公式编数字，问一次要不要现场测。
-			System.Windows.MessageBoxResult ask = System.Windows.MessageBox.Show(
-				"这个模型还没实测过显存占用，目前给不出可信预估。\n\n"
-				+ "现在跑一次测试加载吗？会加载模型、读到真实占用后自动停止，数值记进当前方案，之后启动都用它判断。",
-				"尚未实测", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Question);
-			if (ask == System.Windows.MessageBoxResult.Yes)
-			{
-				TestLlamaLoad_Click(this, new System.Windows.RoutedEventArgs());
-			}
-			return false;
-		}
-		(double estBytes, double modelBytes, double kvBytes, double availBytes, string detail) = est.Value;
-		// 不留经验余量：判定只比 llama 自己报的数与设备可用显存，
-		// 是否真的适配不下由 llama 的 failed to fit params 告警判定（见 _vramFitFailed）。
-		double reserve = 0.0;
-
-		// 公式估算出来的数字只是预测：先告诉用户预测值，并给"先测一次"的选项。
-		if (detail.Contains("公式粗算"))
-		{
-			// 在安全范围内也照常弹：用户要能看到预计占用是多少，而不是"够用就不吭声"。
-			string verdict = (availBytes > 0.0 && estBytes <= availBytes)
-				? "判断: 在可用范围内（预计 " + (estBytes / 1073741824.0).ToString("F1") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）"
-				: (availBytes > 0.0
-					? "判断: 超出可用范围（预计 " + (estBytes / 1073741824.0).ToString("F1") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）"
-					: "判断: 未取到显卡显存信息");
-			System.Windows.MessageBoxResult askPred = System.Windows.MessageBox.Show(
-				"显存占用为预测值（按公式估算，不是实测）：\n\n" + detail + "\n" + verdict
-				+ "\n\n要现在跑一次「测试加载」拿实测值吗？\n「是」先测试　「否」按预测值直接启动　「取消」本次不启动",
-				"预测占用", System.Windows.MessageBoxButton.YesNoCancel, System.Windows.MessageBoxImage.Information);
-			if (askPred == System.Windows.MessageBoxResult.Cancel)
-			{
-				return false;
-			}
-			if (askPred == System.Windows.MessageBoxResult.Yes)
-			{
-				TestLlamaLoad_Click(this, new System.Windows.RoutedEventArgs());
-				return false;
-			}
 			return true;
 		}
-
-		// 精确计算通过就直接启动，不打扰；只有装不下时才问。
+		(double estBytes, double modelBytes, double kvBytes, double availBytes, string detail) = est.Value;
 		if (availBytes <= 0.0 || estBytes <= availBytes)
 		{
 			return true;
 		}
-		string verdictM = "判断: 超出可用范围（实测 " + (estBytes / 1073741824.0).ToString("F1")
+		string verdict = "判断: 超出可用范围（" + (estBytes / 1073741824.0).ToString("F1")
 			+ " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）";
-		System.Windows.MessageBoxResult askM = System.Windows.MessageBox.Show(
-			detail + "\n" + verdictM + "\n\n仍然启动吗？",
-			"显存不足（实测）", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Warning);
-		Log("[显存] 实测 " + (estBytes / 1073741824.0).ToString("F2") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F2") + " GiB");
-		return askM == System.Windows.MessageBoxResult.Yes;
-
-		if (availBytes <= 0.0)
-		{
-			return true;
-		}
-		if (estBytes <= availBytes)
-		{
-			return true;
-		}
-		// --fit 开着时 llama.cpp 会自己下调上下文/层数去适配显存，这种情况不该吓唬用户说"必然崩溃"，
-		// 只提示"按当前参数装不下，可能会被自动缩小"。
-		bool fitOn = TryGetParamValue("fit", out string fitVal)
-			&& !string.Equals(fitVal?.Trim(), "off", StringComparison.OrdinalIgnoreCase)
-			&& !string.Equals(fitVal?.Trim(), "false", StringComparison.OrdinalIgnoreCase);
-		string msg = (fitOn
-				? "按当前参数估算，显存有点紧，llama.cpp 的 --fit 会自动下调上下文或层数来适配。\n\n"
-				: "⚠ 预计显存不足，llama-server 很可能因显存耗尽而崩溃（bad allocation / GGML_ASSERT）。\n\n")
-			+ detail
-			+ (fitOn
-				? "\n\n直接启动吗？（如果自动缩小后仍然不够，再考虑减小“上下文大小”或把 KV 缓存类型改成 q4_0）"
-				: "\n\n仍要尝试启动吗？\n（建议：减小“上下文大小”，或将 KV 缓存类型改为 q4_0/q4_1）");
-		System.Windows.MessageBoxResult r = System.Windows.MessageBox.Show(msg, fitOn ? "显存偏紧" : "显存可能不足", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Warning);
+		System.Windows.MessageBoxResult r = System.Windows.MessageBox.Show(
+			detail + "\n" + verdict + "\n\n仍然启动吗？",
+			"显存不足", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Warning);
 		return r == System.Windows.MessageBoxResult.Yes;
 	}
 
@@ -3961,131 +3619,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	}
 
 	/// <summary>加载一次当前配置的模型，读到显存实测值就自动停止。</summary>
-	private void TestLlamaLoad_Click(object s, RoutedEventArgs e)
-	{
-		if (_llamaProc != null || IsLlamaRunning())
-		{
-			ShowNotice("Llama 已经在运行，直接看日志里有没有“显存实测已记录”即可。", isError: true);
-			return;
-		}
-		_vramTestMode = true;
-		_vramFitFailed = false;
-		_skipVramConfirm = true;
-		_vramAccumMiB = 0.0;
-		// 按真实 ctx 跑：压到 8K 时 KV 只有真实配置的一小部分，峰值永远够不到显存上限，
-		// 那样测出来的"通过"没有意义。宁可慢，也要让峰值真实发生。
-		_vramProbeCtx = 0;
-		_vramRealCtx = 0;
-		string ctxFlagT = "";
-		string ctxOrigT = "";
-		// 严格版测试：把全部层推到 GPU（-ngl 99）、关掉 --fit，
-		// 让 llama 不去"自动缩容遮掩问题"，峰值能不能装下就一目了然。测完原样还原。
-		List<(System.Windows.Controls.Control Ctl, string Orig)> testOverrides = new List<(System.Windows.Controls.Control, string)>();
-		foreach ((string ovFlag, string ovVal) in new (string, string)[] { ("ngl", "99"), ("fit", "off") })
-		{
-			if (!_pw.TryGetValue(ovFlag, out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) prOv))
-			{
-				continue;
-			}
-			System.Windows.Controls.Control ctlOv = prOv.Item2;
-			if (ctlOv is System.Windows.Controls.TextBox tbxOv)
-			{
-				testOverrides.Add((ctlOv, tbxOv.Text));
-				tbxOv.Text = ovVal;
-			}
-			else if (ctlOv is System.Windows.Controls.ComboBox cbxOv)
-			{
-				testOverrides.Add((ctlOv, cbxOv.Text));
-				for (int i = 0; i < cbxOv.Items.Count; i++)
-				{
-					if (string.Equals(cbxOv.Items[i]?.ToString(), ovVal, StringComparison.OrdinalIgnoreCase))
-					{
-						cbxOv.SelectedIndex = i;
-						break;
-					}
-				}
-			}
-		}
-		if (testOverrides.Count > 0)
-		{
-			Log("[实测] 测试参数: ngl=99, fit=off（用完还原）");
-		}
-		// 只为这一次测试启动临时打开 --log-verbose：不打开的话 llama.cpp 不打 buffer size，
-		// 打开后日志很详尽、影响生成性能，所以测完立刻还原，绝不污染正常启动。
-		if (_pbw.TryGetValue("verbose", out System.Windows.Controls.CheckBox? cbVerbose) && cbVerbose.IsChecked != true)
-		{
-			cbVerbose.IsChecked = true;
-			_vramTestVerboseRestore = true;
-		}
-		try
-		{
-			Directory.CreateDirectory(AppLog.LogDir);
-			// 只留最新一份：避免每点一次测试就在日志目录多一个文件。
-			foreach (string oldLog in Directory.GetFiles(AppLog.LogDir, "llama_test_*.log"))
-			{
-				try { File.Delete(oldLog); } catch { }
-			}
-			_vramTestLogPath = Path.Combine(AppLog.LogDir, "llama_test_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".log");
-			File.WriteAllText(_vramTestLogPath, "=== 测试加载 " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ===" + Environment.NewLine);
-		}
-		catch
-		{
-			_vramTestLogPath = null;
-		}
-		Log("--- 测试加载：临时开启 --log-verbose，只为拿实测显存，加载完自动停止 ---");
-		Log("完整输出另存为: " + (_vramTestLogPath ?? "(写入失败)") + "（界面刷得太快就开这个文件）");
-		try
-		{
-			StartLlama();
-		}
-		finally
-		{
-			// 命令已按 8192 生成，立刻把界面还原，避免静默改掉用户设置。
-			if (ctxOrigT.Length > 0 && ctxFlagT.Length > 0
-				&& _pw.TryGetValue(ctxFlagT, out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) prX)
-				&& prX.Item2 is System.Windows.Controls.TextBox tbX)
-			{
-				tbX.Text = ctxOrigT;
-				Log("[实测] 上下文已还原为 " + ctxOrigT + "（探针用 8192 跑）");
-			}
-			foreach ((System.Windows.Controls.Control ctl, string orig) in testOverrides)
-			{
-				if (ctl is System.Windows.Controls.TextBox t2)
-				{
-					t2.Text = orig;
-				}
-				else if (ctl is System.Windows.Controls.ComboBox c2)
-				{
-					for (int i = 0; i < c2.Items.Count; i++)
-					{
-						if (string.Equals(c2.Items[i]?.ToString(), orig, StringComparison.OrdinalIgnoreCase))
-						{
-							c2.SelectedIndex = i;
-							break;
-						}
-					}
-				}
-			}
-			if (testOverrides.Count > 0)
-			{
-				Log("[实测] 测试参数已还原（ngl / fit）");
-			}
-		}
-		// 兜底：万一没等到 listening（端口不通、日志格式变化），10 分钟后强制收工，
-		// 免得测试模式把 llama 一直挂在那里。
-		_ = Task.Delay(TimeSpan.FromMinutes(10)).ContinueWith(_ =>
-		{
-			if (_vramTestMode)
-			{
-				Dispatcher.BeginInvoke((Action)(() =>
-				{
-					_vramTestMode = false;
-					Log("[实测] 测试超时（10 分钟未完成），强制停止 Llama");
-					StopLlama();
-				}));
-			}
-		});
-	}
 
 	private void StopLlama()
 	{
@@ -4556,10 +4089,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				_vramFitFailed = true;
 				Log("[显存] llama 报告无法把参数适配进可用显存（failed to fit params）：实际上已经超了，建议调小 ubatch 或把更多专家放到 CPU");
-			}
-			if (_vramTestMode && text.Contains("listening on", StringComparison.Ordinal))
-			{
-				_ = ProbePeakAsync();
 			}
 			if (text.Contains("loading model '", StringComparison.Ordinal))
 			{
