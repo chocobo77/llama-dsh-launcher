@@ -173,6 +173,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>llama 自己报了 failed to fit params：说明当前参数实际适配不进可用显存。</summary>
 	private bool _vramFitFailed;
 
+	/// <summary>探针启动时临时压低的上下文长度（0 表示没压），用于事后按精确 KV 差回推。</summary>
+	private int _vramProbeCtx;
+
+	/// <summary>用户真实配置的上下文长度。</summary>
+	private int _vramRealCtx;
+
 	/// <summary>测试按钮发起的启动：跳过显存预估弹窗，避免"测试前先被问一次"。</summary>
 	private bool _skipVramConfirm;
 
@@ -2656,10 +2662,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		double baseMiB = _vramBreakdownMiB > 0.0 ? _vramBreakdownMiB : _vramAccumMiB;
 		long peak = (long)baseMiB;
 		string port = RoleText("port", out string pv) && !string.IsNullOrWhiteSpace(pv) ? pv.Trim() : "1234";
+		// 峰值与 ubatch 直接相关：提示长度必须至少覆盖一个完整 ubatch，
+		// 否则根本跑不到峰值。取 2×ubatch，并受上下文长度限制。
+		int ub = 512;
+		if (RoleText("ubatch_size", out string ubs) && int.TryParse(NormTok(ubs), out int ubi) && ubi > 0) { ub = ubi; }
+		int ctxLimit = 8192;
+		if (RoleText("ctx_size", out string csx) && int.TryParse(NormTok(csx), out int cxi) && cxi > 0) { ctxLimit = cxi; }
+		int wantTokens = Math.Min(Math.Max(ub * 2, 1024), ctxLimit);
 		StringBuilder sb = new StringBuilder();
-		for (int i = 0; i < 1200; i++) sb.Append("test ");
+		for (int i = 0; i < wantTokens; i++) sb.Append("test ");
+		Log("[实测] 探针长度 " + wantTokens + " token（ubatch=" + ub + "，ctx=" + ctxLimit + "）");
 		string body = "{\"prompt\":\"" + sb + "\",\"n_predict\":1,\"temperature\":0,\"cache_prompt\":false}";
-		Log("[实测] 开始预填充探针（1200 token），采样峰值显存…");
+		Log("[实测] 开始预填充探针，采样峰值显存…");
 		using HttpClient http = new HttpClient { Timeout = TimeSpan.FromMinutes(8) };
 		using CancellationTokenSource cts = new CancellationTokenSource();
 		Task sampler = Task.Run(async () =>
@@ -2691,6 +2705,32 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		cts.Cancel();
 		try { await sampler.ConfigureAwait(false); } catch { }
+		// 按 KV 每 token 字节数把 8K 探针的峰值精确回推到真实上下文：只有 KV 项是算出来的，
+		// 权重/计算图/驱动开销全部沿用实测，不用任何经验系数。
+		if (_vramProbeCtx > 0 && _vramRealCtx > _vramProbeCtx)
+		{
+			try
+			{
+				GgufArchInfo giP = ReadGgufArch(ResolveModelPath(throwOnError: false) ?? "");
+				int hdP = giP.HeadDim > 0 ? giP.HeadDim : 128;
+				int fullP = giP.Layers > 0
+					? (giP.FullAttentionInterval > 0 ? (int)Math.Ceiling(giP.Layers / (double)giP.FullAttentionInterval) : giP.Layers)
+					: 0;
+				string ckP = RoleText("cache_type_k", out string a1) ? a1 : "f16";
+				string cvP = RoleText("cache_type_v", out string a2) ? a2 : "f16";
+				double kvTok = giP.KvHeads * hdP * (CacheBytesPerElem(ckP) + CacheBytesPerElem(cvP)) * Math.Max(1, fullP);
+				double addMiB = kvTok * (_vramRealCtx - _vramProbeCtx) / 1048576.0;
+				if (kvTok > 0 && addMiB > 0)
+				{
+					Log("[实测] 探针峰值 " + peak.ToString("F0") + " MiB + KV 回推 " + addMiB.ToString("F0")
+						+ " MiB（" + (kvTok / 1024.0).ToString("F2") + " KiB/token × " + (_vramRealCtx - _vramProbeCtx) + "）= " + (peak + (long)addMiB) + " MiB");
+					peak += (long)addMiB;
+				}
+			}
+			catch
+			{
+			}
+		}
 		double fin = peak;
 		Dispatcher.BeginInvoke((Action)(() =>
 		{
@@ -3912,6 +3952,21 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		_vramFitFailed = false;
 		_skipVramConfirm = true;
 		_vramAccumMiB = 0.0;
+		// 探针只压"可精确量化"的 ctx：8K 下预填充只要一两秒，峰值再按 KV 每 token 字节数回推。
+		_vramProbeCtx = 0;
+		_vramRealCtx = 0;
+		string ctxFlagT = RoleDef("ctx_size")?.Flag ?? "";
+		string ctxOrigT = "";
+		if (ctxFlagT.Length > 0
+			&& _pw.TryGetValue(ctxFlagT, out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) pairCtx)
+			&& pairCtx.Item2 is System.Windows.Controls.TextBox tbCtxT
+			&& int.TryParse(NormTok(tbCtxT.Text), out int realCtxT) && realCtxT > 8192)
+		{
+			ctxOrigT = tbCtxT.Text;
+			_vramRealCtx = realCtxT;
+			_vramProbeCtx = 8192;
+			tbCtxT.Text = "8192";
+		}
 		// 只为这一次测试启动临时打开 --log-verbose：不打开的话 llama.cpp 不打 buffer size，
 		// 打开后日志很详尽、影响生成性能，所以测完立刻还原，绝不污染正常启动。
 		if (_pbw.TryGetValue("verbose", out System.Windows.Controls.CheckBox? cbVerbose) && cbVerbose.IsChecked != true)
@@ -3936,7 +3991,21 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		Log("--- 测试加载：临时开启 --log-verbose，只为拿实测显存，加载完自动停止 ---");
 		Log("完整输出另存为: " + (_vramTestLogPath ?? "(写入失败)") + "（界面刷得太快就开这个文件）");
-		StartLlama();
+		try
+		{
+			StartLlama();
+		}
+		finally
+		{
+			// 命令已按 8192 生成，立刻把界面还原，避免静默改掉用户设置。
+			if (ctxOrigT.Length > 0 && ctxFlagT.Length > 0
+				&& _pw.TryGetValue(ctxFlagT, out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) prX)
+				&& prX.Item2 is System.Windows.Controls.TextBox tbX)
+			{
+				tbX.Text = ctxOrigT;
+				Log("[实测] 上下文已还原为 " + ctxOrigT + "（探针用 8192 跑）");
+			}
+		}
 	}
 
 	private void StopLlama()
