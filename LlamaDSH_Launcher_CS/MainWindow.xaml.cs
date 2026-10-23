@@ -3772,6 +3772,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		try
 		{
 			Directory.CreateDirectory(AppLog.LogDir);
+			// 只留最新一份：避免每点一次测试就在日志目录多一个文件。
+			foreach (string oldLog in Directory.GetFiles(AppLog.LogDir, "llama_test_*.log"))
+			{
+				try { File.Delete(oldLog); } catch { }
+			}
 			_vramTestLogPath = Path.Combine(AppLog.LogDir, "llama_test_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".log");
 			File.WriteAllText(_vramTestLogPath, "=== 测试加载 " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ===" + Environment.NewLine);
 		}
