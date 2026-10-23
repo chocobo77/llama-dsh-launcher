@@ -2627,7 +2627,16 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		(double, double, double, double, string)? est = EstimateVramNeeded();
 		if (!est.HasValue)
 		{
-			return true;
+			// 没有实测值：不再用公式编数字，问一次要不要现场测。
+			System.Windows.MessageBoxResult ask = System.Windows.MessageBox.Show(
+				"这个模型还没实测过显存占用，目前给不出可信预估。\n\n"
+				+ "现在跑一次测试加载吗？会加载模型、读到真实占用后自动停止，数值记进当前方案，之后启动都用它判断。",
+				"尚未实测", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Question);
+			if (ask == System.Windows.MessageBoxResult.Yes)
+			{
+				TestLlamaLoad_Click(this, new System.Windows.RoutedEventArgs());
+			}
+			return false;
 		}
 		(double estBytes, double modelBytes, double kvBytes, double availBytes, string detail) = est.Value;
 		if (availBytes <= 0.0)
