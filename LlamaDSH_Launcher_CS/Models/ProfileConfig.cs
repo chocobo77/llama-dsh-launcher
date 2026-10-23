@@ -37,6 +37,15 @@ public class ProfileConfig
 	/// <summary>命令预览里手动追加的自定义参数（橙色显示，原样追加到 llama-server 命令行末尾）。</summary>
 	public List<string> CustomArgs { get; set; } = new List<string>();
 
+	/// <summary>
+	/// 上次成功加载时 llama.cpp 自己报告的显存占用（MiB，只算设备侧）。
+	/// 0 表示没测过，显存预估会退回公式粗算。换了模型就作废。
+	/// </summary>
+	public double VramMeasuredMiB { get; set; }
+
+	/// <summary>上面那个实测值对应的模型路径。</summary>
+	public string VramMeasuredModel { get; set; } = "";
+
 	public bool VramBreakerEnabled { get; set; }
 
 	public int VramBreakerType { get; set; }

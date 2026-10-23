@@ -151,6 +151,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>本次点击"启动"后是否已经尝试过"重连 node_modules 链接"自愈，避免反复触发。</summary>
 	private bool _dshModuleHealTried;
 
+	/// <summary>本次已加载中，llama.cpp 报告的设备侧显存累计（MiB）。</summary>
+	private double _vramAccumMiB;
+
 	private List<ParamDefinition> _paramDefs;
 
 	private ParamSchemaLoadResult _paramSchema = new();
@@ -2383,6 +2386,29 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				return null;
 			}
+			// 有实测值就直接用。公式在 MoE + Vulkan/repack 这类组合上误差能到两倍，
+			// 而 llama.cpp 自己打印的 buffer size 是权威值。
+			if (_profiles != null && _profiles.TryGetValue(_currentProfile, out ProfileConfig? measuredCfg)
+				&& measuredCfg.VramMeasuredMiB > 0.0
+				&& string.Equals(measuredCfg.VramMeasuredModel, modelPath, StringComparison.OrdinalIgnoreCase))
+			{
+				double measTotal = 0.0;
+				double measUsed = 0.0;
+				Dictionary<string, string> gpuM = _gpuMonitor.QueryGpu();
+				if (gpuM.TryGetValue("vram_total", out string tsM) && double.TryParse(tsM, NumberStyles.Float, CultureInfo.InvariantCulture, out measTotal) && measTotal > 0.0
+					&& gpuM.TryGetValue("vram_used", out string usM))
+				{
+					double.TryParse(usM, NumberStyles.Float, CultureInfo.InvariantCulture, out measUsed);
+				}
+				double availM = Math.Max(0.0, measTotal - measUsed);
+				// 打印出来的 buffer 之和比实际占用来得小（实测 8569 vs 9249 MiB，差的是一部分
+				// 未单独打印的图/流水线分配），补 7% 免得低估。
+				double estBytesM = measuredCfg.VramMeasuredMiB * 1048576.0 * 1.07;
+				string detailM = "数据来源: 上次启动时 llama.cpp 实测（精确）\n"
+					+ "实测显存占用: " + (estBytesM / 1073741824.0).ToString("F2") + " GiB\n"
+					+ "可用显存: " + (availM / 1073741824.0).ToString("F2") + " GiB";
+				return (estBytesM, estBytesM, 0.0, availM, detailM);
+			}
 			Match shm2 = Regex.Match(Path.GetFileName(modelPath), "-(\\d{5})-of-(\\d{5})\\.gguf$", RegexOptions.IgnoreCase);
 			if (shm2.Success)
 			{
@@ -2549,7 +2575,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}
 				safeCtx = (safeCtx / 1024L) * 1024L;
 			}
-			string detail = "模型文件: " + (modelFileBytes / 1073741824.0).ToString("F1") + " GiB\n"
+			string detail = "数据来源: 按公式粗算（这个模型还没成功跑过，跑一次之后会改用实测值）\n"
+				+ "模型文件: " + (modelFileBytes / 1073741824.0).ToString("F1") + " GiB\n"
 				+ "上下文: " + ctx + " token (" + (ctx / 1024L) + "K)\n"
 				+ "KV 缓存: " + (kvBytes / 1073741824.0).ToString("F2") + " GiB"
 				+ (swaLayers > 0 ? "（" + fullLayers + " 层全注意力 + " + swaLayers + " 层滑窗）" : "") + "\n"
@@ -4136,6 +4163,64 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		StopDsh();
 	}
 
+	/// <summary>
+	/// 从 llama.cpp 加载日志里捡设备侧显存占用：model / compute / KV / RS / output buffer。
+	/// 只统计设备（Vulkan0 / CUDA0 / Metal），跳过 CPU、CPU_REPACK、Vulkan_Host 这些主机侧缓冲。
+	/// 看到 "model loaded" 就把累计值记进当前方案，下次预估直接用实测值。
+	/// </summary>
+	private void NoteLlamaMemoryLine(string text)
+	{
+		try
+		{
+			if (text.Contains("loading model '", StringComparison.Ordinal))
+			{
+				_vramAccumMiB = 0.0;
+				return;
+			}
+			if (text.Contains("model loaded", StringComparison.Ordinal))
+			{
+				double total = _vramAccumMiB;
+				if (total <= 0.0 || _profiles == null || !_profiles.TryGetValue(_currentProfile, out ProfileConfig? cfg))
+				{
+					return;
+				}
+				string measuredModel = ResolveModelPath(throwOnError: false) ?? "";
+				Dispatcher.BeginInvoke((Action)(() =>
+				{
+					cfg.VramMeasuredMiB = total;
+					cfg.VramMeasuredModel = measuredModel;
+					try
+					{
+						SaveConfigFile();
+						AppLog.WriteInfo($"显存实测已记录: {total:F0} MiB ({Path.GetFileName(measuredModel)})");
+					}
+					catch (Exception ex)
+					{
+						AppLog.WriteError("保存显存实测值失败: " + ex.Message);
+					}
+				}));
+				return;
+			}
+			Match m = Regex.Match(text, @"(S+)s+(?:model|compute|KV|RS|output)s+buffer sizes*=s*([0-9.]+)s*MiB");
+			if (!m.Success)
+			{
+				return;
+			}
+			string dev = m.Groups[1].Value;
+			if (dev.StartsWith("CPU", StringComparison.OrdinalIgnoreCase) || dev.Contains("Host", StringComparison.OrdinalIgnoreCase))
+			{
+				return;
+			}
+			if (double.TryParse(m.Groups[2].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out double v))
+			{
+				_vramAccumMiB += v;
+			}
+		}
+		catch
+		{
+		}
+	}
+
 	/// <summary>启动日志里是否出现模块缺失（pnpm workspace 链接悬空的典型症状）。</summary>
 	private bool DshBootLogHasModuleMissing()
 	{
@@ -4973,6 +5058,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					{
 						text = text.Substring(0, 600) + " ……[已截断]";
 					}
+				}
+				if (text.StartsWith("[llama] ", StringComparison.Ordinal))
+				{
+					NoteLlamaMemoryLine(text);
 				}
 				if (!string.IsNullOrWhiteSpace(text) && (!(text == _lastLogLine) || text.StartsWith("[Perf] Error")))
 				{
