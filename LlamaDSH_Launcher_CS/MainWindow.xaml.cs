@@ -154,12 +154,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>本次已加载中，llama.cpp 报告的设备侧显存累计（MiB）。</summary>
 	private double _vramAccumMiB;
 
-	/// <summary>本次会话最近一次实测值的内存兜底：即使方案对象被重建，也能立刻用上。</summary>
-	private double _measuredMemMiB;
-
-	private string _measuredMemModel = "";
-
-	private string _measuredMemFp = "";
 
 	/// <summary>其中来自 "model buffer size" 的部分；为 0 说明权重走 mmap，没进设备缓冲。</summary>
 	private double _vramModelBufferMiB;
@@ -167,20 +161,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>llama.cpp 自己打印的进程显存占用（memory breakdown 的 self 列），权威值。</summary>
 	private double _vramBreakdownMiB;
 
-	/// <summary>"测试加载"触发的试探性启动：拿到实测值就自动停止。</summary>
-	private bool _vramTestMode;
 
-	/// <summary>llama 自己报了 failed to fit params：说明当前参数实际适配不进可用显存。</summary>
-	private bool _vramFitFailed;
 
-	/// <summary>探针启动时临时压低的上下文长度（0 表示没压），用于事后按精确 KV 差回推。</summary>
-	private int _vramProbeCtx;
 
-	/// <summary>用户真实配置的上下文长度。</summary>
-	private int _vramRealCtx;
-
-	/// <summary>测试按钮发起的启动：跳过显存预估弹窗，避免"测试前先被问一次"。</summary>
-	private bool _skipVramConfirm;
 
 	/// <summary>测试启动时临时打开了 --log-verbose，停止后需要还原。</summary>
 	private bool _vramTestVerboseRestore;
@@ -2482,7 +2465,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				double.TryParse(us, NumberStyles.Float, CultureInfo.InvariantCulture, out usedVram);
 			}
 			double avail = Math.Max(0.0, totalVram - usedVram);
-			string detail = "显存预算（公式）\n"
+			// 元数据缺失时 KV 会算成 0，必须标出来，否则"预算很小"会被误当成结论。
+			string metaWarn = "";
+			if (layers <= 0 || gi.KvHeads <= 0 || ctx <= 0)
+			{
+				metaWarn = "⚠ KV 元数据不完整（层数=" + layers + " KV头=" + gi.KvHeads + " ctx=" + ctx + "），KV 可能算成 0，预算仅供参考\n";
+			}
+			string detail = metaWarn + "显存预算（公式）\n"
 				+ "权重(GPU): " + (gpuWeights / 1073741824.0).ToString("F2") + " GiB"
 				+ (gi.Experts > 0 && hasNcm ? "（MoE 保留 " + ncmV.ToString("F0") + "/" + gi.Experts + " 专家在 CPU）" : "") + "\n"
 				+ "KV(" + ck + "/" + cv + ", " + fullLayers + " 层全注意力): " + (kvBytes / 1073741824.0).ToString("F2") + " GiB\n"
@@ -3626,7 +3615,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		if (_vramTestVerboseRestore)
 		{
 			_vramTestVerboseRestore = false;
-			_vramTestMode = false;
 			if (_pbw.TryGetValue("verbose", out System.Windows.Controls.CheckBox? cbV) && cbV.IsChecked == true)
 			{
 				cbV.IsChecked = false;
@@ -4087,7 +4075,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			// llama 自己说"适配不下"时，说明当前参数已超出可用显存，静态占用再好看也没用。
 			if (text.Contains("failed to fit params", StringComparison.OrdinalIgnoreCase))
 			{
-				_vramFitFailed = true;
 				Log("[显存] llama 报告无法把参数适配进可用显存（failed to fit params）：实际上已经超了，建议调小 ubatch 或把更多专家放到 CPU");
 			}
 			if (text.Contains("loading model '", StringComparison.Ordinal))
@@ -4142,42 +4129,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					try { File.AppendAllText(_vramTestLogPath, diag + Environment.NewLine); } catch { }
 				}
-				// 测试模式不在这里停：等 llama 打印 listening 后跑一次预填充探针，用峰值作为实测值。
-				if (_vramTestMode)
-				{
-					Log("[实测] 静态占用 " + total.ToString("F0") + " MiB，等待 listening 后跑峰值探针");
-				}
-				if (_vramTestMode || total <= 0.0 || !hasProfile)
-				{
-					return;
-				}
-				string measuredModel = ResolveModelPath(throwOnError: false) ?? "";
-				Dispatcher.BeginInvoke((Action)(() =>
-				{
-					cfg.VramMeasuredMiB = total;
-					cfg.VramMeasuredModel = measuredModel;
-					cfg.VramMeasuredFp = VramFingerprint();
-					_measuredMemMiB = total;
-					_measuredMemModel = measuredModel;
-					_measuredMemFp = cfg.VramMeasuredFp;
-					try
-					{
-						SaveConfigFile();
-						AppLog.WriteInfo($"显存实测已记录: {total:F0} MiB ({Path.GetFileName(measuredModel)})");
-						if (_vramTestMode)
-						{
-							_vramTestMode = false;
-							Log("--- 实测完成: " + total.ToString("F0") + " MiB，正在停止 Llama ---");
-							ShowNotice("实测完成：" + (total / 1024.0).ToString("F2") + " GiB，已记录到当前方案。");
-							StopLlama();
-						}
-					}
-					catch (Exception ex)
-					{
-						AppLog.WriteError("保存显存实测值失败: " + ex.Message);
-					}
-				}));
-				return;
+				// 实测值已不再参与显存判断（改为纯公式预算），这里不再落盘，避免每次启动都写配置文件。
 			}
 			Match m = Regex.Match(text, @"(\S+)\s+(?:model|compute|KV|RS|output)\s+buffer size\s*=\s*([0-9.]+)\s*MiB");
 			if (_vramTestLogPath != null)
