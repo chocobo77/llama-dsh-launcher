@@ -2746,9 +2746,29 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				try { SaveConfigFile(); } catch { }
 			}
 			StopLlama();
+			// 上限按显卡总显存的 90% 计：系统/桌面本身要占一部分，留 10% 才不会被抢。
+			double capMiB = 0.0;
+			try
+			{
+				Dictionary<string, string> gT = _gpuMonitor.QueryGpu();
+				if (gT.TryGetValue("vram_total", out string tsT) && long.TryParse(tsT, out long tbT) && tbT > 0)
+				{
+					capMiB = tbT / 1048576.0 * 0.9;
+				}
+			}
+			catch
+			{
+			}
+			string verdictP = capMiB <= 0.0
+				? "判断: 没读到显卡总显存，未做上限判断"
+				: (fin <= capMiB
+					? "判断: 峰值 " + fin.ToString("F0") + " MiB ≤ 上限 90%（" + capMiB.ToString("F0") + " MiB）"
+					: "判断: 峰值 " + fin.ToString("F0") + " MiB 超过上限 90%（" + capMiB.ToString("F0") + " MiB），实际使用会 OOM 或被挤到共享内存");
 			System.Windows.MessageBox.Show(
-				"静态占用: " + baseMiB.ToString("F0") + " MiB\n"
-				+ "预填充峰值: " + fin.ToString("F0") + " MiB（" + (fin / 1024.0).ToString("F2") + " GiB）\n\n"
+				"测试参数: ngl=99, fit=off（其余沿用当前配置）\n"
+				+ "静态占用: " + baseMiB.ToString("F0") + " MiB\n"
+				+ "预填充峰值: " + fin.ToString("F0") + " MiB（" + (fin / 1024.0).ToString("F2") + " GiB）\n"
+				+ verdictP + "\n\n"
 				+ "已按峰值记入当前方案，之后启动按峰值判断。",
 				"测试完成", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
 		}));
@@ -3967,6 +3987,38 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			_vramProbeCtx = 8192;
 			tbCtxT.Text = "8192";
 		}
+		// 严格版测试：把全部层推到 GPU（-ngl 99）、关掉 --fit，
+		// 让 llama 不去"自动缩容遮掩问题"，峰值能不能装下就一目了然。测完原样还原。
+		List<(System.Windows.Controls.Control Ctl, string Orig)> testOverrides = new List<(System.Windows.Controls.Control, string)>();
+		foreach ((string ovFlag, string ovVal) in new (string, string)[] { ("ngl", "99"), ("fit", "off") })
+		{
+			if (!_pw.TryGetValue(ovFlag, out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) prOv))
+			{
+				continue;
+			}
+			System.Windows.Controls.Control ctlOv = prOv.Item2;
+			if (ctlOv is System.Windows.Controls.TextBox tbxOv)
+			{
+				testOverrides.Add((ctlOv, tbxOv.Text));
+				tbxOv.Text = ovVal;
+			}
+			else if (ctlOv is System.Windows.Controls.ComboBox cbxOv)
+			{
+				testOverrides.Add((ctlOv, cbxOv.Text));
+				for (int i = 0; i < cbxOv.Items.Count; i++)
+				{
+					if (string.Equals(cbxOv.Items[i]?.ToString(), ovVal, StringComparison.OrdinalIgnoreCase))
+					{
+						cbxOv.SelectedIndex = i;
+						break;
+					}
+				}
+			}
+		}
+		if (testOverrides.Count > 0)
+		{
+			Log("[实测] 测试参数: ngl=99, fit=off（用完还原）");
+		}
 		// 只为这一次测试启动临时打开 --log-verbose：不打开的话 llama.cpp 不打 buffer size，
 		// 打开后日志很详尽、影响生成性能，所以测完立刻还原，绝不污染正常启动。
 		if (_pbw.TryGetValue("verbose", out System.Windows.Controls.CheckBox? cbVerbose) && cbVerbose.IsChecked != true)
@@ -4004,6 +4056,28 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				tbX.Text = ctxOrigT;
 				Log("[实测] 上下文已还原为 " + ctxOrigT + "（探针用 8192 跑）");
+			}
+			foreach ((System.Windows.Controls.Control ctl, string orig) in testOverrides)
+			{
+				if (ctl is System.Windows.Controls.TextBox t2)
+				{
+					t2.Text = orig;
+				}
+				else if (ctl is System.Windows.Controls.ComboBox c2)
+				{
+					for (int i = 0; i < c2.Items.Count; i++)
+					{
+						if (string.Equals(c2.Items[i]?.ToString(), orig, StringComparison.OrdinalIgnoreCase))
+						{
+							c2.SelectedIndex = i;
+							break;
+						}
+					}
+				}
+			}
+			if (testOverrides.Count > 0)
+			{
+				Log("[实测] 测试参数已还原（ngl / fit）");
 			}
 		}
 		// 兜底：万一没等到 listening（端口不通、日志格式变化），10 分钟后强制收工，
