@@ -2511,15 +2511,17 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return true;
 		}
 		(double estBytes, double modelBytes, double kvBytes, double availBytes, string detail) = est.Value;
-		if (availBytes <= 0.0 || estBytes <= availBytes)
-		{
-			return true;
-		}
-		string verdict = "判断: 超出可用范围（" + (estBytes / 1073741824.0).ToString("F1")
-			+ " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）";
+		bool fits = availBytes <= 0.0 || estBytes <= availBytes;
+		string verdict = availBytes <= 0.0
+			? "判断: 未取到显卡显存信息，无法判断"
+			: (fits
+				? "判断: 在可用范围内（预计 " + (estBytes / 1073741824.0).ToString("F2") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F2") + " GiB）"
+				: "判断: 超出可用范围（预计 " + (estBytes / 1073741824.0).ToString("F2") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F2") + " GiB）");
 		System.Windows.MessageBoxResult r = System.Windows.MessageBox.Show(
-			detail + "\n" + verdict + "\n\n仍然启动吗？",
-			"显存不足", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Warning);
+			detail + "\n" + verdict + "\n\n" + (fits ? "继续启动吗？" : "仍然启动吗？"),
+			fits ? "显存预算" : "显存不足",
+			System.Windows.MessageBoxButton.YesNo,
+			fits ? System.Windows.MessageBoxImage.Information : System.Windows.MessageBoxImage.Warning);
 		return r == System.Windows.MessageBoxResult.Yes;
 	}
 
