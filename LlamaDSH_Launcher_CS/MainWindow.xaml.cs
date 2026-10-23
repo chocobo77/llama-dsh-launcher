@@ -2658,6 +2658,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return true;
 		}
 
+		// 有实测值时也把数字摆出来，让用户知道这次启动的占用和判断。
+		string verdictM = (availBytes > 0.0 && estBytes <= availBytes)
+			? "判断: 在可用范围内（实测 " + (estBytes / 1073741824.0).ToString("F1") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）"
+			: (availBytes > 0.0
+				? "判断: 超出可用范围（实测 " + (estBytes / 1073741824.0).ToString("F1") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）"
+				: "判断: 未取到显卡显存信息");
+		System.Windows.MessageBoxResult askM = System.Windows.MessageBox.Show(
+			detail + "\n" + verdictM + "\n\n继续启动吗？",
+			"显存占用（实测）", System.Windows.MessageBoxButton.OKCancel, System.Windows.MessageBoxImage.Information);
+		Log("[显存] 实测 " + (estBytes / 1073741824.0).ToString("F2") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F2") + " GiB");
+		return askM == System.Windows.MessageBoxResult.OK;
+
 		if (availBytes <= 0.0)
 		{
 			return true;
