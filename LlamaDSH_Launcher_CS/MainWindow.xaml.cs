@@ -4219,7 +4219,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			if (text.Contains("model loaded", StringComparison.Ordinal))
 			{
 				double total = _vramAccumMiB;
-				if (total <= 0.0 || _profiles == null || !_profiles.TryGetValue(_currentProfile, out ProfileConfig? cfg))
+				ProfileConfig? cfg = null;
+				bool hasProfile = _profiles != null && _profiles.TryGetValue(_currentProfile, out cfg);
+				Log("[实测] model loaded：累计 " + total.ToString("F0") + " MiB，方案=" + _currentProfile + "，命中=" + hasProfile);
+				if (total <= 0.0 || !hasProfile)
 				{
 					return;
 				}
