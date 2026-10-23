@@ -2607,6 +2607,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				detail += "\n建议: 当前显存下安全上下文约 " + safeCtx + " token (" + (safeCtx / 1024L) + "K)";
 			}
+			// 极限占用：把当前命令行下的上下文长度用满，且所有层都按全注意力算 KV（最坏情况）。
+			// 滑窗/线性注意力实际会更省，所以这是上限，不是预计值。
+			double kvPeak = perTokPerLayer * Math.Max(1, totalLayers) * ctx;
+			double peakVram = estWeights + kvPeak + bufferBytes;
+			detail += "\n极限占用(满上下文 " + (ctx / 1024L) + "K + 全部 " + Math.Max(1, totalLayers) + " 层按全注意力): "
+				+ (peakVram / 1073741824.0).ToString("F2") + " GiB"
+				+ "\n其中 KV 上限 " + (kvPeak / 1073741824.0).ToString("F2") + " GiB";
 			return (estVram, modelBytes, kvBytes, avail, detail);
 		}
 		catch
