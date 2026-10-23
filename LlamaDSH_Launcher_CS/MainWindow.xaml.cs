@@ -154,6 +154,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>本次已加载中，llama.cpp 报告的设备侧显存累计（MiB）。</summary>
 	private double _vramAccumMiB;
 
+	/// <summary>其中来自 "model buffer size" 的部分；为 0 说明权重走 mmap，没进设备缓冲。</summary>
+	private double _vramModelBufferMiB;
+
 	/// <summary>"测试加载"触发的试探性启动：拿到实测值就自动停止。</summary>
 	private bool _vramTestMode;
 
@@ -4233,9 +4236,37 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			if (text.Contains("model loaded", StringComparison.Ordinal))
 			{
 				double total = _vramAccumMiB;
+				// 权重走 mmap 时设备侧 model buffer 报 0，这块不进 total，用文件大小按比例补回，
+				// 否则实测值会低一个数量级（实测 MoE+repack 下设备侧约占文件 39%）。
+				if (_vramModelBufferMiB < 1.0)
+				{
+					try
+					{
+						string mp0 = ResolveModelPath(throwOnError: false) ?? "";
+						if (mp0.Length > 0 && File.Exists(mp0))
+						{
+							total += new FileInfo(mp0).Length / 1048576.0 * (RoleBool("cpu_moe") ? 0.12 : 0.39);
+						}
+					}
+					catch
+					{
+					}
+				}
 				ProfileConfig? cfg = null;
 				bool hasProfile = _profiles != null && _profiles.TryGetValue(_currentProfile, out cfg);
-				Log("[实测] model loaded：累计 " + total.ToString("F0") + " MiB，方案=" + _currentProfile + "，命中=" + hasProfile);
+				string diag = "[实测] model loaded：累计 " + total.ToString("F0") + " MiB，方案=" + _currentProfile + "，命中=" + hasProfile;
+				Log(diag);
+				if (_vramTestLogPath != null)
+				{
+					try { File.AppendAllText(_vramTestLogPath, diag + Environment.NewLine); } catch { }
+				}
+				if (_vramTestMode)
+				{
+					// 不管解析成没成功，测试模式到了 model loaded 一律停止，避免一直挂着。
+					_vramTestMode = false;
+					Log("--- 测试加载完成（累计 " + total.ToString("F0") + " MiB），正在停止 Llama ---");
+					StopLlama();
+				}
 				if (total <= 0.0 || !hasProfile)
 				{
 					return;
@@ -4264,7 +4295,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}));
 				return;
 			}
-			Match m = Regex.Match(text, @"(S+)s+(?:model|compute|KV|RS|output)s+buffer sizes*=s*([0-9.]+)s*MiB");
+			Match m = Regex.Match(text, @"(\S+)\s+(?:model|compute|KV|RS|output)\s+buffer size\s*=\s*([0-9.]+)\s*MiB");
+			if (_vramTestLogPath != null)
+			{
+				try { File.AppendAllText(_vramTestLogPath, "[实测] 原始行: " + text.Trim() + " | match=" + m.Success + " | 累计=" + _vramAccumMiB.ToString("F0") + Environment.NewLine); } catch { }
+			}
 			if (!m.Success)
 			{
 				return;
@@ -4277,6 +4312,25 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			if (double.TryParse(m.Groups[2].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out double v))
 			{
 				_vramAccumMiB += v;
+				if (text.Contains("model buffer size", StringComparison.Ordinal))
+				{
+					_vramModelBufferMiB += v;
+				}
+			}
+			else
+			{
+				// 正则没匹配上时退回粗暴切分：取最后一个 = 号和 “ MiB” 之间的数字。
+				int eq = text.LastIndexOf('=');
+				int sp = eq >= 0 ? text.IndexOf(" MiB", eq, StringComparison.Ordinal) : -1;
+				if (eq >= 0 && sp > eq)
+				{
+					string num = text.Substring(eq + 1, sp - eq - 1).Trim();
+					if (double.TryParse(num, NumberStyles.Float, CultureInfo.InvariantCulture, out double v2))
+					{
+						_vramAccumMiB += v2;
+						Log("[实测] 解析(回退): " + num + " MiB ← " + text.Trim());
+					}
+				}
 			}
 		}
 		catch
