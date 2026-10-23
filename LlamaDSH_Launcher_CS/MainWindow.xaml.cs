@@ -2660,7 +2660,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					: "判断: 未取到显卡显存信息");
 			System.Windows.MessageBoxResult askPred = System.Windows.MessageBox.Show(
 				"显存占用为预测值（按公式估算，不是实测）：\n\n" + detail + "\n" + verdict
-				+ "\n\n要不要先跑一次「测试加载」拿实测值？\n（选“否”就按当前预测值直接启动）",
+				+ "\n\n要现在跑一次「测试加载」拿实测值吗？\n「是」先测试　「否」按预测值直接启动　「取消」本次不启动",
 				"预测占用", System.Windows.MessageBoxButton.YesNoCancel, System.Windows.MessageBoxImage.Information);
 			if (askPred == System.Windows.MessageBoxResult.Cancel)
 			{
@@ -2674,17 +2674,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return true;
 		}
 
-		// 有实测值时也把数字摆出来，让用户知道这次启动的占用和判断。
-		string verdictM = (availBytes > 0.0 && estBytes <= availBytes)
-			? "判断: 在可用范围内（实测 " + (estBytes / 1073741824.0).ToString("F1") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）"
-			: (availBytes > 0.0
-				? "判断: 超出可用范围（实测 " + (estBytes / 1073741824.0).ToString("F1") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）"
-				: "判断: 未取到显卡显存信息");
+		// 精确计算通过就直接启动，不打扰；只有装不下时才问。
+		if (availBytes <= 0.0 || estBytes <= availBytes)
+		{
+			return true;
+		}
+		string verdictM = "判断: 超出可用范围（实测 " + (estBytes / 1073741824.0).ToString("F1")
+			+ " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）";
 		System.Windows.MessageBoxResult askM = System.Windows.MessageBox.Show(
-			detail + "\n" + verdictM + "\n\n继续启动吗？",
-			"显存占用（实测）", System.Windows.MessageBoxButton.OKCancel, System.Windows.MessageBoxImage.Information);
+			detail + "\n" + verdictM + "\n\n仍然启动吗？",
+			"显存不足（实测）", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Warning);
 		Log("[显存] 实测 " + (estBytes / 1073741824.0).ToString("F2") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F2") + " GiB");
-		return askM == System.Windows.MessageBoxResult.OK;
+		return askM == System.Windows.MessageBoxResult.Yes;
 
 		if (availBytes <= 0.0)
 		{
@@ -4334,6 +4335,16 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 									try { SaveConfigFile(); } catch { }
 								}
 								StopLlama();
+								// 测试完成立刻把结果摆出来：模型、当前上下文、实测占用。
+								string ctxNow = RoleText("ctx_size", out string cs) ? NormTok(cs) : "?";
+								int total0 = 0;
+								int.TryParse(ctxNow, out total0);
+								System.Windows.MessageBox.Show(
+									"模型: " + Path.GetFileName(ResolveModelPath(throwOnError: false) ?? "") + "\n"
+									+ "上下文: " + ctxNow + " token" + (total0 > 0 ? " (" + (total0 / 1024) + "K)" : "") + "\n"
+									+ "实测显存占用: " + (bd / 1024.0).ToString("F2") + " GiB\n\n"
+									+ "已记入当前方案，之后启动按这个值判断。",
+									"测试完成", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
 							}));
 						}
 						return;
