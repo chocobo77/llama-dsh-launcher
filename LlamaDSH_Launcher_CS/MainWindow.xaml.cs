@@ -2650,6 +2650,70 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	}
 
 	/// <summary>实测值的适用条件：K/V 缓存精度 + 上下文长度。这两项一变，KV 占用就变了，旧实测值作废。</summary>
+	/// <summary>测试用：对服务发一段约 1200 token 的提示，跑满一个 ubatch，采样真实峰值显存。</summary>
+	private async Task ProbePeakAsync()
+	{
+		double baseMiB = _vramBreakdownMiB > 0.0 ? _vramBreakdownMiB : _vramAccumMiB;
+		long peak = (long)baseMiB;
+		string port = RoleText("port", out string pv) && !string.IsNullOrWhiteSpace(pv) ? pv.Trim() : "1234";
+		StringBuilder sb = new StringBuilder();
+		for (int i = 0; i < 1200; i++) sb.Append("test ");
+		string body = "{\"prompt\":\"" + sb + "\",\"n_predict\":1,\"temperature\":0,\"cache_prompt\":false}";
+		Log("[实测] 开始预填充探针（1200 token），采样峰值显存…");
+		using HttpClient http = new HttpClient { Timeout = TimeSpan.FromMinutes(8) };
+		using CancellationTokenSource cts = new CancellationTokenSource();
+		Task sampler = Task.Run(async () =>
+		{
+			while (!cts.IsCancellationRequested)
+			{
+				try
+				{
+					Dictionary<string, string> g = _gpuMonitor.QueryGpu();
+					if (g.TryGetValue("vram_used", out string us) && long.TryParse(us, out long used))
+					{
+						long mib = used / 1048576L;
+						if (mib > peak) { peak = mib; }
+					}
+				}
+				catch
+				{
+				}
+				await Task.Delay(200).ConfigureAwait(false);
+			}
+		});
+		try
+		{
+			await http.PostAsync("http://127.0.0.1:" + port + "/completion", new StringContent(body, Encoding.UTF8, "application/json")).ConfigureAwait(false);
+		}
+		catch (Exception ex)
+		{
+			Log("[实测] 探针请求失败: " + ex.Message);
+		}
+		cts.Cancel();
+		try { await sampler.ConfigureAwait(false); } catch { }
+		double fin = peak;
+		Dispatcher.BeginInvoke((Action)(() =>
+		{
+			Log("[实测] 预填充峰值 " + fin.ToString("F0") + " MiB（静态 " + baseMiB.ToString("F0") + " MiB）");
+			if (_profiles != null && _profiles.TryGetValue(_currentProfile, out ProfileConfig? pc))
+			{
+				pc.VramMeasuredMiB = fin;
+				pc.VramMeasuredModel = ResolveModelPath(throwOnError: false) ?? "";
+				pc.VramMeasuredFp = VramFingerprint();
+				_measuredMemMiB = fin;
+				_measuredMemModel = pc.VramMeasuredModel;
+				_measuredMemFp = pc.VramMeasuredFp;
+				try { SaveConfigFile(); } catch { }
+			}
+			StopLlama();
+			System.Windows.MessageBox.Show(
+				"静态占用: " + baseMiB.ToString("F0") + " MiB\n"
+				+ "预填充峰值: " + fin.ToString("F0") + " MiB（" + (fin / 1024.0).ToString("F2") + " GiB）\n\n"
+				+ "已按峰值记入当前方案，之后启动按峰值判断。",
+				"测试完成", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
+		}));
+	}
+
 	private string VramFingerprint()
 	{
 		string ck = RoleText("cache_type_k", out string v1) ? v1 : "";
@@ -4345,6 +4409,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				_vramFitFailed = true;
 				Log("[显存] llama 报告无法把参数适配进可用显存（failed to fit params）：实际上已经超了，建议调小 ubatch 或把更多专家放到 CPU");
 			}
+			if (_vramTestMode && text.Contains("listening on", StringComparison.Ordinal))
+			{
+				_ = ProbePeakAsync();
+			}
 			if (text.Contains("loading model '", StringComparison.Ordinal))
 			{
 				_vramAccumMiB = 0.0;
@@ -4364,41 +4432,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					if (double.TryParse(numStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double bd) && bd > 0.0)
 					{
 						_vramBreakdownMiB = bd;
-						if (_vramTestMode)
-						{
-							// 拿到实测值立刻收工，不再等 model loaded。
-							_vramTestMode = false;
-							Log("[实测] breakdown 取到 " + bd.ToString("F0") + " MiB，立即停止测试加载");
-							Dispatcher.BeginInvoke((Action)(() =>
-							{
-								if (_profiles != null && _profiles.TryGetValue(_currentProfile, out ProfileConfig? pc0))
-								{
-									pc0.VramMeasuredMiB = bd;
-									pc0.VramMeasuredModel = ResolveModelPath(throwOnError: false) ?? "";
-									pc0.VramMeasuredFp = VramFingerprint();
-									_measuredMemMiB = bd;
-									_measuredMemModel = pc0.VramMeasuredModel;
-									_measuredMemFp = pc0.VramMeasuredFp;
-									try { SaveConfigFile(); } catch { }
-								}
-								StopLlama();
-								// 测试完成立刻把结果摆出来：模型、当前上下文、实测占用。
-								string ctxNow = RoleText("ctx_size", out string cs) ? NormTok(cs) : "?";
-								int total0 = 0;
-								int.TryParse(ctxNow, out total0);
-								System.Windows.MessageBox.Show(
-									"模型: " + Path.GetFileName(ResolveModelPath(throwOnError: false) ?? "") + "\n"
-									+ "上下文: " + ctxNow + " token" + (total0 > 0 ? " (" + (total0 / 1024) + "K)" : "") + "\n"
-									+ "实测显存占用: " + (bd / 1024.0).ToString("F2") + " GiB\n"
-									+ (_vramFitFailed
-										? "\n⚠ llama 报告 failed to fit params：当前参数实际适配不进可用显存，\n"
-										  + "这个静态占用不能当作安全结论，请调小 ubatch 或把更多专家放到 CPU 后重测。\n"
-										: "")
-									+ "\n"
-									+ "已记入当前方案，之后启动按这个值判断。",
-									"测试完成", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
-							}));
-						}
+						// 测试模式：等 llama 打印 listening 后跑一次预填充探针，量真实峰值（见 RunPrefillProbeAsync）。
+
 						return;
 					}
 				}
@@ -4437,7 +4472,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					Log("--- 测试加载完成（累计 " + total.ToString("F0") + " MiB），正在停止 Llama ---");
 					StopLlama();
 				}
-				if (total <= 0.0 || !hasProfile)
+				if (_vramTestMode || total <= 0.0 || !hasProfile)
 				{
 					return;
 				}
