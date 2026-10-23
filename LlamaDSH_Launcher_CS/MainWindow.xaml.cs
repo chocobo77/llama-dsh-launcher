@@ -2497,18 +2497,23 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			kvBytes *= 1.1;
 
 			// 计算图缓冲：开 Flash Attention 时主要由 n_ubatch 和隐藏维决定。
-			// 以 30B 模型、ubatch 512 实测约 85 MiB 为基准，按这两个量线性缩放。
+			// 实测基准：稠密 30B / ubatch 512 约 85 MiB；MoE（35B-A3B，ubatch 1024，Vulkan）实测 628 MiB，
+			// 专家路由会明显抬高这一项，所以分两档取基准，再按 ubatch 与隐藏维线性缩放。
 			double ubatch = 512.0;
 			if (RoleText("ubatch_size", out string ubStr) && double.TryParse(ubStr, out double ubVal) && ubVal > 0.0)
 			{
 				ubatch = ubVal;
 			}
 			double embedDim = gi.Embed > 0 ? gi.Embed : 5120.0;
-			double computeBytes = 85.0 * 1024 * 1024 * (ubatch / 512.0) * Math.Max(0.5, embedDim / 5120.0);
+			// 220 → 300：按 35B-A3B / ubatch 1024 实测 628 MiB 反推，300×2×(5120/5120)=600 最贴近。
+			// 样本只有一个，稠密模型仍用 85，别把这条经验值套到非 MoE 上。
+			double computeBaseMiB = (gi.Experts > 0) ? 300.0 : 85.0;
+			double computeBytes = computeBaseMiB * 1024 * 1024 * (ubatch / 512.0) * Math.Max(0.5, embedDim / 5120.0);
 
-			// 固定开销：CUDA context（120~550 MiB）+ host 缓冲 + 驱动与碎片余量，实测合计 1~2 GiB。
+			// 固定开销：后端 context（CUDA 120~550 MiB / Vulkan 类似量级）+ host 缓冲 + 驱动与碎片余量。
+			// host 缓冲实测 177 MiB（Vulkan_Host），旧值 64 MiB 是按 CUDA 拍的。
 			// 线性注意力层另有一份与 ctx 无关的递归状态（实测约 48 MiB）。
-			double fixedBytes = (300.0 + 64.0 + 640.0) * 1024 * 1024;
+			double fixedBytes = (300.0 + 176.0 + 640.0) * 1024 * 1024;
 			if (swaLayers > 0 && gi.SlidingWindow <= 0)
 			{
 				fixedBytes += 48.0 * 1024 * 1024;
