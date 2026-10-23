@@ -154,6 +154,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>本次已加载中，llama.cpp 报告的设备侧显存累计（MiB）。</summary>
 	private double _vramAccumMiB;
 
+	/// <summary>"测试加载"触发的试探性启动：拿到实测值就自动停止。</summary>
+	private bool _vramTestMode;
+
+	/// <summary>测试启动时临时打开了 --log-verbose，停止后需要还原。</summary>
+	private bool _vramTestVerboseRestore;
+
 	private List<ParamDefinition> _paramDefs;
 
 	private ParamSchemaLoadResult _paramSchema = new();
@@ -3720,8 +3726,41 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 	}
 
+	/// <summary>加载一次当前配置的模型，读到显存实测值就自动停止。</summary>
+	private void TestLlamaLoad_Click(object s, RoutedEventArgs e)
+	{
+		if (_llamaProc != null || IsLlamaRunning())
+		{
+			ShowNotice("Llama 已经在运行，直接看日志里有没有“显存实测已记录”即可。", isError: true);
+			return;
+		}
+		_vramTestMode = true;
+		_vramAccumMiB = 0.0;
+		// 只为这一次测试启动临时打开 --log-verbose：不打开的话 llama.cpp 不打 buffer size，
+		// 打开后日志很详尽、影响生成性能，所以测完立刻还原，绝不污染正常启动。
+		if (_pbw.TryGetValue("verbose", out System.Windows.Controls.CheckBox? cbVerbose) && cbVerbose.IsChecked != true)
+		{
+			cbVerbose.IsChecked = true;
+			_vramTestVerboseRestore = true;
+		}
+		Log("--- 测试加载：临时开启 --log-verbose，只为拿实测显存，加载完自动停止 ---");
+		StartLlama();
+	}
+
 	private void StopLlama()
 	{
+		// 测试启动临时打开的 verbose 在这里统一还原，正常启动不受影响
+		if (_vramTestVerboseRestore)
+		{
+			_vramTestVerboseRestore = false;
+			_vramTestMode = false;
+			if (_pbw.TryGetValue("verbose", out System.Windows.Controls.CheckBox? cbV) && cbV.IsChecked == true)
+			{
+				cbV.IsChecked = false;
+				Log("测试结束，已关闭 --log-verbose。");
+			}
+		}
+
 		if (_llamaProc == null && !IsLlamaRunning())
 		{
 			return;
@@ -4193,6 +4232,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					{
 						SaveConfigFile();
 						AppLog.WriteInfo($"显存实测已记录: {total:F0} MiB ({Path.GetFileName(measuredModel)})");
+						if (_vramTestMode)
+						{
+							_vramTestMode = false;
+							Log("--- 实测完成: " + total.ToString("F0") + " MiB，正在停止 Llama ---");
+							ShowNotice("实测完成：" + (total / 1024.0).ToString("F2") + " GiB，已记录到当前方案。");
+							StopLlama();
+						}
 					}
 					catch (Exception ex)
 					{
