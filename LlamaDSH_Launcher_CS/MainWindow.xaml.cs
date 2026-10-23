@@ -2200,6 +2200,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		public int FullAttentionInterval;
 		/// <summary>内置 MTP 头层数，大于 0 表示模型自带多 token 预测。</summary>
 		public int NextNPredictLayers;
+		/// <summary>每层专家数（MoE），用于按 --n-cpu-moe 折算显存里的专家权重。</summary>
+		public int Experts;
 	}
 
 	private static GgufArchInfo ReadGgufArch(string modelPath)
@@ -2269,6 +2271,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					else if (key.EndsWith(".nextn_predict_layers", StringComparison.Ordinal))
 					{
 						r.NextNPredictLayers = (int)v;
+					}
+					else if (key.EndsWith(".expert_count", StringComparison.Ordinal))
+					{
+						r.Experts = (int)v;
 					}
 					break;
 				}
@@ -2398,9 +2404,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			string mmpp = InputMmprojPath.Text.Trim().Trim('"');
 			bool mmCpu = (ChkNoMmprojOffload.IsChecked == true);
+			double mmprojBytes = 0.0;
 			if (!mmCpu && !string.IsNullOrEmpty(mmpp) && File.Exists(mmpp))
 			{
-				modelBytes += new FileInfo(mmpp).Length;
+				mmprojBytes = new FileInfo(mmpp).Length;
+				modelBytes += mmprojBytes;
 			}
 			long ctx = 0;
 			if (RoleText("ctx_size", out string ctxStr))
@@ -2422,21 +2430,29 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				gpuFrac = Math.Clamp(nglV / gi.Layers, 0.0, 1.0);
 			}
 			// MoE 专家在 CPU 时按经验系数折算显存中的模型占用(注意力+共享权重约占 12%)
+			// MoE：显存里只留稠密部分 + 没下放到 CPU 的专家。
+			// 优先按 --n-cpu-moe N 算比例（需要 GGUF 的 expert_count）；只有 --cpu-moe 时按专家全在 CPU 处理。
+			// 旧实现用 0.12 + 0.88×(N/层数) 的公式，量纲是错的——N 是每层专家数，不是层数。
 			bool cpuMoeOn = RoleBool("cpu_moe");
 			double moeFactor = 1.0;
-			if (cpuMoeOn)
+			double ncmV = 0.0;
+			bool hasNcm = RoleText("n_cpu_moe", out string ncm) && double.TryParse(ncm, out ncmV) && ncmV > 0.0;
+			if (hasNcm && gi.Ok && gi.Experts > 0)
+			{
+				moeFactor = Math.Clamp(1.0 - ncmV / gi.Experts, 0.02, 1.0);
+			}
+			else if (cpuMoeOn || hasNcm)
 			{
 				moeFactor = 0.12;
 			}
-			else if (RoleText("n_cpu_moe", out string ncm) && double.TryParse(ncm, out double ncmV) && ncmV > 0 && gi.Ok && gi.Layers > 0)
-			{
-				moeFactor = Math.Min(1.0, 0.12 + 0.88 * (ncmV / (double)gi.Layers));
-			}
 			double modelFileBytes = modelBytes;
+			// 视觉编码器不参与 MoE 折算，也不随 ngl 缩放：开了 --mmproj-offload 就整块在显存里。
+			double denseWeights = Math.Max(0.0, modelBytes - mmprojBytes);
 			if (moeFactor < 1.0)
 			{
-				modelBytes *= moeFactor;
+				denseWeights *= moeFactor;
 			}
+			double estWeights = denseWeights * gpuFrac + mmprojBytes;
 			// KV 缓存按层算：全注意力层随 ctx 线性增长，滑动窗口层只保留一个窗口，超出后不再增长。
 			// 混合架构（线性注意力 / SWA）的线性项远小于 block_count × ctx，统一按全层算会高估两三倍。
 			// 少数模型不写 key_length，用 embedding_length / head_count 反推，都没有就按 128 兜底，
@@ -2502,7 +2518,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			double mtpBytes = gi.NextNPredictLayers > 0 ? 668.0 * 1024 * 1024 : 0.0;
 
 			double bufferBytes = computeBytes + fixedBytes + mtpBytes;
-			double estVram = modelBytes * gpuFrac + kvBytes + bufferBytes;
+			double estVram = estWeights + kvBytes + bufferBytes;
 			double total = 0.0;
 			double used = 0.0;
 			Dictionary<string, string> g = _gpuMonitor.QueryGpu();
@@ -2521,7 +2537,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			// 有滑窗层时 KV 不随 ctx 线性增长，反推安全上下文没有意义，跳过这条建议。
 			if (swaLayers == 0 && gpuFrac > 0.0 && gpuKvPerToken > 0.0 && avail > 0.0)
 			{
-				safeCtx = (long)((avail - modelBytes * gpuFrac - bufferBytes) / gpuKvPerToken);
+				safeCtx = (long)((avail - estWeights - bufferBytes) / gpuKvPerToken);
 				if (safeCtx < 0)
 				{
 					safeCtx = 0;
@@ -2567,10 +2583,19 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			return true;
 		}
-		string msg = "⚠ 预计显存不足，llama-server 很可能因显存耗尽而崩溃（bad allocation / GGML_ASSERT）。\n\n"
+		// --fit 开着时 llama.cpp 会自己下调上下文/层数去适配显存，这种情况不该吓唬用户说"必然崩溃"，
+		// 只提示"按当前参数装不下，可能会被自动缩小"。
+		bool fitOn = TryGetParamValue("fit", out string fitVal)
+			&& !string.Equals(fitVal?.Trim(), "off", StringComparison.OrdinalIgnoreCase)
+			&& !string.Equals(fitVal?.Trim(), "false", StringComparison.OrdinalIgnoreCase);
+		string msg = (fitOn
+				? "按当前参数估算，显存有点紧，llama.cpp 的 --fit 会自动下调上下文或层数来适配。\n\n"
+				: "⚠ 预计显存不足，llama-server 很可能因显存耗尽而崩溃（bad allocation / GGML_ASSERT）。\n\n")
 			+ detail
-			+ "\n\n仍要尝试启动吗？\n（建议：减小“上下文大小”，或将 KV 缓存类型改为 q4_0/q4_1）";
-		System.Windows.MessageBoxResult r = System.Windows.MessageBox.Show(msg, "显存可能不足", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Warning);
+			+ (fitOn
+				? "\n\n直接启动吗？（如果自动缩小后仍然不够，再考虑减小“上下文大小”或把 KV 缓存类型改成 q4_0）"
+				: "\n\n仍要尝试启动吗？\n（建议：减小“上下文大小”，或将 KV 缓存类型改为 q4_0/q4_1）");
+		System.Windows.MessageBoxResult r = System.Windows.MessageBox.Show(msg, fitOn ? "显存偏紧" : "显存可能不足", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Warning);
 		return r == System.Windows.MessageBoxResult.Yes;
 	}
 
