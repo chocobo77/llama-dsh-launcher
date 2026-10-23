@@ -2424,9 +2424,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			double weights = fileBytes;
 			double ncmV = 0.0;
 			bool hasNcm = RoleText("n_cpu_moe", out string ncmStr) && double.TryParse(ncmStr, out ncmV) && ncmV > 0.0;
-			if (gi.Experts > 1 && hasNcm)
+			// --n-cpu-moe N 的 N 是"把 N 层（或 N 个专家组）留在 CPU"，分母该用层数而不是专家总数。
+			// 用专家数当分母会把 GPU 权重算成 90%，实际（对照启动日志 Vulkan0 model buffer）约 35%。
+			if (layers > 0 && hasNcm)
 			{
-				weights *= Math.Clamp(1.0 - ncmV / gi.Experts, 0.02, 1.0);
+				weights *= Math.Clamp(1.0 - ncmV / layers, 0.02, 1.0);
 			}
 			else if (RoleBool("cpu_moe"))
 			{
@@ -2476,7 +2478,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			string detail = metaWarn + "显存预算（公式）\n"
 				+ "权重(GPU): " + (gpuWeights / 1073741824.0).ToString("F2") + " GiB"
-				+ (gi.Experts > 0 && hasNcm ? "（MoE 保留 " + ncmV.ToString("F0") + "/" + gi.Experts + " 专家在 CPU）" : "") + "\n"
+				+ (layers > 0 && hasNcm ? "（MoE 保留 " + ncmV.ToString("F0") + "/" + layers + " 层专家在 CPU）" : "") + "\n"
 				+ "KV(" + ck + "/" + cv + ", " + fullLayers + " 层全注意力): " + (kvBytes / 1073741824.0).ToString("F2") + " GiB\n"
 				+ "计算图(ubatch " + ubatch.ToString("F0") + "): " + (computeBytes / 1048576.0).ToString("F0") + " MiB\n"
 				+ "固定开销: " + (runtimeBytes / 1048576.0).ToString("F0") + " MiB\n"
