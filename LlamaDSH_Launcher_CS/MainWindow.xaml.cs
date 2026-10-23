@@ -2417,11 +2417,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				fullLayers = Math.Max(1, (int)Math.Ceiling(layers / (double)gi.FullAttentionInterval));
 			}
+			// 元数据体检：专家数解析异常会让 MoE 折算严重跑偏，先把解析结果摆出来。
+			Log("[显存] 元数据: layers=" + layers + " experts=" + gi.Experts + " kvHeads=" + gi.KvHeads
+				+ " headDim=" + headDim + " interval=" + gi.FullAttentionInterval + " ctx=" + (RoleText("ctx_size", out string ctxDbg) ? NormTok(ctxDbg) : "?"));
 			// 权重：MoE 的 --n-cpu-moe 线性削减专家权重；ngl 决定上 GPU 的层比例
 			double weights = fileBytes;
 			double ncmV = 0.0;
 			bool hasNcm = RoleText("n_cpu_moe", out string ncmStr) && double.TryParse(ncmStr, out ncmV) && ncmV > 0.0;
-			if (gi.Experts > 0 && hasNcm)
+			if (gi.Experts > 1 && hasNcm)
 			{
 				weights *= Math.Clamp(1.0 - ncmV / gi.Experts, 0.02, 1.0);
 			}
