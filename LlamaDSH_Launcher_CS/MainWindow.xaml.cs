@@ -2636,8 +2636,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		// 公式估算出来的数字只是预测：先告诉用户预测值，并给"先测一次"的选项。
 		if (detail.Contains("公式粗算"))
 		{
+			// 在安全范围内也照常弹：用户要能看到预计占用是多少，而不是"够用就不吭声"。
+			string verdict = (availBytes > 0.0 && estBytes <= availBytes)
+				? "判断: 在可用范围内（预计 " + (estBytes / 1073741824.0).ToString("F1") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）"
+				: (availBytes > 0.0
+					? "判断: 超出可用范围（预计 " + (estBytes / 1073741824.0).ToString("F1") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）"
+					: "判断: 未取到显卡显存信息");
 			System.Windows.MessageBoxResult askPred = System.Windows.MessageBox.Show(
-				"显存占用为预测值（按公式估算，不是实测）：\n\n" + detail
+				"显存占用为预测值（按公式估算，不是实测）：\n\n" + detail + "\n" + verdict
 				+ "\n\n要不要先跑一次「测试加载」拿实测值？\n（选“否”就按当前预测值直接启动）",
 				"预测占用", System.Windows.MessageBoxButton.YesNoCancel, System.Windows.MessageBoxImage.Information);
 			if (askPred == System.Windows.MessageBoxResult.Cancel)
@@ -3649,7 +3655,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		LogParamHints();
 		if (!ConfirmVramFit())
 		{
-			Log("--- 启动已取消：预计显存不足 ---");
+			Log("--- 启动已取消 ---");
 			return;
 		}
 		// qwen35(Gated Delta Net) 部分卸载风险：启动前强制确认，避免 fused op 禁用导致 OOM/崩溃
