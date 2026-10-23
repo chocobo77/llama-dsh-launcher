@@ -160,6 +160,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>测试启动时临时打开了 --log-verbose，停止后需要还原。</summary>
 	private bool _vramTestVerboseRestore;
 
+	/// <summary>测试加载的完整日志文件；仅测试模式非空，verbose 刷屏时以文件为准。</summary>
+	private string? _vramTestLogPath;
+
 	private List<ParamDefinition> _paramDefs;
 
 	private ParamSchemaLoadResult _paramSchema = new();
@@ -3743,7 +3746,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			cbVerbose.IsChecked = true;
 			_vramTestVerboseRestore = true;
 		}
+		try
+		{
+			Directory.CreateDirectory(AppLog.LogDir);
+			_vramTestLogPath = Path.Combine(AppLog.LogDir, "llama_test_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".log");
+			File.WriteAllText(_vramTestLogPath, "=== 测试加载 " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ===" + Environment.NewLine);
+		}
+		catch
+		{
+			_vramTestLogPath = null;
+		}
 		Log("--- 测试加载：临时开启 --log-verbose，只为拿实测显存，加载完自动停止 ---");
+		Log("完整输出另存为: " + (_vramTestLogPath ?? "(写入失败)") + "（界面刷得太快就开这个文件）");
 		StartLlama();
 	}
 
@@ -5111,6 +5125,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				if (text.StartsWith("[llama] ", StringComparison.Ordinal))
 				{
 					NoteLlamaMemoryLine(text);
+					if (_vramTestLogPath != null)
+					{
+						try { File.AppendAllText(_vramTestLogPath, text + Environment.NewLine); } catch { }
+					}
 				}
 				if (!string.IsNullOrWhiteSpace(text) && (!(text == _lastLogLine) || text.StartsWith("[Perf] Error")))
 				{
