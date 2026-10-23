@@ -2396,14 +2396,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				return null;
 			}
-			// 没有实测值就不给数字。公式里的计算图基准、固定开销、MoE 折算比例全是经验值，
-			// 已经证明会把 12GB 显卡上的 9GB 模型判成 18GB，宁可说"未实测"也不报假数。
-			if (_profiles == null || !_profiles.TryGetValue(_currentProfile, out ProfileConfig? preCfg)
-				|| preCfg.VramMeasuredMiB <= 0.0
-				|| !string.Equals(preCfg.VramMeasuredModel, modelPath, StringComparison.OrdinalIgnoreCase))
-			{
-				return null;
-			}
+			// 没有实测值时走公式预测：数字只作参考，弹窗里会标明"预测值"并建议先测一次。
 			double modelBytes = new FileInfo(modelPath).Length;
 			if (modelBytes <= 0.0)
 			{
@@ -2639,6 +2632,26 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return false;
 		}
 		(double estBytes, double modelBytes, double kvBytes, double availBytes, string detail) = est.Value;
+
+		// 公式估算出来的数字只是预测：先告诉用户预测值，并给"先测一次"的选项。
+		if (detail.Contains("公式粗算"))
+		{
+			System.Windows.MessageBoxResult askPred = System.Windows.MessageBox.Show(
+				"显存占用为预测值（按公式估算，不是实测）：\n\n" + detail
+				+ "\n\n要不要先跑一次「测试加载」拿实测值？\n（选“否”就按当前预测值直接启动）",
+				"预测占用", System.Windows.MessageBoxButton.YesNoCancel, System.Windows.MessageBoxImage.Information);
+			if (askPred == System.Windows.MessageBoxResult.Cancel)
+			{
+				return false;
+			}
+			if (askPred == System.Windows.MessageBoxResult.Yes)
+			{
+				TestLlamaLoad_Click(this, new System.Windows.RoutedEventArgs());
+				return false;
+			}
+			return true;
+		}
+
 		if (availBytes <= 0.0)
 		{
 			return true;
@@ -4256,7 +4269,41 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			if (text.Contains("loading model '", StringComparison.Ordinal))
 			{
 				_vramAccumMiB = 0.0;
+				_vramBreakdownMiB = 0.0;
+				_vramModelBufferMiB = 0.0;
 				return;
+			}
+			// memory breakdown 那行是 llama.cpp 直接报的进程占用，比把各 buffer 加起来准：
+			// | - Vulkan0 (...) | 12118 = 11286 + (9249 = ...
+			int plusIdx = text.LastIndexOf("+ (", StringComparison.Ordinal);
+			if (plusIdx > 0 && text.Contains("|", StringComparison.Ordinal))
+			{
+				int eqIdx = text.IndexOf('=', plusIdx);
+				if (eqIdx > plusIdx + 3)
+				{
+					string numStr = text.Substring(plusIdx + 3, eqIdx - plusIdx - 3).Trim();
+					if (double.TryParse(numStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double bd) && bd > 0.0)
+					{
+						_vramBreakdownMiB = bd;
+						if (_vramTestMode)
+						{
+							// 拿到实测值立刻收工，不再等 model loaded。
+							_vramTestMode = false;
+							Log("[实测] breakdown 取到 " + bd.ToString("F0") + " MiB，立即停止测试加载");
+							Dispatcher.BeginInvoke((Action)(() =>
+							{
+								if (_profiles != null && _profiles.TryGetValue(_currentProfile, out ProfileConfig? pc0))
+								{
+									pc0.VramMeasuredMiB = bd;
+									pc0.VramMeasuredModel = ResolveModelPath(throwOnError: false) ?? "";
+									try { SaveConfigFile(); } catch { }
+								}
+								StopLlama();
+							}));
+						}
+						return;
+					}
+				}
 			}
 			if (text.Contains("model loaded", StringComparison.Ordinal))
 			{
