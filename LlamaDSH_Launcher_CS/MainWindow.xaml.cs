@@ -2678,12 +2678,17 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return false;
 		}
 		(double estBytes, double modelBytes, double kvBytes, double availBytes, string detail) = est.Value;
+		// 静态占用只是加载完那一刻的数。预填充（ubatch 1024）会瞬时拉高计算图与激活值，
+		// 这部分 llama 只在真正推理时才分配、测不到，所以判定必须留出余量，否则结论会过于乐观。
+		double reserve = 2048.0 * 1048576.0;
+		string reserveNote = "\n预留峰值余量: 2.00 GiB（预填充瞬时占用不可测，ubatch 调大时还需更多）";
+		detail += reserveNote;
 
 		// 公式估算出来的数字只是预测：先告诉用户预测值，并给"先测一次"的选项。
 		if (detail.Contains("公式粗算"))
 		{
 			// 在安全范围内也照常弹：用户要能看到预计占用是多少，而不是"够用就不吭声"。
-			string verdict = (availBytes > 0.0 && estBytes <= availBytes)
+			string verdict = (availBytes > 0.0 && estBytes + reserve <= availBytes)
 				? "判断: 在可用范围内（预计 " + (estBytes / 1073741824.0).ToString("F1") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）"
 				: (availBytes > 0.0
 					? "判断: 超出可用范围（预计 " + (estBytes / 1073741824.0).ToString("F1") + " GiB / 可用 " + (availBytes / 1073741824.0).ToString("F1") + " GiB）"
@@ -4332,6 +4337,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		try
 		{
+			// llama 自己说"适配不下"时，说明当前参数已超出可用显存，静态占用再好看也没用。
+			if (text.Contains("failed to fit params", StringComparison.OrdinalIgnoreCase))
+			{
+				Log("[显存] llama 报告无法把参数适配进可用显存（failed to fit params）：实际上已经超了，建议调小 ubatch 或把更多专家放到 CPU");
+			}
 			if (text.Contains("loading model '", StringComparison.Ordinal))
 			{
 				_vramAccumMiB = 0.0;
