@@ -2695,31 +2695,47 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			double kvPerTok = fullLayers * gi.KvHeads * headDim * (CacheBytesPerElem(ck) + CacheBytesPerElem(cv));
 			double kvBytes = kvPerTok * ctx * gpuFrac;
-			// SWA/混合注意力层：三类情况——滑动窗口（KV=min(ctx,窗口)）、
-			// 线性注意力（SSM/Gated Delta Net，state 不随 ctx 线性，按元数据粗估）、未知（警告）
+			// SWA/混合注意力层：三类情况——滑动窗口（KV=min(ctx,窗口)，--swa-full 时全 ctx）、
+			// 线性注意力（SSM/Gated Delta Net，state 不随 ctx 线性但随槽数增长）、未知（警告）
 			int swaLayers = Math.Max(0, layers - fullLayers);
 			double swaKvBytes = 0.0;
+			double recStateBytes = 0.0;
 			string swaNote = "";
+			bool swaFull = _pbw.TryGetValue("swa-full", out System.Windows.Controls.CheckBox? sfb) && sfb.IsChecked == true;
 			if (swaLayers > 0)
 			{
 				if (gi.SlidingWindow > 0 && gi.KvHeads > 0 && headDim > 0 && ctx > 0)
 				{
-					long swaCtx = Math.Min(ctx, gi.SlidingWindow);
+					// --swa-full 时 SWA 层也保留全 ctx 的 KV（官方语义: use full-size SWA cache）
+					long swaCtx = swaFull ? ctx : Math.Min(ctx, gi.SlidingWindow);
 					swaKvBytes = swaLayers * gi.KvHeads * headDim * (CacheBytesPerElem(ck) + CacheBytesPerElem(cv)) * swaCtx * gpuFrac;
-					swaNote = "（含 SWA " + swaLayers + " 层 × 窗口 " + gi.SlidingWindow + ": " + (swaKvBytes / 1048576.0).ToString("F0") + " MiB）";
+					swaNote = "（含 SWA " + swaLayers + " 层 × " + (swaFull ? "全 ctx" : "窗口 " + gi.SlidingWindow) + ": " + (swaKvBytes / 1048576.0).ToString("F0") + " MiB）";
 				}
 				else if (gi.SsmInnerSize > 0 && gi.SsmStateSize > 0)
 				{
-					// conv 状态 + recurrent 状态（f32），常数级/层，不随 ctx 线性
-					swaKvBytes = swaLayers * ((double)gi.SsmInnerSize * gi.SsmConvKernel + (double)gi.SsmInnerSize * gi.SsmStateSize) * 4.0 * gpuFrac;
-					swaNote = "（含线性注意力 " + swaLayers + " 层，state 不随 ctx 增长: " + (swaKvBytes / 1048576.0).ToString("F0") + " MiB）";
+					// conv 状态 + recurrent 状态（f32），常数级/层，不随 ctx 线性但随槽数增长
+					recStateBytes = swaLayers * ((double)gi.SsmInnerSize * gi.SsmConvKernel + (double)gi.SsmInnerSize * gi.SsmStateSize) * 4.0 * gpuFrac;
+					swaNote = "（含线性注意力 " + swaLayers + " 层，state 不随 ctx 增长: " + (recStateBytes / 1048576.0).ToString("F0") + " MiB）";
 				}
 				else
 				{
 					metaWarn += "⚠ " + swaLayers + " 个混合注意力层（窗口/状态未知）KV 未计入预算（如遇 OOM 请实测）\n";
 				}
 			}
-			kvBytes += swaKvBytes;
+			// 线性注意力 state 按槽数线性增长（实测: 149.62 MiB = 1 seq；--parallel N → N 份）
+			if (recStateBytes > 0.0 && TryGetParamValue("parallel", out string parStr) && int.TryParse(parStr.Trim(), out int parN))
+			{
+				if (parN > 1)
+				{
+					recStateBytes *= parN;
+					swaNote = swaNote.Replace("MiB）", "MiB × " + parN + " 槽）");
+				}
+				else if (parN < 0)
+				{
+					metaWarn += "⚠ --parallel -1（auto）：槽数由 ctx 自动推导，线性注意力 state 会成倍增长（预算按 1 槽计）\n";
+				}
+			}
+			kvBytes += swaKvBytes + recStateBytes;
 			// 计算图：n_ubatch × n_embd × 173B——系数按实测 breakdown 校准
 			// (qwen35/ubatch512 实测 432 MiB = 512×5120×173B；不同架构 ±50%)
 			double ubatch = 512.0;
@@ -2731,7 +2747,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			double computeBytes = ubatch * embed * 173.0;
 			// 输出 logits 缓冲不占显卡 VRAM：0.7.0 把 output buffer 放在 host 侧
 			// 且按实际 n_outputs 动态分配（实测 decode 单 token 仅 0.95 MiB），不计入预算
-			// 草稿模型（推测解码激活时）整体进显存，按文件大小计入
+			// 草稿模型（推测解码激活时）整体进显存，按文件大小计入；
+			// --spec-draft-ngl 0 时草稿全部驻留 CPU，不计入
 			double draftBytes = 0.0;
 			if (IsSpecDecodingActive())
 			{
@@ -2740,7 +2757,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					dp = sdm;
 				}
-				if (!string.IsNullOrEmpty(dp) && File.Exists(dp))
+				bool draftOnCpu = TryGetParamValue("spec-draft-ngl", out string dngl) && dngl.Trim() == "0";
+				if (!draftOnCpu && !string.IsNullOrEmpty(dp) && File.Exists(dp))
 				{
 					draftBytes = GgufShardBytes(dp);
 				}
