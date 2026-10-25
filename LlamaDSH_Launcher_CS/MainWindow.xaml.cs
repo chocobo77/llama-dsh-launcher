@@ -151,25 +151,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>本次点击"启动"后是否已经尝试过"重连 node_modules 链接"自愈，避免反复触发。</summary>
 	private bool _dshModuleHealTried;
 
-	/// <summary>本次已加载中，llama.cpp 报告的设备侧显存累计（MiB）。</summary>
-	private double _vramAccumMiB;
-
-
-	/// <summary>其中来自 "model buffer size" 的部分；为 0 说明权重走 mmap，没进设备缓冲。</summary>
-	private double _vramModelBufferMiB;
-
-	/// <summary>llama.cpp 自己打印的进程显存占用（memory breakdown 的 self 列），权威值。</summary>
-	private double _vramBreakdownMiB;
-
-
-
-
-
 	/// <summary>测试启动时临时打开了 --log-verbose，停止后需要还原。</summary>
 	private bool _vramTestVerboseRestore;
-
-	/// <summary>测试加载的完整日志文件；仅测试模式非空，verbose 刷屏时以文件为准。</summary>
-	private string? _vramTestLogPath;
 
 	private List<ParamDefinition> _paramDefs;
 
@@ -2428,6 +2411,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			double kvPerTok = fullLayers * gi.KvHeads * headDim * (CacheBytesPerElem(ck) + CacheBytesPerElem(cv));
 			double kvBytes = kvPerTok * ctx * gpuFrac;
+			// 下面计算图与固定开销两组系数均为经验标定值，待实测回归校准。
 			// 计算图：n_ubatch × n_embd × 280B，再乘 1.15 安全边际
 			double ubatch = 512.0;
 			if (RoleText("ubatch_size", out string ubStr) && double.TryParse(ubStr, out double ubVal) && ubVal > 0.0)
@@ -2469,15 +2453,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			return null;
 		}
-	}
-
-	/// <summary>实测值的适用条件：K/V 缓存精度 + 上下文长度。这两项一变，KV 占用就变了，旧实测值作废。</summary>
-	private string VramFingerprint()
-	{
-		string ck = RoleText("cache_type_k", out string v1) ? v1 : "";
-		string cv = RoleText("cache_type_v", out string v2) ? v2 : "";
-		string ctxNow = RoleText("ctx_size", out string v3) ? NormTok(v3) : "";
-		return ck + "/" + cv + "@" + ctxNow;
 	}
 
 	/// <summary>启动前的显存判断：装得下直接走，装不下才问。</summary>
@@ -4048,114 +4023,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		StopDsh();
 	}
 
-	/// <summary>
-	/// 从 llama.cpp 加载日志里捡设备侧显存占用：model / compute / KV / RS / output buffer。
-	/// 只统计设备（Vulkan0 / CUDA0 / Metal），跳过 CPU、CPU_REPACK、Vulkan_Host 这些主机侧缓冲。
-	/// 看到 "model loaded" 就把累计值记进当前方案，下次预估直接用实测值。
-	/// </summary>
+	/// <summary>llama.cpp 报告 "failed to fit params" 时提示用户：当前参数实际已超出可用显存。</summary>
 	private void NoteLlamaMemoryLine(string text)
 	{
-		try
+		// llama 自己说"适配不下"时，说明当前参数已超出可用显存，静态占用再好看也没用。
+		if (text.Contains("failed to fit params", StringComparison.OrdinalIgnoreCase))
 		{
-			// llama 自己说"适配不下"时，说明当前参数已超出可用显存，静态占用再好看也没用。
-			if (text.Contains("failed to fit params", StringComparison.OrdinalIgnoreCase))
-			{
-				Log("[显存] llama 报告无法把参数适配进可用显存（failed to fit params）：实际上已经超了，建议调小 ubatch 或把更多专家放到 CPU");
-			}
-			if (text.Contains("loading model '", StringComparison.Ordinal))
-			{
-				_vramAccumMiB = 0.0;
-				_vramBreakdownMiB = 0.0;
-				_vramModelBufferMiB = 0.0;
-				return;
-			}
-			// memory breakdown 那行是 llama.cpp 直接报的进程占用，比把各 buffer 加起来准：
-			// | - Vulkan0 (...) | 12118 = 11286 + (9249 = ...
-			int plusIdx = text.LastIndexOf("+ (", StringComparison.Ordinal);
-			if (plusIdx > 0 && text.Contains("|", StringComparison.Ordinal))
-			{
-				int eqIdx = text.IndexOf('=', plusIdx);
-				if (eqIdx > plusIdx + 3)
-				{
-					string numStr = text.Substring(plusIdx + 3, eqIdx - plusIdx - 3).Trim();
-					if (double.TryParse(numStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double bd) && bd > 0.0)
-					{
-						_vramBreakdownMiB = bd;
-						// 测试模式：等 llama 打印 listening 后跑一次预填充探针，量真实峰值（见 RunPrefillProbeAsync）。
-
-						return;
-					}
-				}
-			}
-			if (text.Contains("model loaded", StringComparison.Ordinal))
-			{
-				double total = _vramBreakdownMiB > 0.0 ? _vramBreakdownMiB : _vramAccumMiB;
-				// 权重走 mmap 时设备侧 model buffer 报 0，这块不进 total，用文件大小按比例补回，
-				// 否则实测值会低一个数量级（实测 MoE+repack 下设备侧约占文件 39%）。
-				if (_vramBreakdownMiB <= 0.0 && _vramModelBufferMiB < 1.0)
-				{
-					try
-					{
-						string mp0 = ResolveModelPath(throwOnError: false) ?? "";
-						if (mp0.Length > 0 && File.Exists(mp0))
-						{
-							total += new FileInfo(mp0).Length / 1048576.0 * (RoleBool("cpu_moe") ? 0.12 : 0.39);
-						}
-					}
-					catch
-					{
-					}
-				}
-				ProfileConfig? cfg = null;
-				bool hasProfile = _profiles != null && _profiles.TryGetValue(_currentProfile, out cfg);
-				string diag = "[实测] model loaded：累计 " + total.ToString("F0") + " MiB，方案=" + _currentProfile + "，命中=" + hasProfile;
-				Log(diag);
-				if (_vramTestLogPath != null)
-				{
-					try { File.AppendAllText(_vramTestLogPath, diag + Environment.NewLine); } catch { }
-				}
-				// 实测值已不再参与显存判断（改为纯公式预算），这里不再落盘，避免每次启动都写配置文件。
-			}
-			Match m = Regex.Match(text, @"(\S+)\s+(?:model|compute|KV|RS|output)\s+buffer size\s*=\s*([0-9.]+)\s*MiB");
-			if (_vramTestLogPath != null)
-			{
-				try { File.AppendAllText(_vramTestLogPath, "[实测] 原始行: " + text.Trim() + " | match=" + m.Success + " | 累计=" + _vramAccumMiB.ToString("F0") + Environment.NewLine); } catch { }
-			}
-			if (!m.Success)
-			{
-				return;
-			}
-			string dev = m.Groups[1].Value;
-			if (dev.StartsWith("CPU", StringComparison.OrdinalIgnoreCase) || dev.Contains("Host", StringComparison.OrdinalIgnoreCase))
-			{
-				return;
-			}
-			if (double.TryParse(m.Groups[2].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out double v))
-			{
-				_vramAccumMiB += v;
-				if (text.Contains("model buffer size", StringComparison.Ordinal))
-				{
-					_vramModelBufferMiB += v;
-				}
-			}
-			else
-			{
-				// 正则没匹配上时退回粗暴切分：取最后一个 = 号和 “ MiB” 之间的数字。
-				int eq = text.LastIndexOf('=');
-				int sp = eq >= 0 ? text.IndexOf(" MiB", eq, StringComparison.Ordinal) : -1;
-				if (eq >= 0 && sp > eq)
-				{
-					string num = text.Substring(eq + 1, sp - eq - 1).Trim();
-					if (double.TryParse(num, NumberStyles.Float, CultureInfo.InvariantCulture, out double v2))
-					{
-						_vramAccumMiB += v2;
-						Log("[实测] 解析(回退): " + num + " MiB ← " + text.Trim());
-					}
-				}
-			}
-		}
-		catch
-		{
+			Log("[显存] llama 报告无法把参数适配进可用显存（failed to fit params）：实际上已经超了，建议调小 ubatch 或把更多专家放到 CPU");
 		}
 	}
 
@@ -5000,10 +4874,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				if (text.StartsWith("[llama] ", StringComparison.Ordinal))
 				{
 					NoteLlamaMemoryLine(text);
-					if (_vramTestLogPath != null)
-					{
-						try { File.AppendAllText(_vramTestLogPath, text + Environment.NewLine); } catch { }
-					}
 				}
 				if (!string.IsNullOrWhiteSpace(text) && (!(text == _lastLogLine) || text.StartsWith("[Perf] Error")))
 				{
