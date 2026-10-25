@@ -9,8 +9,8 @@
 # 核心功能: 思考强度控制 (reasoning / reasoning-effort / reasoning-budget / reasoning-preserve)
 # =====================================================================
 meta:
-  schema: 7
-  adapt: "llama-server 0.7.0-dev (build 11680, b797b9ca8) 实测对齐 · schema v7（2026-10-22 全量比对 --help：332 个选项名 / 241 个参数，功能型选项无缺口；7 个 <0|1> 参数仍为 Combo、numa 无非法 disabled；<0|1> 裸旗标会 invalid stoul argument）"
+  schema: 8
+  adapt: "llama-server 0.7.0-dev (build 11680, b797b9ca8) 实测对齐 · schema v7（2026-10-22 全量比对 --help：332 个选项名 / 241 个参数，功能型选项无缺口；7 个 <0|1> 参数仍为 Combo、numa 无非法 disabled；<0|1> 裸旗标会 invalid stoul argument）；v8: 同步 0.7.0-dev 参数面"
   notes: >
     llama.cpp 更新时的维护方法（改完点启动器"⟳ 重载参数配置"即时生效）:
     1. 新增参数: 在 params 下加一条, 必填 flag/label/type/default/group
