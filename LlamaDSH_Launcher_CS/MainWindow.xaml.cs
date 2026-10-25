@@ -2183,6 +2183,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		public int NextNPredictLayers;
 		/// <summary>每层专家数（MoE），用于按 --n-cpu-moe 折算显存里的专家权重。</summary>
 		public int Experts;
+		/// <summary>词表大小（tokenizer.ggml.tokens 数组长度），用于估算输出 logits 缓冲。</summary>
+		public long VocabSize;
 	}
 
 	private static GgufArchInfo ReadGgufArch(string modelPath)
@@ -2278,6 +2280,30 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					}
 					break;
 				}
+				case 9:
+				{
+					// 数组: tokenizer.ggml.tokens 的长度即词表大小, 输出 logits 缓冲估算需要;
+					// 字符串元素只读长度后 seek, 免去十几万次 UTF-8 解码
+					uint elemType = br.ReadUInt32();
+					ulong count = br.ReadUInt64();
+					if (key == "tokenizer.ggml.tokens")
+					{
+						r.VocabSize = (long)count;
+					}
+					for (ulong j = 0; j < count; j++)
+					{
+						if (elemType == 8)
+						{
+							ulong len = br.ReadUInt64();
+							br.BaseStream.Position += (long)len;
+						}
+						else
+						{
+							SkipGgufValue(br, elemType);
+						}
+					}
+					break;
+				}
 				default:
 					SkipGgufValue(br, vt);
 					break;
@@ -2350,6 +2376,35 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 	}
 
+	/// <summary>
+	/// GGUF 分片权重求和: --model 传第一片是 llama 的分片加载约定,
+	/// 只取单片会漏掉其余 N-1 片的权重(27B 五分片会被低估到 1/5)。
+	/// </summary>
+	private static double GgufShardBytes(string firstShardPath)
+	{
+		double sum = new FileInfo(firstShardPath).Length;
+		Match m = Regex.Match(Path.GetFileName(firstShardPath), @"-(\d{5})-of-(\d{5})\.gguf$", RegexOptions.IgnoreCase);
+		if (!m.Success)
+		{
+			return sum;
+		}
+		string dir = Path.GetDirectoryName(firstShardPath) ?? ".";
+		string stem = Path.GetFileName(firstShardPath).Substring(0, m.Index);
+		if (!int.TryParse(m.Groups[2].Value, out int total))
+		{
+			return sum;
+		}
+		for (int i = 2; i <= total; i++)
+		{
+			string p = Path.Combine(dir, string.Format("{0}-{1:D5}-of-{2:D5}.gguf", stem, i, total));
+			if (File.Exists(p))
+			{
+				sum += new FileInfo(p).Length;
+			}
+		}
+		return sum;
+	}
+
 	private (double estBytes, double modelBytes, double kvBytes, double availBytes, string detail)? EstimateVramNeeded()
 	{
 		try
@@ -2359,7 +2414,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				return null;
 			}
-			double fileBytes = new FileInfo(modelPath).Length;
+			// 权重: 按 GGUF 分片求和(官方分片加载约定下 --model 只给第一片)
+			double fileBytes = GgufShardBytes(modelPath);
 			if (fileBytes <= 0.0)
 			{
 				return null;
@@ -2401,9 +2457,16 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				gpuFrac = Math.Clamp(nglV / layers, 0.0, 1.0);
 			}
 			double gpuWeights = weights * gpuFrac;
-			// KV：只有全注意力层随上下文线性增长
+			// KV：只有全注意力层随上下文线性增长；V 量化依赖 flash attention，
+			// 显式关闭 FA 时 llama 会把 V 回退到 f16（llama.cpp cache 类型回退规则）
 			string ck = RoleText("cache_type_k", out string ckv) && !string.IsNullOrEmpty(ckv) ? ckv : "f16";
 			string cv = RoleText("cache_type_v", out string cvv) && !string.IsNullOrEmpty(cvv) ? cvv : "f16";
+			string kvNote = "";
+			if (TryGetParamValue("flash-attn", out string faStr) && faStr.Trim() == "off" && cv != "f16")
+			{
+				cv = "f16";
+				kvNote = "（FA 关闭，V 量化回退 f16）";
+			}
 			long ctx = 0L;
 			if (RoleText("ctx_size", out string ctxStr))
 			{
@@ -2411,6 +2474,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			double kvPerTok = fullLayers * gi.KvHeads * headDim * (CacheBytesPerElem(ck) + CacheBytesPerElem(cv));
 			double kvBytes = kvPerTok * ctx * gpuFrac;
+			// SWA 层的 KV 只保留滑动窗口长度（llama 默认非 --swa-full），不随 ctx 全量增长
+			int swaLayers = Math.Max(0, layers - fullLayers);
+			double swaKvBytes = 0.0;
+			if (swaLayers > 0 && gi.KvHeads > 0 && headDim > 0)
+			{
+				long swaCtx = gi.SlidingWindow > 0 ? Math.Min(ctx > 0 ? ctx : long.MaxValue, gi.SlidingWindow) : ctx;
+				if (swaCtx > 0)
+				{
+					swaKvBytes = swaLayers * gi.KvHeads * headDim * (CacheBytesPerElem(ck) + CacheBytesPerElem(cv)) * swaCtx * gpuFrac;
+				}
+			}
+			kvBytes += swaKvBytes;
 			// 下面计算图与固定开销两组系数均为经验标定值，待实测回归校准。
 			// 计算图：n_ubatch × n_embd × 280B，再乘 1.15 安全边际
 			double ubatch = 512.0;
@@ -2420,9 +2495,36 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			double embed = gi.Embed > 0 ? gi.Embed : 4096.0;
 			double computeBytes = ubatch * embed * 280.0 * 1.15;
+			// 输出 logits 缓冲：n_outputs_max(= max(batch, ubatch)) × n_vocab × f32——
+			// llama-context 的 output buffer 是独立大块，大词表模型(150k+)仅此一项即可上 GiB
+			double batchN = 2048.0;
+			if (TryGetParamValue("batch-size", out string bsStr) && double.TryParse(NormTok(bsStr), NumberStyles.Float, CultureInfo.InvariantCulture, out double bsVal) && bsVal > 0.0)
+			{
+				batchN = bsVal;
+			}
+			double outputsMax = Math.Max(batchN, ubatch);
+			double outputBytes = 0.0;
+			if (gi.VocabSize > 0)
+			{
+				outputBytes = gi.VocabSize * outputsMax * 4.0;
+			}
+			// 草稿模型（推测解码激活时）整体进显存，按文件大小计入
+			double draftBytes = 0.0;
+			if (IsSpecDecodingActive())
+			{
+				string dp = InputMtpPath.Text.Trim().Trim('"');
+				if (TryGetParamValue("spec-draft-model", out string sdm) && !string.IsNullOrEmpty(sdm))
+				{
+					dp = sdm;
+				}
+				if (!string.IsNullOrEmpty(dp) && File.Exists(dp))
+				{
+					draftBytes = GgufShardBytes(dp);
+				}
+			}
 			// 固定开销：CUDA context + host + 框架基线 1 GiB + 7.6% 权重
 			double runtimeBytes = (550.0 + 90.0) * 1048576.0 + 1073741824.0 + gpuWeights * 0.076;
-			double total = gpuWeights + kvBytes + computeBytes + runtimeBytes + mmprojBytes;
+			double total = gpuWeights + kvBytes + computeBytes + outputBytes + runtimeBytes + mmprojBytes + draftBytes;
 			double totalVram = 0.0;
 			double usedVram = 0.0;
 			Dictionary<string, string> g = _gpuMonitor.QueryGpu();
@@ -2438,11 +2540,30 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				metaWarn = "⚠ KV 元数据不完整（层数=" + layers + " KV头=" + gi.KvHeads + " ctx=" + ctx + "），KV 可能算成 0，预算仅供参考\n";
 			}
+			if (gi.VocabSize <= 0)
+			{
+				metaWarn += "⚠ 词表大小未解析，输出 logits 缓冲未计入（实际占用更高）\n";
+			}
+			if (swaLayers > 0 && gi.SlidingWindow <= 0)
+			{
+				metaWarn += "⚠ " + swaLayers + " 个 SWA 层的滑动窗口大小在 GGUF 中未标注，这部分 KV 未计入预算（如遇 OOM 请调小 ctx 后实测）\n";
+			}
+			if (TryGetParamValue("flash-attn", out string faAuto) && faAuto.Trim() == "auto" && cv != "f16")
+			{
+				metaWarn += "⚠ FA=auto：若后端不支持 FA，V 缓存会回退 f16，实际占用更高\n";
+			}
+			if (RoleText("lora", out string loraStr) && !string.IsNullOrEmpty(loraStr))
+			{
+				metaWarn += "⚠ LoRA 适配器占用未计入（按文件大小预留）\n";
+			}
 			string detail = metaWarn + "显存预算（公式）\n"
 				+ "权重(GPU): " + (gpuWeights / 1073741824.0).ToString("F2") + " GiB"
 				+ (layers > 0 && hasNcm ? "（MoE 保留 " + ncmV.ToString("F0") + "/" + layers + " 层专家在 CPU）" : "") + "\n"
-				+ "KV(" + ck + "/" + cv + ", " + fullLayers + " 层全注意力): " + (kvBytes / 1073741824.0).ToString("F2") + " GiB\n"
+				+ "KV(" + ck + "/" + cv + ", " + fullLayers + " 层全注意力): " + (kvBytes / 1073741824.0).ToString("F2") + " GiB"
+				+ (swaKvBytes > 0.0 ? "（含 SWA " + swaLayers + " 层 × 窗口 " + gi.SlidingWindow + ": " + (swaKvBytes / 1048576.0).ToString("F0") + " MiB）" : "") + "\n"
 				+ "计算图(ubatch " + ubatch.ToString("F0") + "): " + (computeBytes / 1048576.0).ToString("F0") + " MiB\n"
+				+ (outputBytes > 0.0 ? "输出 logits(" + gi.VocabSize + " 词 × " + outputsMax.ToString("F0") + " outputs): " + (outputBytes / 1048576.0).ToString("F0") + " MiB\n" : "")
+				+ (draftBytes > 0.0 ? "草稿模型: " + (draftBytes / 1073741824.0).ToString("F2") + " GiB\n" : "")
 				+ "固定开销: " + (runtimeBytes / 1048576.0).ToString("F0") + " MiB\n"
 				+ (mmprojBytes > 0 ? "视觉编码器: " + (mmprojBytes / 1048576.0).ToString("F0") + " MiB\n" : "")
 				+ "预计总占用: " + (total / 1073741824.0).ToString("F2") + " GiB\n"
