@@ -69,6 +69,7 @@
       </ListView.View>
     </ListView>
     <WrapPanel Grid.Row="2" Margin="0,8,0,4">
+      <Button Name="BtnActivate" Content="✅ 激活" Width="96" Margin="0,0,6,0" Click="Activate_Click" ToolTip="把插件加回 dsh.profile.bundles（激活表）并解除锁定；DSH 重启后生效" />
       <Button Name="BtnToggle" Content="⏻ 停用并锁定" Width="120" Margin="0,0,6,0" Click="Toggle_Click" ToolTip="从 dsh.profile.bundles 移除并锁定：即使被 DSH 网页端/市场插件写回，启动器也会自动移除。再次点击为重新启用并解锁。" />
       <Button Name="BtnUpgrade" Content="⬆ 升级到最新" Width="110" Margin="0,0,6,0" Click="Upgrade_Click" ToolTip="pnpm add 插件@latest（需先停止 DSH）" />
       <Button Name="BtnExempt" Content="⚖ 版本豁免" Width="100" Margin="0,0,6,0" Click="Exempt_Click" ToolTip="为当前插件版本写入 compatibility.json 豁免（明确接受 peer 版本风险）。注意：豁免不会让构建期模块表漂移的 client 插件可用。" />

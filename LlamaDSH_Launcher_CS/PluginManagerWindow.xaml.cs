@@ -128,6 +128,7 @@ public partial class PluginManagerWindow : Window
 	{
 		DshPluginInfo? p = Selected();
 		bool has = p != null;
+		BtnActivate.IsEnabled = has && p!.Installed && !p.InBundles;
 		BtnToggle.IsEnabled = has && p!.Installed;
 		BtnToggle.Content = p != null && DshCompatService.ReadPinnedInactive(_profile).Contains(p.Name, System.StringComparer.Ordinal)
 			? "⏻ 启用并解锁"
@@ -180,6 +181,37 @@ public partial class PluginManagerWindow : Window
 
 	private async void Refresh_Click(object sender, RoutedEventArgs e)
 	{
+		await RefreshAsync();
+	}
+
+	/// <summary>把插件重新加回激活表（dsh.profile.bundles）并解除锁定，DSH 重启后生效。</summary>
+	private async void Activate_Click(object sender, RoutedEventArgs e)
+	{
+		DshPluginInfo? p = Selected();
+		if (p == null || _busy)
+		{
+			return;
+		}
+		if (!RequireDshStopped())
+		{
+			return;
+		}
+		_busy = true;
+		try
+		{
+			string msg = await Task.Run(delegate { return DshCompatService.SetBundleActive(_profile, p.Name, true, delegate (string m) { Log(m); }); });
+			Log("[操作] " + p.Name + " → " + msg);
+			_hostLog?.Invoke("[插件管理] " + p.Name + " → " + msg);
+			ShowStatus(msg);
+		}
+		catch (Exception ex)
+		{
+			ShowStatus("激活失败: " + ex.Message);
+		}
+		finally
+		{
+			_busy = false;
+		}
 		await RefreshAsync();
 	}
 
