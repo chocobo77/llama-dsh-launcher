@@ -2720,28 +2720,17 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}
 			}
 			kvBytes += swaKvBytes;
-			// 下面计算图与固定开销两组系数均为经验标定值，待实测回归校准。
-			// 计算图：n_ubatch × n_embd × 280B，再乘 1.15 安全边际
+			// 计算图：n_ubatch × n_embd × 173B——系数按实测 breakdown 校准
+			// (qwen35/ubatch512 实测 432 MiB = 512×5120×173B；不同架构 ±50%)
 			double ubatch = 512.0;
 			if (RoleText("ubatch_size", out string ubStr) && double.TryParse(ubStr, out double ubVal) && ubVal > 0.0)
 			{
 				ubatch = ubVal;
 			}
 			double embed = gi.Embed > 0 ? gi.Embed : 4096.0;
-			double computeBytes = ubatch * embed * 280.0 * 1.15;
-			// 输出 logits 缓冲：n_outputs_max(= max(batch, ubatch)) × n_vocab × f32——
-			// llama-context 的 output buffer 是独立大块，大词表模型(150k+)仅此一项即可上 GiB
-			double batchN = 2048.0;
-			if (TryGetParamValue("batch-size", out string bsStr) && double.TryParse(NormTok(bsStr), NumberStyles.Float, CultureInfo.InvariantCulture, out double bsVal) && bsVal > 0.0)
-			{
-				batchN = bsVal;
-			}
-			double outputsMax = Math.Max(batchN, ubatch);
-			double outputBytes = 0.0;
-			if (gi.VocabSize > 0)
-			{
-				outputBytes = gi.VocabSize * outputsMax * 4.0;
-			}
+			double computeBytes = ubatch * embed * 173.0;
+			// 输出 logits 缓冲不占显卡 VRAM：0.7.0 把 output buffer 放在 host 侧
+			// 且按实际 n_outputs 动态分配（实测 decode 单 token 仅 0.95 MiB），不计入预算
 			// 草稿模型（推测解码激活时）整体进显存，按文件大小计入
 			double draftBytes = 0.0;
 			if (IsSpecDecodingActive())
@@ -2756,9 +2745,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					draftBytes = GgufShardBytes(dp);
 				}
 			}
-			// 固定开销：CUDA context + host + 框架基线 1 GiB + 7.6% 权重
-			double runtimeBytes = (550.0 + 90.0) * 1048576.0 + 1073741824.0 + gpuWeights * 0.076;
-			double total = gpuWeights + kvBytes + computeBytes + outputBytes + runtimeBytes + mmprojBytes + draftBytes;
+			// 运行时基线（后端 context/队列等）：按 Vulkan 实测口径 ~300 MiB；
+			// 旧的 1 GiB 基线 + 7.6% 权重副本是高估来源，官方 breakdown 无此项
+			double runtimeBytes = 300.0 * 1048576.0;
+			// 权重显存 = 张量字节 × 0.95：部分张量会被 CPU 回退（如 Vulkan 上 iq2_s 的
+			// token_embd 走 CPU_REPACK）且存在对齐损耗，实测 breakdown 为张量字节的 ~95%
+			double total = gpuWeights * 0.95 + kvBytes + computeBytes + runtimeBytes + mmprojBytes + draftBytes;
 			double totalVram = 0.0;
 			double usedVram = 0.0;
 			Dictionary<string, string> g = _gpuMonitor.QueryGpu();
@@ -2769,17 +2761,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			double avail = Math.Max(0.0, totalVram - usedVram);
 			// 元数据缺失时 KV 会算成 0，必须标出来，否则"预算很小"会被误当成结论。
+			// （混合注意力层的窗口/状态警告在 SWA 三分支内处理，此处不重复）
 			if (layers <= 0 || gi.KvHeads <= 0 || ctx <= 0)
 			{
 				metaWarn = "⚠ KV 元数据不完整（层数=" + layers + " KV头=" + gi.KvHeads + " ctx=" + ctx + "），KV 可能算成 0，预算仅供参考\n";
-			}
-			if (gi.VocabSize <= 0)
-			{
-				metaWarn += "⚠ 词表大小未解析，输出 logits 缓冲未计入（实际占用更高）\n";
-			}
-			if (swaLayers > 0 && gi.SlidingWindow <= 0)
-			{
-				metaWarn += "⚠ " + swaLayers + " 个 SWA 层的滑动窗口大小在 GGUF 中未标注，这部分 KV 未计入预算（如遇 OOM 请调小 ctx 后实测）\n";
 			}
 			if (TryGetParamValue("flash-attn", out string faAuto) && faAuto.Trim() == "auto" && cv != "f16")
 			{
@@ -2789,14 +2774,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				metaWarn += "⚠ LoRA 适配器占用未计入（按文件大小预留）\n";
 			}
-			string detail = metaWarn + "显存预算（公式）\n"
-				+ "权重(GPU): " + (gpuWeights / 1073741824.0).ToString("F2") + " GiB" + moeDetail + "\n"
+			string detail = metaWarn + "显存预算（公式，对齐 llama breakdown）\n"
+				+ "权重(GPU): " + (gpuWeights * 0.95 / 1073741824.0).ToString("F2") + " GiB" + moeDetail + "\n"
 				+ "KV(" + ck + "/" + cv + ", " + fullLayers + " 层全注意力): " + (kvBytes / 1073741824.0).ToString("F2") + " GiB"
 				+ (swaKvBytes > 0.0 ? swaNote : "") + "\n"
 				+ "计算图(ubatch " + ubatch.ToString("F0") + "): " + (computeBytes / 1048576.0).ToString("F0") + " MiB\n"
-				+ (outputBytes > 0.0 ? "输出 logits(" + gi.VocabSize + " 词 × " + outputsMax.ToString("F0") + " outputs): " + (outputBytes / 1048576.0).ToString("F0") + " MiB\n" : "")
 				+ (draftBytes > 0.0 ? "草稿模型: " + (draftBytes / 1073741824.0).ToString("F2") + " GiB\n" : "")
-				+ "固定开销: " + (runtimeBytes / 1048576.0).ToString("F0") + " MiB\n"
+				+ "运行时基线: " + (runtimeBytes / 1048576.0).ToString("F0") + " MiB\n"
 				+ (mmprojBytes > 0 ? "视觉编码器: " + (mmprojBytes / 1048576.0).ToString("F0") + " MiB\n" : "")
 				+ "预计总占用: " + (total / 1073741824.0).ToString("F2") + " GiB\n"
 				+ "可用显存: " + (avail / 1073741824.0).ToString("F2") + " GiB";
