@@ -2185,6 +2185,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		public int Experts;
 		/// <summary>词表大小（tokenizer.ggml.tokens 数组长度），用于估算输出 logits 缓冲。</summary>
 		public long VocabSize;
+		/// <summary>线性注意力（SSM/Gated Delta Net）参数：state 不随 ctx 线性增长。</summary>
+		public int SsmInnerSize;
+		public int SsmStateSize;
+		public int SsmConvKernel;
 	}
 
 	private static GgufArchInfo ReadGgufArch(string modelPath)
@@ -2258,6 +2262,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					else if (key.EndsWith(".expert_count", StringComparison.Ordinal))
 					{
 						r.Experts = (int)v;
+					}
+					else if (key.EndsWith(".ssm.inner_size", StringComparison.Ordinal))
+					{
+						r.SsmInnerSize = (int)v;
+					}
+					else if (key.EndsWith(".ssm.state_size", StringComparison.Ordinal))
+					{
+						r.SsmStateSize = (int)v;
+					}
+					else if (key.EndsWith(".ssm.conv_kernel", StringComparison.Ordinal))
+					{
+						r.SsmConvKernel = (int)v;
 					}
 					break;
 				}
@@ -2382,27 +2398,171 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// </summary>
 	private static double GgufShardBytes(string firstShardPath)
 	{
-		double sum = new FileInfo(firstShardPath).Length;
+		return GgufShardPaths(firstShardPath).Sum((string p) => new FileInfo(p).Length);
+	}
+
+	/// <summary>枚举 GGUF 分片路径（--model 只传第一片，其余分片按命名约定补全）。</summary>
+	private static List<string> GgufShardPaths(string firstShardPath)
+	{
+		List<string> paths = new List<string> { firstShardPath };
 		Match m = Regex.Match(Path.GetFileName(firstShardPath), @"-(\d{5})-of-(\d{5})\.gguf$", RegexOptions.IgnoreCase);
 		if (!m.Success)
 		{
-			return sum;
+			return paths;
 		}
 		string dir = Path.GetDirectoryName(firstShardPath) ?? ".";
 		string stem = Path.GetFileName(firstShardPath).Substring(0, m.Index);
 		if (!int.TryParse(m.Groups[2].Value, out int total))
 		{
-			return sum;
+			return paths;
 		}
 		for (int i = 2; i <= total; i++)
 		{
 			string p = Path.Combine(dir, string.Format("{0}-{1:D5}-of-{2:D5}.gguf", stem, i, total));
 			if (File.Exists(p))
 			{
-				sum += new FileInfo(p).Length;
+				paths.Add(p);
 			}
 		}
-		return sum;
+		return paths;
+	}
+
+	/// <summary>GGUF 张量构成的精确统计（按层拆分专家/非专家字节）。</summary>
+	private sealed class GgufTensorStats
+	{
+		public bool Ok;
+		public int LayerCount;
+		/// <summary>token_embd / output 等非层张量（ngl>0 时在 GPU）。</summary>
+		public double EmbedOutputBytes;
+		/// <summary>每层的非专家权重（attention + 共享路由等）。</summary>
+		public double[] DensePerLayer = Array.Empty<double>();
+		/// <summary>每层的专家 FFN 权重（--n-cpu-moe 按层移 CPU 的就是它们）。</summary>
+		public double[] ExpertPerLayer = Array.Empty<double>();
+		public double ExpertTotalBytes;
+	}
+
+	/// <summary>GGML 量化类型的每元素字节数（来源 ggml.h 各 block 结构定义；未知类型按 1.0 保守）。</summary>
+	private static double GgmlBpe(uint type)
+	{
+		return type switch
+		{
+			0 => 4.0,                                   // F32
+			1 => 2.0,                                   // F16
+			2 => 20.0 / 32,                             // Q4_0
+			3 => 24.0 / 32,                             // Q4_1
+			4 or 5 => 24.0 / 32,                        // Q4_2/Q4_3(遗留)
+			6 => 24.0 / 32,                             // Q5_0
+			7 => 28.0 / 32,                             // Q5_1
+			8 => 34.0 / 32,                             // Q8_0
+			9 => 36.0 / 32,                             // Q8_1
+			10 => 84.0 / 256,                           // Q2_K
+			11 => 110.0 / 256,                          // Q3_K
+			12 => 144.0 / 256,                          // Q4_K
+			13 => 176.0 / 256,                          // Q5_K
+			14 => 210.0 / 256,                          // Q6_K
+			15 => 200.0 / 256,                          // Q8_K
+			16 => 66.0 / 256,                           // IQ2_XXS
+			17 => 74.0 / 256,                           // IQ2_XS
+			18 => 98.0 / 256,                           // IQ3_XXS
+			19 => 50.0 / 256,                           // IQ1_S
+			20 => 20.0 / 32,                            // IQ4_NL
+			21 => 110.0 / 256,                          // IQ3_S
+			22 => 98.0 / 256,                           // IQ2_S
+			23 => 136.0 / 256,                          // IQ4_XS
+			24 => 1.0,                                  // I8
+			25 => 2.0,                                  // I16
+			26 => 4.0,                                  // I32
+			27 => 8.0,                                  // I64
+			28 => 8.0,                                  // F64
+			29 => 56.0 / 256,                           // IQ1_M
+			30 => 2.0,                                  // BF16
+			31 or 32 or 33 => 20.0 / 32,                // Q4_0 交错遗留
+			34 => 18.0 / 64,                            // TQ1_0
+			35 => 84.0 / 256,                           // TQ2_0
+			36 => 17.0 / 32,                            // MXFP4
+			_ => 1.0,
+		};
+	}
+
+	/// <summary>
+	/// 解析 GGUF 张量表（官方规范: KV 之后 alignment, 再 tensor_count 条
+	/// name/n_dims/shape/type/offset），按张量名的层号与是否专家精确拆分字节。
+	/// 分片模型的张量表在各分片头部各自列出，逐片累加。
+	/// </summary>
+	private static GgufTensorStats ReadGgufTensorStats(string modelPath, int layerCount)
+	{
+		GgufTensorStats r = new GgufTensorStats();
+		if (layerCount > 0)
+		{
+			r.LayerCount = layerCount;
+			r.DensePerLayer = new double[layerCount];
+			r.ExpertPerLayer = new double[layerCount];
+		}
+		foreach (string shard in GgufShardPaths(modelPath))
+		{
+			try
+			{
+				using FileStream fs = new FileStream(shard, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+				using BinaryReader br = new BinaryReader(fs);
+				if (br.ReadUInt32() != 0x46554747u)
+				{
+					continue;
+				}
+				uint version = br.ReadUInt32();
+				ulong tensorCount = br.ReadUInt64();
+				ulong kvCount = br.ReadUInt64();
+				for (ulong k = 0; k < kvCount; k++)
+				{
+					_ = ReadGgufString(br);
+					uint vt = br.ReadUInt32();
+					SkipGgufValue(br, vt);
+				}
+				// KV 之后直接是 tensor infos（对齐由 general.alignment KV 键声明, 默认 32,
+				// 只影响数据区起点; llama.cpp 写出的 tensor infos 紧跟 KV, 无填充）
+				for (ulong t = 0; t < tensorCount; t++)
+				{
+					string name = ReadGgufString(br);
+					uint nDims = br.ReadUInt32();
+					ulong elems = 1;
+					for (uint d = 0; d < nDims; d++)
+					{
+						elems *= br.ReadUInt64();
+					}
+					uint type = br.ReadUInt32();
+					_ = br.ReadUInt64();
+					double bytes = elems * GgmlBpe(type);
+					bool expert = name.Contains("ffn_", StringComparison.Ordinal)
+						&& (name.Contains("exps", StringComparison.Ordinal) || name.Contains("shexp", StringComparison.Ordinal));
+					Match lm = Regex.Match(name, @"\.blk\.(\d+)\.");
+					if (lm.Success)
+					{
+						int l = int.Parse(lm.Groups[1].Value);
+						if (expert)
+						{
+							r.ExpertTotalBytes += bytes;
+							if (l < r.LayerCount)
+							{
+								r.ExpertPerLayer[l] += bytes;
+							}
+						}
+						else if (l < r.LayerCount)
+						{
+							r.DensePerLayer[l] += bytes;
+						}
+					}
+					else
+					{
+						r.EmbedOutputBytes += bytes;
+					}
+					r.Ok = true;
+				}
+			}
+			catch
+			{
+				// 单分片解析失败继续其余分片; 全部失败时 Ok=false 走近似回退
+			}
+		}
+		return r;
 	}
 
 	private (double estBytes, double modelBytes, double kvBytes, double availBytes, string detail)? EstimateVramNeeded()
@@ -2437,26 +2597,87 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			// 元数据体检：专家数解析异常会让 MoE 折算严重跑偏，先把解析结果摆出来。
 			Log("[显存] 元数据: layers=" + layers + " experts=" + gi.Experts + " kvHeads=" + gi.KvHeads
 				+ " headDim=" + headDim + " interval=" + gi.FullAttentionInterval + " ctx=" + (RoleText("ctx_size", out string ctxDbg) ? NormTok(ctxDbg) : "?"));
-			// 权重：MoE 的 --n-cpu-moe 线性削减专家权重；ngl 决定上 GPU 的层比例
-			double weights = fileBytes;
+			// 权重：解析 GGUF 张量表按层精确拆分专家/非专家（替代"层数比例×文件大小"近似），
+			// --n-cpu-moe / --cpu-moe / --ngl / --moe-cache-mib 任意组合下都能算准每层归属
+			string metaWarn = "";
+			GgufTensorStats ts = ReadGgufTensorStats(modelPath, layers);
 			double ncmV = 0.0;
 			bool hasNcm = RoleText("n_cpu_moe", out string ncmStr) && double.TryParse(ncmStr, out ncmV) && ncmV > 0.0;
-			// --n-cpu-moe N 的 N 是"把 N 层（或 N 个专家组）留在 CPU"，分母该用层数而不是专家总数。
-			// 用专家数当分母会把 GPU 权重算成 90%，实际（对照启动日志 Vulkan0 model buffer）约 35%。
-			if (layers > 0 && hasNcm)
-			{
-				weights *= Math.Clamp(1.0 - ncmV / layers, 0.02, 1.0);
-			}
-			else if (RoleBool("cpu_moe"))
-			{
-				weights *= 0.12;
-			}
+			// 上 GPU 的层数: ngl=-1/auto 视为全层(fit 会下调, 预算偏保守), "all" 同
+			int gpuLayers = layers;
 			double gpuFrac = 1.0;
-			if (RoleText("ngl", out string nglStr) && double.TryParse(nglStr, out double nglV) && nglV >= 0.0 && layers > 0)
+			if (RoleText("ngl", out string nglStr))
 			{
-				gpuFrac = Math.Clamp(nglV / layers, 0.0, 1.0);
+				string ns = nglStr.Trim();
+				if (double.TryParse(ns, out double nglV) && nglV >= 0.0)
+				{
+					gpuLayers = (int)Math.Min(nglV, layers);
+					if (layers > 0)
+					{
+						gpuFrac = Math.Clamp(nglV / layers, 0.0, 1.0);
+					}
+				}
 			}
-			double gpuWeights = weights * gpuFrac;
+			// 移 CPU 的专家层数: --cpu-moe=全部; --n-cpu-moe N=前 N 层专家(层号 0..N-1)
+			int moeCpuLayers = 0;
+			if (RoleBool("cpu_moe"))
+			{
+				moeCpuLayers = layers;
+			}
+			else if (hasNcm)
+			{
+				moeCpuLayers = (int)Math.Clamp(Math.Round(ncmV), 0, layers);
+			}
+			double gpuWeights;
+			double expertGpuBytes = 0.0;
+			double expertCpuBytes = 0.0;
+			string moeDetail = "";
+			if (ts.Ok)
+			{
+				// 非 blk 张量(token_embd/output 等)在 ngl>0 时上 GPU
+				double embedOut = gpuLayers > 0 ? ts.EmbedOutputBytes : 0.0;
+				double denseOnGpu = 0.0;
+				for (int l = 0; l < Math.Min(gpuLayers, ts.LayerCount); l++)
+				{
+					denseOnGpu += ts.DensePerLayer[l];
+					if (l >= moeCpuLayers)
+					{
+						expertGpuBytes += ts.ExpertPerLayer[l];
+					}
+				}
+				// moe-cache-mib: 专家权重显存缓存上限(MiB), 设了它超出部分驻留 CPU
+				if (TryGetParamValue("moe-cache-mib", out string mcmStr) && double.TryParse(mcmStr, out double mcmV) && mcmV > 0.0 && expertGpuBytes > mcmV * 1048576.0)
+				{
+					expertGpuBytes = mcmV * 1048576.0;
+					moeDetail = "（受 --moe-cache-mib 限制）";
+				}
+				expertCpuBytes = ts.ExpertTotalBytes - expertGpuBytes;
+				gpuWeights = embedOut + denseOnGpu + expertGpuBytes;
+				if (ts.ExpertTotalBytes > 0.0)
+				{
+					moeDetail = "（专家 " + (ts.ExpertTotalBytes / 1073741824.0).ToString("F2") + " GiB，其中 CPU 保留 "
+						+ (expertCpuBytes / 1073741824.0).ToString("F2") + " GiB" + (moeDetail.Length > 0 ? " " + moeDetail : "") + "）";
+				}
+				else
+				{
+					moeDetail = "（dense 模型，无专家张量）";
+				}
+			}
+			else
+			{
+				// 张量表解析失败回退: 旧的层数比例近似
+				double weights = fileBytes;
+				if (layers > 0 && hasNcm)
+				{
+					weights *= Math.Clamp(1.0 - ncmV / layers, 0.02, 1.0);
+				}
+				else if (RoleBool("cpu_moe"))
+				{
+					weights *= 0.12;
+				}
+				gpuWeights = weights * gpuFrac;
+				moeDetail = "（张量表解析失败，按层比例近似）";
+			}
 			// KV：只有全注意力层随上下文线性增长；V 量化依赖 flash attention，
 			// 显式关闭 FA 时 llama 会把 V 回退到 f16（llama.cpp cache 类型回退规则）
 			string ck = RoleText("cache_type_k", out string ckv) && !string.IsNullOrEmpty(ckv) ? ckv : "f16";
@@ -2474,15 +2695,28 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			double kvPerTok = fullLayers * gi.KvHeads * headDim * (CacheBytesPerElem(ck) + CacheBytesPerElem(cv));
 			double kvBytes = kvPerTok * ctx * gpuFrac;
-			// SWA 层的 KV 只保留滑动窗口长度（llama 默认非 --swa-full），不随 ctx 全量增长
+			// SWA/混合注意力层：三类情况——滑动窗口（KV=min(ctx,窗口)）、
+			// 线性注意力（SSM/Gated Delta Net，state 不随 ctx 线性，按元数据粗估）、未知（警告）
 			int swaLayers = Math.Max(0, layers - fullLayers);
 			double swaKvBytes = 0.0;
-			if (swaLayers > 0 && gi.KvHeads > 0 && headDim > 0)
+			string swaNote = "";
+			if (swaLayers > 0)
 			{
-				long swaCtx = gi.SlidingWindow > 0 ? Math.Min(ctx > 0 ? ctx : long.MaxValue, gi.SlidingWindow) : ctx;
-				if (swaCtx > 0)
+				if (gi.SlidingWindow > 0 && gi.KvHeads > 0 && headDim > 0 && ctx > 0)
 				{
+					long swaCtx = Math.Min(ctx, gi.SlidingWindow);
 					swaKvBytes = swaLayers * gi.KvHeads * headDim * (CacheBytesPerElem(ck) + CacheBytesPerElem(cv)) * swaCtx * gpuFrac;
+					swaNote = "（含 SWA " + swaLayers + " 层 × 窗口 " + gi.SlidingWindow + ": " + (swaKvBytes / 1048576.0).ToString("F0") + " MiB）";
+				}
+				else if (gi.SsmInnerSize > 0 && gi.SsmStateSize > 0)
+				{
+					// conv 状态 + recurrent 状态（f32），常数级/层，不随 ctx 线性
+					swaKvBytes = swaLayers * ((double)gi.SsmInnerSize * gi.SsmConvKernel + (double)gi.SsmInnerSize * gi.SsmStateSize) * 4.0 * gpuFrac;
+					swaNote = "（含线性注意力 " + swaLayers + " 层，state 不随 ctx 增长: " + (swaKvBytes / 1048576.0).ToString("F0") + " MiB）";
+				}
+				else
+				{
+					metaWarn += "⚠ " + swaLayers + " 个混合注意力层（窗口/状态未知）KV 未计入预算（如遇 OOM 请实测）\n";
 				}
 			}
 			kvBytes += swaKvBytes;
@@ -2528,14 +2762,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			double totalVram = 0.0;
 			double usedVram = 0.0;
 			Dictionary<string, string> g = _gpuMonitor.QueryGpu();
-			if (g.TryGetValue("vram_total", out string ts) && double.TryParse(ts, NumberStyles.Float, CultureInfo.InvariantCulture, out totalVram) && totalVram > 0.0
+			if (g.TryGetValue("vram_total", out string gts) && double.TryParse(gts, NumberStyles.Float, CultureInfo.InvariantCulture, out totalVram) && totalVram > 0.0
 				&& g.TryGetValue("vram_used", out string us))
 			{
 				double.TryParse(us, NumberStyles.Float, CultureInfo.InvariantCulture, out usedVram);
 			}
 			double avail = Math.Max(0.0, totalVram - usedVram);
 			// 元数据缺失时 KV 会算成 0，必须标出来，否则"预算很小"会被误当成结论。
-			string metaWarn = "";
 			if (layers <= 0 || gi.KvHeads <= 0 || ctx <= 0)
 			{
 				metaWarn = "⚠ KV 元数据不完整（层数=" + layers + " KV头=" + gi.KvHeads + " ctx=" + ctx + "），KV 可能算成 0，预算仅供参考\n";
@@ -2557,10 +2790,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				metaWarn += "⚠ LoRA 适配器占用未计入（按文件大小预留）\n";
 			}
 			string detail = metaWarn + "显存预算（公式）\n"
-				+ "权重(GPU): " + (gpuWeights / 1073741824.0).ToString("F2") + " GiB"
-				+ (layers > 0 && hasNcm ? "（MoE 保留 " + ncmV.ToString("F0") + "/" + layers + " 层专家在 CPU）" : "") + "\n"
+				+ "权重(GPU): " + (gpuWeights / 1073741824.0).ToString("F2") + " GiB" + moeDetail + "\n"
 				+ "KV(" + ck + "/" + cv + ", " + fullLayers + " 层全注意力): " + (kvBytes / 1073741824.0).ToString("F2") + " GiB"
-				+ (swaKvBytes > 0.0 ? "（含 SWA " + swaLayers + " 层 × 窗口 " + gi.SlidingWindow + ": " + (swaKvBytes / 1048576.0).ToString("F0") + " MiB）" : "") + "\n"
+				+ (swaKvBytes > 0.0 ? swaNote : "") + "\n"
 				+ "计算图(ubatch " + ubatch.ToString("F0") + "): " + (computeBytes / 1048576.0).ToString("F0") + " MiB\n"
 				+ (outputBytes > 0.0 ? "输出 logits(" + gi.VocabSize + " 词 × " + outputsMax.ToString("F0") + " outputs): " + (outputBytes / 1048576.0).ToString("F0") + " MiB\n" : "")
 				+ (draftBytes > 0.0 ? "草稿模型: " + (draftBytes / 1073741824.0).ToString("F2") + " GiB\n" : "")
