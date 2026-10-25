@@ -192,10 +192,6 @@ public partial class PluginManagerWindow : Window
 		{
 			return;
 		}
-		if (!RequireDshStopped())
-		{
-			return;
-		}
 		_busy = true;
 		try
 		{
