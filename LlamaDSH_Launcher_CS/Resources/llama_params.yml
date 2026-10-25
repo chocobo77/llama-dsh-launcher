@@ -9,8 +9,8 @@
 # 核心功能: 思考强度控制 (reasoning / reasoning-effort / reasoning-budget / reasoning-preserve)
 # =====================================================================
 meta:
-  schema: 8
-  adapt: "llama-server 0.7.0-dev (build 11680, b797b9ca8) 实测对齐 · schema v7（2026-10-22 全量比对 --help：332 个选项名 / 241 个参数，功能型选项无缺口；7 个 <0|1> 参数仍为 Combo、numa 无非法 disabled；<0|1> 裸旗标会 invalid stoul argument）；v8: 同步 0.7.0-dev 参数面"
+  schema: 9
+  adapt: "llama-server 0.7.0-dev (build 11680, b797b9ca8) 实测对齐 · schema v7（2026-10-22 全量比对 --help：332 个选项名 / 241 个参数，功能型选项无缺口；7 个 <0|1> 参数仍为 Combo、numa 无非法 disabled；<0|1> 裸旗标会 invalid stoul argument）；v9: 因果/冲突/联动规则全量评审（requires+16 conflicts+14 implies/suggests，层级迁移 4 参数）"
   notes: >
     llama.cpp 更新时的维护方法（改完点启动器"⟳ 重载参数配置"即时生效）:
     1. 新增参数: 在 params 下加一条, 必填 flag/label/type/default/group
@@ -166,6 +166,8 @@ params:
     group: server
     wide: true
     tooltip: "API 认证密钥，多个用逗号分隔。留空表示无需认证。暴露在公网时务必设置，否则任何人都能调用你的模型。"
+    conflicts:
+      - api-key-file
 
   - flag: api-key-file
     subgroup: 服务监听与安全
@@ -175,6 +177,8 @@ params:
     group: server
     wide: true
     tooltip: "从文件读取 API 密钥，每行一个，# 开头为注释。与 api-key 二选一或互补。"
+    conflicts:
+      - api-key
 
   - flag: ssl-key-file
     subgroup: 服务监听与安全
@@ -185,6 +189,8 @@ params:
     wide: true
     suggests: [ssl-cert-file]
     tooltip: "PEM 格式的 SSL 私钥文件路径。与证书文件配合启用 HTTPS 加密通信。本地使用无需设置。"
+    implies:
+      - ssl-cert-file
 
   - flag: ssl-cert-file
     subgroup: 服务监听与安全
@@ -195,6 +201,8 @@ params:
     wide: true
     suggests: [ssl-key-file]
     tooltip: "PEM 格式的 SSL 证书文件路径。需与私钥文件配对使用。可用 Let's Encrypt 等免费证书。"
+    implies:
+      - ssl-key-file
 
   - flag: cors-origins
     subgroup: 服务监听与安全
@@ -300,6 +308,10 @@ params:
     wide: true
     advanced: true
     tooltip: "模型直接下载 URL（-mu）。通常不直接使用，推荐用 hf-repo 指定 Hugging Face 仓库。"
+    conflicts:
+      - hf-repo
+      - hf-file
+      - docker-repo
 
   - flag: hf-repo
     subgroup: 模型来源
@@ -310,6 +322,9 @@ params:
     wide: true
     advanced: true
     tooltip: "Hugging Face 模型仓库（-hf）。格式: <user>/<model>[:quant]。quant 可选，不区分大小写，默认 Q4_K_M（不存在则取仓库第一个文件）。mmproj 会自动下载，禁用加 --no-mmproj。示例: ggml-org/GLM-4.7-Flash-GGUF:Q4_K_M"
+    conflicts:
+      - model-url
+      - docker-repo
 
   - flag: hf-file
     subgroup: 模型来源
@@ -320,6 +335,9 @@ params:
     wide: true
     advanced: true
     tooltip: "Hugging Face 模型文件名（-hff）。指定后覆盖 hf-repo 中的 quant 设置。"
+    conflicts:
+      - model-url
+      - docker-repo
 
   - flag: hf-token
     subgroup: 模型来源
@@ -340,6 +358,10 @@ params:
     wide: true
     advanced: true
     tooltip: "Docker Hub 模型仓库（-dr）。格式: [<repo>/]<model>[:quant]。repo 可选默认 ai/，quant 可选默认 :latest。示例: gemma3"
+    conflicts:
+      - model-url
+      - hf-repo
+      - hf-file
 
   - flag: ui
     subgroup: 服务监听与安全
@@ -428,6 +450,9 @@ params:
     group: common
     advanced: true
     tooltip: "是否使用严格的 CPU 放置策略。启用后强制线程只运行在指定的 CPU 核心上。官方此参数需带 0/1 取值（0=关闭，默认 0）；勾选后按所选值发射 --cpu-strict 0 或 1。"
+    suggests:
+      - cpu-mask
+      - cpu-range
 
   - flag: prio
     subgroup: 进程与 CPU 亲和
@@ -496,6 +521,9 @@ params:
     group: common
     advanced: true
     tooltip: "批处理阶段是否使用严格的 CPU 放置策略。默认与 cpu-strict 相同。官方此参数需带 0/1 取值（0=关闭，默认 0）；勾选后按所选值发射 --cpu-strict-batch 0 或 1。"
+    suggests:
+      - cpu-mask-batch
+      - cpu-range-batch
 
   - flag: numa
     subgroup: 进程与 CPU 亲和
@@ -621,6 +649,8 @@ params:
     group: common
     wide: true
     tooltip: "--fit 为每设备保留的目标显存余量，逗号分隔多卡值，单值广播到所有设备。默认 1024 MiB。显存吃紧时可调小。"
+    requires:
+      - {flag: fit, op: "==", value: "on"}
 
   - flag: fit-ctx
     subgroup: 后端与显存
@@ -629,6 +659,8 @@ params:
     default: "4096"
     group: common
     tooltip: "--fit 能自动设置的最小 ctx 大小（token）。默认 4096。防止自动适配把上下文压得过小。"
+    requires:
+      - {flag: fit, op: "==", value: "on"}
 
   - flag: kv-offload
     subgroup: KV 缓存与量化
@@ -797,6 +829,8 @@ params:
     group: server
     advanced: true
     tooltip: "每个并行槽位的上下文限制（token）。设置后共享 KV 池按 n_parallel*N 分配。留空=行为不变。"
+    suggests:
+      - kv-unified
 
   - flag: context-shift
     subgroup: KV 缓存与检查点
@@ -824,6 +858,8 @@ params:
     group: server
     advanced: true
     tooltip: "上下文检查点之间的最小 token 间距（默认 8192；0=无最小限制）。用于控制检查点数量与内存。"
+    suggests:
+      - ctx-checkpoints
 
   - flag: cache-idle-slots
     subgroup: KV 缓存与检查点
@@ -834,6 +870,8 @@ params:
     advanced: true
     tooltip: "新任务到达时把空闲槽位保存到 prompt 缓存，统一 KV 模式下清除（--cache-idle-slots / --no-cache-idle-slots）。官方默认开启，需配合 cache-ram。"
     offFlag: no-cache-idle-slots
+    requires:
+      - {flag: cache-ram, op: enabled}
 
   - flag: defrag-thold
     subgroup: KV 缓存与量化
@@ -919,6 +957,8 @@ params:
     default: "0.0"
     group: sampling
     tooltip: "动态温度范围。0.0=禁用。设为 0.5~1.0 可在生成过程中动态调整温度，平衡多样性与稳定性。需配合 dynatemp-exp 使用。"
+    suggests:
+      - dynatemp-exp
 
   - flag: dynatemp-exp
     subgroup: 高级采样策略
@@ -927,6 +967,8 @@ params:
     default: "1.0"
     group: sampling
     tooltip: "动态温度指数。控制温度调整的曲线形状，默认 1.0（线性）。仅在 dynatemp-range > 0 时生效。"
+    suggests:
+      - dynatemp-range
 
   - flag: top-k
     subgroup: 基础采样
@@ -971,6 +1013,8 @@ params:
     default: "0.0"
     group: sampling
     tooltip: "XTC（eXtremely Truncated Configuration）采样概率。0.0=禁用。0.1~0.5 可提升输出质量，配合 xtc-threshold 使用。"
+    suggests:
+      - xtc-threshold
 
   - flag: xtc-threshold
     subgroup: 高级采样策略
@@ -979,6 +1023,8 @@ params:
     default: "0.1"
     group: sampling
     tooltip: "XTC 采样阈值。默认 0.1，1.0=禁用。仅在 xtc-probability > 0 时生效。"
+    suggests:
+      - xtc-probability
 
   - flag: adaptive-target
     subgroup: 高级采样策略
@@ -987,6 +1033,8 @@ params:
     default: "-1.0"
     group: sampling
     tooltip: "Adaptive-P 采样目标概率。负值=禁用。0.5~0.95 之间有效，配合 adaptive-decay 使用。"
+    suggests:
+      - adaptive-decay
 
   - flag: adaptive-decay
     subgroup: 高级采样策略
@@ -995,6 +1043,8 @@ params:
     default: "0.9"
     group: sampling
     tooltip: "Adaptive-P 衰减率。0.0~0.99，值越低响应越快，越高越稳定。默认 0.9。"
+    suggests:
+      - adaptive-target
 
   - flag: typical
     subgroup: 基础采样
@@ -1055,6 +1105,8 @@ params:
     default: "1.75"
     group: sampling
     tooltip: "DRY 采样基数。默认 1.75。仅在 dry-multiplier > 0 时生效。"
+    requires:
+      - {flag: dry-multiplier, op: "!=", value: 0}
 
   - flag: dry-allowed-length
     subgroup: 重复惩罚
@@ -1063,6 +1115,8 @@ params:
     default: "2"
     group: sampling
     tooltip: "DRY 采样允许的重复序列长度。默认 2。仅在 dry-multiplier > 0 时生效。"
+    requires:
+      - {flag: dry-multiplier, op: "!=", value: 0}
 
   - flag: dry-penalty-last-n
     subgroup: 重复惩罚
@@ -1071,6 +1125,8 @@ params:
     default: "64"
     group: sampling
     tooltip: "DRY 惩罚考虑的最后 N 个 token。默认 64，0=禁用。仅在 dry-multiplier > 0 时生效。"
+    requires:
+      - {flag: dry-multiplier, op: "!=", value: 0}
 
   - flag: dry-sequence-breaker
     subgroup: 重复惩罚
@@ -1080,6 +1136,8 @@ params:
     group: sampling
     wide: true
     tooltip: "DRY 采样的序列分隔符。默认清空默认分隔符('\\n',':','\"','*')。设为 'none' 表示不使用分隔符。"
+    requires:
+      - {flag: dry-multiplier, op: "!=", value: 0}
 
   - flag: mirostat
     subgroup: Mirostat
@@ -1118,6 +1176,10 @@ params:
     group: sampling
     wide: true
     tooltip: "BNF-like 语法约束。强制模型输出符合指定语法结构。用于结构化输出（如 SQL、代码）。语法文件在 grammars/ 目录。"
+    conflicts:
+      - grammar-file
+      - json-schema
+      - json-schema-file
 
   - flag: grammar-file
     subgroup: 约束生成
@@ -1127,6 +1189,10 @@ params:
     group: sampling
     wide: true
     tooltip: "从文件加载 BNF 语法约束。与 grammar 功能相同但内容从文件读取。"
+    conflicts:
+      - grammar
+      - json-schema
+      - json-schema-file
 
   - flag: json-schema
     subgroup: 约束生成
@@ -1136,6 +1202,10 @@ params:
     group: sampling
     wide: true
     tooltip: "JSON Schema 约束。强制模型输出符合指定的 JSON Schema。用于 API 返回结构化数据。如 {type:object,properties:{name:{type:string}}}。"
+    conflicts:
+      - grammar
+      - grammar-file
+      - json-schema-file
 
   - flag: json-schema-file
     subgroup: 约束生成
@@ -1145,6 +1215,10 @@ params:
     group: sampling
     wide: true
     tooltip: "从文件加载 JSON Schema 约束。与 json-schema 功能相同但内容从文件读取。"
+    conflicts:
+      - grammar
+      - grammar-file
+      - json-schema
 
   - flag: logit-bias
     subgroup: 约束生成
@@ -1477,11 +1551,12 @@ params:
     tooltip: "覆盖草稿模型张量的缓冲区类型。格式: <tensor_name_pattern>=<buffer_type>，多个用逗号分隔。"
 
   - flag: spec-draft-type-k
-    subgroup: 草稿模型 KV 类型
+    subgroup: 草稿模型资源
     label: 草稿 Cache 类型 K
     type: Combo
     default: ""
-    group: common
+    group: spec
+    subgroup: 草稿模型资源
     requires:
       - {flag: spec-type, op: "!=", value: none}
     advanced: true
@@ -1489,11 +1564,12 @@ params:
     tooltip: "草稿模型 KV 缓存 K 分量的数据类型。留空=使用官方默认 f16（草稿模型 KV 缓存不压缩）。q6_0/tq3_0 为实验性，主线暂不支持。"
 
   - flag: spec-draft-type-v
-    subgroup: 草稿模型 KV 类型
+    subgroup: 草稿模型资源
     label: 草稿 Cache 类型 V
     type: Combo
     default: ""
-    group: common
+    group: spec
+    subgroup: 草稿模型资源
     requires:
       - {flag: spec-type, op: "!=", value: none}
     advanced: true
@@ -1694,6 +1770,8 @@ params:
     wide: true
     advanced: true
     tooltip: "查找解码（lookup decoding）使用的静态缓存文件路径（生成时不更新）。"
+    requires:
+      - {flag: spec-type, op: "!=", value: none}
 
   - flag: lookup-cache-dynamic
     subgroup: ngram 推测
@@ -1704,6 +1782,8 @@ params:
     wide: true
     advanced: true
     tooltip: "查找解码使用的动态缓存文件路径（生成时更新）。"
+    requires:
+      - {flag: spec-type, op: "!=", value: none}
 
   # ================================================================
   # 多模态
@@ -1903,6 +1983,8 @@ params:
     wide: true
     conflicts: [chat-template-file]
     tooltip: "自定义 Jinja 聊天模板字符串。覆盖模型自带的模板。支持的内置模板名：chatml, llama2, llama3, gemma, mistral, deepseek 等。一般无需设置，使用模型自带模板即可。"
+    conflicts:
+      - chat-template-file
 
   - flag: chat-template-file
     subgroup: 对话模板与思考
@@ -1913,6 +1995,8 @@ params:
     wide: true
     conflicts: [chat-template]
     tooltip: "从文件加载自定义聊天模板。与 --chat-template 功能相同但内容从文件读取。适合模板较长时使用。"
+    conflicts:
+      - chat-template
 
   # ⭐⭐⭐ 核心：思考强度控制 ⭐⭐⭐
   - flag: chat-template-kwargs
@@ -1923,6 +2007,8 @@ params:
     group: server
     wide: true
     tooltip: "【核心】以 JSON 格式传递给聊天模板的额外参数。Qwen3 模型设置 reasoning_effort 为 low/medium/xhigh 控制思考深度。设为 {\"enable_thinking\": false} 关闭思考。示例: low=快速响应, medium=平衡, xhigh=深度推理。"
+    suggests:
+      - jinja
 
   - flag: reasoning-preserve
     subgroup: 对话模板与思考
@@ -2168,11 +2254,12 @@ params:
     tooltip: "启用 Embeddings API 端点（/embedding）。需要使用专门的 Embedding 模型。普通对话场景不要开启。"
 
   - flag: pooling
-    subgroup: 并行与槽位
+    subgroup: 嵌入与重排
     label: Embedding 池化
     type: Combo
     default: ""
     group: server
+    subgroup: 嵌入与重排
     advanced: true
     options: [none, mean, cls, last, rank]
     tooltip: "Embedding 池化类型。留空=使用模型默认。none=返回所有 token 的未归一化 embedding；mean/cls/last=对应池化；rank=用于 rerank 模型。"
@@ -2275,11 +2362,12 @@ params:
     tooltip: "应用控制向量的层范围（起始 结束，含端点）。如 0 16。留空=应用到全部层。"
 
   - flag: sleep-idle-seconds
-    subgroup: 并行与槽位
+    subgroup: 服务管理
     label: 休眠空闲秒数
     type: String
     default: "-1"
     group: server
+    subgroup: 服务管理
     tooltip: "空闲多少秒后服务器自动休眠（卸载模型释放显存）。-1=禁用（默认）。"
 
   - flag: props
