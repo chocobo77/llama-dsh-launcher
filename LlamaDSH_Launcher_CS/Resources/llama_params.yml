@@ -9,8 +9,8 @@
 # 核心功能: 思考强度控制 (reasoning / reasoning-effort / reasoning-budget / reasoning-preserve)
 # =====================================================================
 meta:
-  schema: 9
-  adapt: "llama-server 0.7.0-dev (build 11680, b797b9ca8) 实测对齐 · schema v7（2026-10-22 全量比对 --help：332 个选项名 / 241 个参数，功能型选项无缺口；7 个 <0|1> 参数仍为 Combo、numa 无非法 disabled；<0|1> 裸旗标会 invalid stoul argument）；v9: 因果/冲突/联动规则全量评审（requires+16 conflicts+14 implies/suggests，层级迁移 4 参数）"
+  schema: 10
+  adapt: "llama-server 0.7.0-dev (build 11680, b797b9ca8) 实测对齐 · schema v7（2026-10-22 全量比对 --help：332 个选项名 / 241 个参数，功能型选项无缺口；7 个 <0|1> 参数仍为 Combo、numa 无非法 disabled；<0|1> 裸旗标会 invalid stoul argument）；v10: 49 参数输入校验（数值边界/格式正则，启用且非空时触发）；v9: 因果/冲突/联动规则全量评审（requires+16 conflicts+14 implies/suggests，层级迁移 4 参数）"
   notes: >
     llama.cpp 更新时的维护方法（改完点启动器"⟳ 重载参数配置"即时生效）:
     1. 新增参数: 在 params 下加一条, 必填 flag/label/type/default/group
@@ -71,6 +71,9 @@ params:
     group: server
     enabled: true
     tooltip: "HTTP 监听端口，范围 1-65535。llama-server 默认 8080，此启动器默认 1234 以避免与其他服务冲突。"
+    validate:
+      min: 1
+      max: 65535
 
   - flag: timeout
     subgroup: 服务监听与安全
@@ -80,6 +83,8 @@ params:
     group: server
     enabled: true
     tooltip: "llama-server 读写超时（秒）。超时后断开空闲连接。长文本生成建议 >=300s，多轮对话建议 600s。设为 0 表示永不超时。"
+    validate:
+      min: 0
 
   - flag: ctx-size
     subgroup: 上下文与批处理
@@ -90,6 +95,8 @@ params:
     group: common
     enabled: true
     tooltip: "Prompt 上下文窗口长度（token 数）。设为 0 时由 --fit 根据显存自动适配。支持 K/M 后缀（如 100K=102400）。27B Q4 模型 24GB 显卡建议 40K~48K；100K 以上极易 OOM。启动前会自动估算显存并预警。"
+    validate:
+      min: 0
 
   - flag: keep
     subgroup: 上下文与批处理
@@ -98,6 +105,8 @@ params:
     default: "0"
     group: common
     tooltip: "从初始提示中保留的 token 数量。0=不保留，-1=全部保留。用于在多轮对话中保留系统提示等固定前缀。"
+    validate:
+      min: -1
 
   - flag: batch-size
     subgroup: 上下文与批处理
@@ -108,6 +117,8 @@ params:
     group: common
     enabled: true
     tooltip: "逻辑最大批处理大小。控制 prompt 处理时一次送入模型的 token 上限。增大可加速 prompt 处理但增加显存占用。默认 2048，24GB 显卡建议 2048~4096。"
+    validate:
+      min: 1
 
   - flag: ubatch-size
     subgroup: 上下文与批处理
@@ -119,6 +130,9 @@ params:
     enabled: true
     validate: {leq: batch-size}
     tooltip: "物理微批处理大小。实际每次送入推理引擎的 token 数，必须 <= batch-size。较小值降低延迟但降低吞吐。默认 512，显存充裕可提至 1024。"
+    validate:
+      min: 1
+      leq: batch-size
 
   - flag: threads
     subgroup: 进程与 CPU 亲和
@@ -129,6 +143,8 @@ params:
     group: common
     enabled: true
     tooltip: "生成阶段使用的 CPU 线程数。默认 -1 = 自动（使用全部物理核心）。建议设为 CPU 物理核心数（不含超线程），过多反而因上下文切换降低性能。"
+    validate:
+      min: -1
 
   - flag: gpu-layers
     subgroup: 后端与显存
@@ -140,6 +156,8 @@ params:
     enabled: true
     aliases: [n-gpu-layers]
     tooltip: "卸载到 GPU 的模型层数。0=纯 CPU；99/auto=自动配平。27B Q4 模型 24GB 显卡建议留空让 --fit 自动分配。显存不足时 --fit 会自动将部分层移至 CPU。"
+    validate:
+      regex: '^(auto|all|\d+)$'
 
   - flag: main-gpu
     subgroup: 后端与显存
@@ -149,6 +167,8 @@ params:
     group: common
     enabled: true
     tooltip: "主 GPU 设备编号（从 0 开始）。单卡用户保持 0。多卡时指定存放中间结果和 KV 缓存的 GPU。"
+    validate:
+      min: 0
 
   - flag: threads-http
     subgroup: 服务管理
@@ -157,6 +177,8 @@ params:
     default: "-1"
     group: server
     tooltip: "处理 HTTP 请求的线程数。默认 -1 = 自动（通常为 8）。高并发场景可适当增加，但过多会与推理线程争抢 CPU。建议：单用户保持 -1；多用户可设 4~8。"
+    validate:
+      min: -1
 
   - flag: api-key
     subgroup: 服务监听与安全
@@ -222,6 +244,8 @@ params:
     wide: true
     advanced: true
     tooltip: "CORS 允许的 HTTP 方法，逗号分隔。官方默认 GET, POST, DELETE, OPTIONS。留空=官方默认。"
+    validate:
+      regex: '^[A-Za-z,\s]+$'
 
   - flag: cors-headers
     subgroup: 服务监听与安全
@@ -379,6 +403,8 @@ params:
     default: "30"
     group: server
     tooltip: "SSE 心跳间隔（秒）。-1=禁用。默认 30。保持连接活跃，防止代理超时断开。"
+    validate:
+      min: 0
 
   - flag: system-prompt-file
     subgroup: 服务管理
@@ -413,6 +439,8 @@ params:
     group: common
     wide: true
     tooltip: "多 GPU 张量拆分比例，逗号分隔。如 '3,5' 表示第一块 GPU 占 3/8、第二块占 5/8。按显存大小比例分配。单卡无需设置。DeepSeek 4 新增 -sm tensor 模式。"
+    validate:
+      regex: '^\d+(\.\d+)?(,\d+(\.\d+)?)*$'
 
   - flag: threads-batch
     subgroup: 进程与 CPU 亲和
@@ -421,6 +449,8 @@ params:
     default: ""
     group: common
     tooltip: "Prompt 处理（批处理）时的 CPU 线程数。默认与 --threads 相同。Prompt 处理是计算密集型，可适当增加线程数以加速首次响应。"
+    validate:
+      min: -1
 
   - flag: cpu-mask
     subgroup: 进程与 CPU 亲和
@@ -463,6 +493,8 @@ params:
     advanced: true
     options: ["-1", "0", "1", "2", "3"]
     tooltip: "进程/线程优先级。-1=低，0=正常，1=中，2=高，3=实时。默认 0。"
+    validate:
+      regex: '^-?\d+$'
 
   - flag: prio-batch
     subgroup: 进程与 CPU 亲和
@@ -473,6 +505,8 @@ params:
     advanced: true
     options: ["0", "1", "2", "3"]
     tooltip: "批处理阶段的进程/线程优先级。0=正常，1=中，2=高，3=实时。默认 0。"
+    validate:
+      regex: '^\d+$'
 
   - flag: poll
     subgroup: 进程与 CPU 亲和
@@ -629,6 +663,8 @@ params:
     group: common
     wide: true
     tooltip: "用于卸载的设备列表，逗号分隔（如 0,1）。none=完全不卸载到 GPU。使用 --list-devices 查看可用设备。留空=自动。"
+    validate:
+      regex: '^[A-Za-z0-9\-_,]+$'
 
   - flag: fit
     subgroup: 后端与显存
@@ -651,6 +687,8 @@ params:
     tooltip: "--fit 为每设备保留的目标显存余量，逗号分隔多卡值，单值广播到所有设备。默认 1024 MiB。显存吃紧时可调小。"
     requires:
       - {flag: fit, op: "==", value: "on"}
+    validate:
+      regex: '^\d+(,\d+)*$'
 
   - flag: fit-ctx
     subgroup: 后端与显存
@@ -661,6 +699,8 @@ params:
     tooltip: "--fit 能自动设置的最小 ctx 大小（token）。默认 4096。防止自动适配把上下文压得过小。"
     requires:
       - {flag: fit, op: "==", value: "on"}
+    validate:
+      min: 0
 
   - flag: kv-offload
     subgroup: KV 缓存与量化
@@ -726,6 +766,8 @@ params:
     default: ""
     group: common
     tooltip: "把前 N 层的稠密 FFN 权重放在 CPU（针对非 MoE 模型；MoE 专家用 --n-cpu-moe）。显存与速度的折中。"
+    validate:
+      min: 0
 
   - flag: lazy-mode
     subgroup: 后端与显存
@@ -801,6 +843,8 @@ params:
     requires:
       - {flag: cache-prompt, op: enabled}
     tooltip: "通过 KV 偏移复用缓存的最小 chunk 大小。需要启用 prompt 缓存。默认 0=禁用。设为 256~512 可在相似 prompt 间复用 KV，加速多轮对话。"
+    validate:
+      min: 0
 
   - flag: cache-ram
     subgroup: KV 缓存与检查点
@@ -810,6 +854,8 @@ params:
     group: server
     advanced: true
     tooltip: "设置 prompt 缓存的最大大小（MiB）。官方默认 8192；-1=无限制；0=禁用。超出限制时自动淘汰旧缓存。留空=使用官方默认。"
+    validate:
+      min: -1
 
   - flag: kv-unified
     subgroup: KV 缓存与检查点
@@ -831,6 +877,8 @@ params:
     tooltip: "每个并行槽位的上下文限制（token）。设置后共享 KV 池按 n_parallel*N 分配。留空=行为不变。"
     suggests:
       - kv-unified
+    validate:
+      min: 0
 
   - flag: context-shift
     subgroup: KV 缓存与检查点
@@ -849,6 +897,8 @@ params:
     group: server
     advanced: true
     tooltip: "每槽位最多创建的上下文检查点数量（--ctx-checkpoints，默认 32）。检查点支持缓存回退，值越大越灵活但占内存。"
+    validate:
+      min: 0
 
   - flag: checkpoint-min-step
     subgroup: KV 缓存与检查点
@@ -860,6 +910,8 @@ params:
     tooltip: "上下文检查点之间的最小 token 间距（默认 8192；0=无最小限制）。用于控制检查点数量与内存。"
     suggests:
       - ctx-checkpoints
+    validate:
+      min: 0
 
   - flag: cache-idle-slots
     subgroup: KV 缓存与检查点
@@ -912,6 +964,8 @@ params:
     default: ""
     group: common
     tooltip: "只把前 N 层的 MoE 专家权重放在 CPU，其余层专家留在 GPU——显存与速度的折中。与 --fit 配合使用效果更佳。建议从 0 开始逐步增大直到显存刚好不 OOM。仅对 MoE 模型有效。"
+    validate:
+      min: 0
 
   # ================================================================
   # 采样控制
@@ -924,6 +978,8 @@ params:
     group: sampling
     enabled: true
     tooltip: "RNG 随机种子。-1 = 每次随机（默认）。设为固定值可使相同输入产生相同输出，便于调试和复现。测试时建议固定种子，生产环境保持 -1。"
+    validate:
+      min: -1
 
   - flag: predict
     subgroup: 上下文与批处理
@@ -932,6 +988,8 @@ params:
     default: "-1"
     group: common
     tooltip: "单次请求最大生成 token 数。-1 = 无限（直到模型决定停止或达到上下文上限）。API 调用时通常由客户端的 max_completion_tokens 参数覆盖（max_tokens 已废弃）。"
+    validate:
+      min: -1
 
   - flag: ignore-eos
     subgroup: 基础采样
@@ -978,6 +1036,8 @@ params:
     group: sampling
     enabled: true
     tooltip: "Top-K 采样：仅从概率最高的 K 个 token 中采样。K 越小输出越保守。默认 40。设为 1=贪心；10~40=平衡；0=禁用（仅用 Top-P/Min-P）。建议配合 Top-P 使用，保持默认 40。"
+    validate:
+      min: 0
 
   - flag: top-p
     subgroup: 基础采样
@@ -1117,6 +1177,8 @@ params:
     tooltip: "DRY 采样允许的重复序列长度。默认 2。仅在 dry-multiplier > 0 时生效。"
     requires:
       - {flag: dry-multiplier, op: "!=", value: 0}
+    validate:
+      min: 0
 
   - flag: dry-penalty-last-n
     subgroup: 重复惩罚
@@ -1127,6 +1189,8 @@ params:
     tooltip: "DRY 惩罚考虑的最后 N 个 token。默认 64，0=禁用。仅在 dry-multiplier > 0 时生效。"
     requires:
       - {flag: dry-multiplier, op: "!=", value: 0}
+    validate:
+      min: 0
 
   - flag: dry-sequence-breaker
     subgroup: 重复惩罚
@@ -1269,6 +1333,8 @@ params:
     default: "-1"
     group: server
     tooltip: "【核心】思考 token 预算。-1=无限制（默认）；0=立即结束思考（慎用！会禁用思考过程）；正数（如 512）=限制思考长度，优先级高于 reasoning-effort。Qwen3 支持。"
+    validate:
+      min: -1
 
   # ================================================================
   # 推测解码
@@ -1305,6 +1371,8 @@ params:
     requires:
       - {flag: spec-type, op: "!=", value: none}
     tooltip: "每次推测生成的最大草稿 token 数。MTP 推荐 3，接受率约 75%，可带来 2x+ 加速。2~5=平衡；8~10=激进。"
+    validate:
+      min: 0
 
   - flag: spec-draft-n-min
     subgroup: 类型与草稿
@@ -1316,6 +1384,8 @@ params:
       - {flag: spec-type, op: "!=", value: none}
     advanced: true
     tooltip: "推测解码使用的最小草稿 token 数。默认 0。"
+    validate:
+      min: 0
 
   - flag: spec-draft-p-min
     subgroup: 类型与草稿
@@ -1373,6 +1443,8 @@ params:
       - {flag: spec-type, op: "!=", value: none}
     advanced: true
     tooltip: "草稿模型使用的设备列表，逗号分隔。留空表示不卸载。"
+    validate:
+      regex: '^[A-Za-z0-9\-_,]+$'
 
   - flag: spec-draft-ngl
     subgroup: 类型与草稿
@@ -1384,6 +1456,8 @@ params:
       - {flag: spec-type, op: "!=", value: none}
     advanced: true
     tooltip: "草稿模型卸载到 GPU 的层数。auto/数字/all。"
+    validate:
+      regex: '^(auto|all|\d+)$'
 
   - flag: spec-draft-ctx-size
     subgroup: 已废弃
@@ -1477,6 +1551,8 @@ params:
     advanced: true
     options: ["0", "1", "2", "3"]
     tooltip: "草稿模型进程/线程优先级。0=正常，1=中，2=高，3=实时。默认 0。"
+    validate:
+      regex: '^\d+$'
 
   - flag: spec-draft-poll
     subgroup: 草稿模型资源
@@ -1525,6 +1601,8 @@ params:
     advanced: true
     options: ["0", "1", "2", "3"]
     tooltip: "草稿模型批处理阶段的进程/线程优先级。0=正常，1=中，2=高，3=实时。默认 0。"
+    validate:
+      regex: '^\d+$'
 
   - flag: spec-draft-poll-batch
     subgroup: 草稿模型资源
@@ -1738,6 +1816,8 @@ params:
     group: spec
     advanced: true
     tooltip: "目标平均合成接受长度（含目标 token）。仅用于基准测试，正常使用留空。"
+    validate:
+      min: 0
 
   - flag: spec-synth-rates
     subgroup: 推测基准测试
@@ -1846,6 +1926,8 @@ params:
     wide: true
     advanced: true
     tooltip: "多模态投影仪使用的设备（none=不卸载，auto=自动，或指定设备序号）。默认 auto。"
+    validate:
+      regex: '^[A-Za-z0-9\-_,]+$'
 
   - flag: image-min-tokens
     subgroup: 多模态
@@ -1855,6 +1937,8 @@ params:
     group: server
     advanced: true
     tooltip: "每张图像可占用的最小 token 数，仅动态分辨率视觉模型使用。留空=读模型元数据（官方默认）。"
+    validate:
+      min: 0
 
   - flag: image-max-tokens
     subgroup: 多模态
@@ -1864,6 +1948,8 @@ params:
     group: server
     advanced: true
     tooltip: "每张图像可占用的最大 token 数，仅动态分辨率视觉模型使用。留空=读模型元数据（官方默认）。"
+    validate:
+      min: 0
 
   - flag: mtmd-batch-max-tokens
     subgroup: 多模态
@@ -1873,6 +1959,8 @@ params:
     group: server
     advanced: true
     tooltip: "图像编码时每批的最大 token 数（默认 1024）。显存紧张可调低。"
+    validate:
+      min: 1
 
   - flag: video-fps
     subgroup: 多模态
@@ -1882,6 +1970,8 @@ params:
     group: server
     advanced: true
     tooltip: "视频处理目标帧率（默认 4.0）。越低处理越快、token 越省。"
+    validate:
+      min: 0
 
   - flag: video-timestamp-interval
     subgroup: 多模态
@@ -1891,6 +1981,8 @@ params:
     group: server
     advanced: true
     tooltip: "视频文本时间戳之间的间隔（毫秒，默认 5000）。"
+    validate:
+      min: 0
 
   - flag: video-ffmpeg-dir
     subgroup: 多模态
@@ -1913,6 +2005,8 @@ params:
     group: server
     enabled: true
     tooltip: "服务器并发槽位数（同时处理的请求数）。默认 -1=自动。1=单用户（推荐本地使用）；2~4=多用户并发。每个槽位占用独立的 KV 缓存空间，增加会线性增加显存占用。MTP 推测解码建议保持 1。"
+    validate:
+      min: -1
 
   - flag: cont-batching
     subgroup: 并行与槽位
@@ -2066,6 +2160,8 @@ params:
     group: common
     advanced: true
     tooltip: "日志输出详细程度。0=仅关键信息；1=错误；2=警告；3=信息（默认）；4=追踪；5=调试。"
+    validate:
+      min: 0
 
   - flag: verbose
     subgroup: 日志
@@ -2369,6 +2465,8 @@ params:
     group: server
     subgroup: 服务管理
     tooltip: "空闲多少秒后服务器自动休眠（卸载模型释放显存）。-1=禁用（默认）。"
+    validate:
+      min: -1
 
   - flag: props
     subgroup: 服务管理
@@ -2437,6 +2535,8 @@ params:
     group: server
     advanced: true
     tooltip: "Router 服务器最大同时加载模型数。0=无限制。默认 4。"
+    validate:
+      min: 0
 
   - flag: models-autoload
     subgroup: 模型目录
@@ -2492,6 +2592,8 @@ params:
     group: common
     advanced: true
     tooltip: "为留在 CPU 的 MoE 专家权重分配 GPU 缓存（MiB）。0=禁用（官方默认）。多 GPU 时按 --tensor-split 比例分摊。显存充裕的 MoE 模型可用它减少专家换入换出。"
+    validate:
+      min: 0
 
   - flag: spec-draft-n-ubatch
     subgroup: 类型与草稿
@@ -2503,6 +2605,8 @@ params:
     requires:
       - {flag: spec-type, op: "!=", value: none}
     tooltip: "草稿上下文的物理最大批，调小可省显存。0=跟随 --n-ubatch（官方默认）。"
+    validate:
+      min: 0
 
   - flag: spec-draft-sampling
     subgroup: 类型与草稿
