@@ -3741,6 +3741,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return;
 		}
 		_vramBreakerTriggered = false;
+		_oomSeenInRun = false;
+		if (!_oomRetryActive)
+		{
+			_oomRetryLeft = 3; // 用户手动启动时重置重试额度
+		}
 		double result;
 		while (_tpsSamples.TryDequeue(out result))
 		{
@@ -3804,7 +3809,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 		}
 		LogParamHints();
-		if (!ConfirmVramFit())
+		// OOM 自动重试路径跳过预算弹窗: ngl 已下调、数字只会更宽松，弹窗只会打扰
+		if (!_oomRetryActive && !ConfirmVramFit())
 		{
 			Log("--- 启动已取消 ---");
 			return;
@@ -3887,6 +3893,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				LblLlamaStatus.Text = "● 运行中";
 				LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
+				// OOM 降层重试成功进入运行态: 重置额度与标志
+				_oomRetryActive = false;
+				_oomRetryLeft = 3;
 			}
 		}
 	}
@@ -3911,6 +3920,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				LblLlamaStatus.Text = "● 启动失败/崩溃";
 				LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
 				Log("--- Llama 异常退出 (退出码 " + exitCode + ") --- 请查看上方日志，通常是显存不足或参数错误导致 ---");
+				// OOM 自动降层重试（ollama 同款闭环）: 显存不足信号 + 开关开启 + 还有重试额度
+				if (_oomSeenInRun && ChkOomRetry.IsChecked == true && _oomRetryLeft > 0)
+				{
+					if (TryAutoReduceNglAndRelaunch())
+					{
+						return;
+					}
+				}
 			}
 			else
 			{
@@ -3919,7 +3936,61 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				Log("--- Llama 已退出 ---");
 			}
 			ClearStateFor("llama");
+			_oomRetryLeft = 3;
+			_oomRetryActive = false;
 		}
+	}
+
+	/// <summary>
+	/// OOM 自动降层重试（ollama 同款闭环）: 把 --gpu-layers 降到上一轮实际上 GPU 层数的 85%
+	/// （auto/全层首次重试直接从总层数起算），改写输入框后自动重新启动。成功进入运行态后
+	/// 重试额度重置；连续 3 次失败或层数低于 4 时放弃，保留用户可手动调整的空间。
+	/// </summary>
+	private bool TryAutoReduceNglAndRelaunch()
+	{
+		if (_pw.TryGetValue("gpu-layers", out (System.Windows.Controls.CheckBox ec, System.Windows.Controls.Control vw) pair))
+		{
+			string cur = ((pair.vw is System.Windows.Controls.ComboBox c) ? c.Text : ((System.Windows.Controls.TextBox)pair.vw).Text).Trim();
+			int baseNgl;
+			if (!int.TryParse(cur, out int curNgl) || curNgl <= 0)
+			{
+				// auto/全层: 以上一轮 offloaded 总层数为基准
+				baseNgl = _totalLayers > 0 ? _totalLayers : 0;
+				if (baseNgl <= 0)
+				{
+					return false;
+				}
+			}
+			else
+			{
+				baseNgl = curNgl;
+			}
+			int newNgl = Math.Max(4, (int)Math.Floor(baseNgl * 0.85));
+			if (newNgl >= baseNgl)
+			{
+				newNgl = baseNgl - 1;
+			}
+			if (newNgl < 4)
+			{
+				Log("[OOM 重试] 层数已降到下限以下，放弃自动重试（当前 " + cur + "）。请调小 ctx、量化 KV 或换更小的量化。");
+				return false;
+			}
+			_oomRetryLeft--;
+			_oomRetryActive = true;
+			pair.ec.IsChecked = true;
+			if (pair.vw is System.Windows.Controls.ComboBox cb)
+			{
+				cb.Text = newNgl.ToString();
+			}
+			else
+			{
+				((System.Windows.Controls.TextBox)pair.vw).Text = newNgl.ToString();
+			}
+			Log("[OOM 重试] 显存不足，已把 --gpu-layers 从 " + cur + " 降到 " + newNgl + "（剩余自动重试 " + _oomRetryLeft + " 次），自动重启...");
+			StartLlama();
+			return true;
+		}
+		return false;
 	}
 
 	/// <summary>加载一次当前配置的模型，读到显存实测值就自动停止。</summary>
@@ -4386,13 +4457,31 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private double _obsRsMiB = -1.0;
 	private double _obsComputeMiB = -1.0;
 	private bool _obsLogged;
+	// OOM 自动降层重试状态
+	private bool _oomSeenInRun;
+	private int _offloadedLayers;
+	private int _totalLayers;
+	private int _oomRetryLeft = 3;
+	private bool _oomRetryActive;
 
 	private void NoteLlamaMemoryLine(string text)
 	{
 		// llama 自己说"适配不下"时，说明当前参数已超出可用显存，静态占用再好看也没用。
 		if (text.Contains("failed to fit params", StringComparison.OrdinalIgnoreCase))
 		{
+			_oomSeenInRun = true;
 			Log("[显存] llama 报告无法把参数适配进可用显存（failed to fit params）：实际上已经超了，建议调小 ubatch 或把更多专家放到 CPU");
+		}
+		else if (text.Contains("out of memory", StringComparison.OrdinalIgnoreCase) || text.Contains("failed to allocate", StringComparison.OrdinalIgnoreCase))
+		{
+			_oomSeenInRun = true;
+		}
+		// offloaded X/Y layers to GPU: 记录总层数与实际上 GPU 层数（OOM 降层重试的基准）
+		Match offload = Regex.Match(text, @"offloaded\s+(\d+)/(\d+)\s+layers", RegexOptions.IgnoreCase);
+		if (offload.Success)
+		{
+			_offloadedLayers = int.TryParse(offload.Groups[1].Value, out int offN) ? offN : 0;
+			_totalLayers = int.TryParse(offload.Groups[2].Value, out int totN) ? totN : 0;
 		}
 		// buffer 汇总行解析（ollama 同款思路：从日志读取 llama 实际计算结果）
 		double mib = -1.0;

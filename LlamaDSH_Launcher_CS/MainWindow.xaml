@@ -292,6 +292,7 @@
               <Button Name="BtnLlamaStart" Content="▶ 启动 Llama" Background="#238636" Foreground="#FFFFFFFF" Margin="0,0,0,4" FontSize="13" Click="StartLlama_Click" />
               <Button Name="BtnLlamaStop" Content="⏹ 停止 Llama" Background="#da3633" Foreground="#FFFFFFFF" IsEnabled="False" Margin="0,0,0,4" FontSize="13" Click="StopLlama_Click" />
               <TextBlock Name="LblLlamaStatus" Text="● 已停止" Foreground="#8b949e" HorizontalAlignment="Center" FontSize="12" />
+              <CheckBox Name="ChkOomRetry" Content="OOM 自动降层重试" IsChecked="True" Foreground="#8b949e" FontSize="11" Margin="0,6,0,0" HorizontalAlignment="Center" ToolTip="启动因显存不足失败时，自动降低 --gpu-layers（每次 ×0.85，最多 3 次）并重新启动；需要重新勾选参数面板后手动保存才会持久化" />
             </StackPanel>
             <StackPanel Grid.Column="2">
               <Button Name="BtnDshStart" Content="▶ 启动 DSH Web" Background="#238636" Foreground="#FFFFFFFF" Margin="0,0,0,4" FontSize="13" Click="StartDsh_Click" />
