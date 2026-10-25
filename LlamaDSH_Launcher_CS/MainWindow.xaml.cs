@@ -2533,7 +2533,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					double bytes = elems * GgmlBpe(type);
 					bool expert = name.Contains("ffn_", StringComparison.Ordinal)
 						&& (name.Contains("exps", StringComparison.Ordinal) || name.Contains("shexp", StringComparison.Ordinal));
-					Match lm = Regex.Match(name, @"\.blk\.(\d+)\.");
+					Match lm = Regex.Match(name, @"(?:^|\.)blk\.(\d+)\.");
 					if (lm.Success)
 					{
 						int l = int.Parse(lm.Groups[1].Value);
