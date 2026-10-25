@@ -505,7 +505,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			ParamContent.Children.Add(panel);
 		}
-		LogParamFilter("SelectSubgroup", grpId + "|" + sub, "panelFound=" + (panel != null));
 		int count = _navItems.FirstOrDefault(n => n.GrpId == grpId && n.Sub == sub).Count;
 		ParamBreadcrumb.Text = (grpTitle ?? grpId) + "  ▸  " + sub + "   ·   " + count + " 个参数";
 		foreach (var n in _navItems)
@@ -532,7 +531,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		string q = (InputParamFilter.Text ?? "").Trim();
 		bool filtering = q.Length > 0;
-		LogParamFilter("Apply", DescribeText(q), "filtering=" + filtering);
 		BtnClearParamFilter.Visibility = filtering ? Visibility.Visible : Visibility.Collapsed;
 		if (!filtering)
 		{
@@ -601,32 +599,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void InputParamFilter_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
 	{
-		LogParamFilter("TextChanged", DescribeText(InputParamFilter.Text));
 		ApplyParamFilter();
 	}
 
 	private void ClearParamFilter_Click(object sender, RoutedEventArgs e)
 	{
 		InputParamFilter.Clear();
-	}
-
-	/// <summary>诊断日志：记录过滤框文本变化（含字符码，用于排查不可见残留/输入法组合态）。写入 %TEMP%\llamads_paramfilter_debug.log。</summary>
-	static string DescribeText(string? t)
-	{
-		if (string.IsNullOrEmpty(t)) return "len=0";
-		var sb = new StringBuilder("len=").Append(t.Length).Append(" chars=[");
-		foreach (var c in t) sb.Append((int)c).Append(',');
-		return sb.Append(']').ToString();
-	}
-
-	static void LogParamFilter(string what, string? detail1, string? detail2 = null)
-	{
-		try
-		{
-			File.AppendAllText(Path.Combine(Path.GetTempPath(), "llamads_paramfilter_debug.log"),
-				DateTime.Now.ToString("HH:mm:ss.fff") + "  " + what + (detail1 != null ? "  " + detail1 : "") + (detail2 != null ? "  " + detail2 : "") + Environment.NewLine);
-		}
-		catch { }
 	}
 
 
