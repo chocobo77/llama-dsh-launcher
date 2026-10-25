@@ -4379,12 +4379,54 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	}
 
 	/// <summary>llama.cpp 报告 "failed to fit params" 时提示用户：当前参数实际已超出可用显存。</summary>
+	// llama-server 0.7 显存汇总行的实测值（对齐 ollama 的日志解析方式）：
+	// 启动后展示 llama 实际计算的 breakdown，与启动前预估形成对照
+	private double _obsModelMiB = -1.0;
+	private double _obsKvMiB = -1.0;
+	private double _obsRsMiB = -1.0;
+	private double _obsComputeMiB = -1.0;
+	private bool _obsLogged;
+
 	private void NoteLlamaMemoryLine(string text)
 	{
 		// llama 自己说"适配不下"时，说明当前参数已超出可用显存，静态占用再好看也没用。
 		if (text.Contains("failed to fit params", StringComparison.OrdinalIgnoreCase))
 		{
 			Log("[显存] llama 报告无法把参数适配进可用显存（failed to fit params）：实际上已经超了，建议调小 ubatch 或把更多专家放到 CPU");
+		}
+		// buffer 汇总行解析（ollama 同款思路：从日志读取 llama 实际计算结果）
+		double mib = -1.0;
+		bool model = text.Contains(" model buffer size = ", StringComparison.Ordinal);
+		bool kv = text.Contains(" KV buffer size = ", StringComparison.Ordinal);
+		bool rs = text.Contains(" RS buffer size = ", StringComparison.Ordinal);
+		bool compute = text.Contains(" compute buffer size = ", StringComparison.Ordinal);
+		if (model || kv || rs || compute)
+		{
+			int eq = text.LastIndexOf("= ", StringComparison.Ordinal);
+			if (eq >= 0 && double.TryParse(text.Substring(eq + 2).Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out mib) && mib >= 0.0)
+			{
+				// 排除 CPU/host 侧缓冲（CPU_*/..._Host/CPU_REPACK/BLAS），只统计设备显存
+				bool hostSide = text.Contains("_Host ", StringComparison.Ordinal)
+					|| text.Contains("CPU_", StringComparison.Ordinal)
+					|| text.Contains("CPU model", StringComparison.Ordinal)
+					|| text.Contains("BLAS", StringComparison.Ordinal);
+				if (!hostSide)
+				{
+					if (model) _obsModelMiB = mib;
+					else if (kv) _obsKvMiB = mib;
+					else if (rs) _obsRsMiB = mib;
+					else if (compute) _obsComputeMiB = mib;
+				}
+			}
+			return;
+		}
+		// 四段齐了（compute 通常最后 reserve）→ 输出实测对照
+		if (!_obsLogged && _obsModelMiB >= 0.0 && _obsComputeMiB >= 0.0)
+		{
+			_obsLogged = true;
+			double sum = Math.Max(0.0, _obsModelMiB) + Math.Max(0.0, _obsKvMiB) + Math.Max(0.0, _obsRsMiB) + Math.Max(0.0, _obsComputeMiB);
+			Log(string.Format("[显存实测] llama 实际分配: 权重 {0:F0} + KV {1:F0} + RS {2:F0} + 计算图 {3:F0} = {4:F2} GiB（可与启动前预估对照）",
+				_obsModelMiB, _obsKvMiB, _obsRsMiB, _obsComputeMiB, sum / 1024.0));
 		}
 	}
 
