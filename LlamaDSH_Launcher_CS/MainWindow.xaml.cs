@@ -2136,6 +2136,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private static double CacheBytesPerElem(string cacheType)
 	{
+		// 每元素字节数按 ggml.h 各 block 结构定义换算:
+		// Q4_0=20B/32, Q4_1=24B/32, Q5_0=28B/32, Q5_1=32B/32, Q8_0=34B/32,
+		// IQ4_NL=20B/32, Q6_K=210B/256(0.8203), F16/BF16=2B, F32=4B
 		switch (cacheType.Trim().ToLowerInvariant())
 		{
 		case "f32":
@@ -2147,17 +2150,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return 1.0625;
 		case "q4_0":
 		case "iq4_nl":
-			return 0.5625;
-		case "q4_1":
 			return 0.625;
-		case "q5_0":
-			return 0.6875;
-		case "q5_1":
+		case "q4_1":
 			return 0.75;
-		case "q6_0":
+		case "q5_0":
 			return 0.875;
-		case "tq3_0":
-			return 0.4375;
+		case "q5_1":
+			return 1.0;
+		case "q6_0":
+			return 0.8203125;
 		default:
 			return 2.0;
 		}
