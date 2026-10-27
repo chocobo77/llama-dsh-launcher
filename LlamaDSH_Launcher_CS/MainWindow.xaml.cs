@@ -5823,7 +5823,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					LogError(ex5, "性能监控异常");
 				}
-				Thread.Sleep(2000);
+				// 动态采样间隔: llama 运行中 2s(熔断时效), 未运行 5s(纯面板显示, 无保护需求)
+				bool llamaRunning = IsAlive(_llamaProc);
+				_gpuMonitor.CacheTtlSeconds = llamaRunning ? 5.0 : 15.0;
+				Thread.Sleep(llamaRunning ? 2000 : 5000);
 			}
 		})
 		{

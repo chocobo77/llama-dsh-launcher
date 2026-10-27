@@ -48,6 +48,9 @@ public class GpuMonitor
 
 	public bool TempEnabled { get; set; } = true;
 
+	/// <summary>QueryGpu 缓存有效期(秒)。llama 运行中由调用方设 5s(熔断时效), 未运行 15s(降频)。</summary>
+	public double CacheTtlSeconds { get; set; } = 5.0;
+
 	public string Vendor => DetectVendor();
 
 	private static double EnvTick()
@@ -60,7 +63,7 @@ public class GpuMonitor
 		double num = EnvTick();
 		lock (_lock)
 		{
-			if (_gpuCache != null && num - _gpuCacheTime < 5.0)
+			if (_gpuCache != null && num - _gpuCacheTime < CacheTtlSeconds)
 			{
 				return new Dictionary<string, string>(_gpuCache);
 			}
@@ -75,6 +78,12 @@ public class GpuMonitor
 			if (!TryAmdSmi(dictionary))
 			{
 				TryCimGpuCounters(dictionary);
+				TryRegistryVramTotal(dictionary);
+			}
+			else if (!dictionary.ContainsKey("vram_total"))
+			{
+				// amd-smi metric 输出只有 vram_used；总量从注册表补齐，
+				// 否则百分比熔断/显示在 AMD+amd-smi 机器上永不生效
 				TryRegistryVramTotal(dictionary);
 			}
 			break;
