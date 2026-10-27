@@ -271,7 +271,6 @@
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto" />
         <RowDefinition Height="Auto" />
-        <RowDefinition Height="Auto" />
         <RowDefinition Height="*" />
       </Grid.RowDefinitions>
       <Border Grid.Row="0" Background="#161b22" BorderBrush="#30363d" BorderThickness="1" CornerRadius="6" Padding="10,7" Margin="0,0,0,8">
@@ -306,72 +305,194 @@
          </StackPanel>
       </GroupBox>
 
-      <!-- ── 监控与保护：只读指标 + 显存熔断策略，不含启动动作 ── -->
-      <GroupBox Header="📊 监控与保护" Grid.Row="2" Margin="0,6,0,0">
-         <StackPanel>
-          <Border Background="#0d1117" CornerRadius="6" Padding="8" Margin="0,0,0,0" BorderBrush="#30363d" BorderThickness="1">
-            <UniformGrid Rows="2" Columns="4">
-              <StackPanel HorizontalAlignment="Center" Margin="4">
-                <TextBlock Text="🖥 CPU" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
-                <TextBlock Name="PerfCpu" Text="N/A" Foreground="#58a6ff" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
-              </StackPanel>
-              <StackPanel HorizontalAlignment="Center" Margin="4">
-                <TextBlock Text="💾 内存" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
-                <TextBlock Name="PerfMem" Text="N/A" Foreground="#58a6ff" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
-              </StackPanel>
-              <StackPanel HorizontalAlignment="Center" Margin="4">
-                <TextBlock Text="🎮 显卡" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
-                <TextBlock Name="PerfGpu" Text="N/A" Foreground="#f0883e" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
-              </StackPanel>
-              <StackPanel HorizontalAlignment="Center" Margin="4">
-                <TextBlock Text="📊 显存" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
-                <TextBlock Name="PerfVram" Text="N/A" Foreground="#f0883e" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
-              </StackPanel>
-              <StackPanel HorizontalAlignment="Center" Margin="4">
-                <TextBlock Text="🌡 显卡温度" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
-                <TextBlock Name="PerfGpuTemp" Text="N/A" Foreground="#f0883e" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
-              </StackPanel>
-              <StackPanel HorizontalAlignment="Center" Margin="4">
-                <TextBlock Text="⚡ TPS" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
-                <TextBlock Name="PerfTps" Text="—" Foreground="#7ee787" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
-              </StackPanel>
-              <StackPanel HorizontalAlignment="Center" Margin="4">
-                <TextBlock Text="⏱ 首Token" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
-                <TextBlock Name="PerfTtft" Text="—" Foreground="#7ee787" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
-              </StackPanel>
-              <StackPanel HorizontalAlignment="Center" Margin="4">
-                <TextBlock Text="📈 Prefill" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Center" />
-                <TextBlock Name="PerfPrefill" Text="—" Foreground="#7ee787" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" />
-              </StackPanel>
-            </UniformGrid>
-          </Border>
-          <Border Background="#0d1117" CornerRadius="6" Padding="8,6" Margin="0,6,0,0" BorderBrush="#30363d" BorderThickness="1">
-            <StackPanel Orientation="Horizontal">
-              <CheckBox Name="ChkVramBreaker" Content="🔒 显存熔断" Foreground="#c9d1d9" VerticalAlignment="Center" IsChecked="False" ToolTip="显存超过阈值时自动停止 Llama 服务，防止爆显存" />
-              <local:NoScrollComboBox x:Name="ComboVramBreakerType" Width="120" Margin="8,0,4,0" VerticalAlignment="Center">
-                <ComboBoxItem Content="百分比 (%)" IsSelected="True" />
-                <ComboBoxItem Content="固定值 (GB)" />
-              </local:NoScrollComboBox>
-              <TextBox Name="TxtVramBreakerVal" Width="60" Text="90" VerticalAlignment="Center" Margin="0,0,4,0" ToolTip="阈值：百分比模式填 0-100，GB 模式填小数如 20.0" />
-              <TextBlock Name="LblVramBreaker" Text="" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" />
+      <!-- ── 监测/日志双标签页：标签1 效仿 Strata Monitor 设计（状态卡 + 指标卡带迷你历史曲线 + 数据来源徽标），标签2 原运行日志 ── -->
+      <TabControl Grid.Row="2" Margin="0,6,0,0" Background="Transparent" BorderBrush="#30363d" BorderThickness="1">
+        <TabControl.Resources>
+          <Style TargetType="TabItem">
+            <Setter Property="Foreground" Value="#8b949e" />
+            <Setter Property="Background" Value="#161b22" />
+            <Setter Property="Padding" Value="14,6" />
+            <Setter Property="Template">
+              <Setter.Value>
+                <ControlTemplate TargetType="TabItem">
+                  <Border Name="TabBd" Background="{TemplateBinding Background}" BorderBrush="#30363d" BorderThickness="1,1,1,0" CornerRadius="6,6,0,0" Margin="0,0,2,0" Padding="{TemplateBinding Padding}">
+                    <ContentPresenter ContentSource="Header" VerticalAlignment="Center" />
+                  </Border>
+                  <ControlTemplate.Triggers>
+                    <Trigger Property="IsSelected" Value="True">
+                      <Setter TargetName="TabBd" Property="Background" Value="#0d1117" />
+                      <Setter Property="Foreground" Value="#e6edf3" />
+                      <Setter Property="FontWeight" Value="Bold" />
+                    </Trigger>
+                    <Trigger Property="IsMouseOver" Value="True">
+                      <Setter TargetName="TabBd" Property="Background" Value="#1f2937" />
+                    </Trigger>
+                  </ControlTemplate.Triggers>
+                </ControlTemplate>
+              </Setter.Value>
+            </Setter>
+          </Style>
+        </TabControl.Resources>
+        <TabItem Header="📊 监测" IsSelected="True">
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel Margin="8">
+              <!-- 模型状态卡：阶段徽标 + 进程明细 -->
+              <Border Background="#0d1117" CornerRadius="6" Padding="10,8" BorderBrush="#30363d" BorderThickness="1">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                  </Grid.ColumnDefinitions>
+                  <Border Name="MonPhaseBadge" Background="#338b949e" CornerRadius="4" Padding="10,4" VerticalAlignment="Center">
+                    <TextBlock Name="MonPhaseText" Text="⏸ 空闲" Foreground="#8b949e" FontSize="13" FontWeight="Bold" />
+                  </Border>
+                  <TextBlock Name="MonPhaseDetail" Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center" Foreground="#8b949e" FontSize="11" TextWrapping="Wrap" Text="llama 未启动 · DSH 未启动" />
+                </Grid>
+              </Border>
+              <!-- 指标卡网格：大数值 + 来源徽标 + 迷你历史曲线 -->
+              <UniformGrid Columns="3" Margin="0,6,0,0">
+                <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="3" BorderBrush="#30363d" BorderThickness="1">
+                  <Grid>
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0">
+                      <TextBlock Text="⚡ 速度" Foreground="#8b949e" FontSize="11" />
+                      <TextBlock Name="BdgTps" Text="无数据" FontSize="9" Padding="5,1" HorizontalAlignment="Right" Background="#228b949e" Foreground="#8b949e" />
+                    </Grid>
+                    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,2,0,0">
+                      <TextBlock Name="PerfTps" Text="—" Foreground="#7ee787" FontSize="20" FontWeight="Bold" />
+                      <TextBlock Text="tok/s" Foreground="#8b949e" FontSize="10" VerticalAlignment="Bottom" Margin="4,0,0,4" />
+                    </StackPanel>
+                    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,1,0,0">
+                      <TextBlock Text="首Token " Foreground="#8b949e" FontSize="10" />
+                      <TextBlock Name="PerfTtft" Text="—" Foreground="#c9d1d9" FontSize="10" />
+                      <TextBlock Text=" · 预填充 " Foreground="#8b949e" FontSize="10" />
+                      <TextBlock Name="PerfPrefill" Text="—" Foreground="#c9d1d9" FontSize="10" />
+                      <TextBlock Text=" tok/s" Foreground="#8b949e" FontSize="10" />
+                    </StackPanel>
+                    <Polyline Name="SparkTps" Grid.Row="3" Height="26" Margin="0,4,0,0" Stretch="Fill" Stroke="#7ee787" StrokeThickness="1.5" StrokeLineJoin="Round" />
+                  </Grid>
+                </Border>
+                <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="3" BorderBrush="#30363d" BorderThickness="1">
+                  <Grid>
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0">
+                      <TextBlock Text="🎮 GPU 负载" Foreground="#8b949e" FontSize="11" />
+                      <TextBlock Name="BdgGpu" Text="无数据" FontSize="9" Padding="5,1" HorizontalAlignment="Right" Background="#228b949e" Foreground="#8b949e" />
+                    </Grid>
+                    <TextBlock Grid.Row="1" Name="PerfGpu" Text="N/A" Foreground="#f0883e" FontSize="20" FontWeight="Bold" />
+                    <TextBlock Grid.Row="2" Text="显卡利用率" Foreground="#8b949e" FontSize="10" Margin="0,1,0,0" />
+                    <Polyline Name="SparkGpu" Grid.Row="3" Height="26" Margin="0,4,0,0" Stretch="Fill" Stroke="#f0883e" StrokeThickness="1.5" StrokeLineJoin="Round" />
+                  </Grid>
+                </Border>
+                <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="3" BorderBrush="#30363d" BorderThickness="1">
+                  <Grid>
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0">
+                      <TextBlock Text="📊 显存" Foreground="#8b949e" FontSize="11" />
+                      <TextBlock Name="BdgVram" Text="无数据" FontSize="9" Padding="5,1" HorizontalAlignment="Right" Background="#228b949e" Foreground="#8b949e" />
+                    </Grid>
+                    <TextBlock Grid.Row="1" Name="PerfVram" Text="N/A" Foreground="#f0883e" FontSize="20" FontWeight="Bold" />
+                    <TextBlock Grid.Row="2" Name="MonVramSub" Text="已用 / 总量" Foreground="#8b949e" FontSize="10" Margin="0,1,0,0" />
+                    <Polyline Name="SparkVram" Grid.Row="3" Height="26" Margin="0,4,0,0" Stretch="Fill" Stroke="#f0883e" StrokeThickness="1.5" StrokeLineJoin="Round" />
+                  </Grid>
+                </Border>
+                <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="3" BorderBrush="#30363d" BorderThickness="1">
+                  <Grid>
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0">
+                      <TextBlock Text="🌡 GPU 温度" Foreground="#8b949e" FontSize="11" />
+                      <TextBlock Name="BdgTemp" Text="无数据" FontSize="9" Padding="5,1" HorizontalAlignment="Right" Background="#228b949e" Foreground="#8b949e" />
+                    </Grid>
+                    <TextBlock Grid.Row="1" Name="PerfGpuTemp" Text="N/A" Foreground="#f0883e" FontSize="20" FontWeight="Bold" />
+                    <TextBlock Grid.Row="2" Text="核心温度" Foreground="#8b949e" FontSize="10" Margin="0,1,0,0" />
+                    <Polyline Name="SparkTemp" Grid.Row="3" Height="26" Margin="0,4,0,0" Stretch="Fill" Stroke="#f0883e" StrokeThickness="1.5" StrokeLineJoin="Round" />
+                  </Grid>
+                </Border>
+                <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="3" BorderBrush="#30363d" BorderThickness="1">
+                  <Grid>
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0">
+                      <TextBlock Text="🖥 CPU" Foreground="#8b949e" FontSize="11" />
+                      <TextBlock Name="BdgCpu" Text="无数据" FontSize="9" Padding="5,1" HorizontalAlignment="Right" Background="#228b949e" Foreground="#8b949e" />
+                    </Grid>
+                    <TextBlock Grid.Row="1" Name="PerfCpu" Text="N/A" Foreground="#58a6ff" FontSize="20" FontWeight="Bold" />
+                    <TextBlock Grid.Row="2" Text="处理器占用" Foreground="#8b949e" FontSize="10" Margin="0,1,0,0" />
+                    <Polyline Name="SparkCpu" Grid.Row="3" Height="26" Margin="0,4,0,0" Stretch="Fill" Stroke="#58a6ff" StrokeThickness="1.5" StrokeLineJoin="Round" />
+                  </Grid>
+                </Border>
+                <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="3" BorderBrush="#30363d" BorderThickness="1">
+                  <Grid>
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0">
+                      <TextBlock Text="💾 内存" Foreground="#8b949e" FontSize="11" />
+                      <TextBlock Name="BdgMem" Text="无数据" FontSize="9" Padding="5,1" HorizontalAlignment="Right" Background="#228b949e" Foreground="#8b949e" />
+                    </Grid>
+                    <TextBlock Grid.Row="1" Name="PerfMem" Text="N/A" Foreground="#58a6ff" FontSize="20" FontWeight="Bold" />
+                    <TextBlock Grid.Row="2" Text="已提交内存" Foreground="#8b949e" FontSize="10" Margin="0,1,0,0" />
+                    <Polyline Name="SparkMem" Grid.Row="3" Height="26" Margin="0,4,0,0" Stretch="Fill" Stroke="#58a6ff" StrokeThickness="1.5" StrokeLineJoin="Round" />
+                  </Grid>
+                </Border>
+              </UniformGrid>
+              <!-- 熔断保护条（保护语义不变） -->
+              <Border Background="#0d1117" CornerRadius="6" Padding="8,6" Margin="6" BorderBrush="#30363d" BorderThickness="1">
+                <StackPanel Orientation="Horizontal">
+                  <CheckBox Name="ChkVramBreaker" Content="🔒 显存熔断" Foreground="#c9d1d9" VerticalAlignment="Center" IsChecked="False" ToolTip="显存超过阈值时自动停止 Llama 服务，防止爆显存" />
+                  <local:NoScrollComboBox x:Name="ComboVramBreakerType" Width="120" Margin="8,0,4,0" VerticalAlignment="Center">
+                    <ComboBoxItem Content="百分比 (%)" IsSelected="True" />
+                    <ComboBoxItem Content="固定值 (GB)" />
+                  </local:NoScrollComboBox>
+                  <TextBox Name="TxtVramBreakerVal" Width="60" Text="90" VerticalAlignment="Center" Margin="0,0,4,0" ToolTip="阈值：百分比模式填 0-100，GB 模式填小数如 20.0" />
+                  <TextBlock Name="LblVramBreaker" Text="" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" />
+                </StackPanel>
+              </Border>
             </StackPanel>
-          </Border>
-        </StackPanel>
-      </GroupBox>
-      <GroupBox Header="📝 运行日志" Grid.Row="3" Margin="0,6,0,0">
-        <Grid>
-          <Grid.RowDefinitions>
-            <RowDefinition Height="*" />
-            <RowDefinition Height="Auto" />
-          </Grid.RowDefinitions>
-          <TextBox Name="LogArea" Grid.Row="0" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Background="#0d1117" Foreground="#c9d1d9" FontFamily="Consolas" FontSize="11" BorderBrush="#30363d" BorderThickness="1" />
-          <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,6,0,0">
-            <Button Content="🗑 清空日志" Margin="0,0,6,0" Click="ClearLog_Click" />
-            <Button Content="📂 打开日志目录" Margin="0,0,10,0" Click="OpenLogDir_Click" />
-            <CheckBox Name="ChkAutoScroll" Content="自动滚动" IsChecked="True" Foreground="#c9d1d9" />
-          </StackPanel>
-        </Grid>
-      </GroupBox>
+          </ScrollViewer>
+        </TabItem>
+        <TabItem Header="📜 运行日志">
+          <Grid Margin="8">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="*" />
+              <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <TextBox Name="LogArea" Grid.Row="0" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Background="#0d1117" Foreground="#c9d1d9" FontFamily="Consolas" FontSize="11" BorderBrush="#30363d" BorderThickness="1" />
+            <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,6,0,0">
+              <Button Content="🗑 清空日志" Margin="0,0,6,0" Click="ClearLog_Click" />
+              <Button Content="📂 打开日志目录" Margin="0,0,10,0" Click="OpenLogDir_Click" />
+              <CheckBox Name="ChkAutoScroll" Content="自动滚动" IsChecked="True" Foreground="#c9d1d9" />
+            </StackPanel>
+          </Grid>
+        </TabItem>
+      </TabControl>
     </Grid>
 
     <!-- 非模态提示条：替代阻塞式 MessageBox（信息类）。8s（错误 12s）后自动隐藏，也可手动关闭。 -->

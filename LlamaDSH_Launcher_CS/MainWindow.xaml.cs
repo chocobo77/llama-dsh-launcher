@@ -3763,6 +3763,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			PerfPrefill.Text = "—";
 			PerfTps.Text = "—";
 			PerfTtft.Text = "—";
+			ResetMonitorCards();
 		}, Array.Empty<object>());
 		string? stDir = DetectSafetensorsDir();
 		if (stDir != null)
@@ -5928,25 +5929,137 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 	}
 
+	// 监测标签页(Strata 风格): 指标历史环形缓冲(60 点) + 阶段判定时间戳
+	private readonly ConcurrentQueue<double> _histCpu = new();
+	private readonly ConcurrentQueue<double> _histMem = new();
+	private readonly ConcurrentQueue<double> _histGpu = new();
+	private readonly ConcurrentQueue<double> _histVram = new();
+	private readonly ConcurrentQueue<double> _histTemp = new();
+	private readonly ConcurrentQueue<double> _histTps = new();
+	private DateTime _lastDecodeUtc = DateTime.MinValue;
+	private DateTime _lastPrefillUtc = DateTime.MinValue;
+
+	// 追加一个采样点并把整条历史重绘到迷你曲线; maxV<=0 时按历史最大值自动缩放
+	private static void PushSpark(System.Windows.Shapes.Polyline pl, ConcurrentQueue<double> q, double v, double maxV)
+	{
+		AddS(q, v, 60);
+		double m = maxV;
+		if (m <= 0.0)
+		{
+			foreach (double x in q.ToArray())
+			{
+				m = Math.Max(m, x);
+			}
+			if (m <= 0.0)
+			{
+				m = 1.0;
+			}
+		}
+		var pts = new System.Windows.Media.PointCollection();
+		double[] arr = q.ToArray();
+		for (int i = 0; i < arr.Length; i++)
+		{
+			double y = 23.0 - Math.Max(0.0, Math.Min(1.0, arr[i] / m)) * 21.0;
+			pts.Add(new System.Windows.Point(arr.Length <= 1 ? 0.0 : i * 100.0 / (arr.Length - 1), y));
+		}
+		pl.Points = pts;
+	}
+
+	// 数据来源徽标: 有效="实测"(绿), 失效="无数据"(灰); src 非空时显示来源(温度传感器)
+	private static void SetBadge(System.Windows.Controls.TextBlock b, bool ok, string src = "实测")
+	{
+		b.Text = ok ? src : "无数据";
+		b.Background = new SolidColorBrush(ok ? System.Windows.Media.Color.FromArgb(0x33, 0x23, 0x86, 0x36) : System.Windows.Media.Color.FromArgb(0x22, 0x8b, 0x94, 0x9e));
+		b.Foreground = new SolidColorBrush(ok ? System.Windows.Media.Color.FromRgb(0x7e, 0xe7, 0x87) : System.Windows.Media.Color.FromRgb(0x8b, 0x94, 0x9e));
+	}
+
+	// 模型状态卡: 熔断 > 空闲 > 生成中(近期有解码) > 预填充(近期有预填充) > 待机
+	private void UpdatePhaseCard()
+	{
+		string phase;
+		System.Windows.Media.Color bg;
+		System.Windows.Media.Color fg;
+		if (_vramBreakerTriggered)
+		{
+			phase = "⛔ 已熔断";
+			bg = System.Windows.Media.Color.FromArgb(0x55, 0xda, 0x36, 0x33);
+			fg = System.Windows.Media.Color.FromRgb(0xff, 0xa1, 0x9b);
+		}
+		else if (!IsAlive(_llamaProc))
+		{
+			phase = "⏸ 空闲";
+			bg = System.Windows.Media.Color.FromArgb(0x33, 0x8b, 0x94, 0x9e);
+			fg = System.Windows.Media.Color.FromRgb(0x8b, 0x94, 0x9e);
+		}
+		else if ((DateTime.UtcNow - _lastDecodeUtc).TotalSeconds < 15.0)
+		{
+			phase = "⚡ 生成中";
+			bg = System.Windows.Media.Color.FromArgb(0x55, 0x23, 0x86, 0x36);
+			fg = System.Windows.Media.Color.FromRgb(0x7e, 0xe7, 0x87);
+		}
+		else if ((DateTime.UtcNow - _lastPrefillUtc).TotalSeconds < 15.0)
+		{
+			phase = "📖 预填充";
+			bg = System.Windows.Media.Color.FromArgb(0x55, 0xbb, 0x80, 0x09);
+			fg = System.Windows.Media.Color.FromRgb(0xe3, 0xb3, 0x41);
+		}
+		else
+		{
+			phase = "● 待机";
+			bg = System.Windows.Media.Color.FromArgb(0x55, 0x1f, 0x6f, 0xeb);
+			fg = System.Windows.Media.Color.FromRgb(0x79, 0xc0, 0xff);
+		}
+		MonPhaseText.Text = phase;
+		MonPhaseText.Foreground = new SolidColorBrush(fg);
+		MonPhaseBadge.Background = new SolidColorBrush(bg);
+		MonPhaseDetail.Text = $"llama {(IsAlive(_llamaProc) ? "运行中" : "未启动")} · DSH {(IsAlive(_dshProc) ? "运行中" : "未启动")} · 更新 {DateTime.Now:HH:mm:ss}";
+	}
+
+	// llama 启动时清空监测卡历史与曲线
+	private void ResetMonitorCards()
+	{
+		foreach (var q in new[] { _histCpu, _histMem, _histGpu, _histVram, _histTemp, _histTps })
+		{
+			q.Clear();
+		}
+		foreach (var pl in new[] { SparkCpu, SparkMem, SparkGpu, SparkVram, SparkTemp, SparkTps })
+		{
+			pl.Points = new System.Windows.Media.PointCollection();
+		}
+		_lastDecodeUtc = DateTime.MinValue;
+		_lastPrefillUtc = DateTime.MinValue;
+	}
+
 	private void OnPerf(Dictionary<string, string> d)
 	{
 		if (d.TryGetValue("cpu", out string value))
 		{
-			PerfCpu.Text = FP(value);
+			bool okCpu = double.TryParse(value, out var vCpu);
+			PerfCpu.Text = okCpu ? $"{vCpu:F1}%" : "N/A";
+			SetBadge(BdgCpu, okCpu);
+			if (okCpu)
+			{
+				PushSpark(SparkCpu, _histCpu, vCpu, 100.0);
+			}
 		}
 		if (d.TryGetValue("mem", out string value2))
 		{
-			PerfMem.Text = FP(value2);
+			bool okMem = double.TryParse(value2, out var vMem);
+			PerfMem.Text = okMem ? $"{vMem:F1}%" : "N/A";
+			SetBadge(BdgMem, okMem);
+			if (okMem)
+			{
+				PushSpark(SparkMem, _histMem, vMem, 100.0);
+			}
 		}
 		if (d.TryGetValue("gpu_util", out string value3))
 		{
-			if (double.TryParse(value3, out var result))
+			bool okGpu = double.TryParse(value3, out var vGpu);
+			PerfGpu.Text = okGpu ? $"{Math.Min(100.0, Math.Max(0.0, vGpu)):F0}%" : "N/A";
+			SetBadge(BdgGpu, okGpu);
+			if (okGpu)
 			{
-				PerfGpu.Text = $"{Math.Min(100.0, Math.Max(0.0, result)):F0}%";
-			}
-			else
-			{
-				PerfGpu.Text = "N/A";
+				PushSpark(SparkGpu, _histGpu, Math.Min(100.0, Math.Max(0.0, vGpu)), 100.0);
 			}
 		}
 		string value7;
@@ -5960,11 +6073,16 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				double value6 = ((num2 > 0.0) ? (num / num2 * 100.0) : 0.0);
 				PerfVram.Text = $"{num:F1}/{num2:F0}G";
 				PerfVram.ToolTip = $"显存已用 {num:F1} / {num2:F1} GB（{value6:F1}%）";
+				MonVramSub.Text = $"已用 {value6:F1}%";
+				SetBadge(BdgVram, num2 > 0.0);
+				PushSpark(SparkVram, _histVram, value6, 100.0);
 			}
 			else
 			{
 				PerfVram.Text = "N/A";
 				PerfVram.ToolTip = null;
+				MonVramSub.Text = "—";
+				SetBadge(BdgVram, false);
 			}
 		}
 		else if (d.TryGetValue("vram_total", out value7) && double.TryParse(value7, out result4))
@@ -5972,6 +6090,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			double value8 = result4 / 1073741824.0;
 			PerfVram.Text = $"{value8:F0}G";
 			PerfVram.ToolTip = $"显存总量 {value8:F1} GB";
+			MonVramSub.Text = "总量";
+			SetBadge(BdgVram, true);
 		}
 		if (d.TryGetValue("gpu_temp", out string value9))
 		{
@@ -5989,21 +6109,29 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				string text = ((!string.IsNullOrEmpty(value10) && dictionary.TryGetValue(value10, out var value11)) ? value11 : "");
 				PerfGpuTemp.Text = $"{result5:F0}°C";
 				PerfGpuTemp.ToolTip = (string.IsNullOrEmpty(text) ? null : ("温度来源：" + text));
+				SetBadge(BdgTemp, true, string.IsNullOrEmpty(text) ? "实测" : text);
+				PushSpark(SparkTemp, _histTemp, result5, 100.0);
 			}
 			else
 			{
 				PerfGpuTemp.Text = "N/A";
 				PerfGpuTemp.ToolTip = null;
+				SetBadge(BdgTemp, false);
 			}
 		}
 		if (d.TryGetValue("httptps", out string value12) && double.TryParse(value12, NumberStyles.Float, CultureInfo.InvariantCulture, out var result6) && result6 > 0.0)
 		{
-			PerfTps.Text = FT(result6) + " tok/s";
+			PerfTps.Text = FT(result6);
+			SetBadge(BdgTps, true);
+			PushSpark(SparkTps, _histTps, result6, 0.0);
+			_lastDecodeUtc = DateTime.UtcNow;
 		}
 		if (d.TryGetValue("httppf", out string value13) && double.TryParse(value13, NumberStyles.Float, CultureInfo.InvariantCulture, out var result7) && result7 > 0.0)
 		{
-			PerfPrefill.Text = FT(result7) + " tok/s";
+			PerfPrefill.Text = FT(result7);
+			_lastPrefillUtc = DateTime.UtcNow;
 		}
+		UpdatePhaseCard();
 		if (d.TryGetValue("cpu_err", out string value14))
 		{
 			Log("[Perf] CPU error: " + value14);
@@ -6043,14 +6171,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		catch (Exception ex)
 		{
 			LogError(ex, "显存熔断检查异常");
-		}
-		static string FP(string v)
-		{
-			if (double.TryParse(v, out var result9))
-			{
-				return $"{result9:F1}%";
-			}
-			return "N/A";
 		}
 	}
 
