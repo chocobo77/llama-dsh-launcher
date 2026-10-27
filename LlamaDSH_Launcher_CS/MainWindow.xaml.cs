@@ -6026,7 +6026,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
 			{
 				LblVramBreaker.Text = (hit ? $"⚠ {pct:F1}% ({vUsed / 1073741824.0:F1}/{vTotal / 1073741824.0:F1} GB) 已熔断" : $"{pct:F1}% 正常");
-				LblVramBreaker.Foreground = System.Windows.Media.Brushes.OrangeRed;
+				LblVramBreaker.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb((byte)(hit ? 218 : 139), (byte)(hit ? 54 : 148), (byte)(hit ? 51 : 158)));
 			}, Array.Empty<object>());
 			if (hit)
 			{
