@@ -187,6 +187,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private static readonly Regex _reEvalTps = new Regex("(?<!prompt )eval time\\s+=\\s*[\\d.]+\\s*ms\\s*/\\s*\\d+\\s*(?:new tokens|tokens|runs)\\s*\\([^)]*?([\\d.]+)\\s*(?:tokens? per second|tok/s)", RegexOptions.Compiled);
 
 	private static readonly Regex _reEvalRaw = new Regex("(?<!prompt )eval time\\s+=\\s*([\\d.]+)\\s*ms\\s*/\\s*(\\d+)\\s*(?:new tokens|tokens|runs)", RegexOptions.Compiled);
+	// Strata 请求表/对话缓存: 前缀缓存复用 + 请求总耗时
+	private static readonly Regex _rePromptCached = new Regex("prompt processed \\(cached\\):\\s*(\\d+)\\s*tokens", RegexOptions.Compiled);
+	private static readonly Regex _reTotalTime = new Regex("total time\\s+=\\s*([\\d.]+)\\s*ms", RegexOptions.Compiled);
 
 	public MainWindow()
 	{
@@ -3764,6 +3767,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			PerfTps.Text = "—";
 			PerfTtft.Text = "—";
 			ResetMonitorCards();
+			MonCacheLast.Text = "—";
+			MonCacheTotal.Text = "0 tok / 0 次请求";
+			RefreshReqList();
 		}, Array.Empty<object>());
 		string? stDir = DetectSafetensorsDir();
 		if (stDir != null)
@@ -5664,7 +5670,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void ParseTimings(string text)
 	{
-		if (text.IndexOf("eval time", StringComparison.Ordinal) < 0)
+		if (text.IndexOf("eval time", StringComparison.Ordinal) < 0
+			&& text.IndexOf("total time", StringComparison.Ordinal) < 0
+			&& text.IndexOf("prompt processed", StringComparison.Ordinal) < 0)
 		{
 			return;
 		}
@@ -5693,6 +5701,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					AddS(_pfSamples, (double)num2 / (num / 1000.0), 20);
 					((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Func<string>)(() => PerfPrefill.Text = FT(_pfSamples.ToArray().Average()) + " tok/s"), Array.Empty<object>());
 				}
+				// 新请求的 prompt 行出现而上次请求尚未收尾(无 total time 行)时先落账
+				if (_curOutToks > 0)
+				{
+					FinalizeRequest();
+				}
+				_curPromptToks = num2;
 			}
 			else
 			{
@@ -5703,20 +5717,40 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Func<string>)(() => PerfTtft.Text = $"{_ttftSamples.ToArray().Average() / 1000.0:F2} s"), Array.Empty<object>());
 				}
 			}
+			Match matchC = _rePromptCached.Match(input);
+			if (matchC.Success)
+			{
+				_curReused = int.Parse(matchC.Groups[1].Value);
+			}
 			Match match3 = _reEvalTps.Match(input);
 			if (match3.Success)
 			{
-				AddS(_tpsSamples, double.Parse(match3.Groups[1].Value), 20);
+				_curTps = double.Parse(match3.Groups[1].Value);
+				AddS(_tpsSamples, _curTps, 20);
 				((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Func<string>)(() => PerfTps.Text = FT(_tpsSamples.ToArray().Average()) + " tok/s"), Array.Empty<object>());
+				// 同一行还带 ms/输出 token 数(供请求表), 不能因 continue 漏采
+				Match m3raw = _reEvalRaw.Match(input);
+				if (m3raw.Success)
+				{
+					_curEvalMs = double.Parse(m3raw.Groups[1].Value);
+					_curOutToks = int.Parse(m3raw.Groups[2].Value);
+				}
 				continue;
 			}
 			Match match4 = _reEvalRaw.Match(input);
 			if (!match4.Success)
 			{
+				Match matchT = _reTotalTime.Match(input);
+				if (matchT.Success)
+				{
+					_curEvalMs = double.Parse(matchT.Groups[1].Value);
+					FinalizeRequest();
+				}
 				continue;
 			}
 			double num3 = double.Parse(match4.Groups[1].Value);
 			int num4 = int.Parse(match4.Groups[2].Value);
+			_curOutToks = num4;
 			if (num3 > 0.0)
 			{
 				AddS(_tpsSamples, (double)num4 / (num3 / 1000.0), 20);
@@ -5771,6 +5805,37 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				LogError(ex2, "内存性能计数器初始化失败");
 			}
+			try
+			{
+				_diskReadCounter = new PerformanceCounter("LogicalDisk", "Disk Read Bytes/sec", "_Total");
+				_diskReadCounter.NextValue();
+				_diskWriteCounter = new PerformanceCounter("LogicalDisk", "Disk Write Bytes/sec", "_Total");
+				_diskWriteCounter.NextValue();
+			}
+			catch (Exception ex2b)
+			{
+				LogError(ex2b, "磁盘计数器初始化失败");
+			}
+			try
+			{
+				_ramAvailCounter = new PerformanceCounter("Memory", "Available MBytes");
+				_ramAvailCounter.NextValue();
+				using (System.Management.ManagementObjectSearcher mos = new System.Management.ManagementObjectSearcher("SELECT TotalVisibleMemorySize FROM Win32_OperatingSystem"))
+				{
+					foreach (System.Management.ManagementObject o in mos.Get())
+					{
+						using (o)
+						{
+							_ramTotalBytes = Convert.ToDouble(o["TotalVisibleMemorySize"]) * 1024.0;
+							break;
+						}
+					}
+				}
+			}
+			catch (Exception ex2c)
+			{
+				LogError(ex2c, "物理内存统计初始化失败");
+			}
 			int num = 0;
 			while (!_perfCts.Token.IsCancellationRequested)
 			{
@@ -5799,6 +5864,49 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					{
 						d["mem_err"] = ex4.Message;
 					}
+					try
+					{
+						if (_diskReadCounter != null)
+						{
+							d["disk_read"] = _diskReadCounter.NextValue().ToString("F0", CultureInfo.InvariantCulture);
+						}
+						if (_diskWriteCounter != null)
+						{
+							d["disk_write"] = _diskWriteCounter.NextValue().ToString("F0", CultureInfo.InvariantCulture);
+						}
+					}
+					catch (Exception ex4b)
+					{
+						d["disk_err"] = ex4b.Message;
+					}
+					try
+					{
+						if (_ramAvailCounter != null && _ramTotalBytes > 0.0)
+						{
+							double availBytes = _ramAvailCounter.NextValue() * 1048576.0;
+							d["ram_used"] = Math.Max(0.0, _ramTotalBytes - availBytes).ToString("F0", CultureInfo.InvariantCulture);
+							d["ram_total"] = _ramTotalBytes.ToString("F0", CultureInfo.InvariantCulture);
+						}
+					}
+					catch (Exception ex4c)
+					{
+						d["ram_err"] = ex4c.Message;
+					}
+					// llama-server /metrics 扩展指标: KV 缓存占用 / 处理中 / 排队中（沿用守卫: 存活且日志样本为空）
+					if (IsAlive(_llamaProc) && _tpsSamples.IsEmpty && _ttftSamples.IsEmpty)
+					{
+						if (FetchLlamaMetrics() is (double mTps, double mPf))
+						{
+							d["httptps"] = mTps.ToString("F2", CultureInfo.InvariantCulture);
+							d["httppf"] = mPf.ToString("F2", CultureInfo.InvariantCulture);
+						}
+						d["req_proc"] = _llamaReqProc.ToString(CultureInfo.InvariantCulture);
+						d["req_wait"] = _llamaReqWait.ToString(CultureInfo.InvariantCulture);
+						if (_llamaCtxUsed >= 0.0)
+						{
+							d["ctx_used"] = _llamaCtxUsed.ToString("F0", CultureInfo.InvariantCulture);
+						}
+					}
 					if (num % 2 == 0)
 					{
 						foreach (KeyValuePair<string, string> item in _gpuMonitor.QueryGpu())
@@ -5806,14 +5914,19 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 							d[item.Key] = item.Value;
 						}
 					}
-					if (IsAlive(_llamaProc) && _tpsSamples.IsEmpty && _ttftSamples.IsEmpty)
+					// 能耗累计(Strata 读数条): GPU 功率 × 采样间隔积分, llama 启动时清零（须在 GPU 查询合并之后, power_w 才在 d 中）
+					if (d.TryGetValue("power_w", out string pwStr) && double.TryParse(pwStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var pwVal) && pwVal > 0.0)
 					{
-						(double, double)? tuple = FetchLlamaMetrics();
-						if (tuple.HasValue)
+						long nowTick = Environment.TickCount64;
+						if (_lastPowerTick >= 0)
 						{
-							d["httptps"] = tuple.Value.Item1.ToString("F2", CultureInfo.InvariantCulture);
-							d["httppf"] = tuple.Value.Item2.ToString("F2", CultureInfo.InvariantCulture);
+							_energyWh += pwVal * ((nowTick - _lastPowerTick) / 1000.0) / 3600.0;
 						}
+						_lastPowerTick = nowTick;
+					}
+					else
+					{
+						_lastPowerTick = -1;
 					}
 					((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
 					{
@@ -5883,6 +5996,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			double num2 = 0.0;
 			double num3 = 0.0;
 			double num4 = 0.0;
+			double cacheTok = -1.0;
+			double reqProc = -1.0;
+			double reqWait = -1.0;
 			string[] array = result.Split('\n');
 			for (int i = 0; i < array.Length; i++)
 			{
@@ -5906,7 +6022,22 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					num4 = v4;
 				}
+				else if (GetVal(s, "llamacpp:cache_tokens ", out v2))
+				{
+					cacheTok = v2;
+				}
+				else if (GetVal(s, "llamacpp:requests_processing ", out v3))
+				{
+					reqProc = v3;
+				}
+				else if (GetVal(s, "llamacpp:requests_waiting ", out v4))
+				{
+					reqWait = v4;
+				}
 			}
+			_llamaCtxUsed = cacheTok;
+			_llamaReqProc = reqProc > 0.0 ? (int)reqProc : 0;
+			_llamaReqWait = reqWait > 0.0 ? (int)reqWait : 0;
 			double num5 = ((num4 > 0.0) ? (num3 / num4) : 0.0);
 			double num6 = ((num2 > 0.0) ? (num / num2) : 0.0);
 			if (num5 > 0.0 || num6 > 0.0)
@@ -5916,6 +6047,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		catch
 		{
+			_llamaCtxUsed = -1.0;
+			_llamaReqProc = 0;
+			_llamaReqWait = 0;
 		}
 		return null;
 		static bool GetVal(string text, string prefix, out double reference)
@@ -5929,15 +6063,55 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 	}
 
-	// 监测标签页(Strata 风格): 指标历史环形缓冲(60 点) + 阶段判定时间戳
+	// 监测标签页(Strata 复刻): 指标历史环形缓冲(60 点) + 阶段判定时间戳
 	private readonly ConcurrentQueue<double> _histCpu = new();
-	private readonly ConcurrentQueue<double> _histMem = new();
 	private readonly ConcurrentQueue<double> _histGpu = new();
 	private readonly ConcurrentQueue<double> _histVram = new();
 	private readonly ConcurrentQueue<double> _histTemp = new();
 	private readonly ConcurrentQueue<double> _histTps = new();
+	private readonly ConcurrentQueue<double> _histPf = new();
+	private readonly ConcurrentQueue<double> _histPower = new();
+	private readonly ConcurrentQueue<double> _histPcie = new();
+	private readonly ConcurrentQueue<double> _histDisk = new();
 	private DateTime _lastDecodeUtc = DateTime.MinValue;
 	private DateTime _lastPrefillUtc = DateTime.MinValue;
+
+	// 扩展采集: 磁盘读写/物理内存/能耗积分(GPU 功率 × 采样间隔)
+	private PerformanceCounter? _diskReadCounter;
+	private PerformanceCounter? _diskWriteCounter;
+	private PerformanceCounter? _ramAvailCounter;
+	private double _ramTotalBytes;
+	private double _energyWh;
+	private double _lastPowerTick = -1.0;
+
+	// llama-server /metrics 扩展: KV 缓存占用(tok)/处理中/排队中; -1 = 未报告
+	private double _llamaCtxUsed = -1.0;
+	private int _llamaReqProc;
+	private int _llamaReqWait;
+	private long _ctxTokens;
+	private int _queueCount;
+
+	// 最近请求表 + 对话缓存统计(来自 llama 日志的计时行)
+	private sealed class ReqRec
+	{
+		public string Time = "";
+		public string Status = "✓ 完成";
+		public string Prompt = "—";
+		public string Reused = "—";
+		public string Output = "—";
+		public string Tps = "—";
+		public string Hit = "—";
+		public string Dur = "—";
+	}
+	private readonly List<ReqRec> _reqRecords = new();
+	private readonly object _reqLock = new();
+	private int _curPromptToks;
+	private int _curReused;
+	private int _curOutToks;
+	private double _curTps;
+	private double _curEvalMs;
+	private long _reusedTotal;
+	private long _reqTotalCount;
 
 	// 追加一个采样点并把整条历史重绘到迷你曲线; maxV<=0 时按历史最大值自动缩放
 	private static void PushSpark(System.Windows.Shapes.Polyline pl, ConcurrentQueue<double> q, double v, double maxV)
@@ -5973,61 +6147,175 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		b.Foreground = new SolidColorBrush(ok ? System.Windows.Media.Color.FromRgb(0x7e, 0xe7, 0x87) : System.Windows.Media.Color.FromRgb(0x8b, 0x94, 0x9e));
 	}
 
-	// 模型状态卡: 熔断 > 空闲 > 生成中(近期有解码) > 预填充(近期有预填充) > 待机
+	// 模型状态卡(Strata): 空闲/预填充/生成中/排队/异常 五徽标, 活动徽标高亮; 进度条在活动阶段转为不确定态
 	private void UpdatePhaseCard()
 	{
-		string phase;
-		System.Windows.Media.Color bg;
-		System.Windows.Media.Color fg;
+		bool llamaUp = IsAlive(_llamaProc);
+		string active;   // idle | reading | gen | queue | error
+		string detail;
 		if (_vramBreakerTriggered)
 		{
-			phase = "⛔ 已熔断";
-			bg = System.Windows.Media.Color.FromArgb(0x55, 0xda, 0x36, 0x33);
-			fg = System.Windows.Media.Color.FromRgb(0xff, 0xa1, 0x9b);
+			active = "error";
+			detail = "显存熔断已触发，llama 服务已自动停止";
 		}
-		else if (!IsAlive(_llamaProc))
+		else if (!llamaUp)
 		{
-			phase = "⏸ 空闲";
-			bg = System.Windows.Media.Color.FromArgb(0x33, 0x8b, 0x94, 0x9e);
-			fg = System.Windows.Media.Color.FromRgb(0x8b, 0x94, 0x9e);
+			active = "idle";
+			detail = "llama 未启动";
+		}
+		else if (_queueCount > 0)
+		{
+			active = "queue";
+			detail = $"{_queueCount} 个请求在队列中等待处理";
 		}
 		else if ((DateTime.UtcNow - _lastDecodeUtc).TotalSeconds < 15.0)
 		{
-			phase = "⚡ 生成中";
-			bg = System.Windows.Media.Color.FromArgb(0x55, 0x23, 0x86, 0x36);
-			fg = System.Windows.Media.Color.FromRgb(0x7e, 0xe7, 0x87);
+			active = "gen";
+			double[] arr = _histTps.ToArray();
+			double cur = arr.Length > 0 ? arr[arr.Length - 1] : 0.0;
+			detail = cur > 0.0 ? $"正在生成 · {FT(cur)} tok/s" : "正在生成";
 		}
 		else if ((DateTime.UtcNow - _lastPrefillUtc).TotalSeconds < 15.0)
 		{
-			phase = "📖 预填充";
-			bg = System.Windows.Media.Color.FromArgb(0x55, 0xbb, 0x80, 0x09);
-			fg = System.Windows.Media.Color.FromRgb(0xe3, 0xb3, 0x41);
+			active = "reading";
+			detail = "正在预填充提示词";
 		}
 		else
 		{
-			phase = "● 待机";
-			bg = System.Windows.Media.Color.FromArgb(0x55, 0x1f, 0x6f, 0xeb);
-			fg = System.Windows.Media.Color.FromRgb(0x79, 0xc0, 0xff);
+			active = "idle";
+			detail = "llama 运行中，等待请求";
 		}
-		MonPhaseText.Text = phase;
-		MonPhaseText.Foreground = new SolidColorBrush(fg);
-		MonPhaseBadge.Background = new SolidColorBrush(bg);
-		MonPhaseDetail.Text = $"llama {(IsAlive(_llamaProc) ? "运行中" : "未启动")} · DSH {(IsAlive(_dshProc) ? "运行中" : "未启动")} · 更新 {DateTime.Now:HH:mm:ss}";
+		bool activeBusy = active == "gen" || active == "reading";
+		StylePhase(MonPhIdle, MonPhIdleT, active == "idle", System.Windows.Media.Color.FromArgb(0x33, 0x8b, 0x94, 0x9e), System.Windows.Media.Color.FromRgb(0x8b, 0x94, 0x9e));
+		StylePhase(MonPhReading, MonPhReadingT, active == "reading", System.Windows.Media.Color.FromArgb(0x55, 0xbb, 0x80, 0x09), System.Windows.Media.Color.FromRgb(0xe3, 0xb3, 0x41));
+		StylePhase(MonPhGen, MonPhGenT, active == "gen", System.Windows.Media.Color.FromArgb(0x55, 0x23, 0x86, 0x36), System.Windows.Media.Color.FromRgb(0x7e, 0xe7, 0x87));
+		StylePhase(MonPhQueue, MonPhQueueT, active == "queue", System.Windows.Media.Color.FromArgb(0x55, 0x1f, 0x6f, 0xeb), System.Windows.Media.Color.FromRgb(0x79, 0xc0, 0xff));
+		StylePhase(MonPhError, MonPhErrorT, active == "error", System.Windows.Media.Color.FromArgb(0x55, 0xda, 0x36, 0x33), System.Windows.Media.Color.FromRgb(0xff, 0xa1, 0x9b));
+		MonPhaseDetail.Text = detail;
+		MonProgress.IsIndeterminate = activeBusy;
+		if (!activeBusy)
+		{
+			MonProgress.Value = 0.0;
+		}
+		MonProgressLabel.Text = active == "gen" ? "生成中…" : (active == "reading" ? "预填充中…" : "");
 	}
 
-	// llama 启动时清空监测卡历史与曲线
+	// 阶段徽标统一样式: 活动=彩色底亮字, 非活动=暗底灰字
+	private static void StylePhase(System.Windows.Controls.Border b, System.Windows.Controls.TextBlock t, bool active, System.Windows.Media.Color bg, System.Windows.Media.Color fg)
+	{
+		b.Background = new SolidColorBrush(active ? bg : System.Windows.Media.Color.FromArgb(0x18, 0x8b, 0x94, 0x9e));
+		t.Foreground = new SolidColorBrush(active ? fg : System.Windows.Media.Color.FromRgb(0x6e, 0x76, 0x81));
+		t.FontWeight = active ? FontWeights.Bold : FontWeights.Normal;
+	}
+
+	// 上下文填充 Gauge 环: 顶部起点顺时针弧, pct 0-100
+	private void UpdateGauge(double pct)
+	{
+		double frac = Math.Max(0.0, Math.Min(1.0, pct / 100.0));
+		double r = 34.0, cx = 40.0, cy = 40.0;
+		double sweep = Math.Max(0.5, frac * 359.0);
+		double a0 = -90.0, a1 = a0 + sweep;
+		var p0 = new System.Windows.Point(cx + r * Math.Cos(a0 * Math.PI / 180.0), cy + r * Math.Sin(a0 * Math.PI / 180.0));
+		var p1 = new System.Windows.Point(cx + r * Math.Cos(a1 * Math.PI / 180.0), cy + r * Math.Sin(a1 * Math.PI / 180.0));
+		var geo = new System.Windows.Media.StreamGeometry();
+		using (System.Windows.Media.StreamGeometryContext ctx = geo.Open())
+		{
+			ctx.BeginFigure(p0, false, false);
+			ctx.ArcTo(p1, new System.Windows.Size(r, r), 0.0, sweep > 180.0, SweepDirection.Clockwise, true, false);
+		}
+		MonGaugeArc.Data = geo;
+		MonGaugeArc.Stroke = new SolidColorBrush(frac >= 0.9 ? System.Windows.Media.Color.FromRgb(0xda, 0x36, 0x33) : System.Windows.Media.Color.FromRgb(0x1f, 0x6f, 0xeb));
+		MonGaugePct.Text = $"{frac * 100.0:F0}%";
+	}
+
+	// llama 启动时清空监测卡历史/曲线/能耗/请求表(Strata: 自启动起算)
 	private void ResetMonitorCards()
 	{
-		foreach (var q in new[] { _histCpu, _histMem, _histGpu, _histVram, _histTemp, _histTps })
+		foreach (var q in new[] { _histCpu, _histGpu, _histVram, _histTemp, _histTps, _histPf, _histPower, _histPcie, _histDisk })
 		{
 			q.Clear();
 		}
-		foreach (var pl in new[] { SparkCpu, SparkMem, SparkGpu, SparkVram, SparkTemp, SparkTps })
+		foreach (var pl in new[] { SparkCpu, SparkGpu, SparkVram, SparkTemp, SparkTps, SparkPf, SparkPower, SparkPcie, SparkDisk })
 		{
 			pl.Points = new System.Windows.Media.PointCollection();
 		}
 		_lastDecodeUtc = DateTime.MinValue;
 		_lastPrefillUtc = DateTime.MinValue;
+		_energyWh = 0.0;
+		_lastPowerTick = -1.0;
+		_llamaCtxUsed = -1.0;
+		_llamaReqProc = 0;
+		_llamaReqWait = 0;
+		_queueCount = 0;
+		_ctxTokens = 0;
+		lock (_reqLock)
+		{
+			_reqRecords.Clear();
+		}
+		_curPromptToks = 0;
+		_curReused = 0;
+		_curOutToks = 0;
+		_curTps = 0.0;
+		_curEvalMs = 0.0;
+		_reusedTotal = 0;
+		_reqTotalCount = 0;
+	}
+
+	// 一次请求计时链路完成(prompt → eval → total time), 落一条请求记录并刷新表/汇总/缓存区
+	private void FinalizeRequest()
+	{
+		ReqRec rec = new ReqRec
+		{
+			Time = DateTime.Now.ToString("HH:mm:ss"),
+			Prompt = _curPromptToks > 0 ? _curPromptToks + " tok" : "—",
+			Reused = _curReused > 0 ? _curReused + " tok" : "—",
+			Output = _curOutToks > 0 ? _curOutToks + " tok" : "—",
+			Tps = _curTps > 0.0 ? FT(_curTps) : "—",
+			Dur = _curEvalMs > 0.0 ? $"{_curEvalMs / 1000.0:F1} s" : "—",
+		};
+		if (_curReused > 0)
+		{
+			_reusedTotal += _curReused;
+		}
+		_reqTotalCount++;
+		int lastReused = _curReused;
+		lock (_reqLock)
+		{
+			_reqRecords.Add(rec);
+			if (_reqRecords.Count > 200)
+			{
+				_reqRecords.RemoveAt(0);
+			}
+		}
+		_curPromptToks = 0;
+		_curReused = 0;
+		_curOutToks = 0;
+		_curTps = 0.0;
+		_curEvalMs = 0.0;
+		((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
+		{
+			RefreshReqList();
+			MonCacheLast.Text = lastReused > 0 ? $"复用 {lastReused} tok" : "未报告复用";
+			MonCacheTotal.Text = $"{_reusedTotal} tok / {_reqTotalCount} 次请求";
+		}, Array.Empty<object>());
+	}
+
+	// 请求表刷新: 默认最新 12 条(新→旧), 勾选显示全部
+	private void RefreshReqList()
+	{
+		List<ReqRec> view;
+		lock (_reqLock)
+		{
+			int n = (ChkShowAllReq?.IsChecked == true) ? _reqRecords.Count : Math.Min(12, _reqRecords.Count);
+			view = _reqRecords.Skip(Math.Max(0, _reqRecords.Count - n)).Reverse().ToList();
+		}
+		MonReqList.ItemsSource = view;
+		MonReqSummary.Text = $"{_reqTotalCount} 次请求 · 复用 {_reusedTotal} tok";
+	}
+
+	private void ShowAllReq_Changed(object sender, RoutedEventArgs e)
+	{
+		RefreshReqList();
 	}
 
 	private void OnPerf(Dictionary<string, string> d)
@@ -6040,16 +6328,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			if (okCpu)
 			{
 				PushSpark(SparkCpu, _histCpu, vCpu, 100.0);
-			}
-		}
-		if (d.TryGetValue("mem", out string value2))
-		{
-			bool okMem = double.TryParse(value2, out var vMem);
-			PerfMem.Text = okMem ? $"{vMem:F1}%" : "N/A";
-			SetBadge(BdgMem, okMem);
-			if (okMem)
-			{
-				PushSpark(SparkMem, _histMem, vMem, 100.0);
 			}
 		}
 		if (d.TryGetValue("gpu_util", out string value3))
@@ -6111,6 +6389,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				PerfGpuTemp.ToolTip = (string.IsNullOrEmpty(text) ? null : ("温度来源：" + text));
 				SetBadge(BdgTemp, true, string.IsNullOrEmpty(text) ? "实测" : text);
 				PushSpark(SparkTemp, _histTemp, result5, 100.0);
+				MonGpuTempBar.Value = Math.Min(100.0, result5);
+				MonGpuTempBar.Foreground = new SolidColorBrush(result5 > 92.0 ? System.Windows.Media.Color.FromRgb(0xda, 0x36, 0x33) : System.Windows.Media.Color.FromRgb(0x23, 0x86, 0x36));
+				MonGpuTempVal.Text = $"{result5:F0}°C";
 			}
 			else
 			{
@@ -6129,7 +6410,77 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		if (d.TryGetValue("httppf", out string value13) && double.TryParse(value13, NumberStyles.Float, CultureInfo.InvariantCulture, out var result7) && result7 > 0.0)
 		{
 			PerfPrefill.Text = FT(result7);
+			PushSpark(SparkPf, _histPf, result7, 0.0);
 			_lastPrefillUtc = DateTime.UtcNow;
+		}
+		// Strata 扩展卡: 功率(上限副行) / PCIe(代数×宽度, Rx 吞吐) / 磁盘读(写副行)
+		if (d.TryGetValue("power_w", out string vPw) && double.TryParse(vPw, NumberStyles.Float, CultureInfo.InvariantCulture, out var vP) && vP > 0.0)
+		{
+			MonPower.Text = vP >= 100.0 ? vP.ToString("F0") : vP.ToString("F1");
+			MonPowerSub.Text = (d.TryGetValue("power_limit_w", out string vLim) && double.TryParse(vLim, NumberStyles.Float, CultureInfo.InvariantCulture, out var vL) && vL > 0.0)
+				? $"功耗上限 {vL:F0} W" : "整机 GPU 功率";
+			SetBadge(BdgPower, true);
+			PushSpark(SparkPower, _histPower, vP, 0.0);
+		}
+		if (d.TryGetValue("pcie_gen", out string vGen))
+		{
+			MonPcie.Text = $"Gen{vGen} × {(d.TryGetValue("pcie_width", out string vWid) ? vWid : "?")}";
+			string pcieSub = "PCIe 吞吐";
+			if (d.TryGetValue("pcie_rx_kbs", out string vRx) && double.TryParse(vRx, NumberStyles.Float, CultureInfo.InvariantCulture, out var vR) && vR > 0.0)
+			{
+				double mbs = vR / 1024.0;
+				pcieSub = $"Rx {(mbs >= 1024.0 ? $"{mbs / 1024.0:F1} GB/s" : $"{mbs:F0} MB/s")}";
+				PushSpark(SparkPcie, _histPcie, mbs, 0.0);
+			}
+			MonPcieSub.Text = pcieSub;
+			SetBadge(BdgPcie, true);
+		}
+		if (d.TryGetValue("disk_read", out string vDr) && double.TryParse(vDr, NumberStyles.Float, CultureInfo.InvariantCulture, out var vD) && vD > 0.0)
+		{
+			MonDisk.Text = vD >= 1073741824.0 ? $"{vD / 1073741824.0:F2} GB/s" : $"{vD / 1048576.0:F0} MB/s";
+			MonDiskSub.Text = (d.TryGetValue("disk_write", out string vDw) && double.TryParse(vDw, NumberStyles.Float, CultureInfo.InvariantCulture, out var vDw2) && vDw2 > 0.0)
+				? $"写 {(vDw2 >= 1073741824.0 ? $"{vDw2 / 1073741824.0:F2} GB/s" : $"{vDw2 / 1048576.0:F0} MB/s")}" : "磁盘读吞吐";
+			SetBadge(BdgDisk, true);
+			PushSpark(SparkDisk, _histDisk, vD / 1048576.0, 0.0);
+		}
+		// 读数条: 能耗累计 / 风扇 / 频率 / CPU 温度
+		MonEnergy.Text = _energyWh >= 1000.0 ? $"{_energyWh / 1000.0:F2} kWh" : $"{_energyWh:F1} Wh";
+		if (d.TryGetValue("fan_pct", out string vFn) && double.TryParse(vFn, NumberStyles.Float, CultureInfo.InvariantCulture, out var vF) && vF >= 0.0)
+		{
+			MonFan.Text = $"{vF:F0}%";
+		}
+		if (d.TryGetValue("clock_mhz", out string vCm) && double.TryParse(vCm, NumberStyles.Float, CultureInfo.InvariantCulture, out var vC) && vC > 0.0)
+		{
+			MonClock.Text = $"{vC:F0} MHz";
+		}
+		if (d.TryGetValue("cpu_temp", out string vCt) && double.TryParse(vCt, NumberStyles.Float, CultureInfo.InvariantCulture, out var vCt2) && vCt2 > 0.0)
+		{
+			MonCpuTemp.Text = $"{vCt2:F0}°C";
+			MonCpuTemp.ToolTip = (d.TryGetValue("cpu_temp_src", out string vSrc) && vSrc == "acpi") ? "ACPI 热区(非核心精确值)" : null;
+		}
+		// 上下文填充: Gauge(KV 占用/配置 ctx) + 系统内存条
+		if (_ctxTokens == 0 && IsAlive(_llamaProc) && RoleText("ctx_size", out string ctxStr2))
+		{
+			long.TryParse(NormTok(ctxStr2), out _ctxTokens);
+		}
+		if (d.TryGetValue("ctx_used", out string vCu) && double.TryParse(vCu, NumberStyles.Float, CultureInfo.InvariantCulture, out var vCu2) && vCu2 >= 0.0 && _ctxTokens > 0)
+		{
+			UpdateGauge(Math.Min(100.0, vCu2 / _ctxTokens * 100.0));
+			MonGaugeLabel.Text = $"上下文 {vCu2:F0}/{_ctxTokens} tok";
+		}
+		else if (!IsAlive(_llamaProc))
+		{
+			UpdateGauge(0.0);
+			MonGaugeLabel.Text = "上下文";
+		}
+		if (d.TryGetValue("ram_used", out string vRu) && d.TryGetValue("ram_total", out string vRt) && double.TryParse(vRu, NumberStyles.Float, CultureInfo.InvariantCulture, out var vRu2) && double.TryParse(vRt, NumberStyles.Float, CultureInfo.InvariantCulture, out var vRt2) && vRt2 > 0.0)
+		{
+			MonRamLabel.Text = $"{vRu2 / 1073741824.0:F1} / {vRt2 / 1073741824.0:F0} GB";
+			MonRamBar.Value = Math.Min(100.0, vRu2 / vRt2 * 100.0);
+		}
+		if (d.TryGetValue("req_wait", out string vRw) && int.TryParse(vRw, out var vRw2))
+		{
+			_queueCount = vRw2;
 		}
 		UpdatePhaseCard();
 		if (d.TryGetValue("cpu_err", out string value14))

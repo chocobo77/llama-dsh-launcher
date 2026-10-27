@@ -103,6 +103,8 @@ public class GpuMonitor
 		{
 			TryGpuTempHelper(dictionary);
 		}
+		// CPU 温度(Strata 读数条): LibreHardwareMonitor/OpenHardwareMonitor 优先, ACPI 热区兜底; 60s TTL 独立缓存
+		TryCpuTemp(dictionary);
 		if ((!dictionary.ContainsKey("gpu_temp") || !dictionary.ContainsKey("gpu_util")) && num - _lastPsFallbackTime >= 60.0)
 		{
 			_lastPsFallbackTime = num;
@@ -233,7 +235,147 @@ public class GpuMonitor
 	{
 		try
 		{
-			// 统一走 ProcessRunner（同时异步读两流 + 5s 超时），避免首行阻塞时超时失效；仍只取第一行。
+			// 统一走 ProcessRunner（同时异步读两流 + 5s 超时），避免首行阻塞时超时失效。
+			// 一次查询带齐 Strata 同款指标: 利用率/显存/温度/功率/功耗上限/风扇/频率/PCIe(代数×宽度/Rx 吞吐)。
+			// 旧驱动缺 pcie.link.* 时对应列为 "N/A"，解析失败即跳过该键（UI 显示"无数据"）。
+			ProcessResult runResult = ProcessRunner.Run(
+				"nvidia-smi",
+				new[] { "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,enforced.power.limit,fan.speed,clocks.current.graphics,pcie.link.gen.current,pcie.link.width.current,pcie.link.rx.current", "--format=csv,noheader,nounits" },
+				5000);
+			if (!runResult.Started || runResult.TimedOut)
+			{
+				return false;
+			}
+			// 多卡聚合(Strata 口径): 利用率/风扇/频率取均值, 显存/功率/功耗上限/Rx 求和, 温度取最高, PCIe 代数×宽度取第一张卡
+			double utilSum = 0.0, utilN = 0.0, vramUsed = 0.0, vramTotal = 0.0, tempMax = 0.0;
+			double powerSum = 0.0, limitSum = 0.0, fanSum = 0.0, fanN = 0.0, clockSum = 0.0, clockN = 0.0, rxSum = 0.0, rxN = 0.0;
+			string? gen = null, width = null;
+			bool any = false;
+			foreach (string raw in runResult.StdOut.Split('\n'))
+			{
+				string text = raw.TrimEnd('\r');
+				if (string.IsNullOrWhiteSpace(text))
+				{
+					continue;
+				}
+				string[] array = text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+				if (array.Length < 4)
+				{
+					continue;
+				}
+				if (double.TryParse(array[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var util))
+				{
+					utilSum += Math.Min(100.0, Math.Max(0.0, util));
+					utilN += 1.0;
+				}
+				if (double.TryParse(array[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var mu))
+				{
+					vramUsed += mu;
+				}
+				if (double.TryParse(array[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var mt))
+				{
+					vramTotal += mt;
+				}
+				if (double.TryParse(array[3], NumberStyles.Float, CultureInfo.InvariantCulture, out var t) && t > 0.0 && t < 150.0 && t > tempMax)
+				{
+					tempMax = t;
+				}
+				if (array.Length > 4 && double.TryParse(array[4], NumberStyles.Float, CultureInfo.InvariantCulture, out var p) && p >= 0.0)
+				{
+					powerSum += p;
+				}
+				if (array.Length > 5 && double.TryParse(array[5], NumberStyles.Float, CultureInfo.InvariantCulture, out var pl) && pl > 0.0)
+				{
+					limitSum += pl;
+				}
+				if (array.Length > 6 && double.TryParse(array[6], NumberStyles.Float, CultureInfo.InvariantCulture, out var f) && f >= 0.0)
+				{
+					fanSum += f;
+					fanN += 1.0;
+				}
+				if (array.Length > 7 && double.TryParse(array[7], NumberStyles.Float, CultureInfo.InvariantCulture, out var c) && c > 0.0)
+				{
+					clockSum += c;
+					clockN += 1.0;
+				}
+				if (gen == null && array.Length > 8 && double.TryParse(array[8], NumberStyles.Float, CultureInfo.InvariantCulture, out var g) && g > 0.0)
+				{
+					gen = ((int)g).ToString(CultureInfo.InvariantCulture);
+				}
+				if (width == null && array.Length > 9 && double.TryParse(array[9], NumberStyles.Float, CultureInfo.InvariantCulture, out var w) && w > 0.0)
+				{
+					width = ((int)w).ToString(CultureInfo.InvariantCulture);
+				}
+				if (array.Length > 10 && double.TryParse(array[10], NumberStyles.Float, CultureInfo.InvariantCulture, out var rx) && rx > 0.0)
+				{
+					rxSum += rx;
+					rxN += 1.0;
+				}
+				any = true;
+			}
+			if (!any)
+			{
+				// 旧驱动不认识 pcie.link.* 等新字段时 nvidia-smi 会整体报错, 退回基础四字段查询保证监控不失效
+				return TryNvidiaSmiBasic(r);
+			}
+			if (utilN > 0.0)
+			{
+				r["gpu_util"] = (utilSum / utilN).ToString("F1", CultureInfo.InvariantCulture);
+			}
+			if (vramUsed > 0.0)
+			{
+				r["vram_used"] = ((long)(vramUsed * 1048576.0)).ToString(CultureInfo.InvariantCulture);
+			}
+			if (vramTotal > 0.0)
+			{
+				r["vram_total"] = ((long)(vramTotal * 1048576.0)).ToString(CultureInfo.InvariantCulture);
+			}
+			if (tempMax > 0.0)
+			{
+				r["gpu_temp"] = tempMax.ToString("F1", CultureInfo.InvariantCulture);
+				r["gpu_temp_src"] = "nvidia";
+			}
+			if (powerSum > 0.0)
+			{
+				r["power_w"] = powerSum.ToString("F1", CultureInfo.InvariantCulture);
+			}
+			if (limitSum > 0.0)
+			{
+				r["power_limit_w"] = limitSum.ToString("F1", CultureInfo.InvariantCulture);
+			}
+			if (fanN > 0.0)
+			{
+				r["fan_pct"] = (fanSum / fanN).ToString("F1", CultureInfo.InvariantCulture);
+			}
+			if (clockN > 0.0)
+			{
+				r["clock_mhz"] = (clockSum / clockN).ToString("F0", CultureInfo.InvariantCulture);
+			}
+			if (gen != null)
+			{
+				r["pcie_gen"] = gen;
+			}
+			if (width != null)
+			{
+				r["pcie_width"] = width;
+			}
+			if (rxN > 0.0)
+			{
+				r["pcie_rx_kbs"] = (rxSum / rxN).ToString("F0", CultureInfo.InvariantCulture);
+			}
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	// 基础回退: 仅利用率/显存/温度(旧驱动兼容)
+	private static bool TryNvidiaSmiBasic(Dictionary<string, string> r)
+	{
+		try
+		{
 			ProcessResult runResult = ProcessRunner.Run(
 				"nvidia-smi",
 				new[] { "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits" },
@@ -248,26 +390,22 @@ public class GpuMonitor
 				return false;
 			}
 			string[] array = text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-			if (array.Length < 4)
+			if (array.Length < 4 || !double.TryParse(array[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var result))
 			{
 				return false;
 			}
-			if (!double.TryParse(array[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var result))
-			{
-				return false;
-			}
-			if (!double.TryParse(array[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var result2))
-			{
-				return false;
-			}
-			if (!double.TryParse(array[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var result3))
-			{
-				return false;
-			}
+			double.TryParse(array[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var result2);
+			double.TryParse(array[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var result3);
 			double.TryParse(array[3], NumberStyles.Float, CultureInfo.InvariantCulture, out var result4);
 			r["gpu_util"] = Math.Min(100.0, Math.Max(0.0, result)).ToString("F1", CultureInfo.InvariantCulture);
-			r["vram_used"] = ((long)(result2 * 1048576.0)).ToString(CultureInfo.InvariantCulture);
-			r["vram_total"] = ((long)(result3 * 1048576.0)).ToString(CultureInfo.InvariantCulture);
+			if (result2 > 0.0)
+			{
+				r["vram_used"] = ((long)(result2 * 1048576.0)).ToString(CultureInfo.InvariantCulture);
+			}
+			if (result3 > 0.0)
+			{
+				r["vram_total"] = ((long)(result3 * 1048576.0)).ToString(CultureInfo.InvariantCulture);
+			}
 			if (result4 > 0.0)
 			{
 				r["gpu_temp"] = result4.ToString("F1", CultureInfo.InvariantCulture);
@@ -773,6 +911,105 @@ public class GpuMonitor
 		catch
 		{
 		}
+	}
+
+	private double? _cachedCpuTemp;
+
+	private double _lastCpuTempTime = -60.0;
+
+	private void TryCpuTemp(Dictionary<string, string> r)
+	{
+		double now = EnvTick();
+		lock (_lock)
+		{
+			if (now - _lastCpuTempTime < 60.0)
+			{
+				if (_cachedCpuTemp.HasValue)
+				{
+					r["cpu_temp"] = _cachedCpuTemp.Value.ToString("F1", CultureInfo.InvariantCulture);
+					r["cpu_temp_src"] = _cpuTempSrc ?? "";
+				}
+				return;
+			}
+		}
+		double? temp = ReadCpuTempOhm();
+		string src = "ohm";
+		if (!temp.HasValue)
+		{
+			temp = ReadCpuTempAcpi();
+			src = "acpi";
+		}
+		lock (_lock)
+		{
+			_lastCpuTempTime = now;
+			_cachedCpuTemp = temp;
+			_cpuTempSrc = src;
+			if (temp.HasValue)
+			{
+				r["cpu_temp"] = temp.Value.ToString("F1", CultureInfo.InvariantCulture);
+				r["cpu_temp_src"] = src;
+			}
+		}
+	}
+
+	private string? _cpuTempSrc;
+
+	// OHM/LibreHardwareMonitor WMI 传感器: Name 或 Parent 含 CPU 的温度
+	private static double? ReadCpuTempOhm()
+	{
+		foreach (string ns in new[] { "root\\LibreHardwareMonitor", "root\\OpenHardwareMonitor" })
+		{
+			try
+			{
+				ManagementObjectSearcher searcher = new ManagementObjectSearcher(ns, "SELECT Name, Parent, Value FROM Sensor WHERE SensorType='Temperature'");
+				using ManagementObjectCollection results = searcher.Get();
+				foreach (ManagementObject o in results)
+				{
+					using (o)
+					{
+						string name = o["Name"]?.ToString() ?? "";
+						string parent = o["Parent"]?.ToString() ?? "";
+						if ((name.Contains("CPU", StringComparison.OrdinalIgnoreCase) || parent.Contains("cpu", StringComparison.OrdinalIgnoreCase))
+							&& double.TryParse(o["Value"]?.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var v)
+							&& v > 0.0 && v < 120.0)
+						{
+							return v;
+						}
+					}
+				}
+			}
+			catch
+			{
+			}
+		}
+		return null;
+	}
+
+	private static double? ReadCpuTempAcpi()
+	{
+		try
+		{
+			ManagementObjectSearcher searcher = new ManagementObjectSearcher("root\\wmi", "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature");
+			using ManagementObjectCollection results = searcher.Get();
+			foreach (ManagementObject o in results)
+			{
+				using (o)
+				{
+					if (o["CurrentTemperature"] != null && Convert.ToDouble(o["CurrentTemperature"]) > 0.0)
+					{
+						double tc = Convert.ToDouble(o["CurrentTemperature"]) / 10.0 - 273.15;
+						if (tc > 0.0 && tc < 120.0)
+						{
+							return tc;
+						}
+					}
+				}
+			}
+		}
+		catch
+		{
+		}
+		return null;
 	}
 
 	private static string? FindGpuTempExe()

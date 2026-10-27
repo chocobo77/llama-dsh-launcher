@@ -336,21 +336,33 @@
         <TabItem Header="📊 监测" IsSelected="True">
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel Margin="8">
-              <!-- 模型状态卡：阶段徽标 + 进程明细 -->
+              <!-- 模型状态卡: 阶段徽标(空闲/预填充/生成中/排队/异常) + 状态明细 + 进度条 -->
               <Border Background="#0d1117" CornerRadius="6" Padding="10,8" BorderBrush="#30363d" BorderThickness="1">
-                <Grid>
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="*" />
-                  </Grid.ColumnDefinitions>
-                  <Border Name="MonPhaseBadge" Background="#338b949e" CornerRadius="4" Padding="10,4" VerticalAlignment="Center">
-                    <TextBlock Name="MonPhaseText" Text="⏸ 空闲" Foreground="#8b949e" FontSize="13" FontWeight="Bold" />
-                  </Border>
-                  <TextBlock Name="MonPhaseDetail" Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center" Foreground="#8b949e" FontSize="11" TextWrapping="Wrap" Text="llama 未启动 · DSH 未启动" />
-                </Grid>
+                <StackPanel>
+                  <WrapPanel>
+                    <Border Name="MonPhIdle" Background="#188b949e" CornerRadius="4" Padding="10,3" Margin="0,0,4,4">
+                      <TextBlock Name="MonPhIdleT" Text="空闲" FontSize="12" Foreground="#6e7681" />
+                    </Border>
+                    <Border Name="MonPhReading" Background="#188b949e" CornerRadius="4" Padding="10,3" Margin="0,0,4,4">
+                      <TextBlock Name="MonPhReadingT" Text="预填充" FontSize="12" Foreground="#6e7681" />
+                    </Border>
+                    <Border Name="MonPhGen" Background="#188b949e" CornerRadius="4" Padding="10,3" Margin="0,0,4,4">
+                      <TextBlock Name="MonPhGenT" Text="生成中" FontSize="12" Foreground="#6e7681" />
+                    </Border>
+                    <Border Name="MonPhQueue" Background="#188b949e" CornerRadius="4" Padding="10,3" Margin="0,0,4,4">
+                      <TextBlock Name="MonPhQueueT" Text="排队" FontSize="12" Foreground="#6e7681" />
+                    </Border>
+                    <Border Name="MonPhError" Background="#188b949e" CornerRadius="4" Padding="10,3" Margin="0,0,4,4">
+                      <TextBlock Name="MonPhErrorT" Text="异常" FontSize="12" Foreground="#6e7681" />
+                    </Border>
+                  </WrapPanel>
+                  <TextBlock Name="MonPhaseDetail" Margin="0,4,0,0" Foreground="#8b949e" FontSize="11" TextWrapping="Wrap" Text="llama 未启动" />
+                  <ProgressBar Name="MonProgress" Height="6" Margin="0,6,0,0" Minimum="0" Maximum="100" Value="0" Background="#161b22" Foreground="#1f6feb" BorderThickness="0" IsIndeterminate="False" />
+                  <TextBlock Name="MonProgressLabel" Margin="0,3,0,0" Foreground="#8b949e" FontSize="10" Text="" />
+                </StackPanel>
               </Border>
-              <!-- 指标卡网格：大数值 + 来源徽标 + 迷你历史曲线 -->
-              <UniformGrid Columns="3" Margin="0,6,0,0">
+              <!-- 指标卡网格: 速度/GPU负载/显存/温度/功率/PCIe/CPU/磁盘读取 -->
+              <UniformGrid Columns="4" Margin="0,6,0,0">
                 <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="3" BorderBrush="#30363d" BorderThickness="1">
                   <Grid>
                     <Grid.RowDefinitions>
@@ -374,7 +386,10 @@
                       <TextBlock Name="PerfPrefill" Text="—" Foreground="#c9d1d9" FontSize="10" />
                       <TextBlock Text=" tok/s" Foreground="#8b949e" FontSize="10" />
                     </StackPanel>
-                    <Polyline Name="SparkTps" Grid.Row="3" Height="26" Margin="0,4,0,0" Stretch="Fill" Stroke="#7ee787" StrokeThickness="1.5" StrokeLineJoin="Round" />
+                    <Grid Grid.Row="3" Height="26" Margin="0,4,0,0">
+                      <Polyline Name="SparkTps" Stretch="Fill" Stroke="#7ee787" StrokeThickness="1.5" StrokeLineJoin="Round" />
+                      <Polyline Name="SparkPf" Stretch="Fill" Stroke="#e3b341" StrokeThickness="1.2" StrokeLineJoin="Round" Opacity="0.7" />
+                    </Grid>
                   </Grid>
                 </Border>
                 <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="3" BorderBrush="#30363d" BorderThickness="1">
@@ -390,7 +405,7 @@
                       <TextBlock Name="BdgGpu" Text="无数据" FontSize="9" Padding="5,1" HorizontalAlignment="Right" Background="#228b949e" Foreground="#8b949e" />
                     </Grid>
                     <TextBlock Grid.Row="1" Name="PerfGpu" Text="N/A" Foreground="#f0883e" FontSize="20" FontWeight="Bold" />
-                    <TextBlock Grid.Row="2" Text="显卡利用率" Foreground="#8b949e" FontSize="10" Margin="0,1,0,0" />
+                    <TextBlock Grid.Row="2" Text="多卡均值 · GPU 利用率" Foreground="#8b949e" FontSize="10" Margin="0,1,0,0" />
                     <Polyline Name="SparkGpu" Grid.Row="3" Height="26" Margin="0,4,0,0" Stretch="Fill" Stroke="#f0883e" StrokeThickness="1.5" StrokeLineJoin="Round" />
                   </Grid>
                 </Border>
@@ -424,8 +439,45 @@
                       <TextBlock Name="BdgTemp" Text="无数据" FontSize="9" Padding="5,1" HorizontalAlignment="Right" Background="#228b949e" Foreground="#8b949e" />
                     </Grid>
                     <TextBlock Grid.Row="1" Name="PerfGpuTemp" Text="N/A" Foreground="#f0883e" FontSize="20" FontWeight="Bold" />
-                    <TextBlock Grid.Row="2" Text="核心温度" Foreground="#8b949e" FontSize="10" Margin="0,1,0,0" />
+                    <TextBlock Grid.Row="2" Text="核心温度(多卡最高)" Foreground="#8b949e" FontSize="10" Margin="0,1,0,0" />
                     <Polyline Name="SparkTemp" Grid.Row="3" Height="26" Margin="0,4,0,0" Stretch="Fill" Stroke="#f0883e" StrokeThickness="1.5" StrokeLineJoin="Round" />
+                  </Grid>
+                </Border>
+                <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="3" BorderBrush="#30363d" BorderThickness="1">
+                  <Grid>
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0">
+                      <TextBlock Text="⚡ 功率" Foreground="#8b949e" FontSize="11" />
+                      <TextBlock Name="BdgPower" Text="无数据" FontSize="9" Padding="5,1" HorizontalAlignment="Right" Background="#228b949e" Foreground="#8b949e" />
+                    </Grid>
+                    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,2,0,0">
+                      <TextBlock Name="MonPower" Text="—" Foreground="#d29922" FontSize="20" FontWeight="Bold" />
+                      <TextBlock Text="W" Foreground="#8b949e" FontSize="10" VerticalAlignment="Bottom" Margin="4,0,0,4" />
+                    </StackPanel>
+                    <TextBlock Grid.Row="2" Name="MonPowerSub" Text="整机 GPU 功率" Foreground="#8b949e" FontSize="10" Margin="0,1,0,0" />
+                    <Polyline Name="SparkPower" Grid.Row="3" Height="26" Margin="0,4,0,0" Stretch="Fill" Stroke="#d29922" StrokeThickness="1.5" StrokeLineJoin="Round" />
+                  </Grid>
+                </Border>
+                <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="3" BorderBrush="#30363d" BorderThickness="1">
+                  <Grid>
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                      <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0">
+                      <TextBlock Text="🔀 PCIe" Foreground="#8b949e" FontSize="11" />
+                      <TextBlock Name="BdgPcie" Text="无数据" FontSize="9" Padding="5,1" HorizontalAlignment="Right" Background="#228b949e" Foreground="#8b949e" />
+                    </Grid>
+                    <TextBlock Grid.Row="1" Name="MonPcie" Text="—" Foreground="#58a6ff" FontSize="20" FontWeight="Bold" />
+                    <TextBlock Grid.Row="2" Name="MonPcieSub" Text="链路代数 × 宽度" Foreground="#8b949e" FontSize="10" Margin="0,1,0,0" />
+                    <Polyline Name="SparkPcie" Grid.Row="3" Height="26" Margin="0,4,0,0" Stretch="Fill" Stroke="#58a6ff" StrokeThickness="1.5" StrokeLineJoin="Round" />
                   </Grid>
                 </Border>
                 <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="3" BorderBrush="#30363d" BorderThickness="1">
@@ -454,15 +506,122 @@
                       <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
                     <Grid Grid.Row="0">
-                      <TextBlock Text="💾 内存" Foreground="#8b949e" FontSize="11" />
-                      <TextBlock Name="BdgMem" Text="无数据" FontSize="9" Padding="5,1" HorizontalAlignment="Right" Background="#228b949e" Foreground="#8b949e" />
+                      <TextBlock Text="💽 磁盘读取" Foreground="#8b949e" FontSize="11" />
+                      <TextBlock Name="BdgDisk" Text="无数据" FontSize="9" Padding="5,1" HorizontalAlignment="Right" Background="#228b949e" Foreground="#8b949e" />
                     </Grid>
-                    <TextBlock Grid.Row="1" Name="PerfMem" Text="N/A" Foreground="#58a6ff" FontSize="20" FontWeight="Bold" />
-                    <TextBlock Grid.Row="2" Text="已提交内存" Foreground="#8b949e" FontSize="10" Margin="0,1,0,0" />
-                    <Polyline Name="SparkMem" Grid.Row="3" Height="26" Margin="0,4,0,0" Stretch="Fill" Stroke="#58a6ff" StrokeThickness="1.5" StrokeLineJoin="Round" />
+                    <TextBlock Grid.Row="1" Name="MonDisk" Text="—" Foreground="#58a6ff" FontSize="20" FontWeight="Bold" />
+                    <TextBlock Grid.Row="2" Name="MonDiskSub" Text="磁盘读吞吐" Foreground="#8b949e" FontSize="10" Margin="0,1,0,0" />
+                    <Polyline Name="SparkDisk" Grid.Row="3" Height="26" Margin="0,4,0,0" Stretch="Fill" Stroke="#58a6ff" StrokeThickness="1.5" StrokeLineJoin="Round" />
                   </Grid>
                 </Border>
               </UniformGrid>
+              <!-- 读数条: 能耗/风扇/频率/CPU 温度(无数据源时隐藏该项) -->
+              <Border Background="#0d1117" CornerRadius="6" Padding="10,6" Margin="0,6,0,0" BorderBrush="#30363d" BorderThickness="1">
+                <WrapPanel>
+                  <StackPanel Orientation="Horizontal" Margin="0,0,16,0">
+                    <TextBlock Text="🔋 能耗 " Foreground="#8b949e" FontSize="11" />
+                    <TextBlock Name="MonEnergy" Text="—" Foreground="#c9d1d9" FontSize="11" FontWeight="Bold" />
+                  </StackPanel>
+                  <StackPanel Orientation="Horizontal" Margin="0,0,16,0">
+                    <TextBlock Text="🌀 风扇 " Foreground="#8b949e" FontSize="11" />
+                    <TextBlock Name="MonFan" Text="—" Foreground="#c9d1d9" FontSize="11" FontWeight="Bold" />
+                  </StackPanel>
+                  <StackPanel Orientation="Horizontal" Margin="0,0,16,0">
+                    <TextBlock Text="⏲ 频率 " Foreground="#8b949e" FontSize="11" />
+                    <TextBlock Name="MonClock" Text="—" Foreground="#c9d1d9" FontSize="11" FontWeight="Bold" />
+                  </StackPanel>
+                  <StackPanel Orientation="Horizontal" Margin="0,0,16,0">
+                    <TextBlock Text="🌡 CPU 温度 " Foreground="#8b949e" FontSize="11" />
+                    <TextBlock Name="MonCpuTemp" Text="—" Foreground="#c9d1d9" FontSize="11" FontWeight="Bold" />
+                  </StackPanel>
+                </WrapPanel>
+              </Border>
+              <!-- 上下文填充: Gauge 环 + 柱条(显存内专家/系统内存/GPU 温度) -->
+              <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="0,6,0,0" BorderBrush="#30363d" BorderThickness="1">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                  </Grid.ColumnDefinitions>
+                  <Grid Grid.Column="0" Width="96" Height="96" VerticalAlignment="Center">
+                    <Ellipse Stroke="#21262d" StrokeThickness="8" Width="80" Height="80" />
+                    <Path Name="MonGaugeArc" Stroke="#1f6feb" StrokeThickness="8" StrokeStartLineCap="Round" StrokeEndLineCap="Round" Stretch="None" />
+                    <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+                      <TextBlock Name="MonGaugePct" Text="0%" FontSize="15" FontWeight="Bold" Foreground="#e6edf3" HorizontalAlignment="Center" />
+                      <TextBlock Name="MonGaugeLabel" Text="上下文" FontSize="8" Foreground="#8b949e" HorizontalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="78" />
+                    </StackPanel>
+                  </Grid>
+                  <StackPanel Grid.Column="1" Margin="16,0,0,0" VerticalAlignment="Center">
+                    <TextBlock Text="上下文填充" Foreground="#e6edf3" FontSize="12" FontWeight="Bold" Margin="0,0,0,8" />
+                    <Grid Margin="0,0,0,4">
+                      <TextBlock Text="显存内专家" Foreground="#8b949e" FontSize="10" />
+                      <TextBlock Name="MonExpertsVal" Text="—" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Right" ToolTip="需要引擎上报专家缓存统计(llama.cpp 未提供)" />
+                    </Grid>
+                    <Grid Margin="0,0,0,2">
+                      <TextBlock Text="系统内存" Foreground="#8b949e" FontSize="10" />
+                      <TextBlock Name="MonRamLabel" Text="—" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Right" />
+                    </Grid>
+                    <ProgressBar Name="MonRamBar" Height="6" Minimum="0" Maximum="100" Value="0" Background="#161b22" Foreground="#1f6feb" BorderThickness="0" Margin="0,0,0,8" />
+                    <Grid Margin="0,0,0,2">
+                      <TextBlock Text="GPU 温度" Foreground="#8b949e" FontSize="10" />
+                      <TextBlock Name="MonGpuTempVal" Text="—" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Right" />
+                    </Grid>
+                    <ProgressBar Name="MonGpuTempBar" Height="6" Minimum="0" Maximum="100" Value="0" Background="#161b22" Foreground="#238636" BorderThickness="0" />
+                  </StackPanel>
+                </Grid>
+              </Border>
+              <!-- 最近请求表 -->
+              <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="0,6,0,0" BorderBrush="#30363d" BorderThickness="1">
+                <StackPanel>
+                  <Grid Margin="0,0,0,4">
+                    <StackPanel Orientation="Horizontal">
+                      <TextBlock Text="最近请求" Foreground="#e6edf3" FontSize="12" FontWeight="Bold" />
+                      <TextBlock Name="MonReqSummary" Text="0 次请求" Foreground="#8b949e" FontSize="10" Margin="8,0,0,0" VerticalAlignment="Center" />
+                    </StackPanel>
+                    <CheckBox Name="ChkShowAllReq" Content="显示全部" HorizontalAlignment="Right" Foreground="#8b949e" FontSize="11" Checked="ShowAllReq_Changed" Unchecked="ShowAllReq_Changed" />
+                  </Grid>
+                  <ListView Name="MonReqList" BorderThickness="0" Background="Transparent" FontSize="11" MaxHeight="190" ScrollViewer.VerticalScrollBarVisibility="Auto">
+                    <ListView.View>
+                      <GridView>
+                        <GridViewColumn Header="时间" DisplayMemberBinding="{Binding Time}" Width="70" />
+                        <GridViewColumn Header="状态" DisplayMemberBinding="{Binding Status}" Width="60" />
+                        <GridViewColumn Header="Prompt" DisplayMemberBinding="{Binding Prompt}" Width="78" />
+                        <GridViewColumn Header="复用" DisplayMemberBinding="{Binding Reused}" Width="78" />
+                        <GridViewColumn Header="输出" DisplayMemberBinding="{Binding Output}" Width="78" />
+                        <GridViewColumn Header="Tok/s" DisplayMemberBinding="{Binding Tps}" Width="70" />
+                        <GridViewColumn Header="VRAM 命中率" DisplayMemberBinding="{Binding Hit}" Width="90" />
+                        <GridViewColumn Header="时长" DisplayMemberBinding="{Binding Dur}" Width="70" />
+                      </GridView>
+                    </ListView.View>
+                  </ListView>
+                </StackPanel>
+              </Border>
+              <!-- 对话缓存 -->
+              <Border Background="#0d1117" CornerRadius="6" Padding="10" Margin="0,6,0,0" BorderBrush="#30363d" BorderThickness="1">
+                <StackPanel>
+                  <TextBlock Text="对话缓存" Foreground="#e6edf3" FontSize="12" FontWeight="Bold" />
+                  <TextBlock Text="llama-server 在同一 KV 槽位自动复用前缀；复用统计来自日志的 cached prompt 记录。" Foreground="#8b949e" FontSize="10" Margin="0,2,0,6" TextWrapping="Wrap" />
+                  <Grid>
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="*" />
+                      <ColumnDefinition Width="*" />
+                      <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0">
+                      <TextBlock Text="上次请求复用" Foreground="#8b949e" FontSize="10" />
+                      <TextBlock Name="MonCacheLast" Text="—" Foreground="#c9d1d9" FontSize="13" FontWeight="Bold" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="1">
+                      <TextBlock Text="启动以来复用" Foreground="#8b949e" FontSize="10" />
+                      <TextBlock Name="MonCacheTotal" Text="0 tok / 0 次请求" Foreground="#c9d1d9" FontSize="13" FontWeight="Bold" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="2">
+                      <TextBlock Text="停靠会话" Foreground="#8b949e" FontSize="10" />
+                      <TextBlock Text="—" Foreground="#8b949e" FontSize="13" FontWeight="Bold" ToolTip="会话停靠为 Strata 引擎特性，llama.cpp 未提供" />
+                    </StackPanel>
+                  </Grid>
+                </StackPanel>
+              </Border>
               <!-- 熔断保护条（保护语义不变） -->
               <Border Background="#0d1117" CornerRadius="6" Padding="8,6" Margin="6" BorderBrush="#30363d" BorderThickness="1">
                 <StackPanel Orientation="Horizontal">
