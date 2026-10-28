@@ -6161,6 +6161,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		UpdateEventFeed(api);
 	}
 
+	private bool _synthGpuLogged;
+
 	// 真进度条: pct 有值=决定填充, 无值=不定态滑块
 	private void SetMonBar(bool active, System.Windows.Media.Color tone, double? pct)
 	{
@@ -6475,6 +6477,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		if (gpus.Count == 0 && d.TryGetValue("gpu_util", out string sGu0))
 		{
+			if (!_synthGpuLogged)
+			{
+				_synthGpuLogged = true;
+				Log("[GPU] NVML 与 nvidia-smi 均不可用, GPU 面板使用系统聚合数据(非 NVIDIA 或驱动未装)");
+			}
 			// 非 NVIDIA/无驱动: 用既有聚合键合成一张卡, 保底不让 GPU 区空白
 			double Num1(string k) => d.TryGetValue(k, out string v) && double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out var vv) ? vv : 0;
 			gpus.Add(new GpuDevInfo
@@ -6482,8 +6489,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				Index = 0,
 				Name = d.TryGetValue("gpu_name", out string gn) ? gn : "GPU(系统聚合)",
 				Util = Num1("gpu_util"),
-				MemUsedMb = Num1("vram_used") / 1024.0,
-				MemTotalMb = Num1("vram_total") / 1024.0,
+				// vram_* 键是字节(GpuMonitor 口径) → MB
+				MemUsedMb = Num1("vram_used") / 1048576.0,
+				MemTotalMb = Num1("vram_total") / 1048576.0,
 				Temp = Num1("gpu_temp"),
 				Power = Num1("power_w"),
 				Limit = Num1("power_limit_w"),
