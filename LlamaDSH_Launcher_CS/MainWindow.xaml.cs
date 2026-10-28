@@ -6163,6 +6163,38 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private bool _synthGpuLogged;
 
+	// WMI 显卡友好名(一次性缓存): "AMD Radeon RX 7900 XTX"
+	private string? _gpuFriendlyName;
+
+	private string GpuFriendlyName()
+	{
+		if (_gpuFriendlyName != null)
+		{
+			return _gpuFriendlyName;
+		}
+		try
+		{
+			using var mos = new System.Management.ManagementObjectSearcher("SELECT Name FROM Win32_VideoController");
+			foreach (System.Management.ManagementObject o in mos.Get())
+			{
+				using (o)
+				{
+					var nm = o["Name"]?.ToString();
+					if (!string.IsNullOrWhiteSpace(nm))
+					{
+						_gpuFriendlyName = nm.Trim();
+						break;
+					}
+				}
+			}
+		}
+		catch
+		{
+		}
+		_gpuFriendlyName ??= "GPU(系统聚合)";
+		return _gpuFriendlyName;
+	}
+
 	// 真进度条: pct 有值=决定填充, 无值=不定态滑块
 	private void SetMonBar(bool active, System.Windows.Media.Color tone, double? pct)
 	{
@@ -6484,10 +6516,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			// 非 NVIDIA/无驱动: 用既有聚合键合成一张卡, 保底不让 GPU 区空白
 			double Num1(string k) => d.TryGetValue(k, out string v) && double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out var vv) ? vv : 0;
-			gpus.Add(new GpuDevInfo
+				gpus.Add(new GpuDevInfo
 			{
 				Index = 0,
-				Name = d.TryGetValue("gpu_name", out string gn) ? gn : "GPU(系统聚合)",
+				Name = d.TryGetValue("gpu_name", out string gn) ? gn : GpuFriendlyName(),
 				Util = Num1("gpu_util"),
 				// vram_* 键是字节(GpuMonitor 口径) → MB
 				MemUsedMb = Num1("vram_used") / 1048576.0,
@@ -6603,7 +6635,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				double memPct = g.MemTotalMb > 0 ? g.MemUsedMb / g.MemTotalMb * 100.0 : 0;
 				right.Children.Add(new TextBlock
 				{
-					Text = $"显存 {g.MemUsedMb:F0} / {g.MemTotalMb:F0} MB ({memPct:F0}%)",
+					Text = g.MemTotalMb > 0
+						? $"显存 {g.MemUsedMb / 1024.0:F1} / {g.MemTotalMb / 1024.0:F1} GB ({memPct:F0}%)"
+						: $"显存 {g.MemUsedMb / 1024.0:F1} GB",
 					FontSize = 11,
 					FontFamily = new FontFamily("Consolas"),
 					Foreground = new SolidColorBrush(memPct >= 90 ? Color.FromRgb(0xff, 0x8a, 0x98) : Color.FromRgb(0x8e, 0x97, 0x9f)),

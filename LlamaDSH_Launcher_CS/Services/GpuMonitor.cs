@@ -172,7 +172,8 @@ public class GpuMonitor
 										text = "nvidia";
 										break;
 									}
-									if (text2.Contains("amd") || text2.Contains("radeon") || text2.Contains("ati"))
+									// 新版 AMD 驱动的 AdapterCompatibility 是 "Advanced Micro Devices, Inc.", 不含 amd/radeon/ati 子串
+									if (text2.Contains("amd") || text2.Contains("radeon") || text2.Contains("ati") || text2.Contains("advanced micro devices"))
 									{
 										text = "amd";
 										break;
