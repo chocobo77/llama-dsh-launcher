@@ -37,9 +37,11 @@
 
 
   <ItemGroup>
-    <PackageReference Include="System.Management" Version="[8.0.0,9.0.0)" />
+    <PackageReference Include="System.Management" Version="[9.0.0,10.0.0)" />
     <PackageReference Include="System.Drawing.Common" Version="[8.0.0,9.0.0)" />
     <PackageReference Include="YamlDotNet" Version="[16.0.0,17.0.0)" />
+    <!-- 跨厂商硬件传感成熟方案(FanControl/Sidebar Diagnostics 同源): NVIDIA/AMD/Intel 温度/功率/风扇/频率/负载 -->
+    <PackageReference Include="LibreHardwareMonitorLib" Version="[0.9.4,1.0.0)" />
   </ItemGroup>
 
 </Project>

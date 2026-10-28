@@ -103,7 +103,9 @@ public class GpuMonitor
 		{
 			TryGpuTempHelper(dictionary);
 		}
-		// CPU 温度(Strata 读数条): LibreHardwareMonitor/OpenHardwareMonitor 优先, ACPI 热区兜底; 60s TTL 独立缓存
+		// LibreHardwareMonitorLib(社区成熟方案)统一补齐: AMD/Intel 功率/风扇/频率/负载, 各家缺失的键
+		TryLhmMerge(dictionary);
+		// CPU 温度兜底: LHM 已提供则跳过, 否则 OHM WMI → ACPI; 60s TTL 独立缓存
 		TryCpuTemp(dictionary);
 		if ((!dictionary.ContainsKey("gpu_temp") || !dictionary.ContainsKey("gpu_util")) && num - _lastPsFallbackTime >= 60.0)
 		{
@@ -423,10 +425,10 @@ public class GpuMonitor
 	{
 		try
 		{
-			// amd-smi metric 带功率/风扇/频率/温度/利用率/显存; Strata 同款指标 AMD 侧适配
+			// 已知可用的三个参数(新增开关在部分 amd-smi 版本会整体失败); 功率/风扇/频率由 LHM 库补齐
 			ProcessResult runResult = ProcessRunner.Run(
 				"amd-smi.exe",
-				new[] { "metric", "--temperature", "--gpu-utilization", "--vram-usage", "--power", "--fan-speed", "--pcie" },
+				new[] { "metric", "--temperature", "--gpu-utilization", "--vram-usage" },
 				5000);
 			bool result = false;
 			if (runResult.Started && !runResult.TimedOut && !string.IsNullOrWhiteSpace(runResult.StdOut + runResult.StdErr))
@@ -1020,6 +1022,24 @@ public class GpuMonitor
 					{
 						result[text5] = value;
 					}
+				}
+			}
+		}
+		catch
+		{
+		}
+	}
+
+	// LibreHardwareMonitorLib 库合并: 只填当前缺失的键(命令行通道优先, 库做跨厂商兜底/补充)
+	private void TryLhmMerge(Dictionary<string, string> r)
+	{
+		try
+		{
+			foreach (KeyValuePair<string, string> kv in HardwareMonitor.Instance.Sample())
+			{
+				if (!r.ContainsKey(kv.Key))
+				{
+					r[kv.Key] = kv.Value;
 				}
 			}
 		}
