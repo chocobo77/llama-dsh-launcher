@@ -6839,7 +6839,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			SlotCardsHost.Children.Clear();
 			if (!llamaUp || slots.Count == 0)
 			{
-				SlotCardsHost.Children.Add(new TextBlock { Text = "llama 未启动", Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontSize = 12, Margin = new Thickness(0, 2, 0, 2) });
+				SlotCardsHost.Children.Add(new TextBlock { Text = llamaUp ? "无活动槽位" : "llama 未启动", Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontSize = 12, Margin = new Thickness(0, 2, 0, 2) });
 				MonSlotSummary.Text = "";
 				return;
 			}

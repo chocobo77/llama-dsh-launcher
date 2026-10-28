@@ -404,7 +404,6 @@
                 <DockPanel>
                   <Button DockPanel.Dock="Right" Name="BtnSnapshot" Content="📷" Click="Snapshot_Click" ToolTip="保存监测页截图为 PNG" Padding="8,3" VerticalAlignment="Center" />
                   <WrapPanel>
-                    <Border Width="1" Background="#2a3036" Margin="0,2,22,2" />
                     <StackPanel Margin="0,0,22,0">
                       <StackPanel Orientation="Horizontal"><Ellipse Width="7" Height="7" Fill="#f0883e" VerticalAlignment="Center" /><TextBlock Text=" GPU 利用率" Foreground="#8e979f" FontSize="11" /></StackPanel>
                       <StackPanel Orientation="Horizontal"><TextBlock Name="StripGpuVal" Text="—" Foreground="#eef1f3" FontSize="19" FontWeight="Bold" FontFamily="Consolas" /><TextBlock Text="%" Foreground="#8e979f" FontSize="10" VerticalAlignment="Bottom" Margin="3,0,0,3" /></StackPanel>

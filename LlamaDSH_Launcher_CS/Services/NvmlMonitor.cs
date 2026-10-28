@@ -449,6 +449,8 @@ partial class NvmlMonitor
 
 partial class NvmlMonitor
 {
+	private static double _smiNextTry;
+
 	/// <summary>NVML 不可用时的回退: nvidia-smi 每卡一行解析(含驱动/P-State)。</summary>
 	public static List<GpuDevInfo> SampleViaNvidiaSmi()
 	{
@@ -461,6 +463,7 @@ partial class NvmlMonitor
 				5000);
 			if (!r.Started || r.TimedOut)
 			{
+				_smiNextTry = Environment.TickCount64 + 30000;
 				return list;
 			}
 			foreach (var raw in r.StdOut.Split('\n'))
@@ -499,6 +502,7 @@ partial class NvmlMonitor
 		}
 		catch
 		{
+			_smiNextTry = Environment.TickCount64 + 30000;
 		}
 		return list;
 	}
