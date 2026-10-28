@@ -724,11 +724,7 @@
                     <TextBlock Text="CPU 温度" Foreground="#8e979f" FontSize="12" />
                     <TextBlock Name="MonCpuTemp" Text="—" Foreground="#eef1f3" FontSize="15" FontWeight="SemiBold" ToolTip="Windows 无无需管理员权限的可信 CPU 温度源(Strata 同款处理)；以管理员身份运行启动器时经 LibreHardwareMonitor 读取" />
                   </StackPanel>
-                                    <StackPanel Name="StripTtft" Margin="0,4,28,4" MinWidth="90">
-                    <TextBlock Text="首 Token" Foreground="#8e979f" FontSize="12" />
-                    <TextBlock Name="MonTtft" Text="—" Foreground="#eef1f3" FontSize="15" FontWeight="SemiBold" />
-                  </StackPanel>
-                </WrapPanel>
+                                  </WrapPanel>
               </Border>
             </StackPanel>
           </ScrollViewer>

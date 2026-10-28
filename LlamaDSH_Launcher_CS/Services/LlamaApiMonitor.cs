@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Net.Http;
+using System.Text.RegularExpressions;
+
 using System.Text.Json;
 
 namespace LlamaDSH_Launcher.Services;
@@ -13,7 +15,7 @@ namespace LlamaDSH_Launcher.Services;
 /// 差分算法与字段兼容(llama-lens backend/pollers/llama_api.py), 含自定义 build 的
 /// next_token[0].n_decoded 回退与 n_prompt_tokens 已含 decoded 的口径处理。
 /// </summary>
-public sealed class LlamaApiMonitor
+public sealed partial class LlamaApiMonitor
 {
 	private sealed class SlotState
 	{
@@ -444,5 +446,310 @@ public sealed class LlamaApiMonitor
 			return n2.ValueKind == JsonValueKind.Number && n2.TryGetInt64(out var l2) ? l2 : 0;
 		}
 		return 0;
+	}
+}
+
+// ============================ 日志状态机(llama-lens LogPoller 移植) ============================
+public sealed class LastTaskInfo
+{
+	public int? Slot;
+	public long? TaskId;
+	public double? PromptMs;
+	public long? PromptTokens;
+	public double? PromptSpeed;
+	public double? EvalMs;
+	public long? DecodedTokens;
+	public double? GenSpeed;
+	public double? TotalMs;
+	public long? TotalTokens;
+	public double Duration;
+	public double? AvgTps;
+	public bool Truncated;
+	public DateTime EndTime;
+}
+
+// 11 类日志行(与 llama-lens log_poller.py 同一正则集)
+public static partial class LlamaLogRules
+{
+	public static readonly Regex Decode = new Regex(
+		"slot\\s+print_timing:\\s+id\\s+(\\d+)\\s*\\|\\s*task\\s+(\\d+)\\s*\\|\\s*" +
+		"n_decoded\\s*=\\s*(\\d+),\\s*tg\\s*=\\s*([\\d.]+)\\s*t/s,\\s*tg_3s\\s*=\\s*([\\d.]+)\\s*t/s");
+	public static readonly Regex Prompt = new Regex(
+		"slot\\s+print_timing:\\s+id\\s+(\\d+)\\s*\\|\\s*task\\s+(\\d+)\\s*\\|\\s*" +
+		"prompt processing,\\s*n_tokens\\s*=\\s*(\\d+),\\s*progress\\s*=\\s*([\\d.]+),\\s*" +
+		"t\\s*=\\s*([\\d.]+)\\s*s\\s*/\\s*([\\d.]+)\\s*tokens per second");
+	public static readonly Regex PromptSummary = new Regex(
+		"prompt eval time\\s*=\\s*([\\d.]+)\\s*ms\\s*/\\s*(\\d+)\\s*tokens\\s*" +
+		"\\(\\s*([\\d.]+)\\s*ms per token,\\s*([\\d.]+)\\s*tokens per second\\)");
+	public static readonly Regex EvalSummary = new Regex(
+		"(?<!prompt )eval time\\s*=\\s*([\\d.]+)\\s*ms\\s*/\\s*(\\d+)\\s*tokens\\s*" +
+		"\\(\\s*([\\d.]+)\\s*ms per token,\\s*([\\d.]+)\\s*tokens per second\\)");
+	public static readonly Regex TotalSummary = new Regex("total time\\s*=\\s*([\\d.]+)\\s*ms\\s*/\\s*(\\d+)\\s*tokens");
+	public static readonly Regex Graphs = new Regex("graphs reused\\s*=\\s*(\\d+)");
+	public static readonly Regex Release = new Regex(
+		"slot\\s+release:\\s+id\\s+(\\d+)\\s*\\|\\s*task\\s+(\\d+)\\s*\\|\\s*" +
+		"stop processing:\\s*n_tokens\\s*=\\s*(\\d+),\\s*truncated\\s*=\\s*(\\d+)");
+	public static readonly Regex Launch = new Regex(
+		"slot\\s+launch_slot_:\\s+id\\s+(\\d+)\\s*\\|\\s*task\\s+(\\d+)\\s*\\|\\s*" +
+		"processing task,\\s*is_child\\s*=\\s*(\\d+)");
+	public static readonly Regex SlotSelect = new Regex(
+		"slot\\s+get_availabl:\\s+id\\s+(\\d+)\\s*\\|\\s*task\\s+-1\\s*\\|\\s*" +
+		"selected slot by\\s+(LRU|LCP similarity)" +
+		"(?:,\\s*f_sim_best\\s*=\\s*([\\d.]+)\\s*\\(>\\s*[\\d.]+\\s+thold\\),\\s*f_keep\\s*=\\s*([\\d.]+))?");
+	public static readonly Regex BootModel = new Regex("loading model\\s+'(.+?)'");
+	public static readonly Regex BootSlots = new Regex("n_slots\\s*=\\s*(\\d+),\\s*n_ctx_slot\\s*=\\s*(\\d+),\\s*kv_unified\\s*=\\s*'(\\w+)'");
+	public static readonly Regex BootListen = new Regex("listening on\\s+(\\S+)");
+}
+
+public sealed class BootInfo
+{
+	public string Model = "";
+	public int? NSlots;
+	public int? NCtxSlot;
+	public bool? KvUnified;
+	public string Listening = "";
+	public List<string> Warnings = new();
+}
+
+partial class LlamaApiMonitor
+{
+	// 相位/实时状态(日志优先, llama-lens state 字段同名同义)
+	public string Phase { get; private set; } = "idle";
+	public long? LogTaskId { get; private set; }
+	public long LogNDecoded { get; private set; }
+	public double? TgTps { get; private set; }
+	public double? Tg3sTps { get; private set; }
+	public double? PromptProgress { get; private set; }
+	public double? LogPromptSpeed { get; private set; }
+	public long? PromptTotalTokens { get; private set; }
+	public double? PromptElapsedS { get; private set; }
+	public bool? IsChild { get; private set; }
+	public DateTime? TaskStartedAt { get; private set; }
+
+	// 持久记录
+	public LastTaskInfo? LastTask { get; private set; }
+	public double? LastPrefillSpeed { get; private set; }
+	public long? LastPrefillTokens { get; private set; }
+
+	// 启动块
+	public BootInfo Boot { get; } = new();
+
+	// ctx(日志 release 行, slots API 优先合并)
+	public long? LogCtxUsed { get; private set; }
+	public bool LogCtxTruncated { get; private set; }
+
+	private long? _prefillTask;
+	private double _promptMs, _evalMs;
+	private long _promptTokens, _decodedTokens, _totalTokens;
+	private double _promptSpd, _genSpd;
+	private double _totalMs;
+	private int? _relSlot;
+	private long? _relTask;
+	private long _relTokens;
+	private bool _relTruncated;
+
+	private static double? F(string? x)
+	{
+		return double.TryParse(x, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : null;
+	}
+
+	private static long I(string? x)
+	{
+		return long.TryParse(x, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : 0;
+	}
+
+	private static string G(Regex re, string input, int g)
+	{
+		var m = re.Match(input);
+		return m.Success && m.Groups[g].Success ? m.Groups[g].Value : "";
+	}
+
+	/// <summary>llama stdout 行喂入(每行, 顺序调用)。PID 前缀的 syslog 场景不存在(本机直读 stdout)。</summary>
+	public void FeedLogLine(string line)
+	{
+		if (string.IsNullOrWhiteSpace(line))
+		{
+			return;
+		}
+		try
+		{
+			ParseLogLine(line);
+		}
+		catch
+		{
+		}
+	}
+
+	/// <summary>llama 重启时重置状态机(等价 _reset_machine)。</summary>
+	public void ResetLogMachine()
+	{
+		Phase = "idle";
+		LogTaskId = null;
+		LogNDecoded = 0;
+		TgTps = Tg3sTps = null;
+		PromptProgress = LogPromptSpeed = null;
+		PromptTotalTokens = null;
+		PromptElapsedS = null;
+		IsChild = null;
+		TaskStartedAt = null;
+		_prefillTask = null;
+		LogCtxUsed = null;
+		LogCtxTruncated = false;
+		_promptMs = _evalMs = _promptSpd = _genSpd = _totalMs = 0;
+		_promptTokens = _decodedTokens = _totalTokens = 0;
+		Boot.Warnings.Clear();
+	}
+
+	private void ParseLogLine(string msg)
+	{
+		var m = LlamaLogRules.Decode.Match(msg);
+		if (m.Success)
+		{
+			Phase = "decoding";
+			LogTaskId = I(G(LlamaLogRules.Decode, msg, 2));
+			LogNDecoded = I(m.Groups[3].Value);
+			TgTps = F(m.Groups[4].Value);
+			Tg3sTps = F(m.Groups[5].Value);
+			return;
+		}
+		m = LlamaLogRules.Prompt.Match(msg);
+		if (m.Success)
+		{
+			Phase = "prompt_processing";
+			LogTaskId = I(m.Groups[2].Value);
+			PromptProgress = F(m.Groups[4].Value);
+			LogPromptSpeed = F(m.Groups[6].Value);
+			PromptTotalTokens = I(m.Groups[3].Value);
+			PromptElapsedS = F(m.Groups[5].Value);
+			LastPrefillSpeed = LogPromptSpeed;
+			LastPrefillTokens = PromptTotalTokens;
+			if (_prefillTask != LogTaskId)
+			{
+				_prefillTask = LogTaskId;
+				AddEvent("info", $"任务 #{LogTaskId} 预填充开始{(PromptTotalTokens.HasValue ? $" (prompt {PromptTotalTokens} tokens)" : "")}");
+			}
+			return;
+		}
+		m = LlamaLogRules.Release.Match(msg);
+		if (m.Success)
+		{
+			_relSlot = (int)I(m.Groups[1].Value);
+			_relTask = I(m.Groups[2].Value);
+			_relTokens = I(m.Groups[3].Value);
+			_relTruncated = m.Groups[4].Value == "1";
+			OnTaskEnd();
+			return;
+		}
+		m = LlamaLogRules.Launch.Match(msg);
+		if (m.Success)
+		{
+			LogTaskId = I(m.Groups[2].Value);
+			IsChild = m.Groups[3].Value != "0";
+			TaskStartedAt = DateTime.Now;
+			_promptMs = _evalMs = _totalMs = 0;
+			_promptTokens = _decodedTokens = _totalTokens = 0;
+			_promptSpd = _genSpd = 0;
+			AddEvent("info", $"任务 #{LogTaskId} 开始{(IsChild == true ? " · 子任务" : "")}");
+			return;
+		}
+		m = LlamaLogRules.PromptSummary.Match(msg);
+		if (m.Success)
+		{
+			_promptMs = F(m.Groups[1].Value) ?? 0;
+			_promptTokens = I(m.Groups[2].Value);
+			_promptSpd = F(m.Groups[4].Value) ?? 0;
+			return;
+		}
+		m = LlamaLogRules.EvalSummary.Match(msg);
+		if (m.Success)
+		{
+			_evalMs = F(m.Groups[1].Value) ?? 0;
+			_decodedTokens = I(m.Groups[2].Value);
+			_genSpd = F(m.Groups[4].Value) ?? 0;
+			return;
+		}
+		m = LlamaLogRules.TotalSummary.Match(msg);
+		if (m.Success)
+		{
+			_totalMs = F(m.Groups[1].Value) ?? 0;
+			_totalTokens = I(m.Groups[2].Value);
+			return;
+		}
+		if (LlamaLogRules.Graphs.IsMatch(msg))
+		{
+			return;
+		}
+		m = LlamaLogRules.BootSlots.Match(msg);
+		if (m.Success)
+		{
+			Boot.NSlots = (int)I(m.Groups[1].Value);
+			Boot.NCtxSlot = (int)I(m.Groups[2].Value);
+			Boot.KvUnified = m.Groups[3].Value == "true";
+			return;
+		}
+		m = LlamaLogRules.BootModel.Match(msg);
+		if (m.Success)
+		{
+			Boot.Model = m.Groups[1].Value;
+			return;
+		}
+		m = LlamaLogRules.BootListen.Match(msg);
+		if (m.Success)
+		{
+			Boot.Listening = m.Groups[1].Value;
+			AddEvent("ok", "llama-server 监听 " + Boot.Listening);
+			return;
+		}
+	}
+
+	private void OnTaskEnd()
+	{
+		LogCtxUsed = _relTokens;
+		LogCtxTruncated = _relTruncated;
+		double dur = TaskStartedAt.HasValue ? (DateTime.Now - TaskStartedAt.Value).TotalSeconds : 0;
+		var t = new LastTaskInfo
+		{
+			Slot = _relSlot,
+			TaskId = _relTask,
+			PromptMs = _promptMs > 0 ? _promptMs : null,
+			PromptTokens = _promptTokens > 0 ? _promptTokens : null,
+			PromptSpeed = _promptSpd > 0 ? _promptSpd : null,
+			EvalMs = _evalMs > 0 ? _evalMs : null,
+			DecodedTokens = _decodedTokens > 0 ? _decodedTokens : null,
+			GenSpeed = _genSpd > 0 ? _genSpd : null,
+			TotalMs = _totalMs > 0 ? _totalMs : null,
+			TotalTokens = _totalTokens > 0 ? _totalTokens : null,
+			Duration = dur,
+			AvgTps = dur > 0 && _decodedTokens > 0 ? _decodedTokens / dur : null,
+			Truncated = _relTruncated,
+			EndTime = DateTime.Now,
+		};
+		LastTask = t;
+		Phase = "idle";
+		Tg3sTps = TgTps = null;
+		PromptProgress = LogPromptSpeed = null;
+		TaskStartedAt = null;
+		AddEvent("ok", $"任务 #{_relTask} 完成 · {(t.DecodedTokens ?? t.TotalTokens) ?? 0} tok"
+			+ (t.Duration > 0 ? $" · {t.Duration:F1}s" : "")
+			+ (t.AvgTps.HasValue ? $" · 均 {t.AvgTps:F1} tok/s" : ""));
+	}
+
+	/// <summary>速度来源优先级(= llama-lens engine.speeds()): 日志 tg_3s / prompt 行 > /slots 差分。</summary>
+	public (double gen, double prompt, string source) Speeds()
+	{
+		double gen = GenTps;
+		double prompt = PromptTps;
+		string source = string.IsNullOrEmpty(SpeedSource) ? "api" : SpeedSource;
+		if (Phase == "decoding" && Tg3sTps.HasValue)
+		{
+			gen = Tg3sTps.Value;
+			source = "log";
+		}
+		if (Phase == "prompt_processing" && LogPromptSpeed.HasValue)
+		{
+			prompt = LogPromptSpeed.Value;
+			source = "log";
+		}
+		return (gen, prompt, source);
 	}
 }
