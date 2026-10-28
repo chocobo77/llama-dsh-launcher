@@ -87,7 +87,8 @@
   </FrameworkElement.Resources>
   <Grid>
     <Grid.ColumnDefinitions>
-      <ColumnDefinition Width="1.1*" />
+      <!-- 左(参数配置) 0.73* : 右(控制+监测/日志) 1* —— 左侧较原 1.1* 缩 1/3 -->
+      <ColumnDefinition Width="0.73*" />
       <ColumnDefinition Width="1*" />
     </Grid.ColumnDefinitions>
     <ScrollViewer Name="LeftScroll" Grid.Column="0" VerticalScrollBarVisibility="Disabled" HorizontalScrollBarVisibility="Disabled" Padding="8">
