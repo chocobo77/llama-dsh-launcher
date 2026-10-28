@@ -485,6 +485,9 @@ public static partial class LlamaLogRules
 		"(?<!prompt )eval time\\s*=\\s*([\\d.]+)\\s*ms\\s*/\\s*(\\d+)\\s*tokens\\s*" +
 		"\\(\\s*([\\d.]+)\\s*ms per token,\\s*([\\d.]+)\\s*tokens per second\\)");
 	public static readonly Regex TotalSummary = new Regex("total time\\s*=\\s*([\\d.]+)\\s*ms\\s*/\\s*(\\d+)\\s*tokens");
+	public static readonly Regex Mtp = new Regex(
+		"draft acceptance\\s*=\\s*([\\d.]+)\\s*\\(\\s*(\\d+) accepted\\s*/\\s*(\\d+) generated\\),\\s*" +
+		"mean len\\s*=\\s*([\\d.]+)");
 	public static readonly Regex Graphs = new Regex("graphs reused\\s*=\\s*(\\d+)");
 	public static readonly Regex Release = new Regex(
 		"slot\\s+release:\\s+id\\s+(\\d+)\\s*\\|\\s*task\\s+(\\d+)\\s*\\|\\s*" +
@@ -533,6 +536,12 @@ partial class LlamaApiMonitor
 
 	// 启动块
 	public BootInfo Boot { get; } = new();
+
+	// MTP 投机解码接受率(draft acceptance 行, 无投机时 null)
+	public double? MtpAcceptance { get; private set; }
+	public long? MtpAccepted { get; private set; }
+	public long? MtpGenerated { get; private set; }
+	public double? MtpMeanLen { get; private set; }
 
 	// ctx(日志 release 行, slots API 优先合并)
 	public long? LogCtxUsed { get; private set; }
@@ -583,6 +592,9 @@ partial class LlamaApiMonitor
 	/// <summary>llama 重启时重置状态机(等价 _reset_machine)。</summary>
 	public void ResetLogMachine()
 	{
+		MtpAcceptance = MtpAccepted = null;
+		MtpGenerated = null;
+		MtpMeanLen = null;
 		Phase = "idle";
 		LogTaskId = null;
 		LogNDecoded = 0;
@@ -673,6 +685,15 @@ partial class LlamaApiMonitor
 		{
 			_totalMs = F(m.Groups[1].Value) ?? 0;
 			_totalTokens = I(m.Groups[2].Value);
+			return;
+		}
+		m = LlamaLogRules.Mtp.Match(msg);
+		if (m.Success)
+		{
+			MtpAcceptance = F(m.Groups[1].Value);
+			MtpAccepted = (long)I(m.Groups[2].Value);
+			MtpGenerated = (long)I(m.Groups[3].Value);
+			MtpMeanLen = F(m.Groups[4].Value);
 			return;
 		}
 		if (LlamaLogRules.Graphs.IsMatch(msg))

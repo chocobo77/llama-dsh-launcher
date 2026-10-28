@@ -16,6 +16,11 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using Color = System.Windows.Media.Color;
+using Point = System.Windows.Point;
+using FontFamily = System.Windows.Media.FontFamily;
+using HorizontalAlignment = System.Windows.HorizontalAlignment;
+using UniformGrid = System.Windows.Controls.Primitives.UniformGrid;
 using System.Windows.Controls;
 using System.Windows.Forms;
 using System.Windows.Markup;
@@ -5713,6 +5718,36 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				LogError(ex2c, "物理内存统计初始化失败");
 			}
+			try
+			{
+				var cat = new PerformanceCounterCategory("Processor");
+				var inst = cat.GetInstanceNames().Where(x => x != "_Total").OrderBy(x => int.TryParse(x, out var n) ? n : int.MaxValue).ToArray();
+				_coreCounters = inst.Select(x => new PerformanceCounter("Processor", "% Processor Time", x)).ToArray();
+				foreach (var c in _coreCounters)
+				{
+					c.NextValue();
+				}
+			}
+			catch (Exception exCore)
+			{
+				LogError(exCore, "每核 CPU 计数器初始化失败");
+			}
+			try
+			{
+				var catNet = new PerformanceCounterCategory("Network Interface");
+				_netCounters = catNet.GetInstanceNames()
+					.Select(name => (name, rx: new PerformanceCounter("Network Interface", "Bytes Received/sec", name), tx: new PerformanceCounter("Network Interface", "Bytes Sent/sec", name)))
+					.ToList();
+				foreach (var (_, rx, tx) in _netCounters)
+				{
+					rx.NextValue();
+					tx.NextValue();
+				}
+			}
+			catch (Exception exNet)
+			{
+				LogError(exNet, "网卡计数器初始化失败");
+			}
 			_llamaApi = new LlamaApiMonitor(() =>
 			{
 				try
@@ -5782,7 +5817,34 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					{
 						LogError(exLp, "llama /slots 采集异常");
 					}
-				// 每拍查询(NVML 为进程内直采, 开销极低): 2 倍频会让温度/功率卡在半数拍上显示无数据
+					try
+					{
+						if (_coreCounters != null && _coreCounters.Length > 0)
+						{
+							_corePcts = _coreCounters.Select(c => Math.Max(0.0, Math.Min(100.0, c.NextValue()))).ToArray();
+						}
+					}
+					catch
+					{
+					}
+					try
+					{
+						var rows = new List<(string, double, double)>();
+						double rxSum = 0;
+						foreach (var (name, rx, tx) in _netCounters)
+						{
+							double r = Math.Max(0.0, rx.NextValue()) / 1048576.0;
+							double t = Math.Max(0.0, tx.NextValue()) / 1048576.0;
+							rows.Add((name, r, t));
+							rxSum += r;
+						}
+						_netSamples = rows;
+						_netRxMbs = rxSum;
+					}
+					catch
+					{
+					}
+					// 每拍查询(NVML 为进程内直采, 开销极低): 2 倍频会让温度/功率卡在半数拍上显示无数据
 					foreach (KeyValuePair<string, string> item in _gpuMonitor.QueryGpu())
 					{
 						d[item.Key] = item.Value;
@@ -5895,14 +5957,21 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private readonly Hist _hCpu = new();
 	private readonly Hist _hRam = new();
-	private readonly Hist _hGpu = new();
-	private readonly Hist _hVram = new();
 	private readonly Hist _hTemp = new();
 	private readonly Hist _hPower = new();
-	private readonly Hist _hPcie = new();
-	private readonly Hist _hDisk = new();
 	private readonly Hist _hTps = new();
 	private readonly Hist _hPf = new();
+	private readonly Hist _hCtx = new();
+	private readonly Hist _hMtp = new();
+	private readonly Hist _hGpuUtil = new();
+	private readonly Hist _hGpuMem = new();
+	private readonly Hist _hNet = new();
+
+	// 每核 CPU 与网卡采样(perf 线程写, UI 读)
+	private PerformanceCounter[]? _coreCounters;
+	private double[] _corePcts = Array.Empty<double>();
+	private List<(string name, double rx, double tx)> _netSamples = new();
+	private double _netRxMbs;
 
 	// Strata dark tokens: accent/info/warn/danger
 	private static readonly System.Windows.Media.Color ToneAccent = System.Windows.Media.Color.FromRgb(0x34, 0xd3, 0x99);
@@ -5923,6 +5992,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private PerformanceCounter? _diskWriteCounter;
 	private PerformanceCounter? _ramAvailCounter;
 	private double _ramTotalBytes;
+	private List<(string name, PerformanceCounter rx, PerformanceCounter tx)> _netCounters = new();
 
 
 	// 追加采样点并重绘 spark(与 SparkChart 同规格)
@@ -6086,7 +6156,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			MonPhaseDetail.Text = rightText;
 			MonPhaseLabel.ToolTip = leftText;
 		}
-		UpdateSlotsCard(slots, llamaUp);
+		BuildSlotCards(slots, llamaUp);
 		UpdateModelInfoCard(api);
 		UpdateEventFeed(api);
 	}
@@ -6147,48 +6217,17 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	}
 
 	// Slot 表(llama-lens SlotTable)
-	private void UpdateSlotsCard(List<LlamaApiMonitor.SlotInfo> slots, bool llamaUp)
+	private static string FmtTok(double n)
 	{
-		if (!llamaUp)
+		if (n >= 1000000.0)
 		{
-			MonSlotList.ItemsSource = null;
-			MonSlotSummary.Text = "";
-			return;
+			return (n / 1000000.0).ToString("0.#") + "M";
 		}
-		var rows = new List<object>();
-		foreach (var x in slots)
+		if (n >= 1000.0)
 		{
-			string state = x.Processing ? "处理中" : "空闲";
-			var stateColor = x.Processing ? System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80) : System.Windows.Media.Color.FromRgb(0x8e, 0x97, 0x9f);
-			double pct = x.CtxPct ?? 0.0;
-			var ctxColor = pct >= 90 ? System.Windows.Media.Color.FromRgb(0xff, 0x5a, 0x6e) : pct >= 70 ? System.Windows.Media.Color.FromRgb(0xf5, 0xb5, 0x3d) : System.Windows.Media.Color.FromRgb(0x34, 0xd3, 0x99);
-			rows.Add(new
-			{
-				x.Id,
-				State = state,
-				StateColor = new SolidColorBrush(stateColor),
-				Task = x.TaskId.HasValue ? "#" + x.TaskId : "—",
-				Prompt = FmtTok(x.NPromptTokens),
-				ProcCache = $"{FmtTok(x.NPromptProcessed)} / {FmtTok(x.NPromptCache)}",
-				Decoded = FmtTok(x.NDecoded),
-				CtxText = x.NCtx > 0 ? $"{FmtTok(x.CtxUsed)} / {FmtTok(x.NCtx)} ({pct:F0}%)" : "—",
-				CtxBarW = Math.Max(1.0, pct / 100.0 * 110.0),
-				CtxColor = new SolidColorBrush(ctxColor),
-				Gen = x.GenSpeed > 0 ? FT(x.GenSpeed) : "—",
-				Pf = x.PromptSpeed > 0 ? FT(x.PromptSpeed) : "—",
-				Spec = x.Speculative ? "✓" : "—",
-			});
+			return (n / 1000.0).ToString("0.#") + "K";
 		}
-		MonSlotList.ItemsSource = rows;
-		int proc = 0;
-		foreach (var x in slots)
-		{
-			if (x.Processing)
-			{
-				proc++;
-			}
-		}
-		MonSlotSummary.Text = $"{slots.Count} 槽 · {proc} 处理中";
+		return ((long)n).ToString();
 	}
 
 	// 模型信息卡(llama-lens ModelInfoCard)
@@ -6225,7 +6264,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		MiModal.Text = mods.Count > 0 ? string.Join(" · ", mods) : "—";
 	}
 
-	// 事件流(llama-lens EventFeed): 时间 + 级别 + 消息
+	// 事件流(llama-lens EventFeed)
 	private void UpdateEventFeed(LlamaApiMonitor? api)
 	{
 		if (api == null)
@@ -6243,10 +6282,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		for (int i = evs.Count - 1; i >= 0; i--)
 		{
 			var e = evs[i];
-			var color = e.Level == "error" ? System.Windows.Media.Color.FromRgb(0xff, 0x8a, 0x98)
-				: e.Level == "warn" ? System.Windows.Media.Color.FromRgb(0xf8, 0xc9, 0x6a)
-				: e.Level == "ok" ? System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80)
-				: System.Windows.Media.Color.FromRgb(0x8e, 0x97, 0x9f);
+			var color = e.Level == "error" ? Color.FromRgb(0xff, 0x8a, 0x98)
+				: e.Level == "warn" ? Color.FromRgb(0xf8, 0xc9, 0x6a)
+				: e.Level == "ok" ? Color.FromRgb(0x4a, 0xde, 0x80)
+				: Color.FromRgb(0x8e, 0x97, 0x9f);
 			list.Add(new
 			{
 				Line = $"{e.Ts:HH:mm:ss}  {e.Msg}",
@@ -6258,27 +6297,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private int _eventFeedCount;
 
-	private static string FmtTok(double n)
+	// Slot 卡片(顶层版本, OnPerf 内另有同名局部函数, 供 UpdatePhaseCard 调用)
+	private void BuildSlotCards(List<LlamaApiMonitor.SlotInfo> slots, bool llamaUp)
 	{
-		if (n >= 1000000.0)
+		SlotCardsHost.Children.Clear();
+		if (!llamaUp || slots.Count == 0)
 		{
-			return (n / 1000000.0).ToString("0.#") + "M";
+			SlotCardsHost.Children.Clear();
+			return;
 		}
-		if (n >= 1000.0)
-		{
-			return (n / 1000.0).ToString("0.#") + "K";
-		}
-		return ((long)n).ToString();
-	}
-
-	// llama 启动时清空监测卡历史(曲线由 llama-lens 状态机驱动)
-	private void ResetMonitorCards()
-	{
-		foreach (Hist h in new[] { _hCpu, _hRam, _hGpu, _hVram, _hTemp, _hPower, _hPcie, _hDisk, _hTps, _hPf })
-		{
-			h.Clear();
-		}
-		_llamaApi?.ResetLogMachine();
 	}
 
 	// 保存监测页快照(Strata Save Monitor screenshot): 渲染面板为 PNG
@@ -6329,164 +6356,435 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		bool prompting = api != null && api.Online && api.Phase == "prompt_processing";
 		double decNow = _hTps.Last();
 		double pfNow = _hPf.Last();
-		PerfTps.Text = decoding && !double.IsNaN(decNow) ? FT(decNow) : (api?.LastTask?.GenSpeed is double lg && lg > 0 ? FT(lg) : "—");
-		SpdDecSub.Text = decoding ? "解码 · 现在" : (api?.LastTask != null ? "解码 · 上次请求" : "解码");
-		PerfPrefill.Text = prompting && !double.IsNaN(pfNow) ? FT(pfNow) : (api?.LastPrefillSpeed is double lp && lp > 0 ? FT(lp) : "—");
-		SpdPfSub.Text = prompting ? "预填充 · 现在" : (api?.LastPrefillSpeed != null ? "预填充 · 上次请求" : "预填充");
-		SetBadge(BdgTps, !double.IsNaN(decNow) || !double.IsNaN(pfNow));
-		SparkSpeed.SetSeries(_hTps.Arr(), _hPf.Arr(), double.NaN, "t/s", _hTps.Stamps(), ToneAccent, ToneAccent2, "解码", "预填充");
-		// ── GPU 负载: 多卡均值, 副行标明设备 ──
-		if (d.TryGetValue("gpu_util", out string vGu) && double.TryParse(vGu, NumberStyles.Float, CultureInfo.InvariantCulture, out var vGpu))
+		var slotsNow = api?.SlotsSnapshot() ?? new List<LlamaApiMonitor.SlotInfo>();
+		var actSlot = slotsNow.FirstOrDefault(x => x.Processing);
+
+		// ctx 合并(slots API 优先, release/启动块兜底)
+		long ctxUsed = api != null && api.CtxUsed >= 0 ? api.CtxUsed : api?.LogCtxUsed ?? -1;
+		long ctxTotal = api?.CtxTotal ?? 0;
+		if (ctxTotal <= 0)
 		{
-			vGpu = Math.Min(100.0, Math.Max(0.0, vGpu));
-			PerfGpu.Text = vGpu.ToString("F0");
-			GpuSub.Text = _gpuCount > 1 ? $"{_gpuCount} GPUs · 均值利用率" : _gpuName;
-			SetBadge(BdgGpu, true);
-			PushChart(SparkGpu, _hGpu, vGpu, 100.0, "%", ToneAccent);
-		}
-		// ── 显存: 单位随总量, 曲线上限=总量 ──
-		if (d.TryGetValue("vram_used", out string vVu) && d.TryGetValue("vram_total", out string vVt)
-			&& double.TryParse(vVu, NumberStyles.Float, CultureInfo.InvariantCulture, out var vUsed)
-			&& double.TryParse(vVt, NumberStyles.Float, CultureInfo.InvariantCulture, out var vTotal))
-		{
-			double gU = vUsed / 1073741824.0;
-			double gT = vTotal / 1073741824.0;
-			PerfVram.Text = gU.ToString("F1");
-			VramUnit.Text = gT > 0.0 ? $"/ {gT:F0} GB" : "GB";
-			MonVramSub.Text = _gpuCount > 1 ? "多卡合计" : "GPU 显存";
-			SetBadge(BdgVram, gT > 0.0);
-			PushChart(SparkVram, _hVram, gU, gT > 0.0 ? gT : double.NaN, "GB", ToneAccent);
-		}
-		else if (d.TryGetValue("vram_total", out string vTo) && double.TryParse(vTo, NumberStyles.Float, CultureInfo.InvariantCulture, out var vTo2))
-		{
-			double gT = vTo2 / 1073741824.0;
-			PerfVram.Text = gT.ToString("F0");
-			VramUnit.Text = "GB";
-			MonVramSub.Text = "总量";
-			SetBadge(BdgVram, true);
-		}
-		// ── GPU 温度: 多卡取最热, 曲线上限 90 tone warn ──
-		if (d.TryGetValue("gpu_temp", out string vGt) && double.TryParse(vGt, NumberStyles.Float, CultureInfo.InvariantCulture, out var vTemp) && vTemp > 0.0 && vTemp < 150.0)
-		{
-			PerfGpuTemp.Text = vTemp.ToString("F0");
-			TempSub.Text = _gpuCount > 1 ? "最热 GPU" : _gpuName;
-			SetBadge(BdgTemp, true);
-			PushChart(SparkTemp, _hTemp, vTemp, 90.0, "°C", ToneWarn);
-		}
-		else
-		{
-			PerfGpuTemp.Text = "—";
-			SetBadge(BdgTemp, false);
-		}
-		// ── 功率: 副行功耗上限, 曲线上限=上限 ──
-		if (d.TryGetValue("power_w", out string vPw) && double.TryParse(vPw, NumberStyles.Float, CultureInfo.InvariantCulture, out var vP) && vP > 0.0)
-		{
-			MonPower.Text = vP >= 100.0 ? vP.ToString("F0") : vP.ToString("F1");
-			double? limit = d.TryGetValue("power_limit_w", out string vLim) && double.TryParse(vLim, NumberStyles.Float, CultureInfo.InvariantCulture, out var vL) && vL > 0.0 ? vL : null;
-			MonPowerSub.Text = limit.HasValue ? $"上限 {limit.Value:F0} W" : "GPU 功率";
-			SetBadge(BdgPower, true);
-			PushChart(SparkPower, _hPower, vP, limit ?? double.NaN, "W", ToneAccent);
-		}
-		else
-		{
-			SetBadge(BdgPower, false);
-		}
-		// ── PCIe: 单卡值=Gen×宽度副行吞吐; 多卡值=合计吞吐 ──
-		double rxMbs = 0.0;
-		if (d.TryGetValue("pcie_rx_kbs", out string vRx) && double.TryParse(vRx, NumberStyles.Float, CultureInfo.InvariantCulture, out var vRxK))
-		{
-			rxMbs = vRxK / 1024.0;
-		}
-		if (d.TryGetValue("pcie_gen", out string vGen))
-		{
-			if (_gpuCount > 1 && rxMbs > 0.0)
+			long bt = api?.Boot?.NCtxSlot ?? 0;
+			if (bt > 0)
 			{
-				MonPcie.Text = rxMbs.ToString("F1");
-				PcieUnit.Text = "MB/s";
-				MonPcieSub.Text = "多卡合计传输";
+				ctxTotal = bt;
 			}
-			else
+		}
+		_hCtx.Push(ctxUsed >= 0 ? ctxUsed : null);
+		_hMtp.Push(api?.MtpAcceptance);
+
+		// ── 摘要条 ──
+		StripGenVal.Text = decoding && api.Tg3sTps is double sg ? sg.ToString("0.#") : !double.IsNaN(decNow) ? decNow.ToString("0.#") : "—";
+		StripPfVal.Text = prompting && api.LogPromptSpeed is double sp ? sp.ToString("0.#") : !double.IsNaN(pfNow) ? pfNow.ToString("0.#") : "—";
+		StripCtxVal.Text = ctxUsed >= 0 ? FmtTok(ctxUsed) : "—";
+		StripGpuVal.Text = "—";
+		StripMemVal.Text = "—";
+		StripTempVal.Text = "—";
+		StripPowerVal.Text = "—";
+
+		// ── BarCard 生成速度 ──
+		GenVal.Text = decoding && api.Tg3sTps is double gt3 ? FT(gt3)
+			: api?.LastTask?.GenSpeed is double lg ? FT(lg)
+			: !double.IsNaN(decNow) ? FT(decNow) : "—";
+		GenSub.Text = decoding ? "decoding" : "";
+		if (decoding && actSlot != null && actSlot.NRemain > 0 && GenBar.ActualWidth > 0)
+		{
+			double gp = Math.Min(100.0, actSlot.NDecoded * 100.0 / (actSlot.NDecoded + actSlot.NRemain));
+			GenBarFill.Width = gp / 100.0 * GenBar.ActualWidth;
+			GenBarMax.Text = FmtTok(actSlot.NDecoded + actSlot.NRemain);
+		}
+		else
+		{
+			GenBarFill.Width = 0;
+			GenBarMax.Text = "";
+		}
+		GenFoot.Text = api != null && (api.TgTps.HasValue || api.Tg3sTps.HasValue)
+			? $"tg {api.TgTps:0.##} · tg3 {api.Tg3sTps:0.##} tok/s"
+			: api != null && api.Online ? "来源 /slots 差分" : "";
+		GenSpark.SetSeries(_hTps.Arr(), null, double.NaN, "t/s", _hTps.Stamps(), ToneInfo, ToneAccent2, "", "");
+
+		// ── BarCard 预填充速度 ──
+		PfVal.Text = prompting && api.LogPromptSpeed is double lps ? FT(lps)
+			: api?.LastPrefillSpeed is double lpf ? FT(lpf)
+			: !double.IsNaN(pfNow) ? FT(pfNow) : "—";
+		PfSub.Text = prompting ? "prefilling" : "";
+		if (prompting && api.PromptProgress is double pp && PfBar.ActualWidth > 0)
+		{
+			PfBarFill.Width = Math.Min(100.0, pp * 100.0) / 100.0 * PfBar.ActualWidth;
+			PfBarMax.Text = api.PromptTotalTokens is long pt ? FmtTok(pt) : "";
+		}
+		else
+		{
+			PfBarFill.Width = 0;
+			PfBarMax.Text = "";
+		}
+		PfFoot.Text = prompting ? $"已耗时 {api.PromptElapsedS:F1}s · 总量 {(api.PromptTotalTokens.HasValue ? FmtTok(api.PromptTotalTokens.Value) : "—")} tok"
+			: api?.LastPrefillSpeed is double lpf2 ? $"上次预填充 {FT(lpf2)} tok/s" : "";
+		PfSpark.SetSeries(_hPf.Arr(), null, double.NaN, "t/s", _hPf.Stamps(), ToneAccent, ToneAccent2, "", "");
+
+		// ── BarCard 上下文占用 ──
+		if (ctxUsed >= 0 && ctxTotal > 0)
+		{
+			double pct = Math.Min(100.0, ctxUsed * 100.0 / ctxTotal);
+			CtxVal.Text = FmtTok(ctxUsed);
+			CtxMax.Text = FmtTok(ctxTotal);
+			CtxBadge.Visibility = pct >= 90 ? Visibility.Visible : Visibility.Collapsed;
+			if (CtxBar.ActualWidth > 0)
 			{
-				MonPcie.Text = $"Gen{vGen}";
-				PcieUnit.Text = d.TryGetValue("pcie_width", out string vWid) ? $"×{vWid}" : "";
-				MonPcieSub.Text = rxMbs > 0.0 ? $"到 GPU {rxMbs:F1} MB/s" : "传输速率不可用";
+				CtxBarFill.Width = pct / 100.0 * CtxBar.ActualWidth;
 			}
-			SetBadge(BdgPcie, true);
-			PushChart(SparkPcie, _hPcie, rxMbs > 0.0 ? rxMbs : null, double.NaN, "MB/s", ToneInfo);
+			CtxBarFill.Background = new SolidColorBrush(pct >= 90 ? System.Windows.Media.Color.FromRgb(0xff, 0x5a, 0x6e) : pct >= 70 ? System.Windows.Media.Color.FromRgb(0xf5, 0xb5, 0x3d) : ToneAccent);
+			CtxSub.Text = $"{pct:F1}% · 剩余 {FmtTok(Math.Max(0, ctxTotal - ctxUsed))} tokens";
 		}
 		else
 		{
-			SetBadge(BdgPcie, false);
+			CtxVal.Text = "—";
+			CtxMax.Text = "—";
+			CtxBadge.Visibility = Visibility.Collapsed;
+			CtxBarFill.Width = 0;
+			CtxSub.Text = "无请求记录";
 		}
-		// ── CPU: 副行型号+核线拓扑 ──
-		if (d.TryGetValue("cpu", out string vCpu) && double.TryParse(vCpu, out var vC))
+		CtxSpark.SetSeries(_hCtx.Arr(), null, ctxTotal > 0 ? ctxTotal : double.NaN, "tok", _hCtx.Stamps(), ToneWarn, ToneAccent2, "", "");
+
+		// ── MTP 接受率 Gauge ──
+		if (api?.MtpAcceptance is double acc)
 		{
-			PerfCpu.Text = vC.ToString("F0");
-			CpuSub.Text = _cpuName;
-			SetBadge(BdgCpu, true);
-			PushChart(SparkCpu, _hCpu, vC, 100.0, "%", ToneAccent);
-		}
-		// ── 磁盘读取: ≥1 GB/s 用 GB/s 否则 MB/s, 副行写 ──
-		if (d.TryGetValue("disk_read", out string vDr) && double.TryParse(vDr, NumberStyles.Float, CultureInfo.InvariantCulture, out var vD) && vD > 0.0)
-		{
-			double mbs = vD / 1048576.0;
-			MonDisk.Text = mbs >= 1024.0 ? (mbs / 1024.0).ToString("F1") : mbs.ToString("F1");
-			DiskUnit.Text = mbs >= 1024.0 ? "GB/s" : "MB/s";
-			MonDiskSub.Text = d.TryGetValue("disk_write", out string vDw) && double.TryParse(vDw, NumberStyles.Float, CultureInfo.InvariantCulture, out var vDw2) && vDw2 > 0.0
-				? $"写 {vDw2 / 1048576.0:F1} MB/s" : "读吞吐";
-			SetBadge(BdgDisk, true);
-			PushChart(SparkDisk, _hDisk, mbs, double.NaN, "MB/s", ToneInfo);
+			MtpRing.StrokeDashArray = new System.Windows.Media.DoubleCollection { Math.Max(0.02, 24.74 * acc), 100.0 };
+			MtpRing.Opacity = 1.0;
+			MtpVal.Text = $"{acc * 100.0:F1}%";
+			MtpSub.Text = $"{api.MtpAccepted} / {api.MtpGenerated} · mean {api.MtpMeanLen:0.##}";
 		}
 		else
 		{
-			SetBadge(BdgDisk, false);
+			MtpRing.Opacity = 0.0;
+			MtpVal.Text = "—";
+			MtpSub.Text = "启用投机解码后显示";
 		}
-		// ── 读数条: 风扇/频率/CPU 温度 ──
-		if (d.TryGetValue("fan_pct", out string vFn) && double.TryParse(vFn, NumberStyles.Float, CultureInfo.InvariantCulture, out var vF) && vF >= 0.0)
+		MtpSpark.SetSeries(_hMtp.Arr(), null, 100.0, "%", _hMtp.Stamps(), ToneInfo, ToneAccent2, "", "");
+
+		// ── GPU 每卡 + 聚合 ──
+		var gpus = NvmlMonitor.SamplePerDevice();
+		if (gpus.Count > 0)
 		{
-			MonFan.Text = $"{vF:F0} %";
-			StripFan.Visibility = Visibility.Visible;
+			StripGpuVal.Text = gpus.Average(x => x.Util).ToString("F0");
+			StripMemVal.Text = (gpus.Sum(x => x.MemUsedMb) / 1024.0).ToString("F1");
+			StripMemUnit.Text = "GB";
+			StripTempVal.Text = gpus.Max(x => x.Temp).ToString("F0");
+			StripPowerVal.Text = gpus.Sum(x => x.Power).ToString("F0");
+			_hGpuUtil.Push(gpus.Average(x => x.Util));
+			_hGpuMem.Push(gpus.Sum(x => x.MemUsedMb) / 1024.0);
+			_hTemp.Push(gpus.Max(x => x.Temp));
+			_hPower.Push(gpus.Sum(x => x.Power));
 		}
 		else
 		{
-			StripFan.Visibility = Visibility.Collapsed;
+			_hGpuUtil.Push(null);
+			_hGpuMem.Push(null);
+			_hTemp.Push(null);
+			_hPower.Push(null);
 		}
-		if (d.TryGetValue("clock_mhz", out string vCm) && double.TryParse(vCm, NumberStyles.Float, CultureInfo.InvariantCulture, out var vCk) && vCk > 0.0)
+		BuildGpuPanels(gpus);
+
+		// ── 系统资源 ──
+		if (d.TryGetValue("cpu", out string vCpu) && double.TryParse(vCpu, out var cpuPct))
 		{
-			MonClock.Text = $"{vCk:F0} MHz";
-			StripClock.Visibility = Visibility.Visible;
+			_hCpu.Push(cpuPct);
 		}
-		else
-		{
-			StripClock.Visibility = Visibility.Collapsed;
-		}
-		if (d.TryGetValue("cpu_temp", out string vCt) && double.TryParse(vCt, NumberStyles.Float, CultureInfo.InvariantCulture, out var vCt2) && vCt2 > 0.0)
-		{
-			MonCpuTemp.Text = $"{vCt2:F0} °C";
-			MonCpuTemp.ToolTip = (d.TryGetValue("cpu_temp_src", out string vSrc) && vSrc == "acpi") ? "ACPI 热区(非核心精确值)" : null;
-			StripCpuTemp.Visibility = Visibility.Visible;
-		}
-		else
-		{
-			// Strata Windows 语义: 读不到的 CPU 温度整行不显示(无免管理员可信来源)
-			StripCpuTemp.Visibility = Visibility.Collapsed;
-		}
-		// ── 系统内存卡(同显存卡样式) ──
+		double ramUsedGb = double.NaN, ramTotalGb = double.NaN;
 		if (d.TryGetValue("ram_used", out string vRu) && d.TryGetValue("ram_total", out string vRt) && double.TryParse(vRu, NumberStyles.Float, CultureInfo.InvariantCulture, out var vRu2) && double.TryParse(vRt, NumberStyles.Float, CultureInfo.InvariantCulture, out var vRt2) && vRt2 > 0.0)
 		{
-			double gRamU = vRu2 / 1073741824.0;
-			double gRamT = vRt2 / 1073741824.0;
-			PerfRam.Text = gRamU.ToString("F1");
-			RamUnit.Text = $"/ {gRamT:F0} GB";
-			MonRamSub.Text = $"已用 {gRamU / gRamT * 100.0:F0}%";
-			SetBadge(BdgRam, true);
-			PushChart(SparkRam, _hRam, gRamU, gRamT, "GB", ToneAccent);
+			ramUsedGb = vRu2 / 1073741824.0;
+			ramTotalGb = vRt2 / 1073741824.0;
+			_hRam.Push(ramUsedGb);
 		}
 		else
 		{
-			SetBadge(BdgRam, false);
+			_hRam.Push(null);
 		}
+		_hNet.Push(_netRxMbs > 0 ? _netRxMbs : null);
+		BuildSysPanels(d, ramUsedGb, ramTotalGb);
+
+		// ── 模型与 Slot ──
+		BuildSlotCards(slotsNow, llamaUp: IsAlive(_llamaProc));
+
+		// ── 历史趋势 ──
+		UpdateTrends();
 		UpdatePhaseCard();
+
+		// ============ 构建器: GPU 每卡面板(llama-lens GpuPanel) ============
+		void BuildGpuPanels(List<GpuDevInfo> gpus)
+		{
+			GpuPanelsHost.Children.Clear();
+			if (gpus.Count == 0)
+			{
+				GpuPanelsHost.Children.Add(new TextBlock { Text = "▣ 数据不可用（需要 NVIDIA 驱动 NVML）", Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontSize = 12, Margin = new Thickness(4, 2, 0, 2) });
+				return;
+			}
+			foreach (var g in gpus)
+			{
+				var card = new Border
+				{
+					Background = new SolidColorBrush(Color.FromRgb(0x16, 0x1a, 0x1d)),
+					BorderBrush = new SolidColorBrush(Color.FromRgb(0x2a, 0x30, 0x36)),
+					BorderThickness = new Thickness(1),
+					CornerRadius = new CornerRadius(10),
+					Padding = new Thickness(14, 10, 14, 12),
+					Margin = new Thickness(0, 0, 0, 8),
+				};
+				var root = new StackPanel();
+				root.Children.Add(new TextBlock
+				{
+					Text = $"GPU{g.Index} · {(string.IsNullOrEmpty(g.Name) ? "NVIDIA GPU" : g.Name)}",
+					Foreground = new SolidColorBrush(Color.FromRgb(0xee, 0xf1, 0xf3)),
+					FontSize = 13,
+					FontWeight = FontWeights.Bold,
+				});
+				var body = new Grid { Margin = new Thickness(0, 8, 0, 0) };
+				body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(120) });
+				body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+				// 环形利用率
+				var ringWrap = new Grid { Width = 104, Height = 104, VerticalAlignment = VerticalAlignment.Center };
+				const double utilArc = 30.04; // 270° of r=42 圈(=104 边长 stroke8), WPF dash 单位=×8
+				ringWrap.Children.Add(new System.Windows.Shapes.Ellipse { Stroke = new SolidColorBrush(Color.FromRgb(0x1d, 0x22, 0x26)), StrokeThickness = 8, StrokeDashCap = PenLineCap.Round, StrokeDashArray = new DoubleCollection { utilArc, 100.0 }, RenderTransformOrigin = new Point(0.5, 0.5) });
+				double frac = Math.Max(0.0, Math.Min(1.0, g.Util / 100.0));
+				var utilColor = g.Util >= 90 ? Color.FromRgb(0xff, 0x5a, 0x6e) : g.Util >= 70 ? Color.FromRgb(0xf5, 0xb5, 0x3d) : Color.FromRgb(0x34, 0xd3, 0x99);
+				ringWrap.Children.Add(new System.Windows.Shapes.Ellipse { Stroke = new SolidColorBrush(utilColor), StrokeThickness = 8, StrokeDashCap = PenLineCap.Round, StrokeDashArray = new DoubleCollection { Math.Max(0.02, utilArc * frac), 100.0 }, RenderTransformOrigin = new Point(0.5, 0.5) });
+				var ringLabel = new StackPanel { VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center };
+				ringLabel.Children.Add(new TextBlock { Text = $"{g.Util:F0}", FontSize = 20, FontWeight = FontWeights.Bold, FontFamily = new FontFamily("Consolas"), Foreground = new SolidColorBrush(Color.FromRgb(0xee, 0xf1, 0xf3)), HorizontalAlignment = HorizontalAlignment.Center });
+				ringLabel.Children.Add(new TextBlock { Text = "利用率", FontSize = 9, Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), HorizontalAlignment = HorizontalAlignment.Center });
+				ringWrap.Children.Add(ringLabel);
+				Grid.SetColumn(ringWrap, 0);
+				body.Children.Add(ringWrap);
+				// 右列: 显存条 + kv
+				var right = new StackPanel { Margin = new Thickness(14, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
+				double memPct = g.MemTotalMb > 0 ? g.MemUsedMb / g.MemTotalMb * 100.0 : 0;
+				right.Children.Add(new TextBlock
+				{
+					Text = $"显存 {g.MemUsedMb:F0} / {g.MemTotalMb:F0} MB ({memPct:F0}%)",
+					FontSize = 11,
+					FontFamily = new FontFamily("Consolas"),
+					Foreground = new SolidColorBrush(memPct >= 90 ? Color.FromRgb(0xff, 0x8a, 0x98) : Color.FromRgb(0x8e, 0x97, 0x9f)),
+				});
+				var memBar = new Grid { Height = 5, Margin = new Thickness(0, 3, 0, 8), Background = new SolidColorBrush(Color.FromRgb(0x1d, 0x22, 0x26)) };
+				memBar.Children.Add(new Border { HorizontalAlignment = HorizontalAlignment.Left, Width = Math.Max(0, memPct / 100.0 * (right.ActualWidth > 0 ? right.ActualWidth : 320)), Background = new SolidColorBrush(memPct >= 90 ? Color.FromRgb(0xff, 0x5a, 0x6e) : memPct >= 70 ? Color.FromRgb(0xf5, 0xb5, 0x3d) : Color.FromRgb(0x34, 0xd3, 0x99)), CornerRadius = new CornerRadius(2) });
+				right.Children.Add(memBar);
+				var grid3 = new UniformGrid { Columns = 3 };
+				void Kv(string k, string v, System.Windows.Media.Color? c = null)
+				{
+					var sp = new StackPanel { Margin = new Thickness(0, 3, 10, 3) };
+					sp.Children.Add(new TextBlock { Text = k, FontSize = 10, Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)) });
+					sp.Children.Add(new TextBlock { Text = v, FontSize = 12, FontFamily = new FontFamily("Consolas"), Foreground = new SolidColorBrush(c ?? Color.FromRgb(0xc7, 0xcd, 0xd3)) });
+					grid3.Children.Add(sp);
+				}
+				Kv("温度", $"{g.Temp:F0}°C", g.Temp >= 85 ? Color.FromRgb(0xff, 0x8a, 0x98) : null);
+				Kv("功耗", $"{g.Power:F0} / {g.Limit:F0} W");
+				Kv("风扇", $"{g.Fan:F0}%");
+				Kv("频率", $"{g.Clock:F0} MHz");
+				Kv("PCIe", g.Gen.HasValue ? $"gen{g.Gen} x{g.Width ?? 0}" : "—");
+				Kv("P-State", string.IsNullOrEmpty(g.Pstate) ? "—" : g.Pstate);
+				Kv("驱动", string.IsNullOrEmpty(g.Driver) ? "—" : g.Driver);
+				Kv("显存利用率", $"{memPct:F0}%");
+				Kv("卡序", $"{g.Index + 1}/{gpus.Count}");
+				right.Children.Add(grid3);
+				Grid.SetColumn(right, 1);
+				body.Children.Add(right);
+				root.Children.Add(body);
+				card.Child = root;
+				GpuPanelsHost.Children.Add(card);
+			}
+		}
+
+		// ============ 系统面板(CPU 每核/内存/磁盘/网络, llama-lens Cpu/Mem/Disk/NetPanel) ============
+		void BuildSysPanels(Dictionary<string, string> d, double ramUsedGb, double ramTotalGb)
+		{
+			// CPU
+			if (d.TryGetValue("cpu", out string vCpu) && double.TryParse(vCpu, out var cpuPct))
+			{
+				CpuBigVal.Text = cpuPct.ToString("F0");
+				CpuBigVal.Foreground = new SolidColorBrush(cpuPct >= 90 ? Color.FromRgb(0xff, 0x8a, 0x98) : cpuPct >= 70 ? Color.FromRgb(0xf8, 0xc9, 0x6a) : Color.FromRgb(0xee, 0xf1, 0xf3));
+			}
+			CpuHeadSub.Text = _cpuName;
+			CpuCoresHost.Children.Clear();
+			if (_corePcts.Length > 0)
+			{
+				bool dense = _corePcts.Length > 16;
+				for (int i = 0; i < _corePcts.Length; i++)
+				{
+					double v = _corePcts[i];
+					var col = v >= 90 ? Color.FromRgb(0xff, 0x5a, 0x6e) : v >= 70 ? Color.FromRgb(0xf5, 0xb5, 0x3d) : Color.FromRgb(0x34, 0xd3, 0x99);
+					var coreWrap = new StackPanel { Margin = new Thickness(1, 0, 1, 0), VerticalAlignment = VerticalAlignment.Bottom };
+					var barGrid = new Grid { Height = 46, VerticalAlignment = VerticalAlignment.Bottom, Background = new SolidColorBrush(Color.FromRgb(0x1d, 0x22, 0x26)) };
+					barGrid.Children.Add(new Border { VerticalAlignment = VerticalAlignment.Bottom, Height = Math.Max(1, v / 100.0 * 46), Background = new SolidColorBrush(col) });
+					coreWrap.Children.Add(barGrid);
+					if (!dense)
+					{
+						coreWrap.Children.Add(new TextBlock { Text = i.ToString(), FontSize = 8, Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 1, 0, 0) });
+					}
+					CpuCoresHost.Children.Add(coreWrap);
+				}
+			}
+			// 内存
+			if (!double.IsNaN(ramTotalGb) && ramTotalGb > 0)
+			{
+				double pct = Math.Min(100.0, ramUsedGb / ramTotalGb * 100.0);
+				MemBigVal.Text = pct.ToString("F0");
+				MemHeadSub.Text = $"{ramTotalGb:F1} GB 总量";
+				MemUsedSub.Text = $"{ramUsedGb:F1} / {ramTotalGb:F0} GB";
+				if (MemStackUsed.ActualWidth > 0 || MemStackUsed.Parent is Grid)
+				{
+					MemStackUsed.Width = Math.Max(0, pct / 100.0 * ((MemStackUsed.Parent as Grid)?.ActualWidth ?? 0));
+				}
+				MemStackUsed.Background = new SolidColorBrush(pct >= 90 ? Color.FromRgb(0xff, 0x5a, 0x6e) : pct >= 70 ? Color.FromRgb(0xf5, 0xb5, 0x3d) : Color.FromRgb(0x34, 0xd3, 0x99));
+				MemLegendUsed.Text = $" 已用 {ramUsedGb:F1} GB";
+				MemLegendAvail.Text = $" 可用 {Math.Max(0.0, ramTotalGb - ramUsedGb):F1} GB";
+			}
+			// 磁盘
+			double rd = d.TryGetValue("disk_read", out string vDr2) && double.TryParse(vDr2, NumberStyles.Float, CultureInfo.InvariantCulture, out var vDr3) ? vDr3 / 1048576.0 : 0;
+			double wr = d.TryGetValue("disk_write", out string vDw1) && double.TryParse(vDw1, NumberStyles.Float, CultureInfo.InvariantCulture, out var vDw2) ? vDw2 / 1048576.0 : 0;
+			DiskHeadSub.Text = $"读 {rd:F1} MB/s · 写 {wr:F1} MB/s";
+			DiskRowsHost.Children.Clear();
+			foreach (var drv in System.IO.DriveInfo.GetDrives())
+			{
+				try
+				{
+					if (!drv.IsReady || drv.DriveType != System.IO.DriveType.Fixed)
+					{
+						continue;
+					}
+					double total = drv.TotalSize / 1073741824.0;
+					double free = drv.AvailableFreeSpace / 1073741824.0;
+					double used = total - free;
+					double pct = total > 0 ? used / total * 100.0 : 0;
+					var row = new Grid { Margin = new Thickness(0, 2, 0, 2) };
+					row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(46) });
+					row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+					row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
+					DiskRowsHost.Children.Add(row);
+					var name = new TextBlock { Text = drv.Name, FontSize = 11, FontFamily = new FontFamily("Consolas"), Foreground = new SolidColorBrush(Color.FromRgb(0xc7, 0xcd, 0xd3)), VerticalAlignment = VerticalAlignment.Center };
+					Grid.SetColumn(name, 0);
+					row.Children.Add(name);
+					var barWrap = new Grid { Height = 6, Background = new SolidColorBrush(Color.FromRgb(0x1d, 0x22, 0x26)), VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 10, 0) };
+					barWrap.Children.Add(new Border { HorizontalAlignment = HorizontalAlignment.Left, Width = Math.Max(0, pct / 100.0 * 260), Background = new SolidColorBrush(pct >= 90 ? Color.FromRgb(0xff, 0x5a, 0x6e) : pct >= 70 ? Color.FromRgb(0xf5, 0xb5, 0x3d) : Color.FromRgb(0x34, 0xd3, 0x99)), CornerRadius = new CornerRadius(2) });
+					Grid.SetColumn(barWrap, 1);
+					row.Children.Add(barWrap);
+					var txt = new TextBlock { Text = $"{used:F0}G / {total:F0}G ({pct:F0}%)", FontSize = 11, FontFamily = new FontFamily("Consolas"), Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), VerticalAlignment = VerticalAlignment.Center, TextAlignment = TextAlignment.Right };
+					Grid.SetColumn(txt, 2);
+					row.Children.Add(txt);
+				}
+				catch
+				{
+				}
+			}
+			// 网络
+			NetHeadSub.Text = $"{_netSamples.Count} 个网卡";
+			NetRowsHost.Children.Clear();
+			foreach (var (name, rx, tx) in _netSamples.Take(6))
+			{
+				var row = new Grid { Margin = new Thickness(0, 2, 0, 2) };
+				row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+				row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(110) });
+				row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(110) });
+				NetRowsHost.Children.Add(row);
+				var n = new TextBlock { Text = name, FontSize = 11, FontFamily = new FontFamily("Consolas"), Foreground = new SolidColorBrush(Color.FromRgb(0xc7, 0xcd, 0xd3)), TextTrimming = TextTrimming.CharacterEllipsis, VerticalAlignment = VerticalAlignment.Center };
+				Grid.SetColumn(n, 0);
+				row.Children.Add(n);
+				var r = new TextBlock { Text = $"↓ {rx:F2} MB/s", FontSize = 11, FontFamily = new FontFamily("Consolas"), Foreground = new SolidColorBrush(Color.FromRgb(0x7c, 0xd7, 0xf7)), VerticalAlignment = VerticalAlignment.Center, TextAlignment = TextAlignment.Right };
+				Grid.SetColumn(r, 1);
+				row.Children.Add(r);
+				var t = new TextBlock { Text = $"↑ {tx:F2} MB/s", FontSize = 11, FontFamily = new FontFamily("Consolas"), Foreground = new SolidColorBrush(Color.FromRgb(0x4a, 0xde, 0x80)), VerticalAlignment = VerticalAlignment.Center, TextAlignment = TextAlignment.Right };
+				Grid.SetColumn(t, 2);
+				row.Children.Add(t);
+			}
+		}
+
+		// ============ Slot 卡片(llama-lens SlotTable 卡片式) ============
+		void BuildSlotCards(List<LlamaApiMonitor.SlotInfo> slots, bool llamaUp)
+		{
+			SlotCardsHost.Children.Clear();
+			if (!llamaUp || slots.Count == 0)
+			{
+				SlotCardsHost.Children.Add(new TextBlock { Text = "llama 未启动", Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontSize = 12, Margin = new Thickness(0, 2, 0, 2) });
+				MonSlotSummary.Text = "";
+				return;
+			}
+			int proc = 0;
+			foreach (var x in slots)
+			{
+				if (x.Processing)
+				{
+					proc++;
+				}
+				var card = new Border
+				{
+					Background = new SolidColorBrush(Color.FromRgb(0x1d, 0x22, 0x26)),
+					BorderBrush = new SolidColorBrush(Color.FromRgb(0x2a, 0x30, 0x36)),
+					BorderThickness = new Thickness(1),
+					CornerRadius = new CornerRadius(8),
+					Padding = new Thickness(12, 8, 12, 10),
+					Margin = new Thickness(0, 0, 0, 8),
+				};
+				var root = new StackPanel();
+				var head = new DockPanel { LastChildFill = false, Margin = new Thickness(0, 0, 0, 6) };
+				var badge = new Border
+				{
+					Background = new SolidColorBrush(x.Processing ? Color.FromArgb(0x2e, 0x34, 0xd3, 0x99) : Color.FromRgb(0x1a, 0x1a, 0x1a)),
+					CornerRadius = new CornerRadius(999),
+					Padding = new Thickness(10, 2, 10, 2),
+					VerticalAlignment = VerticalAlignment.Center,
+				};
+					badge.Child = new TextBlock { Text = x.Processing ? "处理中" : "空闲", FontSize = 11, Foreground = new SolidColorBrush(x.Processing ? Color.FromRgb(0x4a, 0xde, 0x80) : Color.FromRgb(0x8e, 0x97, 0x9f)) };
+				DockPanel.SetDock(badge, Dock.Right);
+				head.Children.Add(badge);
+				head.Children.Add(new TextBlock { Text = $"Slot {x.Id}", FontSize = 13, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(0xee, 0xf1, 0xf3)) });
+				root.Children.Add(head);
+				var grid = new UniformGrid { Columns = 2 };
+				void Kv(string k, string v, System.Windows.Media.Color? c = null)
+				{
+					var sp = new StackPanel { Margin = new Thickness(0, 2, 10, 2) };
+					sp.Children.Add(new TextBlock { Text = k, FontSize = 10, Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)) });
+					sp.Children.Add(new TextBlock { Text = v, FontSize = 12, FontFamily = new FontFamily("Consolas"), Foreground = new SolidColorBrush(c ?? Color.FromRgb(0xc7, 0xcd, 0xd3)) });
+					grid.Children.Add(sp);
+				}
+				Kv("任务", x.TaskId.HasValue ? "#" + x.TaskId : "—");
+				Kv("n_ctx", FmtTok(x.NCtx));
+				Kv("Prompt", FmtTok(x.NPromptTokens));
+				Kv("已处理 / 缓存", $"{FmtTok(x.NPromptProcessed)} / {FmtTok(x.NPromptCache)}");
+				Kv("已解码", FmtTok(x.NDecoded));
+				Kv("剩余", FmtTok(x.NRemain));
+				double pct = x.CtxPct ?? 0;
+				Kv("上下文占用", x.NCtx > 0 ? $"{FmtTok(x.CtxUsed)} / {FmtTok(x.NCtx)} ({pct:F0}%)" : "—", pct >= 90 ? Color.FromRgb(0xff, 0x8a, 0x98) : pct >= 70 ? Color.FromRgb(0xf8, 0xc9, 0x6a) : null);
+				Kv("投机解码", x.Speculative ? "启用" : "—");
+				root.Children.Add(grid);
+				root.Children.Add(new TextBlock
+				{
+					Text = $"gen {x.GenSpeed:0.#} t/s · prompt {x.PromptSpeed:0.#} t/s",
+					FontSize = 11,
+					FontFamily = new FontFamily("Consolas"),
+					Foreground = new SolidColorBrush(Color.FromRgb(0xc7, 0xcd, 0xd3)),
+					Margin = new Thickness(0, 4, 0, 0),
+				});
+				card.Child = root;
+				SlotCardsHost.Children.Add(card);
+			}
+			MonSlotSummary.Text = $"{slots.Count} 槽 · {proc} 处理中";
+		}
+
+		// ============ 历史趋势(实时 60s 窗口) ============
+		void UpdateTrends()
+		{
+			TrendGen.SetSeries("tok/s", new List<(string, Color, double?[])> { ("生成", Color.FromRgb(0x7c, 0xd7, 0xf7), _hTps.Arr()), ("预填充", Color.FromRgb(0x4a, 0xde, 0x80), _hPf.Arr()) }, double.NaN, double.NaN);
+			TrendPf.SetSeries("tok/s", new List<(string, Color, double?[])> { ("预填充", Color.FromRgb(0x4a, 0xde, 0x80), _hPf.Arr()) }, double.NaN, double.NaN);
+			TrendCtx.SetSeries("tokens", new List<(string, Color, double?[])> { ("上下文", Color.FromRgb(0xf5, 0xb5, 0x3d), _hCtx.Arr()) }, 0, ctxTotal > 0 ? ctxTotal : double.NaN);
+			TrendMtp.SetSeries("%", new List<(string, Color, double?[])> { ("接受率", Color.FromRgb(0x7c, 0xd7, 0xf7), _hMtp.Arr()) }, 0, 100);
+			TrendGpuUtil.SetSeries("%", new List<(string, Color, double?[])> { ("利用率", Color.FromRgb(0xf0, 0x88, 0x3e), _hGpuUtil.Arr()) }, 0, 100);
+			TrendGpuMem.SetSeries("GB", new List<(string, Color, double?[])> { ("显存", Color.FromRgb(0xf0, 0x88, 0x3e), _hGpuMem.Arr()) }, 0, double.NaN);
+			TrendGpuTemp.SetSeries("°C", new List<(string, Color, double?[])> { ("温度", Color.FromRgb(0xf5, 0xb5, 0x3d), _hTemp.Arr()) }, 0, 110);
+			TrendGpuPower.SetSeries("W", new List<(string, Color, double?[])> { ("功耗", Color.FromRgb(0xd2, 0x99, 0x22), _hPower.Arr()) }, 0, double.NaN);
+			TrendCpu.SetSeries("%", new List<(string, Color, double?[])> { ("CPU", Color.FromRgb(0x58, 0xa6, 0xff), _hCpu.Arr()) }, 0, 100);
+			TrendMem.SetSeries("GB", new List<(string, Color, double?[])> { ("内存", Color.FromRgb(0x58, 0xa6, 0xff), _hRam.Arr()) }, 0, double.NaN);
+			TrendNet.SetSeries("MB/s", new List<(string, Color, double?[])> { ("下行", Color.FromRgb(0x7c, 0xd7, 0xf7), _hNet.Arr()) }, 0, double.NaN);
+		}
+
 		if (d.TryGetValue("cpu_err", out string vCe))
 		{
 			Log("[Perf] CPU error: " + vCe);
