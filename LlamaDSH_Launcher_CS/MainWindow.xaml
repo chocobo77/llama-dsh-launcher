@@ -552,10 +552,9 @@
                     </StackPanel>
                   </Grid>
                   <StackPanel Grid.Column="1" Margin="16,0,0,0" VerticalAlignment="Center">
-                    <TextBlock Text="上下文填充" Foreground="#e6edf3" FontSize="12" FontWeight="Bold" Margin="0,0,0,8" />
                     <Grid Margin="0,0,0,4">
-                      <TextBlock Text="显存内专家" Foreground="#8b949e" FontSize="10" />
-                      <TextBlock Name="MonExpertsVal" Text="—" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Right" ToolTip="需要引擎上报专家缓存统计(llama.cpp 未提供)" />
+                      <TextBlock Text="上下文填充" Foreground="#e6edf3" FontSize="12" FontWeight="Bold" Margin="0,0,0,8" />
+                      <TextBlock Name="MonCtxLabel" Text="KV 占用 / 配置上下文" Foreground="#8b949e" FontSize="10" HorizontalAlignment="Right" />
                     </Grid>
                     <Grid Margin="0,0,0,2">
                       <TextBlock Text="系统内存" Foreground="#8b949e" FontSize="10" />
@@ -605,7 +604,6 @@
                     <Grid.ColumnDefinitions>
                       <ColumnDefinition Width="*" />
                       <ColumnDefinition Width="*" />
-                      <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
                     <StackPanel Grid.Column="0">
                       <TextBlock Text="上次请求复用" Foreground="#8b949e" FontSize="10" />
@@ -614,10 +612,6 @@
                     <StackPanel Grid.Column="1">
                       <TextBlock Text="启动以来复用" Foreground="#8b949e" FontSize="10" />
                       <TextBlock Name="MonCacheTotal" Text="0 tok / 0 次请求" Foreground="#c9d1d9" FontSize="13" FontWeight="Bold" />
-                    </StackPanel>
-                    <StackPanel Grid.Column="2">
-                      <TextBlock Text="停靠会话" Foreground="#8b949e" FontSize="10" />
-                      <TextBlock Text="—" Foreground="#8b949e" FontSize="13" FontWeight="Bold" ToolTip="会话停靠为 Strata 引擎特性，llama.cpp 未提供" />
                     </StackPanel>
                   </Grid>
                 </StackPanel>

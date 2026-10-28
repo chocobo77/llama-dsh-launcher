@@ -5938,10 +5938,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					LogError(ex5, "性能监控异常");
 				}
-				// 动态采样间隔: llama 运行中 2s(熔断时效), 未运行 5s(纯面板显示, 无保护需求)
+				// 采样节奏(Strata 口径): llama 运行中 1s, 空闲 5s; GPU 查询缓存 TTL 与之同步
 				bool llamaRunning = IsAlive(_llamaProc);
-				_gpuMonitor.CacheTtlSeconds = llamaRunning ? 5.0 : 15.0;
-				Thread.Sleep(llamaRunning ? 2000 : 5000);
+				_gpuMonitor.CacheTtlSeconds = llamaRunning ? 1.0 : 10.0;
+				Thread.Sleep(llamaRunning ? 1000 : 5000);
 			}
 		})
 		{
@@ -6168,7 +6168,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			active = "queue";
 			detail = $"{_queueCount} 个请求在队列中等待处理";
 		}
-		else if ((DateTime.UtcNow - _lastDecodeUtc).TotalSeconds < 15.0)
+		else if ((DateTime.UtcNow - _lastDecodeUtc).TotalSeconds < 15.0 || _llamaReqProc > 0)
 		{
 			active = "gen";
 			double[] arr = _histTps.ToArray();
@@ -6273,6 +6273,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			Tps = _curTps > 0.0 ? FT(_curTps) : "—",
 			Dur = _curEvalMs > 0.0 ? $"{_curEvalMs / 1000.0:F1} s" : "—",
 		};
+		// VRAM 命中率(Strata 口径): 复用 / prompt tokens
+		if (_curReused > 0 && _curPromptToks > 0)
+		{
+			rec.Hit = $"{Math.Min(100.0, _curReused * 100.0 / _curPromptToks):F0}%";
+		}
 		if (_curReused > 0)
 		{
 			_reusedTotal += _curReused;
@@ -6467,11 +6472,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			UpdateGauge(Math.Min(100.0, vCu2 / _ctxTokens * 100.0));
 			MonGaugeLabel.Text = $"上下文 {vCu2:F0}/{_ctxTokens} tok";
+			MonCtxLabel.Text = $"KV {vCu2:F0} / ctx {_ctxTokens} tok";
 		}
 		else if (!IsAlive(_llamaProc))
 		{
 			UpdateGauge(0.0);
 			MonGaugeLabel.Text = "上下文";
+			MonCtxLabel.Text = "KV 占用 / 配置上下文";
 		}
 		if (d.TryGetValue("ram_used", out string vRu) && d.TryGetValue("ram_total", out string vRt) && double.TryParse(vRu, NumberStyles.Float, CultureInfo.InvariantCulture, out var vRu2) && double.TryParse(vRt, NumberStyles.Float, CultureInfo.InvariantCulture, out var vRt2) && vRt2 > 0.0)
 		{

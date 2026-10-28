@@ -423,39 +423,33 @@ public class GpuMonitor
 	{
 		try
 		{
-			// 统一走 ProcessRunner（同时异步读两流 + 5s 超时），避免“先读后等”让超时失效。
+			// amd-smi metric 带功率/风扇/频率/温度/利用率/显存; Strata 同款指标 AMD 侧适配
 			ProcessResult runResult = ProcessRunner.Run(
 				"amd-smi.exe",
-				new[] { "metric", "--temperature", "--gpu-utilization", "--vram-usage" },
+				new[] { "metric", "--temperature", "--gpu-utilization", "--vram-usage", "--power", "--fan-speed", "--pcie" },
 				5000);
-			if (!runResult.Started || runResult.TimedOut)
-			{
-				return false;
-			}
-			string text = runResult.StdOut + runResult.StdErr;
-			if (string.IsNullOrWhiteSpace(text))
-			{
-				return false;
-			}
 			bool result = false;
-			Match match = Regex.Match(text, "([\\d.]+)\\s*C", RegexOptions.IgnoreCase);
-			if (match.Success && double.TryParse(match.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var result2) && result2 > 0.0 && result2 < 150.0)
+			if (runResult.Started && !runResult.TimedOut && !string.IsNullOrWhiteSpace(runResult.StdOut + runResult.StdErr))
 			{
-				r["gpu_temp"] = result2.ToString("F1", CultureInfo.InvariantCulture);
-				r["gpu_temp_src"] = "amd";
-				result = true;
+				string text = runResult.StdOut + runResult.StdErr;
+				result = ParseAmdOutput(text, r, "amd");
 			}
-			Match match2 = Regex.Match(text, "([\\d.]+)\\s*%", RegexOptions.IgnoreCase);
-			if (match2.Success && double.TryParse(match2.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var result3))
+			// rocm-smi 回退(旧版 ROCm): 分别带各开关
+			if (!result && CommandExists("rocm-smi"))
 			{
-				r["gpu_util"] = Math.Min(100.0, Math.Max(0.0, result3)).ToString("F1", CultureInfo.InvariantCulture);
-				result = true;
+				ProcessResult rs = ProcessRunner.Run(
+					"rocm-smi",
+					new[] { "--showuse", "--showmemuse", "--showvram", "--showtemp", "--showpower", "--showfan", "--showclocks", "--showpcie" },
+					5000);
+				if (rs.Started && !rs.TimedOut)
+				{
+					result = ParseRocmOutput(rs.StdOut, r);
+				}
 			}
-			Match match3 = Regex.Match(text, "([\\d.]+)\\s*MiB", RegexOptions.IgnoreCase);
-			if (match3.Success && double.TryParse(match3.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var result4) && result4 > 0.0)
+			if (result && !r.ContainsKey("vram_total"))
 			{
-				r["vram_used"] = ((long)(result4 * 1048576.0)).ToString(CultureInfo.InvariantCulture);
-				result = true;
+				// AMD 输出只有 vram_used；总量从注册表补齐，否则百分比熔断/显示在 AMD 机器上永不生效
+				TryRegistryVramTotal(r);
 			}
 			return result;
 		}
@@ -463,6 +457,114 @@ public class GpuMonitor
 		{
 			return false;
 		}
+	}
+
+	// amd-smi metric 输出解析: 关键字行/列匹配 W/%/MiB/°C/MHz/PCIe
+	private static bool ParseAmdOutput(string text, Dictionary<string, string> r, string src)
+	{
+		bool ok = false;
+		Match match = Regex.Match(text, "([\\d.]+)\\s*C", RegexOptions.IgnoreCase);
+		if (match.Success && double.TryParse(match.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var t) && t > 0.0 && t < 150.0)
+		{
+			r["gpu_temp"] = t.ToString("F1", CultureInfo.InvariantCulture);
+			r["gpu_temp_src"] = src;
+			ok = true;
+		}
+		// 利用率: 显式 util/gpu use 字段优先, 避免与风扇 % 混淆
+		Match mu = Regex.Match(text, "(?:gpu[_ ]?util|use)\\D{0,10}([\\d.]+)\\s*%", RegexOptions.IgnoreCase);
+		if (mu.Success && double.TryParse(mu.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var u))
+		{
+			r["gpu_util"] = Math.Min(100.0, Math.Max(0.0, u)).ToString("F1", CultureInfo.InvariantCulture);
+			ok = true;
+		}
+		Match mv = Regex.Match(text, "([\\d.]+)\\s*MiB", RegexOptions.IgnoreCase);
+		if (mv.Success && double.TryParse(mv.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var m) && m > 0.0)
+		{
+			r["vram_used"] = ((long)(m * 1048576.0)).ToString(CultureInfo.InvariantCulture);
+			ok = true;
+		}
+		Match mp = Regex.Match(text, "(?:power|功耗)\\D{0,12}([\\d.]+)\\s*W", RegexOptions.IgnoreCase);
+		if (mp.Success && double.TryParse(mp.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var p) && p > 0.0)
+		{
+			r["power_w"] = p.ToString("F1", CultureInfo.InvariantCulture);
+			ok = true;
+		}
+		Match mf = Regex.Match(text, "(?:fan|风扇)\\D{0,12}([\\d.]+)\\s*%", RegexOptions.IgnoreCase);
+		if (mf.Success && double.TryParse(mf.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var f) && f >= 0.0)
+		{
+			r["fan_pct"] = f.ToString("F1", CultureInfo.InvariantCulture);
+			ok = true;
+		}
+		Match mc = Regex.Match(text, "(?:sclk|clock|频率)\\D{0,12}([\\d.]+)\\s*MHz", RegexOptions.IgnoreCase);
+		if (mc.Success && double.TryParse(mc.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var c) && c > 0.0)
+		{
+			r["clock_mhz"] = c.ToString("F0", CultureInfo.InvariantCulture);
+			ok = true;
+		}
+		Match mg = Regex.Match(text, "Gen\\s*([1-6])\\s*[x×]\\s*(\\d{1,2})", RegexOptions.IgnoreCase);
+		if (mg.Success)
+		{
+			r["pcie_gen"] = mg.Groups[1].Value;
+			r["pcie_width"] = mg.Groups[2].Value;
+			ok = true;
+		}
+		return ok;
+	}
+
+	// rocm-smi 输出解析: "Power: 100 W" / "Fan: 30%" / "sclk: 2000MHz" / "PCIe: Gen4x16"
+	private static bool ParseRocmOutput(string text, Dictionary<string, string> r)
+	{
+		bool ok = false;
+		Match mt = Regex.Match(text, "(?:Temperature|温度)\\D{0,12}([\\d.]+)", RegexOptions.IgnoreCase);
+		if (mt.Success && double.TryParse(mt.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var t) && t > 0.0 && t < 150.0)
+		{
+			r["gpu_temp"] = t.ToString("F1", CultureInfo.InvariantCulture);
+			r["gpu_temp_src"] = "amd";
+			ok = true;
+		}
+		Match mu = Regex.Match(text, "GPU use \\(utilization\\.rate\\)\\s*:\\s*([\\d.]+)", RegexOptions.IgnoreCase);
+		if (!mu.Success)
+		{
+			mu = Regex.Match(text, "(?:use|utilization)\\D{0,20}([\\d.]+)\\s*%", RegexOptions.IgnoreCase);
+		}
+		if (mu.Success && double.TryParse(mu.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var u))
+		{
+			r["gpu_util"] = Math.Min(100.0, Math.Max(0.0, u)).ToString("F1", CultureInfo.InvariantCulture);
+			ok = true;
+		}
+		Match mv = Regex.Match(text, "(?:vram used|used vram|VRAM Total Used)\\D{0,16}([\\d.]+)", RegexOptions.IgnoreCase);
+		if (mv.Success && double.TryParse(mv.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var m) && m > 0.0)
+		{
+			// rocm-smi 显存单位可能是 MB 或 MiB, 同义处理
+			r["vram_used"] = ((long)(m * 1048576.0)).ToString(CultureInfo.InvariantCulture);
+			ok = true;
+		}
+		Match mp = Regex.Match(text, "Power\\D{0,12}([\\d.]+)", RegexOptions.IgnoreCase);
+		if (mp.Success && double.TryParse(mp.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var p) && p > 0.0)
+		{
+			r["power_w"] = p.ToString("F1", CultureInfo.InvariantCulture);
+			ok = true;
+		}
+		Match mf = Regex.Match(text, "Fan\\D{0,12}([\\d.]+)", RegexOptions.IgnoreCase);
+		if (mf.Success && double.TryParse(mf.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var f) && f >= 0.0)
+		{
+			r["fan_pct"] = f.ToString("F1", CultureInfo.InvariantCulture);
+			ok = true;
+		}
+		Match mc = Regex.Match(text, "sclk\\D{0,12}([\\d.]+)", RegexOptions.IgnoreCase);
+		if (mc.Success && double.TryParse(mc.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var c) && c > 0.0)
+		{
+			r["clock_mhz"] = c.ToString("F0", CultureInfo.InvariantCulture);
+			ok = true;
+		}
+		Match mg = Regex.Match(text, "Gen\\s*([1-6])\\s*[x×]\\s*(\\d{1,2})", RegexOptions.IgnoreCase);
+		if (mg.Success)
+		{
+			r["pcie_gen"] = mg.Groups[1].Value;
+			r["pcie_width"] = mg.Groups[2].Value;
+			ok = true;
+		}
+		return ok;
 	}
 
 	private static bool TryIntelSmi(Dictionary<string, string> r)
@@ -498,6 +600,19 @@ public class GpuMonitor
 			if (match3.Success && double.TryParse(match3.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var result4) && result4 > 0.0)
 			{
 				r["vram_used"] = ((long)(result4 * 1048576.0)).ToString(CultureInfo.InvariantCulture);
+				result = true;
+			}
+			// Intel 侧 Strata 指标: xpu-smi stats 自带功率/频率字段
+			Match matchP = Regex.Match(text, "(?:GPU[_ ]?Power|功率)\\D{0,12}([\\d.]+)", RegexOptions.IgnoreCase);
+			if (matchP.Success && double.TryParse(matchP.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var vP) && vP > 0.0)
+			{
+				r["power_w"] = vP.ToString("F1", CultureInfo.InvariantCulture);
+				result = true;
+			}
+			Match matchC = Regex.Match(text, "(?:GPU[_ ]?Frequency|频率)\\D{0,12}([\\d.]+)", RegexOptions.IgnoreCase);
+			if (matchC.Success && double.TryParse(matchC.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var vC) && vC > 0.0)
+			{
+				r["clock_mhz"] = vC.ToString("F0", CultureInfo.InvariantCulture);
 				result = true;
 			}
 			return result;
