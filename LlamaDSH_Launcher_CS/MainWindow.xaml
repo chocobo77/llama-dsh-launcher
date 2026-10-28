@@ -306,7 +306,7 @@
       </GroupBox>
 
       <!-- ── 监测/日志双标签页：标签1 效仿 Strata Monitor 设计（状态卡 + 指标卡带迷你历史曲线 + 数据来源徽标），标签2 原运行日志 ── -->
-      <TabControl Grid.Row="2" Margin="0,6,0,0" Background="Transparent" BorderBrush="#30363d" BorderThickness="1">
+      <TabControl Name="MainTabs" Grid.Row="2" Margin="0,6,0,0" Background="Transparent" BorderBrush="#30363d" BorderThickness="1" SelectionChanged="MainTabs_SelectionChanged">
         <TabControl.Resources>
           <Style TargetType="TabItem">
             <Setter Property="Foreground" Value="#8b949e" />
@@ -521,6 +521,14 @@
                   <StackPanel Orientation="Horizontal" Margin="0,0,16,0">
                     <TextBlock Text="🔋 能耗 " Foreground="#8b949e" FontSize="11" />
                     <TextBlock Name="MonEnergy" Text="—" Foreground="#c9d1d9" FontSize="11" FontWeight="Bold" />
+                    <TextBlock Text=" 电价 " Foreground="#8b949e" FontSize="11" Margin="10,0,0,0" />
+                    <TextBox Name="TxtElecPrice" Width="42" Text="0.6" FontSize="11" VerticalAlignment="Center" Margin="0,0,2,0" ToolTip="电价(元/千瓦时), 0 = 不显示成本" />
+                    <TextBlock Text="元/kWh" Foreground="#8b949e" FontSize="10" />
+                    <TextBlock Name="MonEnergyCost" Text="" Foreground="#c9d1d9" FontSize="11" FontWeight="Bold" Margin="6,0,0,0" />
+                  </StackPanel>
+                  <StackPanel Orientation="Horizontal" Margin="0,0,16,0">
+                    <TextBlock Text="🖴 SSD 温度 " Foreground="#8b949e" FontSize="11" />
+                    <TextBlock Name="MonSsdTemp" Text="—" Foreground="#c9d1d9" FontSize="11" FontWeight="Bold" />
                   </StackPanel>
                   <StackPanel Orientation="Horizontal" Margin="0,0,16,0">
                     <TextBlock Text="🌀 风扇 " Foreground="#8b949e" FontSize="11" />

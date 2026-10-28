@@ -5938,10 +5938,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					LogError(ex5, "性能监控异常");
 				}
-				// 采样节奏(Strata 口径): llama 运行中 1s, 空闲 5s; GPU 查询缓存 TTL 与之同步
+				// 采样节奏(Strata #4066): 监测页可见 3s, 不可见 30s; llama 运行中保底 3s(熔断时效)
 				bool llamaRunning = IsAlive(_llamaProc);
-				_gpuMonitor.CacheTtlSeconds = llamaRunning ? 1.0 : 10.0;
-				Thread.Sleep(llamaRunning ? 1000 : 5000);
+				bool fast = llamaRunning || _monitorTabVisible;
+				_gpuMonitor.CacheTtlSeconds = fast ? 2.5 : 24.0;
+				Thread.Sleep(fast ? 3000 : 30000);
 			}
 		})
 		{
@@ -6063,7 +6064,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 	}
 
-	// 监测标签页(Strata 复刻): 指标历史环形缓冲(60 点) + 阶段判定时间戳
+	// 监测页是否可见(Strata #4066: 可见 3s / 不可见 30s 采样)
+	private bool _monitorTabVisible = true;
+
+	private void MainTabs_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+	{
+		_monitorTabVisible = MainTabs?.SelectedIndex == 0;
+	}
+
+	// 监测标签页指标: 历史环形缓冲(60 点) + 阶段判定时间戳
 	private readonly ConcurrentQueue<double> _histCpu = new();
 	private readonly ConcurrentQueue<double> _histGpu = new();
 	private readonly ConcurrentQueue<double> _histVram = new();
@@ -6110,8 +6119,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private int _curOutToks;
 	private double _curTps;
 	private double _curEvalMs;
+	private int _lastOutToks;
 	private long _reusedTotal;
 	private long _reqTotalCount;
+	private long _reqReusedCount;
 
 	// 追加一个采样点并把整条历史重绘到迷你曲线; maxV<=0 时按历史最大值自动缩放
 	private static void PushSpark(System.Windows.Shapes.Polyline pl, ConcurrentQueue<double> q, double v, double maxV)
@@ -6151,6 +6162,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private void UpdatePhaseCard()
 	{
 		bool llamaUp = IsAlive(_llamaProc);
+		bool writing = (DateTime.UtcNow - _lastDecodeUtc).TotalSeconds < 15.0 || _llamaReqProc > 0;
+		bool reading = !writing && (DateTime.UtcNow - _lastPrefillUtc).TotalSeconds < 15.0;
 		string active;   // idle | reading | gen | queue | error
 		string detail;
 		if (_vramBreakerTriggered)
@@ -6163,34 +6176,42 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			active = "idle";
 			detail = "llama 未启动";
 		}
-		else if (_queueCount > 0)
+		else if (writing)
 		{
-			active = "queue";
-			detail = $"{_queueCount} 个请求在队列中等待处理";
-		}
-		else if ((DateTime.UtcNow - _lastDecodeUtc).TotalSeconds < 15.0 || _llamaReqProc > 0)
-		{
+			// Strata: writing 阶段优先于排队; 明细 "N tokens · T tok/s"
 			active = "gen";
 			double[] arr = _histTps.ToArray();
 			double cur = arr.Length > 0 ? arr[arr.Length - 1] : 0.0;
-			detail = cur > 0.0 ? $"正在生成 · {FT(cur)} tok/s" : "正在生成";
+			detail = cur > 0.0 ? $"{_curOutToks} tokens · {FT(cur)} tok/s" : "正在生成";
 		}
-		else if ((DateTime.UtcNow - _lastPrefillUtc).TotalSeconds < 15.0)
+		else if (reading)
 		{
 			active = "reading";
 			detail = "正在预填充提示词";
 		}
+		else if (_queueCount > 0)
+		{
+			// Strata: 排队仅在底层空闲(无写入/读取)时呈现
+			active = "queue";
+			detail = $"{_queueCount} 个请求在队列中等待处理";
+		}
 		else
 		{
 			active = "idle";
-			detail = "llama 运行中，等待请求";
+			// Strata: 空闲明细 "Last: N tokens @ T tok/s"
+			double[] arr = _histTps.ToArray();
+			double lastTps = arr.Length > 0 ? arr[arr.Length - 1] : 0.0;
+			detail = lastTps > 0.0 ? $"上次: {_lastOutToks} tokens @ {FT(lastTps)} tok/s" : "llama 运行中，等待请求";
 		}
-		bool activeBusy = active == "gen" || active == "reading";
+		bool writingFlag = active == "gen";
+		bool readingFlag = active == "reading";
+		bool activeBusy = writingFlag || readingFlag;
 		StylePhase(MonPhIdle, MonPhIdleT, active == "idle", System.Windows.Media.Color.FromArgb(0x33, 0x8b, 0x94, 0x9e), System.Windows.Media.Color.FromRgb(0x8b, 0x94, 0x9e));
-		StylePhase(MonPhReading, MonPhReadingT, active == "reading", System.Windows.Media.Color.FromArgb(0x55, 0xbb, 0x80, 0x09), System.Windows.Media.Color.FromRgb(0xe3, 0xb3, 0x41));
-		StylePhase(MonPhGen, MonPhGenT, active == "gen", System.Windows.Media.Color.FromArgb(0x55, 0x23, 0x86, 0x36), System.Windows.Media.Color.FromRgb(0x7e, 0xe7, 0x87));
+		StylePhase(MonPhReading, MonPhReadingT, readingFlag, System.Windows.Media.Color.FromArgb(0x55, 0xbb, 0x80, 0x09), System.Windows.Media.Color.FromRgb(0xe3, 0xb3, 0x41));
+		StylePhase(MonPhGen, MonPhGenT, writingFlag, System.Windows.Media.Color.FromArgb(0x55, 0x23, 0x86, 0x36), System.Windows.Media.Color.FromRgb(0x7e, 0xe7, 0x87));
 		StylePhase(MonPhQueue, MonPhQueueT, active == "queue", System.Windows.Media.Color.FromArgb(0x55, 0x1f, 0x6f, 0xeb), System.Windows.Media.Color.FromRgb(0x79, 0xc0, 0xff));
 		StylePhase(MonPhError, MonPhErrorT, active == "error", System.Windows.Media.Color.FromArgb(0x55, 0xda, 0x36, 0x33), System.Windows.Media.Color.FromRgb(0xff, 0xa1, 0x9b));
+		MonPhQueueT.Text = _queueCount > 0 ? $"排队 ({_queueCount})" : "排队";
 		MonPhaseDetail.Text = detail;
 		MonProgress.IsIndeterminate = activeBusy;
 		if (!activeBusy)
@@ -6254,6 +6275,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		_curPromptToks = 0;
 		_curReused = 0;
+		_lastOutToks = _curOutToks;
 		_curOutToks = 0;
 		_curTps = 0.0;
 		_curEvalMs = 0.0;
@@ -6273,17 +6295,19 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			Tps = _curTps > 0.0 ? FT(_curTps) : "—",
 			Dur = _curEvalMs > 0.0 ? $"{_curEvalMs / 1000.0:F1} s" : "—",
 		};
-		// VRAM 命中率(Strata 口径): 复用 / prompt tokens
+		// VRAM 命中率(Strata 口径): 复用 / prompt tokens, 1 位小数
 		if (_curReused > 0 && _curPromptToks > 0)
 		{
-			rec.Hit = $"{Math.Min(100.0, _curReused * 100.0 / _curPromptToks):F0}%";
+			rec.Hit = $"{Math.Min(100.0, _curReused * 100.0 / _curPromptToks):F1}%";
 		}
 		if (_curReused > 0)
 		{
 			_reusedTotal += _curReused;
+			_reqReusedCount++;
 		}
 		_reqTotalCount++;
 		int lastReused = _curReused;
+		int lastPrompt = _curPromptToks;
 		lock (_reqLock)
 		{
 			_reqRecords.Add(rec);
@@ -6300,8 +6324,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
 		{
 			RefreshReqList();
-			MonCacheLast.Text = lastReused > 0 ? $"复用 {lastReused} tok" : "未报告复用";
-			MonCacheTotal.Text = $"{_reusedTotal} tok / {_reqTotalCount} 次请求";
+			MonCacheLast.Text = lastReused > 0 ? $"{lastReused} / {lastPrompt} prompt tokens 复用" : "未报告复用";
+			MonCacheTotal.Text = $"{_reusedTotal} tok · {_reqReusedCount} / {_reqTotalCount} 次复用";
 		}, Array.Empty<object>());
 	}
 
@@ -6448,8 +6472,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			SetBadge(BdgDisk, true);
 			PushSpark(SparkDisk, _histDisk, vD / 1048576.0, 0.0);
 		}
-		// 读数条: 能耗累计 / 风扇 / 频率 / CPU 温度
+		// 读数条: 能耗累计+电费 / 风扇 / 频率 / CPU 温度 / SSD 温度(Strata Readings 全项)
 		MonEnergy.Text = _energyWh >= 1000.0 ? $"{_energyWh / 1000.0:F2} kWh" : $"{_energyWh:F1} Wh";
+		double elecPrice = double.TryParse(TxtElecPrice?.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var vEp) ? vEp : 0.0;
+		MonEnergyCost.Text = (elecPrice > 0.0 && _energyWh > 0.0) ? $" ≈ ¥{_energyWh / 1000.0 * elecPrice:F2}" : "";
+		if (d.TryGetValue("ssd_temp", out string vSt) && double.TryParse(vSt, NumberStyles.Float, CultureInfo.InvariantCulture, out var vSt2) && vSt2 > 0.0)
+		{
+			MonSsdTemp.Text = $"{vSt2:F0}°C";
+		}
 		if (d.TryGetValue("fan_pct", out string vFn) && double.TryParse(vFn, NumberStyles.Float, CultureInfo.InvariantCulture, out var vF) && vF >= 0.0)
 		{
 			MonFan.Text = $"{vF:F0}%";
