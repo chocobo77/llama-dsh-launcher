@@ -5868,6 +5868,17 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				LogError(ex2c, "物理内存统计初始化失败");
 			}
+			_llamaApi = new LlamaApiMonitor(() =>
+			{
+				try
+				{
+					return GetLlamaPort();
+				}
+				catch
+				{
+					return 0;
+				}
+			});
 			int num = 0;
 			while (!_perfCts.Token.IsCancellationRequested)
 			{
@@ -5924,7 +5935,20 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					{
 						d["ram_err"] = ex4c.Message;
 					}
-					// llama-server /metrics: 存活即取(上下文填充/排队/阶段不依赖日志), tps 仅在日志无样本时输出避免双算
+					// llama-server /slots + /props(llama-lens 采集): 存活即轮询
+					try
+					{
+						if (IsAlive(_llamaProc))
+						{
+							_llamaApi?.PollFast();
+							_llamaApi?.PollSlowIfNeeded();
+						}
+					}
+					catch (Exception exLp)
+					{
+						LogError(exLp, "llama /slots 采集异常");
+					}
+					// llama-server /metrics: 排队数与 tps 兜底(slots 不可用时)
 					if (IsAlive(_llamaProc))
 					{
 						if (FetchLlamaMetrics() is (double mTps, double mPf) && _tpsSamples.IsEmpty && _ttftSamples.IsEmpty)
@@ -6157,10 +6181,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private string _gpuName = "GPU";
 	private string _cpuName = "处理器";
 
-	// 阶段判定时间戳与上次请求输出(Strata statusDetail 用)
+	// 阶段判定时间戳与上次请求输出
 	private DateTime _lastDecodeUtc = DateTime.MinValue;
 	private DateTime _lastPrefillUtc = DateTime.MinValue;
 	private int _lastOutToks;
+
+	// llama-server HTTP 采集(llama-lens 移植): /slots 差分 + /props 模型信息 + 事件流
+	private LlamaApiMonitor? _llamaApi;
 
 	// 扩展采集: 磁盘读写/物理内存/能耗积分(GPU 功率 × 采样间隔)
 	private PerformanceCounter? _diskReadCounter;
@@ -6201,74 +6228,156 @@ private int _curPromptToks;
 		b.Foreground = new SolidColorBrush(ok ? System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80) : System.Windows.Media.Color.FromRgb(0x8b, 0x94, 0x9e));
 	}
 
-	// 模型状态卡(Strata): 徽标配色 accent/info/warn/danger; 排队仅在空闲时呈现; 明细行左相位右数据
+	// Llama 状态卡(llama-lens LlamaStateCard): 相位 pill + 模型名 + 三列 stat + 真进度条 + ctx
 	private void UpdatePhaseCard()
 	{
+		var api = _llamaApi;
 		bool llamaUp = IsAlive(_llamaProc);
-		bool writing = (DateTime.UtcNow - _lastDecodeUtc).TotalSeconds < 15.0 || _llamaReqProc > 0;
-		bool reading = !writing && (DateTime.UtcNow - _lastPrefillUtc).TotalSeconds < 15.0;
-		string active;
-		string phaseLabel;
-		string detail;
+		bool online = api != null && api.Online && llamaUp;
+		var slots = api?.SlotsSnapshot() ?? new List<LlamaApiMonitor.SlotInfo>();
+		var act = slots.FirstOrDefault(x => x.Processing);
+		bool writing = online && act != null && act.GenSpeed > 0.5;
+		bool reading = online && act != null && !writing && act.PromptSpeed > 0.5;
+		bool queued = online && !actANone(slots) && _queueCount > 0;
+
+		string phaseText;
+		System.Windows.Media.Color pillBg;
+		System.Windows.Media.Color pillFg;
 		if (_vramBreakerTriggered)
 		{
-			active = "error";
-			phaseLabel = "已熔断";
-			detail = "显存熔断已触发，llama 服务已自动停止";
+			phaseText = "已熔断";
+			pillBg = System.Windows.Media.Color.FromArgb(0x2e, 0xff, 0x5a, 0x6e);
+			pillFg = System.Windows.Media.Color.FromRgb(0xff, 0x8a, 0x98);
 		}
 		else if (!llamaUp)
 		{
-			active = "idle";
-			phaseLabel = "等待请求";
-			detail = "llama 未启动";
+			phaseText = "空闲";
+			pillBg = System.Windows.Media.Color.FromRgb(0x1d, 0x22, 0x26);
+			pillFg = System.Windows.Media.Color.FromRgb(0x8e, 0x97, 0x9f);
 		}
 		else if (writing)
 		{
-			active = "gen";
-			phaseLabel = "生成中";
-			double cur = _hTps.Last();
-			detail = !double.IsNaN(cur) && cur > 0.0 ? $"{_curOutToks} tokens · {FT(cur)} tok/s" : "正在生成";
+			phaseText = "生成中";
+			pillBg = System.Windows.Media.Color.FromArgb(0x2e, 0x34, 0xd3, 0x99);
+			pillFg = System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80);
 		}
 		else if (reading)
 		{
-			active = "reading";
-			phaseLabel = "预填充中";
-			detail = _curPromptToks > 0 ? $"{_curPromptToks} tokens · 预填充中" : "正在预填充提示词";
+			phaseText = "预填充中";
+			pillBg = System.Windows.Media.Color.FromArgb(0x2e, 0x3a, 0xa9, 0xff);
+			pillFg = System.Windows.Media.Color.FromRgb(0x7c, 0xc4, 0xff);
 		}
-		else if (_queueCount > 0)
+		else if (queued)
 		{
-			active = "queue";
-			phaseLabel = "排队中";
-			detail = $"{_queueCount} 个请求在队列中等待";
+			phaseText = $"排队 ({_queueCount})";
+			pillBg = System.Windows.Media.Color.FromArgb(0x2e, 0xf5, 0xb5, 0x3d);
+			pillFg = System.Windows.Media.Color.FromRgb(0xf8, 0xc9, 0x6a);
 		}
 		else
 		{
-			active = "idle";
-			phaseLabel = "等待请求";
-			detail = _lastTps > 0.0 ? $"上次: {_lastOutToks} tokens @ {FT(_lastTps)} tok/s" : "";
+			phaseText = "等待请求";
+			pillBg = System.Windows.Media.Color.FromArgb(0x2e, 0x34, 0xd3, 0x99);
+			pillFg = System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80);
 		}
-		bool activeBusy = active == "gen";
-		StylePhase(MonPhIdle, MonPhIdleT, active == "idle", ToneAccent, System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80));
-		StylePhase(MonPhReading, MonPhReadingT, active == "reading", ToneInfo, System.Windows.Media.Color.FromRgb(0x7c, 0xc4, 0xff));
-		StylePhase(MonPhGen, MonPhGenT, active == "gen", ToneAccent, System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80));
-		StylePhase(MonPhQueue, MonPhQueueT, active == "queue", ToneWarn, System.Windows.Media.Color.FromRgb(0xf8, 0xc9, 0x6a));
-		StylePhase(MonPhError, MonPhErrorT, active == "error", System.Windows.Media.Color.FromRgb(0xff, 0x5a, 0x6e), System.Windows.Media.Color.FromRgb(0xff, 0x8a, 0x98));
-		MonPhQueueT.Text = _queueCount > 0 ? $"排队 ({_queueCount})" : "排队";
-		MonPhaseLabel.Text = phaseLabel;
-		MonPhaseDetail.Text = detail;
-		// Strata Bar: 活动期不定态(滑块呼吸, 非滚动点), 空闲归零; reading=info 蓝 / 生成=accent 绿
-		SetMonBar(activeBusy, active == "reading" ? ToneInfo : ToneAccent);
+		MonPhaseText.Text = phaseText;
+		MonPhaseText.Foreground = new SolidColorBrush(pillFg);
+		MonPhasePill.Background = new SolidColorBrush(pillBg);
+		MonPhasePill.BorderBrush = new SolidColorBrush(pillBg);
+
+		string modelName = api?.Model?.Name;
+		MonModelName.Text = string.IsNullOrEmpty(modelName) ? (llamaUp ? "已连接 · 模型未报告" : "未加载模型") : modelName;
+
+		long ctxUsed = api?.CtxUsed ?? -1;
+		long ctxTotal = api?.CtxTotal ?? 0;
+		string ctxText = ctxUsed >= 0 && ctxTotal > 0 ? $"{FmtTok(ctxUsed)} / {FmtTok(ctxTotal)}" : "—";
+		string ctxPct = ctxUsed >= 0 && ctxTotal > 0 ? $" ({ctxUsed * 100.0 / ctxTotal:F0}%)" : "";
+
+		if (reading && act != null)
+		{
+			// 预填充: 真进度 processed/total
+			Stat1Label.Text = "已处理 Prompt";
+			Stat1Val.Text = act.NPromptProcessed > 0 ? FmtTok(act.NPromptProcessed) : "—";
+			Stat1Unit.Text = "tokens";
+			Stat2Label.Text = "Prompt 速度";
+			Stat2Val.Text = act.PromptSpeed > 0 ? FT(act.PromptSpeed) : "—";
+			Stat3Label.Text = "上下文占用";
+			Stat3Val.Text = ctxText;
+			Stat3Unit.Text = ctxPct;
+			double pct = act.NPromptTokens > 0 ? Math.Min(100.0, act.NPromptProcessed * 100.0 / act.NPromptTokens) : 0.0;
+			SetMonBar(true, ToneInfo, pct);
+			MonPhaseLabel.Text = $"预填充中 · slot {act.Id}";
+			MonPhaseDetail.Text = $"prompt {FmtTok(act.NPromptTokens)} tokens{(pct > 0 ? $" · {pct:F0}%" : "")}";
+		}
+		else if (writing && act != null)
+		{
+			// 生成: 已解码 / 实时速度 / 上下文; 进度 = decoded/(decoded+remain) 有 n_remain 时
+			Stat1Label.Text = "已解码";
+			Stat1Val.Text = FmtTok(act.NDecoded);
+			Stat1Unit.Text = "tokens";
+			Stat2Label.Text = "实时速度";
+			Stat2Val.Text = FT(act.GenSpeed);
+			Stat3Label.Text = "上下文占用";
+			Stat3Val.Text = ctxText;
+			Stat3Unit.Text = ctxPct;
+			if (act.NRemain > 0)
+			{
+				SetMonBar(true, ToneAccent, Math.Min(100.0, act.NDecoded * 100.0 / (act.NDecoded + act.NRemain)));
+			}
+			else
+			{
+				SetMonBar(true, ToneAccent, null);
+			}
+			MonPhaseLabel.Text = $"生成中 · 任务 #{act.TaskId}";
+			MonPhaseDetail.Text = $"剩余 {FmtTok(act.NRemain)} tokens · 上下文 {ctxText}{ctxPct}";
+		}
+		else
+		{
+			// 空闲/排队/熔断: 上次请求 + 上下文
+			Stat1Label.Text = "上次输出";
+			Stat1Val.Text = _lastOutToks > 0 ? FmtTok(_lastOutToks) : "—";
+			Stat1Unit.Text = "tokens";
+			Stat2Label.Text = "上次速度";
+			Stat2Val.Text = _lastTps > 0 ? FT(_lastTps) : "—";
+			Stat3Label.Text = "上下文占用";
+			Stat3Val.Text = ctxText;
+			Stat3Unit.Text = ctxPct;
+			SetMonBar(false, ToneAccent, 0.0);
+			MonPhaseLabel.Text = phaseText == "排队" || phaseText.StartsWith("排队") ? $"{_queueCount} 个请求在队列中" : (llamaUp ? "等待请求" : "llama 未启动");
+			MonPhaseDetail.Text = _lastTps > 0 ? $"上次: {_lastOutToks} tokens @ {FT(_lastTps)} tok/s" : "";
+		}
+		UpdateSlotsCard(slots, llamaUp);
+		UpdateModelInfoCard(api);
+		UpdateEventFeed(api);
 	}
 
-	// 自定义进度条: 决定态=按 pct 填充; 不定态=30% 宽滑块左右缓动(WPF 默认圆点滚动观感差)
-	private void SetMonBar(bool active, System.Windows.Media.Color tone)
+	private static bool actANone(List<LlamaApiMonitor.SlotInfo> slots)
+	{
+		foreach (var x in slots)
+		{
+			if (x.Processing)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// 真进度条: pct 有值=决定填充, 无值=不定态滑块
+	private void SetMonBar(bool active, System.Windows.Media.Color tone, double? pct)
 	{
 		MonBarFill.Background = new SolidColorBrush(tone);
+		MonBarFill.BeginAnimation(System.Windows.FrameworkElement.WidthProperty, null);
 		double w = MonBar.ActualWidth;
 		if (!active)
 		{
-			MonBarFill.BeginAnimation(System.Windows.FrameworkElement.WidthProperty, null);
 			MonBarFill.Width = 0.0;
+			_barAnim = null;
+			return;
+		}
+		if (pct.HasValue && w > 0)
+		{
+			_barAnim = null;
+			MonBarFill.Width = Math.Max(0.0, Math.Min(1.0, pct.Value / 100.0)) * w;
 			return;
 		}
 		if (w <= 0 || _barAnim != null)
@@ -6290,16 +6399,117 @@ private int _curPromptToks;
 
 	private System.Windows.Media.Animation.DoubleAnimation? _barAnim;
 
-
-	// 阶段徽标: 活动=色底/亮字, 非活动=表面灰
-	private static void StylePhase(System.Windows.Controls.Border b, System.Windows.Controls.TextBlock t, bool active, System.Windows.Media.Color bg, System.Windows.Media.Color fg)
+	// Slot 表(llama-lens SlotTable)
+	private void UpdateSlotsCard(List<LlamaApiMonitor.SlotInfo> slots, bool llamaUp)
 	{
-		// Strata: 活动徽标 tint 底 + 彩字 + 边框透明; 非活动 surface 底 + 灰字 + 线框
-		b.Background = new SolidColorBrush(active ? System.Windows.Media.Color.FromArgb(0x2e, bg.R, bg.G, bg.B) : System.Windows.Media.Color.FromRgb(0x1d, 0x22, 0x26));
-		b.BorderBrush = new SolidColorBrush(active ? System.Windows.Media.Color.FromArgb(0x55, bg.R, bg.G, bg.B) : System.Windows.Media.Color.FromRgb(0x30, 0x36, 0x3d));
-		t.Foreground = new SolidColorBrush(active ? fg : System.Windows.Media.Color.FromRgb(0x8e, 0x97, 0x9f));
-		t.FontWeight = active ? FontWeights.Bold : FontWeights.Normal;
+		if (!llamaUp)
+		{
+			MonSlotList.ItemsSource = null;
+			MonSlotSummary.Text = "";
+			return;
+		}
+		var rows = new List<object>();
+		foreach (var x in slots)
+		{
+			string state = x.Processing ? "处理中" : "空闲";
+			var stateColor = x.Processing ? System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80) : System.Windows.Media.Color.FromRgb(0x8e, 0x97, 0x9f);
+			double pct = x.CtxPct ?? 0.0;
+			var ctxColor = pct >= 90 ? System.Windows.Media.Color.FromRgb(0xff, 0x5a, 0x6e) : pct >= 70 ? System.Windows.Media.Color.FromRgb(0xf5, 0xb5, 0x3d) : System.Windows.Media.Color.FromRgb(0x34, 0xd3, 0x99);
+			rows.Add(new
+			{
+				x.Id,
+				State = state,
+				StateColor = new SolidColorBrush(stateColor),
+				Task = x.TaskId.HasValue ? "#" + x.TaskId : "—",
+				Prompt = FmtTok(x.NPromptTokens),
+				ProcCache = $"{FmtTok(x.NPromptProcessed)} / {FmtTok(x.NPromptCache)}",
+				Decoded = FmtTok(x.NDecoded),
+				CtxText = x.NCtx > 0 ? $"{FmtTok(x.CtxUsed)} / {FmtTok(x.NCtx)} ({pct:F0}%)" : "—",
+				CtxBarW = Math.Max(1.0, pct / 100.0 * 110.0),
+				CtxColor = new SolidColorBrush(ctxColor),
+				Gen = x.GenSpeed > 0 ? FT(x.GenSpeed) : "—",
+				Pf = x.PromptSpeed > 0 ? FT(x.PromptSpeed) : "—",
+				Spec = x.Speculative ? "✓" : "—",
+			});
+		}
+		MonSlotList.ItemsSource = rows;
+		int proc = 0;
+		foreach (var x in slots)
+		{
+			if (x.Processing)
+			{
+				proc++;
+			}
+		}
+		MonSlotSummary.Text = $"{slots.Count} 槽 · {proc} 处理中";
 	}
+
+	// 模型信息卡(llama-lens ModelInfoCard)
+	private void UpdateModelInfoCard(LlamaApiMonitor? api)
+	{
+		var m = api?.Model;
+		if (m == null || (string.IsNullOrEmpty(m.Path) && string.IsNullOrEmpty(m.Name)))
+		{
+			return;
+		}
+		MiName.Text = string.IsNullOrEmpty(m.Name) ? "—" : m.Name;
+		MiPath.Text = "路径 " + (string.IsNullOrEmpty(m.Path) ? "—" : m.Path);
+		MiFtype.Text = m.Ftype;
+		MiParams.Text = m.NParams.HasValue ? FmtTok(m.NParams.Value) : "—";
+		MiSize.Text = m.FileSize.HasValue ? m.FileSize.Value >= 1073741824L ? $"{m.FileSize.Value / 1073741824.0:F2} GB" : $"{m.FileSize.Value / 1048576.0:F0} MB" : "—";
+		MiEmbd.Text = m.NEmbd?.ToString() ?? "—";
+		MiVocab.Text = m.NVocab?.ToString() ?? "—";
+		MiCtx.Text = m.NCtx?.ToString() ?? "—";
+		MiCtxTrain.Text = m.NCtxTrain?.ToString() ?? "—";
+		MiVocabType.Text = string.IsNullOrEmpty(m.VocabType) ? "—" : m.VocabType;
+		var mods = new List<string>();
+		if (m.Vision)
+		{
+			mods.Add("vision");
+		}
+		if (m.Video)
+		{
+			mods.Add("video");
+		}
+		if (m.Audio)
+		{
+			mods.Add("audio");
+		}
+		MiModal.Text = mods.Count > 0 ? string.Join(" · ", mods) : "—";
+	}
+
+	// 事件流(llama-lens EventFeed): 时间 + 级别 + 消息
+	private void UpdateEventFeed(LlamaApiMonitor? api)
+	{
+		if (api == null)
+		{
+			return;
+		}
+		var evs = api.EventsSnapshot();
+		if (evs.Count == _eventFeedCount)
+		{
+			return;
+		}
+		_eventFeedCount = evs.Count;
+		MonEventCount.Text = $"{evs.Count} / 200";
+		var list = new List<object>(evs.Count);
+		for (int i = evs.Count - 1; i >= 0; i--)
+		{
+			var e = evs[i];
+			var color = e.Level == "error" ? System.Windows.Media.Color.FromRgb(0xff, 0x8a, 0x98)
+				: e.Level == "warn" ? System.Windows.Media.Color.FromRgb(0xf8, 0xc9, 0x6a)
+				: e.Level == "ok" ? System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80)
+				: System.Windows.Media.Color.FromRgb(0x8e, 0x97, 0x9f);
+			list.Add(new
+			{
+				Line = $"{e.Ts:HH:mm:ss}  {e.Msg}",
+				LevelColor = new SolidColorBrush(color),
+			});
+		}
+		MonEventFeed.ItemsSource = list;
+	}
+
+	private int _eventFeedCount;
 
 	private static string FmtTok(double n)
 	{
@@ -6388,13 +6598,26 @@ private int _curPromptToks;
 
 	private void OnPerf(Dictionary<string, string> d)
 	{
-		// llama /metrics 即时速度入历史(Strata: 遥测吞吐驱动解码/预填充曲线与阶段)
-		if (d.TryGetValue("httptps", out string vTps) && double.TryParse(vTps, NumberStyles.Float, CultureInfo.InvariantCulture, out var vT) && vT > 0.0)
+		// 速度历史: /slots 差分优先(llama-lens 口径), /metrics 兜底
+		var api = _llamaApi;
+		bool apiGen = api != null && api.Online && api.GenTps > 0.0;
+		bool apiPf = api != null && api.Online && api.PromptTps > 0.0;
+		if (apiGen)
+		{
+			_hTps.Push(api.GenTps);
+			_lastDecodeUtc = DateTime.UtcNow;
+		}
+		else if (d.TryGetValue("httptps", out string vTps) && double.TryParse(vTps, NumberStyles.Float, CultureInfo.InvariantCulture, out var vT) && vT > 0.0)
 		{
 			_hTps.Push(vT);
 			_lastDecodeUtc = DateTime.UtcNow;
 		}
-		if (d.TryGetValue("httppf", out string vPfS) && double.TryParse(vPfS, NumberStyles.Float, CultureInfo.InvariantCulture, out var vPf) && vPf > 0.0)
+		if (apiPf)
+		{
+			_hPf.Push(api.PromptTps);
+			_lastPrefillUtc = DateTime.UtcNow;
+		}
+		else if (d.TryGetValue("httppf", out string vPfS) && double.TryParse(vPfS, NumberStyles.Float, CultureInfo.InvariantCulture, out var vPf) && vPf > 0.0)
 		{
 			_hPf.Push(vPf);
 			_lastPrefillUtc = DateTime.UtcNow;

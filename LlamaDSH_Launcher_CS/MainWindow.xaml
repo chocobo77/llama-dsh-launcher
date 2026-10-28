@@ -273,7 +273,7 @@
         <RowDefinition Height="*" />
       </Grid.RowDefinitions>
       <!-- ── 运行控制：启动/停止 Llama 与 DSH + 熔断 + 托盘选项, 紧凑单卡 ── -->
-      <GroupBox Grid.Row="0" Margin="0,0,0,6" Padding="14,10,14,12">
+      <GroupBox Grid.Row="0" Margin="0,0,0,8" Padding="16,12,16,14">
         <GroupBox.Header>
           <DockPanel LastChildFill="False">
             <TextBlock Text="▶ 运行控制" FontWeight="Bold" />
@@ -288,38 +288,53 @@
             <ColumnDefinition Width="*" />
           </Grid.ColumnDefinitions>
           <!-- Llama 区块 -->
-          <StackPanel Grid.Column="0" Margin="0,0,10,0">
-            <StackPanel Orientation="Horizontal">
-              <Button Name="BtnLlamaStart" Content="▶ 启动 Llama" Background="#238636" Foreground="#FFFFFFFF" Padding="16,5" MinWidth="104" FontSize="12" Margin="0,0,10,0" HorizontalAlignment="Left" Click="StartLlama_Click" />
-              <Button Name="BtnLlamaStop" Content="⏹ 停止 Llama" Background="#da3633" Foreground="#FFFFFFFF" Padding="16,5" MinWidth="104" FontSize="12" HorizontalAlignment="Left" IsEnabled="False" Click="StopLlama_Click" />
-              <TextBlock Name="LblLlamaStatus" Text="● 已停止" Foreground="#8b949e" FontSize="11" Margin="12,0,0,0" VerticalAlignment="Center" />
-            </StackPanel>
-            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-              <CheckBox Name="ChkOomRetry" Content="OOM 自动降层重试" IsChecked="True" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" ToolTip="启动因显存不足失败时，自动降低 --gpu-layers（每次 ×0.85，最多 3 次）并重新启动；需要重新勾选参数面板后手动保存才会持久化" />
-            </StackPanel>
-            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+          <Grid Grid.Column="0" Margin="0,0,14,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="122" />
+              <ColumnDefinition Width="122" />
+              <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <Button Grid.Row="0" Grid.Column="0" Name="BtnLlamaStart" Content="▶ 启动 Llama" Background="#238636" Foreground="#FFFFFFFF" Height="30" FontSize="12" Margin="0,0,10,8" HorizontalAlignment="Left" Click="StartLlama_Click" />
+            <Button Grid.Row="0" Grid.Column="1" Name="BtnLlamaStop" Content="⏹ 停止 Llama" Background="#da3633" Foreground="#FFFFFFFF" Height="30" FontSize="12" IsEnabled="False" Click="StopLlama_Click" />
+            <TextBlock Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Name="LblLlamaStatus" Text="● 已停止" Foreground="#8b949e" FontSize="12" Margin="0,0,0,8" />
+            <CheckBox Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" Name="ChkOomRetry" Content="OOM 自动降层重试" IsChecked="True" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" Margin="0,0,0,8" ToolTip="启动因显存不足失败时，自动降低 --gpu-layers（每次 ×0.85，最多 3 次）并重新启动；需要重新勾选参数面板后手动保存才会持久化" />
+            <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal">
               <CheckBox Name="ChkVramBreaker" Content="🔒 显存熔断" Foreground="#c9d1d9" FontSize="11" VerticalAlignment="Center" IsChecked="False" ToolTip="显存超过阈值时自动停止 Llama 服务，防止爆显存" />
-              <local:NoScrollComboBox x:Name="ComboVramBreakerType" Width="100" Margin="6,0,4,0" VerticalAlignment="Center" FontSize="11">
+              <local:NoScrollComboBox x:Name="ComboVramBreakerType" Width="100" Margin="8,0,4,0" VerticalAlignment="Center" FontSize="11">
                 <ComboBoxItem Content="百分比 (%)" IsSelected="True" />
                 <ComboBoxItem Content="固定值 (GB)" />
               </local:NoScrollComboBox>
-              <TextBox Name="TxtVramBreakerVal" Width="48" Text="90" VerticalAlignment="Center" FontSize="11" Margin="0,0,6,0" ToolTip="阈值：百分比模式填 0-100，GB 模式填小数如 20.0" />
+              <TextBox Name="TxtVramBreakerVal" Width="48" Text="90" VerticalAlignment="Center" FontSize="11" Margin="0,0,8,0" ToolTip="阈值：百分比模式填 0-100，GB 模式填小数如 20.0" />
               <TextBlock Name="LblVramBreaker" Text="" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" />
             </StackPanel>
-          </StackPanel>
+          </Grid>
           <Border Grid.Column="1" Background="#30363d" Width="1" />
           <!-- DSH 区块 -->
-          <StackPanel Grid.Column="2" Margin="10,0,0,0">
-            <StackPanel Orientation="Horizontal">
-              <Button Name="BtnDshStart" Content="▶ 启动 DSH" Background="#238636" Foreground="#FFFFFFFF" Padding="16,5" MinWidth="104" FontSize="12" Margin="0,0,10,0" HorizontalAlignment="Left" Click="StartDsh_Click" />
-              <Button Name="BtnDshStop" Content="⏹ 停止 DSH" Background="#da3633" Foreground="#FFFFFFFF" Padding="16,5" MinWidth="104" FontSize="12" HorizontalAlignment="Left" IsEnabled="False" Click="StopDsh_Click" />
+          <Grid Grid.Column="2" Margin="14,0,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="122" />
+              <ColumnDefinition Width="122" />
+              <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <Button Grid.Row="0" Grid.Column="0" Name="BtnDshStart" Content="▶ 启动 DSH" Background="#238636" Foreground="#FFFFFFFF" Height="30" FontSize="12" Margin="0,0,10,8" HorizontalAlignment="Left" Click="StartDsh_Click" />
+            <Button Grid.Row="0" Grid.Column="1" Name="BtnDshStop" Content="⏹ 停止 DSH" Background="#da3633" Foreground="#FFFFFFFF" Height="30" FontSize="12" IsEnabled="False" Click="StopDsh_Click" />
+            <TextBlock Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Name="LblDshStatus" Text="● 已停止" Foreground="#8b949e" FontSize="12" Margin="0,0,0,8" />
+            <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal">
+              <Button Name="BtnRebuildDsh" Content="🔨 重建 DSH" Height="30" FontSize="12" Margin="0,0,10,0" Click="RebuildDsh_Click" ToolTip="全量重建 DSH 编译产物 (pnpm clean + build:lib + vite)。若 DSH 正在运行会先停止；重建完成后自动做兼容性检查并启动 DSH。" />
+              <Button Name="BtnOpenDsh" Content="🌐 打开 Web" Height="30" FontSize="12" IsEnabled="False" Click="OpenDsh_Click" />
             </StackPanel>
-            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-              <Button Name="BtnRebuildDsh" Content="🔨 重建 DSH" Padding="16,5" MinWidth="104" FontSize="12" Margin="0,0,10,0" HorizontalAlignment="Left" Click="RebuildDsh_Click" ToolTip="全量重建 DSH 编译产物 (pnpm clean + build:lib + vite)。若 DSH 正在运行会先停止；重建完成后自动做兼容性检查并启动 DSH。" />
-              <Button Name="BtnOpenDsh" Content="🌐 打开 Web" Padding="16,5" MinWidth="104" FontSize="12" HorizontalAlignment="Left" IsEnabled="False" Click="OpenDsh_Click" />
-              <TextBlock Name="LblDshStatus" Text="● 已停止" Foreground="#8b949e" FontSize="11" Margin="12,0,0,0" VerticalAlignment="Center" />
-            </StackPanel>
-          </StackPanel>
+          </Grid>
         </Grid>
       </GroupBox>
 
@@ -383,46 +398,156 @@
         <TabItem Header="📊 监测" IsSelected="True">
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel Name="MonitorRoot" Margin="8">
-              <!-- 模型状态卡(Strata monitor-state): 标题左/阶段徽标右, 明细行左相位右数据, 进度条 tone 随阶段 -->
-              <Border Background="#161b22" CornerRadius="8" Padding="12,10" BorderBrush="#30363d" BorderThickness="1">
+              <!-- Llama 服务状态(llama-lens LlamaStateCard): 相位 pill/模型名 · 三列 stat · 真进度条 · ctx 行 -->
+              <Border Background="#161b22" CornerRadius="10" Padding="16,12" BorderBrush="#30363d" BorderThickness="1">
                 <StackPanel>
                   <DockPanel>
-                    <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
-                      <Button Name="BtnSnapshot" Content="📷 快照" Click="Snapshot_Click" ToolTip="保存监测页截图为 PNG" Padding="6,2" Margin="0,0,10,0" />
-                      <WrapPanel VerticalAlignment="Center">
-                        <Border Name="MonPhIdle" Background="#1d2226" BorderBrush="#30363d" BorderThickness="1" CornerRadius="999" Padding="10,2" Margin="4,0,0,0">
-                          <TextBlock Name="MonPhIdleT" FontSize="11" Text="空闲" Foreground="#8e979f" />
-                        </Border>
-                        <Border Name="MonPhReading" Background="#1d2226" BorderBrush="#30363d" BorderThickness="1" CornerRadius="999" Padding="10,2" Margin="4,0,0,0">
-                          <TextBlock Name="MonPhReadingT" FontSize="11" Text="预填充" Foreground="#8e979f" />
-                        </Border>
-                        <Border Name="MonPhGen" Background="#1d2226" BorderBrush="#30363d" BorderThickness="1" CornerRadius="999" Padding="10,2" Margin="4,0,0,0">
-                          <TextBlock Name="MonPhGenT" FontSize="11" Text="生成中" Foreground="#8e979f" />
-                        </Border>
-                        <Border Name="MonPhQueue" Background="#1d2226" BorderBrush="#30363d" BorderThickness="1" CornerRadius="999" Padding="10,2" Margin="4,0,0,0">
-                          <TextBlock Name="MonPhQueueT" FontSize="11" Text="排队" Foreground="#8e979f" />
-                        </Border>
-                        <Border Name="MonPhError" Background="#1d2226" BorderBrush="#30363d" BorderThickness="1" CornerRadius="999" Padding="10,2" Margin="4,0,0,0">
-                          <TextBlock Name="MonPhErrorT" FontSize="11" Text="异常" Foreground="#8e979f" />
-                        </Border>
-                      </WrapPanel>
-                    </StackPanel>
-                    <TextBlock Text="模型状态" Foreground="#eef1f3" FontSize="15" FontWeight="Bold" VerticalAlignment="Center" />
+                    <Border DockPanel.Dock="Right" Background="#1d2226" BorderBrush="#30363d" BorderThickness="1" CornerRadius="999" Padding="12,3" VerticalAlignment="Center">
+                      <TextBlock Name="MonModelName" Text="未加载模型" FontSize="11" Foreground="#8e979f" />
+                    </Border>
+                    <Border Name="MonPhasePill" Background="#1d2226" BorderBrush="#30363d" BorderThickness="1" CornerRadius="999" Padding="14,4" VerticalAlignment="Center">
+                      <TextBlock Name="MonPhaseText" Text="空闲" FontSize="13" FontWeight="Bold" Foreground="#8e979f" />
+                    </Border>
                   </DockPanel>
-                  <Grid Margin="0,10,0,0">
+                  <Grid Margin="0,12,0,0">
                     <Grid.ColumnDefinitions>
-                      <ColumnDefinition Width="Auto" />
+                      <ColumnDefinition Width="*" />
+                      <ColumnDefinition Width="*" />
                       <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
-                    <TextBlock Name="MonPhaseLabel" Text="等待请求" Foreground="#eef1f3" FontSize="16" FontWeight="SemiBold" />
-                    <TextBlock Name="MonPhaseDetail" Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Bottom" Foreground="#8e979f" FontSize="12" Text="" />
+                    <StackPanel>
+                      <TextBlock Name="Stat1Label" Text="已解码" Foreground="#8e979f" FontSize="11" />
+                      <StackPanel Orientation="Horizontal">
+                        <TextBlock Name="Stat1Val" Text="—" Foreground="#7cd7f7" FontSize="22" FontWeight="Bold" />
+                        <TextBlock Name="Stat1Unit" Text="tokens" Foreground="#8e979f" FontSize="10" VerticalAlignment="Bottom" Margin="3,0,0,5" />
+                      </StackPanel>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1">
+                      <TextBlock Name="Stat2Label" Text="实时速度" Foreground="#8e979f" FontSize="11" />
+                      <StackPanel Orientation="Horizontal">
+                        <TextBlock Name="Stat2Val" Text="—" Foreground="#7cd7f7" FontSize="22" FontWeight="Bold" />
+                        <TextBlock Text="t/s" Foreground="#8e979f" FontSize="10" VerticalAlignment="Bottom" Margin="3,0,0,5" />
+                      </StackPanel>
+                    </StackPanel>
+                    <StackPanel Grid.Column="2">
+                      <TextBlock Name="Stat3Label" Text="上下文占用" Foreground="#8e979f" FontSize="11" />
+                      <StackPanel Orientation="Horizontal">
+                        <TextBlock Name="Stat3Val" Text="—" Foreground="#eef1f3" FontSize="22" FontWeight="Bold" />
+                        <TextBlock Name="Stat3Unit" Text="" Foreground="#8e979f" FontSize="10" VerticalAlignment="Bottom" Margin="3,0,0,5" />
+                      </StackPanel>
+                    </StackPanel>
                   </Grid>
-                  <Border Name="MonBar" Height="4" Margin="0,10,0,0" Background="#1d2226" CornerRadius="2">
+                  <Grid Name="MonBar" Height="5" Margin="0,10,0,0" Background="#1d2226">
                     <Border Name="MonBarFill" HorizontalAlignment="Left" Width="0" CornerRadius="2" Background="#34d399" />
-                  </Border>
+                  </Grid>
+                  <Grid Margin="0,5,0,0">
+                    <TextBlock Name="MonPhaseLabel" Text="等待请求" Foreground="#eef1f3" FontSize="12" />
+                    <TextBlock Name="MonPhaseDetail" HorizontalAlignment="Right" Foreground="#8e979f" FontSize="12" Text="" />
+                  </Grid>
                 </StackPanel>
               </Border>
-              <!-- 指标卡 4×2(Strata monitor-metrics): 标签+来源徽标 / 大数值+副行 / 32px 迷你曲线 -->
+              <!-- Slot 表(llama-lens SlotTable): 每槽 状态/Prompt/处理·缓存/解码/上下文/速度/投机 -->
+              <Border Background="#161b22" CornerRadius="10" Padding="16,12" Margin="0,8,0,0" BorderBrush="#30363d" BorderThickness="1">
+                <StackPanel>
+                  <DockPanel Margin="0,0,0,6">
+                    <TextBlock DockPanel.Dock="Right" Name="MonSlotSummary" Text="" Foreground="#8e979f" FontSize="11" VerticalAlignment="Center" />
+                    <TextBlock Text="Slot" Foreground="#eef1f3" FontSize="14" FontWeight="Bold" />
+                  </DockPanel>
+                  <ListView Name="MonSlotList" BorderThickness="0" Background="Transparent" Foreground="#c7cdd3" FontSize="12" ItemContainerStyle="{StaticResource ReqItem}" ScrollViewer.VerticalScrollBarVisibility="Disabled">
+                    <ListView.View>
+                      <GridView>
+                        <GridViewColumn Header="槽" DisplayMemberBinding="{Binding Id}" Width="36" />
+                        <GridViewColumn Header="状态" Width="64">
+                          <GridViewColumn.CellTemplate>
+                            <DataTemplate>
+                              <TextBlock Text="{Binding State}" Foreground="{Binding StateColor}" />
+                            </DataTemplate>
+                          </GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="任务" DisplayMemberBinding="{Binding Task}" Width="70" />
+                        <GridViewColumn Header="Prompt" DisplayMemberBinding="{Binding Prompt}" Width="82">
+                          <GridViewColumn.CellTemplate>
+                            <DataTemplate><TextBlock Text="{Binding Prompt}" TextAlignment="Right" /></DataTemplate>
+                          </GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="已处理/缓存" Width="108">
+                          <GridViewColumn.CellTemplate>
+                            <DataTemplate><TextBlock Text="{Binding ProcCache}" TextAlignment="Right" /></DataTemplate>
+                          </GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="已解码" Width="80">
+                          <GridViewColumn.CellTemplate>
+                            <DataTemplate><TextBlock Text="{Binding Decoded}" TextAlignment="Right" /></DataTemplate>
+                          </GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="上下文" Width="118">
+                          <GridViewColumn.CellTemplate>
+                            <DataTemplate>
+                              <StackPanel>
+                                <TextBlock Text="{Binding CtxText}" FontSize="11" />
+                                <Grid Height="3" Background="#1d2226" Margin="0,2,0,0">
+                                  <Border HorizontalAlignment="Left" Width="{Binding CtxBarW}" Background="{Binding CtxColor}" CornerRadius="1" />
+                                </Grid>
+                              </StackPanel>
+                            </DataTemplate>
+                          </GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="生成 t/s" Width="74">
+                          <GridViewColumn.CellTemplate>
+                            <DataTemplate><TextBlock Text="{Binding Gen}" TextAlignment="Right" Foreground="#7cd7f7" /></DataTemplate>
+                          </GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="预填充 t/s" Width="80">
+                          <GridViewColumn.CellTemplate>
+                            <DataTemplate><TextBlock Text="{Binding Pf}" TextAlignment="Right" Foreground="#4ade80" /></DataTemplate>
+                          </GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="投机" DisplayMemberBinding="{Binding Spec}" Width="44" />
+                      </GridView>
+                    </ListView.View>
+                  </ListView>
+                </StackPanel>
+              </Border>
+              <!-- 模型信息(llama-lens ModelInfoCard) + 事件流(EventFeed) -->
+              <Grid Margin="0,8,0,0">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Border Background="#161b22" CornerRadius="10" Padding="16,12" Margin="0,0,4,0" BorderBrush="#30363d" BorderThickness="1">
+                  <StackPanel>
+                    <DockPanel Margin="0,0,0,8">
+                      <TextBlock DockPanel.Dock="Right" Name="MiFtype" Text="" FontSize="11" Foreground="#8e979f" VerticalAlignment="Center" />
+                      <TextBlock Text="模型" Foreground="#eef1f3" FontSize="14" FontWeight="Bold" />
+                    </DockPanel>
+                    <TextBlock Name="MiName" Text="—" Foreground="#eef1f3" FontSize="15" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Name="MiPath" Text="路径 —" Foreground="#8e979f" FontSize="11" Margin="0,3,0,8" TextTrimming="CharacterEllipsis" />
+                    <UniformGrid Columns="2">
+                      <StackPanel Margin="0,3,8,3"><TextBlock Text="参数量" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiParams" Text="—" FontSize="12" /></StackPanel>
+                      <StackPanel Margin="0,3,0,3"><TextBlock Text="文件体积" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiSize" Text="—" FontSize="12" /></StackPanel>
+                      <StackPanel Margin="0,3,8,3"><TextBlock Text="嵌入维度" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiEmbd" Text="—" FontSize="12" /></StackPanel>
+                      <StackPanel Margin="0,3,0,3"><TextBlock Text="词表大小" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiVocab" Text="—" FontSize="12" /></StackPanel>
+                      <StackPanel Margin="0,3,8,3"><TextBlock Text="n_ctx" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiCtx" Text="—" FontSize="12" /></StackPanel>
+                      <StackPanel Margin="0,3,0,3"><TextBlock Text="n_ctx_train" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiCtxTrain" Text="—" FontSize="12" /></StackPanel>
+                      <StackPanel Margin="0,3,8,3"><TextBlock Text="vocab_type" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiVocabType" Text="—" FontSize="12" /></StackPanel>
+                      <StackPanel Margin="0,3,0,3"><TextBlock Text="模态" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiModal" Text="—" FontSize="12" /></StackPanel>
+                    </UniformGrid>
+                  </StackPanel>
+                </Border>
+                <Border Grid.Column="1" Background="#161b22" CornerRadius="10" Padding="16,12" Margin="4,0,0,0" BorderBrush="#30363d" BorderThickness="1">
+                  <StackPanel>
+                    <DockPanel Margin="0,0,0,6">
+                      <TextBlock DockPanel.Dock="Right" Name="MonEventCount" Text="0 / 200" Foreground="#8e979f" FontSize="11" VerticalAlignment="Center" />
+                      <TextBlock Text="事件流" Foreground="#eef1f3" FontSize="14" FontWeight="Bold" />
+                    </DockPanel>
+                    <ScrollViewer MaxHeight="220" VerticalScrollBarVisibility="Auto">
+                      <ItemsControl Name="MonEventFeed" FontFamily="Consolas" FontSize="11" />
+                    </ScrollViewer>
+                  </StackPanel>
+                </Border>
+              </Grid>
+              <!-- 硬件(Strata 卡片组): 速度/GPU/显存/温度/功率/PCIe/CPU/内存/磁盘 -->
+              <!-- 硬件指标卡 4×2(Strata monitor-metrics): 标签+来源徽标 / 大数值+副行 / 32px 迷你曲线 -->
               <UniformGrid Columns="3" Margin="0,8,0,0">
                 <Border Background="#161b22" CornerRadius="10" Padding="12" Margin="5" BorderBrush="#30363d" BorderThickness="1">
                   <StackPanel>
