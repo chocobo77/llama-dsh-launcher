@@ -242,7 +242,7 @@ public class GpuMonitor
 			// 旧驱动缺 pcie.link.* 时对应列为 "N/A"，解析失败即跳过该键（UI 显示"无数据"）。
 			ProcessResult runResult = ProcessRunner.Run(
 				"nvidia-smi",
-				new[] { "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,enforced.power.limit,fan.speed,clocks.current.graphics,pcie.link.gen.current,pcie.link.width.current,pcie.link.rx.current", "--format=csv,noheader,nounits" },
+				new[] { "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,enforced.power.limit,fan.speed,clocks.current.graphics,pcie.link.gen.current,pcie.link.width.current,pcie.link.rx.current,name", "--format=csv,noheader,nounits" },
 				5000);
 			if (!runResult.Started || runResult.TimedOut)
 			{
@@ -252,6 +252,8 @@ public class GpuMonitor
 			double utilSum = 0.0, utilN = 0.0, vramUsed = 0.0, vramTotal = 0.0, tempMax = 0.0;
 			double powerSum = 0.0, limitSum = 0.0, fanSum = 0.0, fanN = 0.0, clockSum = 0.0, clockN = 0.0, rxSum = 0.0, rxN = 0.0;
 			string? gen = null, width = null;
+			string name = "";
+			int count = 0;
 			bool any = false;
 			foreach (string raw in runResult.StdOut.Split('\n'))
 			{
@@ -313,6 +315,11 @@ public class GpuMonitor
 					rxSum += rx;
 					rxN += 1.0;
 				}
+				if (array.Length > 11 && string.IsNullOrWhiteSpace(name))
+				{
+					name = array[11];
+				}
+				count++;
 				any = true;
 			}
 			if (!any)
@@ -364,6 +371,14 @@ public class GpuMonitor
 			if (rxN > 0.0)
 			{
 				r["pcie_rx_kbs"] = (rxSum / rxN).ToString("F0", CultureInfo.InvariantCulture);
+			}
+			if (count > 0)
+			{
+				r["gpu_count"] = count.ToString(CultureInfo.InvariantCulture);
+			}
+			if (!string.IsNullOrWhiteSpace(name))
+			{
+				r["gpu_name"] = name.Trim();
 			}
 			return true;
 		}

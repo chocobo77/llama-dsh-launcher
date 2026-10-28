@@ -39,3 +39,4 @@ LlamaDSH_Launcher_CS/installer_staging_linux/
 
 # 个人整理的参考资料，不入库
 /显存占用计算指南.md
+vendor/Strata/
