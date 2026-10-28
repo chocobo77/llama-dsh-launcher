@@ -3769,9 +3769,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			PerfTps.Text = "—";
 			MonTtft.Text = "—";
 			ResetMonitorCards();
-			MonCacheLast.Text = "—";
-			MonCacheTotal.Text = "0 tok / 0 次请求";
-			RefreshReqList();
 		}, Array.Empty<object>());
 		string? stDir = DetectSafetensorsDir();
 		if (stDir != null)
@@ -6139,6 +6136,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	}
 
 	private readonly Hist _hCpu = new();
+	private readonly Hist _hRam = new();
 	private readonly Hist _hGpu = new();
 	private readonly Hist _hVram = new();
 	private readonly Hist _hTemp = new();
@@ -6177,28 +6175,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private long _ctxTokens;
 	private int _queueCount;
 
-	// 最近请求表 + 对话缓存统计(来自 llama 日志的计时行)
-	private sealed class ReqRec
-	{
-		public string Time = "";
-		public string Status = "完成";
-		public string Prompt = "—";
-		public string Reused = "—";
-		public string Output = "—";
-		public string Tps = "—";
-		public string Hit = "—";
-		public string Dur = "—";
-	}
-	private readonly List<ReqRec> _reqRecords = new();
-	private readonly object _reqLock = new();
-	private int _curPromptToks;
+private int _curPromptToks;
 	private int _curReused;
 	private int _curOutToks;
 	private double _curTps;
 	private double _curEvalMs;
-	private long _reusedTotal;
-	private long _reqTotalCount;
-	private long _reqReusedCount;
 
 	// 上次请求的解码/预填充速度(Strata: 无活动时显示 last request)
 	private double _lastTps;
@@ -6275,14 +6256,40 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		MonPhQueueT.Text = _queueCount > 0 ? $"排队 ({_queueCount})" : "排队";
 		MonPhaseLabel.Text = phaseLabel;
 		MonPhaseDetail.Text = detail;
-		// Strata: 进度条 reading=info 蓝 / 其余 accent 绿; writing 且无实时百分比时不确定态
-		MonProgress.IsIndeterminate = activeBusy;
-		MonProgress.Foreground = new SolidColorBrush(active == "reading" ? ToneInfo : ToneAccent);
-		if (!activeBusy)
-		{
-			MonProgress.Value = 0.0;
-		}
+		// Strata Bar: 活动期不定态(滑块呼吸, 非滚动点), 空闲归零; reading=info 蓝 / 生成=accent 绿
+		SetMonBar(activeBusy, active == "reading" ? ToneInfo : ToneAccent);
 	}
+
+	// 自定义进度条: 决定态=按 pct 填充; 不定态=30% 宽滑块左右缓动(WPF 默认圆点滚动观感差)
+	private void SetMonBar(bool active, System.Windows.Media.Color tone)
+	{
+		MonBarFill.Background = new SolidColorBrush(tone);
+		double w = MonBar.ActualWidth;
+		if (!active)
+		{
+			MonBarFill.BeginAnimation(System.Windows.FrameworkElement.WidthProperty, null);
+			MonBarFill.Width = 0.0;
+			return;
+		}
+		if (w <= 0 || _barAnim != null)
+		{
+			return;
+		}
+		var anim = new System.Windows.Media.Animation.DoubleAnimation
+		{
+			From = 0.0,
+			To = w,
+			Duration = new System.Windows.Duration(TimeSpan.FromSeconds(1.6)),
+			AutoReverse = true,
+			RepeatBehavior = System.Windows.Media.Animation.RepeatBehavior.Forever,
+			EasingFunction = new System.Windows.Media.Animation.SineEase { EasingMode = System.Windows.Media.Animation.EasingMode.EaseInOut }
+		};
+		_barAnim = anim;
+		MonBarFill.BeginAnimation(System.Windows.FrameworkElement.WidthProperty, anim);
+	}
+
+	private System.Windows.Media.Animation.DoubleAnimation? _barAnim;
+
 
 	// 阶段徽标: 活动=色底/亮字, 非活动=表面灰
 	private static void StylePhase(System.Windows.Controls.Border b, System.Windows.Controls.TextBlock t, bool active, System.Windows.Media.Color bg, System.Windows.Media.Color fg)
@@ -6292,17 +6299,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		b.BorderBrush = new SolidColorBrush(active ? System.Windows.Media.Color.FromArgb(0x55, bg.R, bg.G, bg.B) : System.Windows.Media.Color.FromRgb(0x30, 0x36, 0x3d));
 		t.Foreground = new SolidColorBrush(active ? fg : System.Windows.Media.Color.FromRgb(0x8e, 0x97, 0x9f));
 		t.FontWeight = active ? FontWeights.Bold : FontWeights.Normal;
-	}
-
-	// 上下文 Gauge(Strata 270° 弧: r=50 stroke10 dasharray 235.62/314.16 rotate135; WPF dash 单位=stroke 厚度→/10)
-	private void UpdateGauge(double pct, double used, double maxTokens, bool known)
-	{
-		double frac = Math.Max(0.0, Math.Min(1.0, pct / 100.0));
-		double dash = Math.Max(0.02, 23.562 * frac);
-		MonGaugeFill.StrokeDashArray = new System.Windows.Media.DoubleCollection { dash, 100.0 };
-		MonGaugeFill.Opacity = dash >= 0.3 ? 1.0 : 0.0;
-		MonGaugePct.Text = known ? $"{frac * 100.0:F0}%" : "—";
-		MonGaugeSub.Text = known ? $"{FmtTok(used)} / {FmtTok(maxTokens)} tokens" : "暂无请求记录";
 	}
 
 	private static string FmtTok(double n)
@@ -6321,7 +6317,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	// llama 启动时清空监测卡历史/能耗/请求表(Strata: 自启动起算)
 	private void ResetMonitorCards()
 	{
-		foreach (Hist h in new[] { _hCpu, _hGpu, _hVram, _hTemp, _hPower, _hPcie, _hDisk, _hTps, _hPf })
+		foreach (Hist h in new[] { _hCpu, _hRam, _hGpu, _hVram, _hTemp, _hPower, _hPcie, _hDisk, _hTps, _hPf })
 		{
 			h.Clear();
 		}
@@ -6336,54 +6332,16 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		_lastPf = 0.0;
 		_curPf = 0.0;
 		_lastOutToks = 0;
-		lock (_reqLock)
-		{
-			_reqRecords.Clear();
-		}
 		_curPromptToks = 0;
 		_curReused = 0;
 		_curOutToks = 0;
 		_curTps = 0.0;
 		_curEvalMs = 0.0;
-		_reusedTotal = 0;
-		_reqTotalCount = 0;
-		_reqReusedCount = 0;
-		((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
-		{
-			MonCacheLast.Text = "—";
-			MonCacheTotal.Text = "—";
-			MonCacheSummary.Text = "";
-			MonCacheDesc.Text = "引擎报告 prompt 复用后，这里会显示缓存明细。";
-			RefreshReqList();
-		}, Array.Empty<object>());
 	}
 
-	// 一次请求计时链路完成(prompt → eval → total time), 落一条请求记录并刷新表/汇总/缓存区
+	// 一次请求计时链路完成(prompt → eval → total time): 记录上次请求速度供速度卡"上次请求"副行
 	private void FinalizeRequest()
 	{
-		ReqRec rec = new ReqRec
-		{
-			Time = DateTime.Now.ToString("HH:mm:ss"),
-			Status = "完成",
-			Prompt = _curPromptToks > 0 ? FmtTok(_curPromptToks) : "—",
-			Reused = _curReused > 0 ? FmtTok(_curReused) : "—",
-			Output = _curOutToks > 0 ? FmtTok(_curOutToks) : "—",
-			Tps = _curTps > 0.0 ? FT(_curTps) : "—",
-			Dur = _curEvalMs > 0.0 ? $"{_curEvalMs / 1000.0:F1} s" : "—",
-		};
-		// VRAM 命中率(Strata 口径): 复用 / prompt tokens, 1 位小数
-		if (_curReused > 0 && _curPromptToks > 0)
-		{
-			rec.Hit = $"{Math.Min(100.0, _curReused * 100.0 / _curPromptToks):F1}%";
-		}
-		if (_curReused > 0)
-		{
-			_reusedTotal += _curReused;
-			_reqReusedCount++;
-		}
-		_reqTotalCount++;
-		int lastReused = _curReused;
-		int lastPrompt = _curPromptToks;
 		if (_curTps > 0.0)
 		{
 			_lastTps = _curTps;
@@ -6393,90 +6351,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			_lastPf = _curPf;
 		}
 		_lastOutToks = _curOutToks;
-		lock (_reqLock)
-		{
-			_reqRecords.Add(rec);
-			if (_reqRecords.Count > 200)
-			{
-				_reqRecords.RemoveAt(0);
-			}
-		}
 		_curPromptToks = 0;
 		_curReused = 0;
 		_curOutToks = 0;
 		_curTps = 0.0;
 		_curEvalMs = 0.0;
-		((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
-		{
-			RefreshReqList();
-			if (lastReused > 0)
-			{
-				MonCacheLast.Text = $"{FmtTok(lastReused)} / {FmtTok(lastPrompt)} prompt tokens 复用";
-				MonCacheSummary.Text = $"{_reqReusedCount} / {_reqTotalCount} 次请求复用了 prompt tokens";
-				MonCacheDesc.Text = "后续请求可复用上一请求已缓存的 prompt tokens。";
-			}
-			else
-			{
-				MonCacheLast.Text = "未报告复用";
-			}
-			MonCacheTotal.Text = _reusedTotal > 0 ? $"{FmtTok(_reusedTotal)} tokens" : "—";
-		}, Array.Empty<object>());
-	}
-
-	// 请求表刷新: 默认最新 12 条(新→旧), 按钮切换全部(Strata Show all (N)); 底部汇总句
-	private void RefreshReqList()
-	{
-		List<ReqRec> view;
-		bool showAll = _showAllReq;
-		lock (_reqLock)
-		{
-			int n = showAll ? _reqRecords.Count : Math.Min(12, _reqRecords.Count);
-			view = _reqRecords.Skip(Math.Max(0, _reqRecords.Count - n)).Reverse().ToList();
-		}
-		MonReqList.ItemsSource = view;
-		BtnShowAllReq.Visibility = _reqTotalCount > 12 ? Visibility.Visible : Visibility.Collapsed;
-		BtnShowAllReq.Content = showAll ? "收起" : $"显示全部 ({_reqTotalCount})";
-		MonReqTotals.Text = RequestSummary();
-	}
-
-	private bool _showAllReq;
-
-	private void ShowAllReq_Click(object sender, RoutedEventArgs e)
-	{
-		_showAllReq = !_showAllReq;
-		RefreshReqList();
-	}
-
-	// 汇总句(Strata requestSummary): 引擎未报告的部分从句子里省掉, 而不是显示破折号
-	private string RequestSummary()
-	{
-		int n = (int)_reqTotalCount;
-		if (n <= 0)
-		{
-			return "";
-		}
-		double ao = _tpsSamples.IsEmpty ? 0.0 : _tpsSamples.ToArray().Average();
-		double ar = _pfSamples.IsEmpty ? 0.0 : _pfSamples.ToArray().Average();
-		bool ho = ao > 0.0;
-		bool hr = ar > 0.0;
-		bool hu = _reusedTotal > 0;
-		if (ho && hr && hu)
-		{
-			return $"共 {n} 次请求，平均输出 {ao:F1} tok/s，prompt 读取 {ar:F0} tok/s，复用 {FmtTok(_reusedTotal)} tokens。";
-		}
-		if (ho && hr)
-		{
-			return $"共 {n} 次请求，平均输出 {ao:F1} tok/s，prompt 读取 {ar:F0} tok/s。";
-		}
-		if (ho && hu)
-		{
-			return $"共 {n} 次请求，平均输出 {ao:F1} tok/s，复用 {FmtTok(_reusedTotal)} tokens。";
-		}
-		if (ho)
-		{
-			return $"共 {n} 次请求，平均输出 {ao:F1} tok/s。";
-		}
-		return $"共 {n} 次请求。";
 	}
 
 	// 保存监测页快照(Strata Save Monitor screenshot): 渲染面板为 PNG
@@ -6570,8 +6449,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			TempSub.Text = _gpuCount > 1 ? "最热 GPU" : _gpuName;
 			SetBadge(BdgTemp, true);
 			PushChart(SparkTemp, _hTemp, vTemp, 90.0, "°C", ToneWarn);
-			MonGpuTempVal.Text = $"{vTemp:F0} °C";
-			MonGpuTempBar.Value = Math.Min(100.0, vTemp);
 		}
 		else
 		{
@@ -6645,37 +6522,46 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		if (d.TryGetValue("fan_pct", out string vFn) && double.TryParse(vFn, NumberStyles.Float, CultureInfo.InvariantCulture, out var vF) && vF >= 0.0)
 		{
 			MonFan.Text = $"{vF:F0} %";
+			StripFan.Visibility = Visibility.Visible;
+		}
+		else
+		{
+			StripFan.Visibility = Visibility.Collapsed;
 		}
 		if (d.TryGetValue("clock_mhz", out string vCm) && double.TryParse(vCm, NumberStyles.Float, CultureInfo.InvariantCulture, out var vCk) && vCk > 0.0)
 		{
 			MonClock.Text = $"{vCk:F0} MHz";
+			StripClock.Visibility = Visibility.Visible;
+		}
+		else
+		{
+			StripClock.Visibility = Visibility.Collapsed;
 		}
 		if (d.TryGetValue("cpu_temp", out string vCt) && double.TryParse(vCt, NumberStyles.Float, CultureInfo.InvariantCulture, out var vCt2) && vCt2 > 0.0)
 		{
 			MonCpuTemp.Text = $"{vCt2:F0} °C";
 			MonCpuTemp.ToolTip = (d.TryGetValue("cpu_temp_src", out string vSrc) && vSrc == "acpi") ? "ACPI 热区(非核心精确值)" : null;
+			StripCpuTemp.Visibility = Visibility.Visible;
 		}
-		// ── 上下文填充 Gauge + 系统内存条 ──
-		if (_ctxTokens == 0 && IsAlive(_llamaProc) && RoleText("ctx_size", out string ctxStr2))
+		else
 		{
-			long.TryParse(NormTok(ctxStr2), out _ctxTokens);
+			// Strata Windows 语义: 读不到的 CPU 温度整行不显示(无免管理员可信来源)
+			StripCpuTemp.Visibility = Visibility.Collapsed;
 		}
-		bool ctxKnown = false;
-		double ctxPct = 0.0;
-		double vCu2 = 0.0;
-		if (d.TryGetValue("ctx_used", out string vCu) && double.TryParse(vCu, NumberStyles.Float, CultureInfo.InvariantCulture, out vCu2) && vCu2 >= 0.0 && _ctxTokens > 0)
-		{
-			ctxKnown = true;
-			ctxPct = Math.Min(100.0, vCu2 / _ctxTokens * 100.0);
-		}
-		UpdateGauge(ctxPct, ctxKnown ? vCu2 : 0.0, _ctxTokens, ctxKnown);
+		// ── 系统内存卡(同显存卡样式) ──
 		if (d.TryGetValue("ram_used", out string vRu) && d.TryGetValue("ram_total", out string vRt) && double.TryParse(vRu, NumberStyles.Float, CultureInfo.InvariantCulture, out var vRu2) && double.TryParse(vRt, NumberStyles.Float, CultureInfo.InvariantCulture, out var vRt2) && vRt2 > 0.0)
 		{
-			double ramPct = Math.Min(100.0, vRu2 / vRt2 * 100.0);
-			MonRamLabel.Text = $"{vRu2 / 1073741824.0:F1} / {vRt2 / 1073741824.0:F0} GB";
-			MonRamBar.Value = ramPct;
-			// Strata: RAM >92% danger 红
-			MonRamBar.Foreground = new SolidColorBrush(ramPct > 92.0 ? System.Windows.Media.Color.FromRgb(0xff, 0x5a, 0x6e) : ToneAccent);
+			double gRamU = vRu2 / 1073741824.0;
+			double gRamT = vRt2 / 1073741824.0;
+			PerfRam.Text = gRamU.ToString("F1");
+			RamUnit.Text = $"/ {gRamT:F0} GB";
+			MonRamSub.Text = $"已用 {gRamU / gRamT * 100.0:F0}%";
+			SetBadge(BdgRam, true);
+			PushChart(SparkRam, _hRam, gRamU, gRamT, "GB", ToneAccent);
+		}
+		else
+		{
+			SetBadge(BdgRam, false);
 		}
 		if (d.TryGetValue("req_wait", out string vRw) && int.TryParse(vRw, out var vRw2))
 		{

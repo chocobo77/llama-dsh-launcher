@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Runtime.InteropServices;
 
 namespace LlamaDSH_Launcher.Services;
@@ -24,6 +25,7 @@ public static class NvmlMonitor
 	[DllImport("kernel32", CharSet = CharSet.Ansi, SetLastError = true)]
 	private static extern IntPtr LoadLibrary(string name);
 
+	[UnmanagedFunctionPointer(System.Runtime.InteropServices.CallingConvention.Cdecl)]
 	private delegate int IntFn();
 
 	// NVML API 全部 stdcall(int 返回)
@@ -115,18 +117,25 @@ public static class NvmlMonitor
 		}
 	}
 
+	[UnmanagedFunctionPointer(System.Runtime.InteropServices.CallingConvention.Cdecl)]
 	private delegate int DeviceCount(out uint count);
 
+	[UnmanagedFunctionPointer(System.Runtime.InteropServices.CallingConvention.Cdecl)]
 	private delegate int GetHandle(uint index, out IntPtr dev);
 
+	[UnmanagedFunctionPointer(System.Runtime.InteropServices.CallingConvention.Cdecl)]
 	private delegate int GetUint(IntPtr dev, out uint value);
 
+	[UnmanagedFunctionPointer(System.Runtime.InteropServices.CallingConvention.Cdecl)]
 	private delegate int GetUintWith(IntPtr dev, uint arg, out uint value);
 
+	[UnmanagedFunctionPointer(System.Runtime.InteropServices.CallingConvention.Cdecl)]
 	private delegate int GetUtil(IntPtr dev, out NvmlUtilization u);
 
+	[UnmanagedFunctionPointer(System.Runtime.InteropServices.CallingConvention.Cdecl)]
 	private delegate int GetMem(IntPtr dev, out NvmlMemory m);
 
+	[UnmanagedFunctionPointer(System.Runtime.InteropServices.CallingConvention.Cdecl)]
 	private delegate int GetName(IntPtr dev, [Out] byte[] name, uint len);
 
 	/// <summary>聚合全部 GPU: 均值(利用率/风扇/频率), 求和(显存/功率/上限/吞吐), 最热温度, 设备0 的链路代数宽度与名称。</summary>
@@ -146,6 +155,11 @@ public static class NvmlMonitor
 				if (getCount == null || getHandle == null || getCount(out uint n) != 0 || n == 0)
 				{
 					return false;
+				}
+				var missing = new[] { "nvmlDeviceGetUtilizationRates", "nvmlDeviceGetMemoryInfo", "nvmlDeviceGetTemperature", "nvmlDeviceGetPowerUsage", "nvmlDeviceGetEnforcedPowerLimit", "nvmlDeviceGetCurrPcieLinkGeneration", "nvmlDeviceGetCurrPcieLinkWidth", "nvmlDeviceGetPcieThroughput", "nvmlDeviceGetClockInfo", "nvmlDeviceGetFanSpeed", "nvmlDeviceGetName" }.Where(f => GetProcAddress(_lib, f) == IntPtr.Zero && GetProcAddress(_lib, f.EndsWith("_v2", StringComparison.Ordinal) ? f[..^3] : f + "_v2") == IntPtr.Zero).ToList();
+				if (missing.Count > 0)
+				{
+					AppLog.WriteError("NVML 缺失导出: " + string.Join(",", missing));
 				}
 				var getUtil = GetFn<GetUtil>("nvmlDeviceGetUtilizationRates");
 				var getMem = GetFn<GetMem>("nvmlDeviceGetMemoryInfo");
