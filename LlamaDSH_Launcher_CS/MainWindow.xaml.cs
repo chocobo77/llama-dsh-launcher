@@ -5942,12 +5942,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 							d["ctx_used"] = _llamaCtxUsed.ToString("F0", CultureInfo.InvariantCulture);
 						}
 					}
-					if (num % 2 == 0)
+					// 每拍查询(NVML 为进程内直采, 开销极低): 2 倍频会让温度/功率卡在半数拍上显示无数据
+					foreach (KeyValuePair<string, string> item in _gpuMonitor.QueryGpu())
 					{
-						foreach (KeyValuePair<string, string> item in _gpuMonitor.QueryGpu())
-						{
-							d[item.Key] = item.Value;
-						}
+						d[item.Key] = item.Value;
 					}
 					((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
 					{
@@ -6289,7 +6287,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	// 阶段徽标: 活动=色底/亮字, 非活动=表面灰
 	private static void StylePhase(System.Windows.Controls.Border b, System.Windows.Controls.TextBlock t, bool active, System.Windows.Media.Color bg, System.Windows.Media.Color fg)
 	{
-		b.Background = new SolidColorBrush(active ? System.Windows.Media.Color.FromArgb(0x1f, bg.R, bg.G, bg.B) : System.Windows.Media.Color.FromRgb(0x1d, 0x22, 0x26));
+		// Strata: 活动徽标 tint 底 + 彩字 + 边框透明; 非活动 surface 底 + 灰字 + 线框
+		b.Background = new SolidColorBrush(active ? System.Windows.Media.Color.FromArgb(0x2e, bg.R, bg.G, bg.B) : System.Windows.Media.Color.FromRgb(0x1d, 0x22, 0x26));
+		b.BorderBrush = new SolidColorBrush(active ? System.Windows.Media.Color.FromArgb(0x55, bg.R, bg.G, bg.B) : System.Windows.Media.Color.FromRgb(0x30, 0x36, 0x3d));
 		t.Foreground = new SolidColorBrush(active ? fg : System.Windows.Media.Color.FromRgb(0x8e, 0x97, 0x9f));
 		t.FontWeight = active ? FontWeights.Bold : FontWeights.Normal;
 	}

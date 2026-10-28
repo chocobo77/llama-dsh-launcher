@@ -62,31 +62,56 @@ public static class NvmlMonitor
 		public ulong Free;
 	}
 
+	private static double _lastTry;
+
 	private static void EnsureInit()
 	{
-		if (_tried)
+		if (_ok)
+		{
+			return;
+		}
+		// 失败 60s 冷却后重试(驱动可能后装); NVML 常见位置: System32 或旧版驱动目录
+		if (_tried && Environment.TickCount64 - _lastTry < 60000)
 		{
 			return;
 		}
 		_tried = true;
+		_lastTry = Environment.TickCount64;
 		try
 		{
-			_lib = LoadLibrary("nvml.dll");
+			string[] candidates =
+			{
+				"nvml.dll",
+				System.IO.Path.Combine(Environment.SystemDirectory, "nvml.dll"),
+				@"C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll"
+			};
+			foreach (string path in candidates)
+			{
+				_lib = LoadLibrary(path);
+				if (_lib != IntPtr.Zero)
+				{
+					break;
+				}
+			}
 			if (_lib == IntPtr.Zero)
 			{
+				AppLog.WriteError("NVML 加载失败: 未找到 nvml.dll(PCIe 吞吐/功率将回退 nvidia-smi)");
 				return;
 			}
 			var init = GetFn<IntFn>("nvmlInit_v2");
 			if (init == null || init() != 0)
 			{
 				_lib = IntPtr.Zero;
+				AppLog.WriteError("NVML 初始化失败: nvmlInit 非零返回");
 				return;
 			}
 			_ok = true;
 		}
-		catch
+		catch (Exception ex)
 		{
 			_ok = false;
+			_lib = IntPtr.Zero;
+			AppLog.WriteError("NVML 初始化异常: " + ex.Message);
 		}
 	}
 
