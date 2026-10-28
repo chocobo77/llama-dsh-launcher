@@ -5966,6 +5966,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private readonly Hist _hGpuUtil = new();
 	private readonly Hist _hGpuMem = new();
 	private readonly Hist _hNet = new();
+	private readonly Hist _hNetTx = new();
 
 	// 每核 CPU 与网卡采样(perf 线程写, UI 读)
 	private PerformanceCounter[]? _coreCounters;
@@ -6156,7 +6157,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			MonPhaseDetail.Text = rightText;
 			MonPhaseLabel.ToolTip = leftText;
 		}
-		BuildSlotCards(slots, llamaUp);
 		UpdateModelInfoCard(api);
 		UpdateEventFeed(api);
 	}
@@ -6297,17 +6297,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private int _eventFeedCount;
 
-	// Slot 卡片(顶层版本, OnPerf 内另有同名局部函数, 供 UpdatePhaseCard 调用)
-	private void BuildSlotCards(List<LlamaApiMonitor.SlotInfo> slots, bool llamaUp)
+	private static Grid CreateBar(double pct, Color color, double height)
 	{
-		SlotCardsHost.Children.Clear();
-		if (!llamaUp || slots.Count == 0)
-		{
-			SlotCardsHost.Children.Clear();
-			return;
-		}
+	var g = new Grid { Height = height, Background = new SolidColorBrush(Color.FromRgb(0x1d, 0x22, 0x26)) };
+	g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(Math.Max(0.0, Math.Min(100.0, pct)), GridUnitType.Star) });
+	g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(Math.Max(0.0, 100 - Math.Min(100.0, pct)), GridUnitType.Star) });
+	g.Children.Add(new Border { Background = new SolidColorBrush(color), CornerRadius = new CornerRadius(2) });
+	return g;
 	}
-
 	// 保存监测页快照(Strata Save Monitor screenshot): 渲染面板为 PNG
 	private void Snapshot_Click(object sender, RoutedEventArgs e)
 	{
@@ -6427,6 +6424,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			double pct = Math.Min(100.0, ctxUsed * 100.0 / ctxTotal);
 			CtxVal.Text = FmtTok(ctxUsed);
+			CtxVal.Foreground = new SolidColorBrush(pct >= 90 ? Color.FromRgb(0xff, 0x8a, 0x98) : pct >= 70 ? Color.FromRgb(0xf8, 0xc9, 0x6a) : Color.FromRgb(0xee, 0xf1, 0xf3));
 			CtxMax.Text = FmtTok(ctxTotal);
 			CtxBadge.Visibility = pct >= 90 ? Visibility.Visible : Visibility.Collapsed;
 			if (CtxBar.ActualWidth > 0)
@@ -6501,7 +6499,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			_hRam.Push(null);
 		}
+		double txSum = 0;
+		foreach (var (_, _, t) in _netSamples)
+		{
+			txSum += t;
+		}
 		_hNet.Push(_netRxMbs > 0 ? _netRxMbs : null);
+		_hNetTx.Push(txSum > 0 ? txSum : null);
 		BuildSysPanels(d, ramUsedGb, ramTotalGb);
 
 		// ── 模型与 Slot ──
@@ -6511,7 +6515,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		UpdateTrends();
 		UpdatePhaseCard();
 
-		// ============ 构建器: GPU 每卡面板(llama-lens GpuPanel) ============
+	// ============ 构建器: GPU 每卡面板(llama-lens GpuPanel) ============
 		void BuildGpuPanels(List<GpuDevInfo> gpus)
 		{
 			GpuPanelsHost.Children.Clear();
@@ -6565,8 +6569,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					FontFamily = new FontFamily("Consolas"),
 					Foreground = new SolidColorBrush(memPct >= 90 ? Color.FromRgb(0xff, 0x8a, 0x98) : Color.FromRgb(0x8e, 0x97, 0x9f)),
 				});
-				var memBar = new Grid { Height = 5, Margin = new Thickness(0, 3, 0, 8), Background = new SolidColorBrush(Color.FromRgb(0x1d, 0x22, 0x26)) };
-				memBar.Children.Add(new Border { HorizontalAlignment = HorizontalAlignment.Left, Width = Math.Max(0, memPct / 100.0 * (right.ActualWidth > 0 ? right.ActualWidth : 320)), Background = new SolidColorBrush(memPct >= 90 ? Color.FromRgb(0xff, 0x5a, 0x6e) : memPct >= 70 ? Color.FromRgb(0xf5, 0xb5, 0x3d) : Color.FromRgb(0x34, 0xd3, 0x99)), CornerRadius = new CornerRadius(2) });
+				var memBar = CreateBar(memPct, memPct >= 90 ? Color.FromRgb(0xff, 0x5a, 0x6e) : memPct >= 70 ? Color.FromRgb(0xf5, 0xb5, 0x3d) : Color.FromRgb(0x34, 0xd3, 0x99), 5);
+				memBar.Margin = new Thickness(0, 3, 0, 8);
 				right.Children.Add(memBar);
 				var grid3 = new UniformGrid { Columns = 3 };
 				void Kv(string k, string v, System.Windows.Media.Color? c = null)
@@ -6630,9 +6634,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				MemBigVal.Text = pct.ToString("F0");
 				MemHeadSub.Text = $"{ramTotalGb:F1} GB 总量";
 				MemUsedSub.Text = $"{ramUsedGb:F1} / {ramTotalGb:F0} GB";
-				if (MemStackUsed.ActualWidth > 0 || MemStackUsed.Parent is Grid)
+				if (MemStackUsed.Parent is Grid pg && pg.ColumnDefinitions.Count == 0)
 				{
-					MemStackUsed.Width = Math.Max(0, pct / 100.0 * ((MemStackUsed.Parent as Grid)?.ActualWidth ?? 0));
+					pg.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(pct, GridUnitType.Star) });
+					pg.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(100 - pct, GridUnitType.Star) });
+				}
+				else if (MemStackUsed.Parent is Grid pg2 && pg2.ColumnDefinitions.Count == 2)
+				{
+					pg2.ColumnDefinitions[0].Width = new GridLength(pct, GridUnitType.Star);
+					pg2.ColumnDefinitions[1].Width = new GridLength(100 - pct, GridUnitType.Star);
 				}
 				MemStackUsed.Background = new SolidColorBrush(pct >= 90 ? Color.FromRgb(0xff, 0x5a, 0x6e) : pct >= 70 ? Color.FromRgb(0xf5, 0xb5, 0x3d) : Color.FromRgb(0x34, 0xd3, 0x99));
 				MemLegendUsed.Text = $" 已用 {ramUsedGb:F1} GB";
@@ -6663,8 +6673,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					var name = new TextBlock { Text = drv.Name, FontSize = 11, FontFamily = new FontFamily("Consolas"), Foreground = new SolidColorBrush(Color.FromRgb(0xc7, 0xcd, 0xd3)), VerticalAlignment = VerticalAlignment.Center };
 					Grid.SetColumn(name, 0);
 					row.Children.Add(name);
-					var barWrap = new Grid { Height = 6, Background = new SolidColorBrush(Color.FromRgb(0x1d, 0x22, 0x26)), VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 10, 0) };
-					barWrap.Children.Add(new Border { HorizontalAlignment = HorizontalAlignment.Left, Width = Math.Max(0, pct / 100.0 * 260), Background = new SolidColorBrush(pct >= 90 ? Color.FromRgb(0xff, 0x5a, 0x6e) : pct >= 70 ? Color.FromRgb(0xf5, 0xb5, 0x3d) : Color.FromRgb(0x34, 0xd3, 0x99)), CornerRadius = new CornerRadius(2) });
+					var barWrap = CreateBar(pct, pct >= 90 ? Color.FromRgb(0xff, 0x5a, 0x6e) : pct >= 70 ? Color.FromRgb(0xf5, 0xb5, 0x3d) : Color.FromRgb(0x34, 0xd3, 0x99), 6);
+					barWrap.VerticalAlignment = VerticalAlignment.Center;
+					barWrap.Margin = new Thickness(0, 0, 10, 0);
 					Grid.SetColumn(barWrap, 1);
 					row.Children.Add(barWrap);
 					var txt = new TextBlock { Text = $"{used:F0}G / {total:F0}G ({pct:F0}%)", FontSize = 11, FontFamily = new FontFamily("Consolas"), Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), VerticalAlignment = VerticalAlignment.Center, TextAlignment = TextAlignment.Right };
@@ -6772,6 +6783,17 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		// ============ 历史趋势(实时 60s 窗口) ============
 		void UpdateTrends()
 		{
+			TrendGen.StampsRef = _hTps.Stamps();
+			TrendPf.StampsRef = _hPf.Stamps();
+			TrendCtx.StampsRef = _hCtx.Stamps();
+			TrendMtp.StampsRef = _hMtp.Stamps();
+			TrendGpuUtil.StampsRef = _hGpuUtil.Stamps();
+			TrendGpuMem.StampsRef = _hGpuMem.Stamps();
+			TrendGpuTemp.StampsRef = _hTemp.Stamps();
+			TrendGpuPower.StampsRef = _hPower.Stamps();
+			TrendCpu.StampsRef = _hCpu.Stamps();
+			TrendMem.StampsRef = _hRam.Stamps();
+			TrendNet.StampsRef = _hNet.Stamps();
 			TrendGen.SetSeries("tok/s", new List<(string, Color, double?[])> { ("生成", Color.FromRgb(0x7c, 0xd7, 0xf7), _hTps.Arr()), ("预填充", Color.FromRgb(0x4a, 0xde, 0x80), _hPf.Arr()) }, double.NaN, double.NaN);
 			TrendPf.SetSeries("tok/s", new List<(string, Color, double?[])> { ("预填充", Color.FromRgb(0x4a, 0xde, 0x80), _hPf.Arr()) }, double.NaN, double.NaN);
 			TrendCtx.SetSeries("tokens", new List<(string, Color, double?[])> { ("上下文", Color.FromRgb(0xf5, 0xb5, 0x3d), _hCtx.Arr()) }, 0, ctxTotal > 0 ? ctxTotal : double.NaN);
@@ -6782,7 +6804,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			TrendGpuPower.SetSeries("W", new List<(string, Color, double?[])> { ("功耗", Color.FromRgb(0xd2, 0x99, 0x22), _hPower.Arr()) }, 0, double.NaN);
 			TrendCpu.SetSeries("%", new List<(string, Color, double?[])> { ("CPU", Color.FromRgb(0x58, 0xa6, 0xff), _hCpu.Arr()) }, 0, 100);
 			TrendMem.SetSeries("GB", new List<(string, Color, double?[])> { ("内存", Color.FromRgb(0x58, 0xa6, 0xff), _hRam.Arr()) }, 0, double.NaN);
-			TrendNet.SetSeries("MB/s", new List<(string, Color, double?[])> { ("下行", Color.FromRgb(0x7c, 0xd7, 0xf7), _hNet.Arr()) }, 0, double.NaN);
+			TrendNet.SetSeries("MB/s", new List<(string, Color, double?[])> { ("下行", Color.FromRgb(0x7c, 0xd7, 0xf7), _hNet.Arr()), ("上行", Color.FromRgb(0x4a, 0xde, 0x80), _hNetTx.Arr()) }, 0, double.NaN);
 		}
 
 		if (d.TryGetValue("cpu_err", out string vCe))

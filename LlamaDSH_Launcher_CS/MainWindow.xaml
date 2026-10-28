@@ -552,7 +552,13 @@
                       <TextBlock Text="事件流" Foreground="#eef1f3" FontSize="14" FontWeight="Bold" />
                     </DockPanel>
                     <ScrollViewer MaxHeight="230" VerticalScrollBarVisibility="Auto">
-                      <ItemsControl Name="MonEventFeed" FontFamily="Consolas" FontSize="11" />
+                      <ItemsControl Name="MonEventFeed" FontFamily="Consolas" FontSize="11">
+                        <ItemsControl.ItemTemplate>
+                          <DataTemplate>
+                            <TextBlock Text="{Binding Line}" Foreground="{Binding LevelColor}" TextWrapping="Wrap" Margin="0,1" />
+                          </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                      </ItemsControl>
                     </ScrollViewer>
                   </StackPanel>
                 </Border>
@@ -697,7 +703,7 @@
               <!-- 熔断保护条（保护语义不变） -->
               <Border Background="#161a1d" CornerRadius="10" Padding="12,8" Margin="0,8,0,0" BorderBrush="#2a3036" BorderThickness="1">
                 <StackPanel Orientation="Horizontal">
-                  <TextBlock Text="🔒 显存熔断与启动控制位于「▶ 运行控制」区" Foreground="#8e979e" FontSize="11" />
+                  <TextBlock Text="🔒 显存熔断与启动控制位于「▶ 运行控制」区" Foreground="#8e979f" FontSize="11" />
                 </StackPanel>
               </Border>
             </StackPanel>

@@ -140,11 +140,22 @@ public sealed partial class LlamaApiMonitor
 		catch
 		{
 			_failCount++;
-			if (_failCount == 3 && Online)
+			if (_failCount >= 3 && Online)
 			{
 				Online = false;
 				GenTps = 0;
 				PromptTps = 0;
+				lock (Slots)
+				{
+					foreach (var sl in Slots)
+					{
+						sl.GenSpeed = 0;
+						sl.PromptSpeed = 0;
+					}
+				}
+				Phase = "idle";
+				TgTps = Tg3sTps = null;
+				PromptProgress = LogPromptSpeed = null;
 				AddEvent("error", "llama-server 离线(连续 3 次采集失败)");
 			}
 			return false;
@@ -367,11 +378,9 @@ public sealed partial class LlamaApiMonitor
 				}
 				else
 				{
+					// 完成事件由 release 行(日志源, 统计完整)统一发出; 此处只复位差分基线
 					if (st.PrevTaskId != null)
 					{
-						double? dur = st.TaskStartTs.HasValue ? now - st.TaskStartTs.Value : null;
-						double? avg = dur > 0 && st.PrevDecoded > 0 ? st.PrevDecoded / dur : null;
-						AddEvent("ok", $"任务 #{st.PrevTaskId} 完成 · {st.PrevDecoded} tok{(dur.HasValue ? $" · {dur:F1}s" : "")}{(avg.HasValue ? $" · 均 {avg:F1} tok/s" : "")}");
 						st.PrevTaskId = null;
 						st.TaskStartTs = null;
 					}
@@ -727,6 +736,8 @@ partial class LlamaApiMonitor
 	{
 		LogCtxUsed = _relTokens;
 		LogCtxTruncated = _relTruncated;
+		// 中断检测(= upstream): 无汇总行(eval/total time)说明任务被手动停止/断连
+		bool interrupted = _totalMs <= 0 && _evalMs <= 0;
 		double dur = TaskStartedAt.HasValue ? (DateTime.Now - TaskStartedAt.Value).TotalSeconds : 0;
 		var t = new LastTaskInfo
 		{
@@ -747,12 +758,22 @@ partial class LlamaApiMonitor
 		};
 		LastTask = t;
 		Phase = "idle";
+		LogNDecoded = 0;
 		Tg3sTps = TgTps = null;
 		PromptProgress = LogPromptSpeed = null;
+		PromptTotalTokens = null;
+		PromptElapsedS = null;
 		TaskStartedAt = null;
-		AddEvent("ok", $"任务 #{_relTask} 完成 · {(t.DecodedTokens ?? t.TotalTokens) ?? 0} tok"
+		_prefillTask = null;
+		_promptMs = _evalMs = _totalMs = _promptSpd = _genSpd = 0;
+		_promptTokens = _decodedTokens = _totalTokens = 0;
+		long outTok = t.TotalTokens ?? t.DecodedTokens ?? 0;
+		AddEvent(interrupted ? "warn" : "ok",
+			$"任务 #{_relTask} 完成 · {outTok} tok"
 			+ (t.Duration > 0 ? $" · {t.Duration:F1}s" : "")
-			+ (t.AvgTps.HasValue ? $" · 均 {t.AvgTps:F1} tok/s" : ""));
+			+ (t.AvgTps.HasValue ? $" · 均 {t.AvgTps:F1} tok/s" : "")
+			+ (interrupted ? " · 已中断" : "")
+			+ (MtpAcceptance is double ma ? $" · MTP {ma * 100.0:F1}%" : ""));
 	}
 
 	/// <summary>速度来源优先级(= llama-lens engine.speeds()): 日志 tg_3s / prompt 行 > /slots 差分。</summary>

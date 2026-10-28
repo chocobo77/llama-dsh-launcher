@@ -28,6 +28,7 @@ public class TrendChart : Grid
 	private double? _yMax;
 	private string _unitText = "";
 	private List<(string name, Color color, double?[] data)> _series = new();
+	private DateTime[] _stampsForFoot = Array.Empty<DateTime>();
 	private int _hover = -1;
 
 	public TrendChart()
@@ -42,6 +43,8 @@ public class TrendChart : Grid
 		Unit = unit;
 		Height = height;
 	}
+
+	public DateTime[] StampsRef { get; set; } = Array.Empty<DateTime>();
 
 	public string Title
 	{
@@ -81,7 +84,7 @@ public class TrendChart : Grid
 		_plot.ClipToBounds = true;
 		for (int i = 0; i < 3; i++)
 		{
-			var ln = new Line { Stroke = new SolidColorBrush(Color.FromArgb(0x1f, 0x8f, 0xa3, 0xc8)), StrokeThickness = 1, Stretch = Stretch.Fill, X1 = 0, X2 = 100 };
+			var ln = new Line { Stroke = new SolidColorBrush(Color.FromArgb(0x1f, 0x8f, 0xa3, 0xc8)), StrokeThickness = 1, X1 = 0, X2 = 100 };
 			_grid.Add(ln);
 			_plot.Children.Add(ln);
 		}
@@ -107,10 +110,11 @@ public class TrendChart : Grid
 		SetRow(_plot, 1);
 
 		var foot = new Grid { Margin = new Thickness(0, 3, 0, 0) };
+		_footLabels = new TextBlock[3];
 		for (int i = 0; i < 3; i++)
 		{
 			var tb = new TextBlock { FontSize = 9, Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontFamily = new FontFamily("Consolas") };
-			tb.Text = i == 0 ? "-60s" : i == 1 ? "-30s" : "now";
+			_footLabels[i] = tb;
 			Grid.SetColumn(tb, i);
 			if (i == 1)
 			{
@@ -142,7 +146,8 @@ public class TrendChart : Grid
 		{
 			return;
 		}
-		int idx = (int)Math.Round(Math.Max(0, Math.Min(1, pos.X / w)) * 59);
+		int maxLen = MaxLen();
+		int idx = (int)Math.Round(Math.Max(0, Math.Min(1, pos.X / w)) * Math.Max(1, maxLen - 1));
 		_hover = idx;
 		if (_crosshair != null)
 		{
@@ -186,6 +191,7 @@ public class TrendChart : Grid
 	{
 		_unitText = unit;
 		_series = series ?? new();
+		_stampsForFoot = _series.Count > 0 ? StampsRef ?? Array.Empty<DateTime>() : Array.Empty<DateTime>();
 		_yMin = double.IsNaN(yMin) ? null : yMin;
 		_yMax = double.IsNaN(yMax) ? null : yMax;
 		_unit.Text = unit;
@@ -226,19 +232,55 @@ public class TrendChart : Grid
 		return null;
 	}
 
+	private Line? _baseline;
+	private TextBlock[]? _footLabels;
+
+	private int MaxLen()
+	{
+		int n = 0;
+		foreach (var (_, _, d) in _series)
+		{
+			if (d.Length > n)
+			{
+				n = d.Length;
+			}
+		}
+		return Math.Max(n, 1);
+	}
+
 	private void Rebuild()
 	{
+		// 窗口标签按实际时间跨度(采样间隔自适应)
+		if (_footLabels != null && _series.Count > 0)
+		{
+			var stamps = _series[0].data.Length >= 0 ? _stampsForFoot : null;
+			double windowSec = 60;
+			if (stamps != null && stamps.Length >= 2)
+			{
+				windowSec = Math.Max(1.0, (stamps[^1] - stamps[0]).TotalSeconds);
+			}
+			_footLabels[0].Text = $"-{windowSec:F0}s";
+			_footLabels[1].Text = $"-{windowSec / 2:F0}s";
+			_footLabels[2].Text = "now";
+		}
 		double w = _plot.ActualWidth;
 		double h = _plot.ActualHeight;
 		if (w <= 0 || h <= 0)
 		{
 			return;
 		}
+		if (_baseline != null)
+		{
+			_plot.Children.Remove(_baseline);
+			_baseline = null;
+		}
 		for (int i = 0; i < _grid.Count; i++)
 		{
 			if (_grid[i] is Line ln)
 			{
 				double frac = (i + 1) / 4.0;
+				ln.X1 = 0;
+				ln.X2 = w;
 				ln.Y1 = ln.Y2 = h * frac;
 			}
 		}
@@ -281,6 +323,7 @@ public class TrendChart : Grid
 		}
 		_lines.Clear();
 		_areas.Clear();
+		int maxLen = MaxLen();
 		foreach (var (name, color, data) in _series)
 		{
 			var line = new Path
@@ -313,7 +356,7 @@ public class TrendChart : Grid
 					int end = valid ? i : i - 1;
 					if (end > start)
 					{
-						Point P(int k) => new Point(k / 59.0 * w, h - ((data[k]!.Value - bot) / span) * (h - 6) - 3);
+						Point P(int k) => new Point(maxLen > 1 ? k / (double)(maxLen - 1) * w : 0, h - ((data[k]!.Value - bot) / span) * (h - 6) - 3);
 						ctx.BeginFigure(P(start), false, false);
 						actx?.BeginFigure(P(start), false, false);
 						for (int j = start + 1; j <= end; j++)
@@ -344,9 +387,9 @@ public class TrendChart : Grid
 		}
 		if (_lines.Count == 0)
 		{
-			// 空态虚线基线
-			var empty = new Line { X1 = 0, Y1 = h - 3, X2 = w, Y2 = h - 3, Stroke = new SolidColorBrush(Color.FromRgb(0x2a, 0x30, 0x36)), StrokeThickness = 1, StrokeDashArray = new DoubleCollection { 3, 3 } };
-			_plot.Children.Add(empty);
+			// 空态虚线基线(受管, 防 Rebuild 累积)
+			_baseline = new Line { X1 = 0, Y1 = h - 3, X2 = w, Y2 = h - 3, Stroke = new SolidColorBrush(Color.FromRgb(0x2a, 0x30, 0x36)), StrokeThickness = 1, StrokeDashArray = new DoubleCollection { 3, 3 } };
+			_plot.Children.Add(_baseline);
 		}
 		ShowHover();
 	}
