@@ -32,7 +32,7 @@ public sealed class HardwareMonitor : IDisposable
 				IsCpuEnabled = true,
 				IsMemoryEnabled = false,
 				IsMotherboardEnabled = false,
-				IsStorageEnabled = true,
+				IsStorageEnabled = false,
 				IsNetworkEnabled = false,
 				IsControllerEnabled = false,
 				IsPsuEnabled = false
@@ -186,27 +186,6 @@ public sealed class HardwareMonitor : IDisposable
 			{
 				r["cpu_temp"] = cpuTemp;
 				r["cpu_temp_src"] = "lhm";
-			}
-			// SSD 温度(Strata Readings): 存储硬件取最高温度
-			double ssdMax = 0;
-			foreach (IHardware hw in c.Hardware)
-			{
-				if (hw.HardwareType != HardwareType.Storage)
-				{
-					continue;
-				}
-				try { hw.Update(); } catch { }
-				foreach (ISensor s in hw.Sensors)
-				{
-					if (s.SensorType == SensorType.Temperature && s.Value.HasValue && s.Value.Value > ssdMax && s.Value.Value < 120)
-					{
-						ssdMax = s.Value.Value;
-					}
-				}
-			}
-			if (ssdMax > 0)
-			{
-				r["ssd_temp"] = ssdMax.ToString("F1", CultureInfo.InvariantCulture);
 			}
 		}
 		catch

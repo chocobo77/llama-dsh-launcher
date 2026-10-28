@@ -190,6 +190,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	// Strata 请求表/对话缓存: 前缀缓存复用 + 请求总耗时
 	private static readonly Regex _rePromptCached = new Regex("prompt processed \\(cached\\):\\s*(\\d+)\\s*tokens", RegexOptions.Compiled);
 	private static readonly Regex _reTotalTime = new Regex("total time\\s+=\\s*([\\d.]+)\\s*ms", RegexOptions.Compiled);
+	// llama-server 槽位日志 "n_past = N"(请求开始时的已缓存 token 数), cached prompt 专用行缺失时兜底
+	private static readonly Regex _reNpast = new Regex("n_past = (\\d+)", RegexOptions.Compiled);
 
 	public MainWindow()
 	{
@@ -5672,7 +5674,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		if (text.IndexOf("eval time", StringComparison.Ordinal) < 0
 			&& text.IndexOf("total time", StringComparison.Ordinal) < 0
-			&& text.IndexOf("prompt processed", StringComparison.Ordinal) < 0)
+			&& text.IndexOf("prompt processed", StringComparison.Ordinal) < 0
+			&& text.IndexOf("n_past", StringComparison.Ordinal) < 0)
 		{
 			return;
 		}
@@ -5722,6 +5725,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			if (matchC.Success)
 			{
 				_curReused = int.Parse(matchC.Groups[1].Value);
+			}
+			else
+			{
+				// 槽位 n_past: 处理中可能多次出现(含本请求已写入部分), 取最大值即请求起点缓存
+				Match matchN = _reNpast.Match(input);
+				if (matchN.Success && int.TryParse(matchN.Groups[1].Value, out var vNp) && vNp > _curReused)
+				{
+					_curReused = vNp;
+				}
 			}
 			Match match3 = _reEvalTps.Match(input);
 			if (match3.Success)
@@ -5819,6 +5831,28 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			try
 			{
+				using (System.Management.ManagementObjectSearcher mos = new System.Management.ManagementObjectSearcher("SELECT Name, NumberOfCores, NumberOfLogicalProcessors FROM Win32_Processor"))
+				{
+					foreach (System.Management.ManagementObject o in mos.Get())
+					{
+						using (o)
+						{
+							string nm = (o["Name"]?.ToString() ?? "").Trim();
+							if (!string.IsNullOrEmpty(nm))
+							{
+								_cpuName = $"{nm} · {o["NumberOfCores"]} 核 {o["NumberOfLogicalProcessors"]} 线程";
+							}
+							break;
+						}
+					}
+				}
+			}
+			catch (Exception exCpu)
+			{
+				LogError(exCpu, "CPU 型号采集失败");
+			}
+			try
+			{
 				_ramAvailCounter = new PerformanceCounter("Memory", "Available MBytes");
 				_ramAvailCounter.NextValue();
 				using (System.Management.ManagementObjectSearcher mos = new System.Management.ManagementObjectSearcher("SELECT TotalVisibleMemorySize FROM Win32_OperatingSystem"))
@@ -5893,10 +5927,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					{
 						d["ram_err"] = ex4c.Message;
 					}
-					// llama-server /metrics 扩展指标: KV 缓存占用 / 处理中 / 排队中（沿用守卫: 存活且日志样本为空）
-					if (IsAlive(_llamaProc) && _tpsSamples.IsEmpty && _ttftSamples.IsEmpty)
+					// llama-server /metrics: 存活即取(上下文填充/排队/阶段不依赖日志), tps 仅在日志无样本时输出避免双算
+					if (IsAlive(_llamaProc))
 					{
-						if (FetchLlamaMetrics() is (double mTps, double mPf))
+						if (FetchLlamaMetrics() is (double mTps, double mPf) && _tpsSamples.IsEmpty && _ttftSamples.IsEmpty)
 						{
 							d["httptps"] = mTps.ToString("F2", CultureInfo.InvariantCulture);
 							d["httppf"] = mPf.ToString("F2", CultureInfo.InvariantCulture);
@@ -5914,20 +5948,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 						{
 							d[item.Key] = item.Value;
 						}
-					}
-					// 能耗累计(Strata 读数条): GPU 功率 × 采样间隔积分, llama 启动时清零（须在 GPU 查询合并之后, power_w 才在 d 中）
-					if (d.TryGetValue("power_w", out string pwStr) && double.TryParse(pwStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var pwVal) && pwVal > 0.0)
-					{
-						long nowTick = Environment.TickCount64;
-						if (_lastPowerTick >= 0)
-						{
-							_energyWh += pwVal * ((nowTick - _lastPowerTick) / 1000.0) / 3600.0;
-						}
-						_lastPowerTick = nowTick;
-					}
-					else
-					{
-						_lastPowerTick = -1;
 					}
 					((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
 					{
@@ -6151,8 +6171,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private PerformanceCounter? _diskWriteCounter;
 	private PerformanceCounter? _ramAvailCounter;
 	private double _ramTotalBytes;
-	private double _energyWh;
-	private double _lastPowerTick = -1.0;
 
 	// llama-server /metrics 扩展: KV 缓存占用(tok)/处理中/排队中; -1 = 未报告
 	private double _llamaCtxUsed = -1.0;
@@ -6309,8 +6327,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		_lastDecodeUtc = DateTime.MinValue;
 		_lastPrefillUtc = DateTime.MinValue;
-		_energyWh = 0.0;
-		_lastPowerTick = -1.0;
 		_llamaCtxUsed = -1.0;
 		_llamaReqProc = 0;
 		_llamaReqWait = 0;
@@ -6625,10 +6641,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			SetBadge(BdgDisk, false);
 		}
-		// ── 读数条(Strata Readings): 能耗/电费/风扇/频率/CPU 温度/SSD 温度 ──
-		MonEnergy.Text = _energyWh >= 1000.0 ? $"{_energyWh / 1000.0:F2} kWh" : (_energyWh > 0.0 ? $"{_energyWh:F1} Wh" : "—");
-		double elecPrice = double.TryParse(TxtElecPrice?.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var vEp) ? vEp : 0.0;
-		MonEnergyCost.Text = elecPrice > 0.0 && _energyWh > 0.0 ? $"≈ ¥{_energyWh / 1000.0 * elecPrice:F2}" : "—";
+		// ── 读数条: 风扇/频率/CPU 温度 ──
 		if (d.TryGetValue("fan_pct", out string vFn) && double.TryParse(vFn, NumberStyles.Float, CultureInfo.InvariantCulture, out var vF) && vF >= 0.0)
 		{
 			MonFan.Text = $"{vF:F0} %";
@@ -6641,10 +6654,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			MonCpuTemp.Text = $"{vCt2:F0} °C";
 			MonCpuTemp.ToolTip = (d.TryGetValue("cpu_temp_src", out string vSrc) && vSrc == "acpi") ? "ACPI 热区(非核心精确值)" : null;
-		}
-		if (d.TryGetValue("ssd_temp", out string vSt) && double.TryParse(vSt, NumberStyles.Float, CultureInfo.InvariantCulture, out var vSt2) && vSt2 > 0.0)
-		{
-			MonSsdTemp.Text = $"{vSt2:F0} °C";
 		}
 		// ── 上下文填充 Gauge + 系统内存条 ──
 		if (_ctxTokens == 0 && IsAlive(_llamaProc) && RoleText("ctx_size", out string ctxStr2))

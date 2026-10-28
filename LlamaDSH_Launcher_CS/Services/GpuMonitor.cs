@@ -72,7 +72,11 @@ public class GpuMonitor
 		switch (DetectVendor())
 		{
 		case "nvidia":
-			TryNvidiaSmi(dictionary);
+			// NVML 直采(Strata 同源, PCIe 吞吐等 nvidia-smi 常返 N/A 的字段), 失败回退 nvidia-smi
+			if (!NvmlMonitor.TryFill(dictionary))
+			{
+				TryNvidiaSmi(dictionary);
+			}
 			break;
 		case "amd":
 			if (!TryAmdSmi(dictionary))

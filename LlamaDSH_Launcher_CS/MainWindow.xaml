@@ -267,46 +267,56 @@
         </Border>
       </DockPanel>
     </ScrollViewer>
-    <Grid Column="1" Margin="8">
+    <Grid Column="1" Margin="8,6,8,6">
       <Grid.RowDefinitions>
-        <RowDefinition Height="Auto" />
         <RowDefinition Height="Auto" />
         <RowDefinition Height="*" />
       </Grid.RowDefinitions>
-      <Border Grid.Row="0" Background="#161b22" BorderBrush="#30363d" BorderThickness="1" CornerRadius="6" Padding="10,7" Margin="0,0,0,8">
-        <CheckBox Name="ChkMinimizeToTray" Content="📌 关闭窗口时最小化到托盘（不退出）" IsChecked="True"
-                  Foreground="#e0e0e0" VerticalAlignment="Center"
-                  ToolTip="勾选后点关闭只会隐藏窗口；从托盘图标右键菜单可真正退出" />
-      </Border>
-      <!-- ── 运行控制：启动/停止 Llama 与 DSH，只含"动作" ── -->
-      <GroupBox Header="▶ 运行控制" Grid.Row="1">
-        <StackPanel>
-          <Grid>
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="*" />
-              <ColumnDefinition Width="16" />
-              <ColumnDefinition Width="*" />
-            </Grid.ColumnDefinitions>
-            <StackPanel Grid.Column="0">
-              <Button Name="BtnLlamaStart" Content="▶ 启动 Llama" Background="#238636" Foreground="#FFFFFFFF" Margin="0,0,0,4" FontSize="13" Click="StartLlama_Click" />
-              <Button Name="BtnLlamaStop" Content="⏹ 停止 Llama" Background="#da3633" Foreground="#FFFFFFFF" IsEnabled="False" Margin="0,0,0,4" FontSize="13" Click="StopLlama_Click" />
-              <TextBlock Name="LblLlamaStatus" Text="● 已停止" Foreground="#8b949e" HorizontalAlignment="Center" FontSize="12" />
-              <CheckBox Name="ChkOomRetry" Content="OOM 自动降层重试" IsChecked="True" Foreground="#8b949e" FontSize="11" Margin="0,6,0,0" HorizontalAlignment="Center" ToolTip="启动因显存不足失败时，自动降低 --gpu-layers（每次 ×0.85，最多 3 次）并重新启动；需要重新勾选参数面板后手动保存才会持久化" />
-            </StackPanel>
-            <StackPanel Grid.Column="2">
-              <Button Name="BtnDshStart" Content="▶ 启动 DSH Web" Background="#238636" Foreground="#FFFFFFFF" Margin="0,0,0,4" FontSize="13" Click="StartDsh_Click" />
-              <Button Name="BtnDshStop" Content="⏹ 停止 DSH Web" Background="#da3633" Foreground="#FFFFFFFF" IsEnabled="False" Margin="0,0,0,4" FontSize="13" Click="StopDsh_Click" />
-              <Button Name="BtnRebuildDsh" Content="🔨 重建 DSH" Margin="0,0,0,4" Click="RebuildDsh_Click" ToolTip="全量重建 DSH 编译产物 (pnpm clean + build:lib + vite)。若 DSH 正在运行会先停止；重建完成后自动做兼容性检查并启动 DSH。" />
-
-              <Button Name="BtnOpenDsh" Content="🌐 打开 DSH Web" IsEnabled="False" Margin="0,0,0,4" Click="OpenDsh_Click" />
-              <TextBlock Name="LblDshStatus" Text="● 已停止" Foreground="#8b949e" HorizontalAlignment="Center" FontSize="12" />
-            </StackPanel>
-          </Grid>
-         </StackPanel>
+      <!-- ── 运行控制：启动/停止 Llama 与 DSH + 熔断 + 托盘选项, 紧凑单卡 ── -->
+      <GroupBox Grid.Row="0" Margin="0,0,0,4" Padding="8,6">
+        <GroupBox.Header>
+          <DockPanel LastChildFill="False">
+            <TextBlock Text="▶ 运行控制" FontWeight="Bold" />
+            <CheckBox Name="ChkMinimizeToTray" DockPanel.Dock="Right" Content="关闭最小化到托盘" IsChecked="True" FontSize="11" Foreground="#8b949e" Margin="10,0,0,0" VerticalAlignment="Center"
+                      ToolTip="勾选后点关闭只会隐藏窗口；从托盘图标右键菜单可真正退出" />
+            <TextBlock Name="LblDshStatus" DockPanel.Dock="Right" Text="● 已停止" Foreground="#8b949e" FontSize="11" Margin="10,0,0,0" VerticalAlignment="Center" />
+            <TextBlock Name="LblLlamaStatus" DockPanel.Dock="Right" Text="● 已停止" Foreground="#8b949e" FontSize="11" Margin="10,0,0,0" VerticalAlignment="Center" />
+          </DockPanel>
+        </GroupBox.Header>
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" />
+          </Grid.ColumnDefinitions>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+          </Grid.RowDefinitions>
+          <StackPanel Grid.Row="0" Orientation="Horizontal">
+            <Button Name="BtnLlamaStart" Content="▶ 启动 Llama" Background="#238636" Foreground="#FFFFFFFF" Padding="12,3" Margin="0,0,6,0" FontSize="12" Click="StartLlama_Click" />
+            <Button Name="BtnLlamaStop" Content="⏹ 停止 Llama" Background="#da3633" Foreground="#FFFFFFFF" Padding="12,3" IsEnabled="False" FontSize="12" Click="StopLlama_Click" />
+          </StackPanel>
+          <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,5,0,0">
+            <CheckBox Name="ChkOomRetry" Content="OOM 自动降层重试" IsChecked="True" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" ToolTip="启动因显存不足失败时，自动降低 --gpu-layers（每次 ×0.85，最多 3 次）并重新启动；需要重新勾选参数面板后手动保存才会持久化" />
+            <CheckBox Name="ChkVramBreaker" Content="🔒 显存熔断" Foreground="#c9d1d9" FontSize="11" VerticalAlignment="Center" Margin="14,0,0,0" IsChecked="False" ToolTip="显存超过阈值时自动停止 Llama 服务，防止爆显存" />
+            <local:NoScrollComboBox x:Name="ComboVramBreakerType" Width="104" Margin="6,0,4,0" VerticalAlignment="Center" FontSize="11">
+              <ComboBoxItem Content="百分比 (%)" IsSelected="True" />
+              <ComboBoxItem Content="固定值 (GB)" />
+            </local:NoScrollComboBox>
+            <TextBox Name="TxtVramBreakerVal" Width="52" Text="90" VerticalAlignment="Center" FontSize="11" Margin="0,0,6,0" ToolTip="阈值：百分比模式填 0-100，GB 模式填小数如 20.0" />
+            <TextBlock Name="LblVramBreaker" Text="" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" />
+          </StackPanel>
+          <StackPanel Grid.Column="1" Grid.Row="0" Grid.RowSpan="2" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+            <Button Name="BtnDshStart" Content="▶ 启动 DSH" Background="#238636" Foreground="#FFFFFFFF" Padding="12,3" Margin="0,0,6,0" FontSize="12" Click="StartDsh_Click" />
+            <Button Name="BtnDshStop" Content="⏹ 停止 DSH" Background="#da3633" Foreground="#FFFFFFFF" Padding="12,3" IsEnabled="False" Margin="0,0,6,0" FontSize="12" Click="StopDsh_Click" />
+            <Button Name="BtnRebuildDsh" Content="🔨 重建" Padding="12,3" Margin="0,0,6,0" FontSize="12" Click="RebuildDsh_Click" ToolTip="全量重建 DSH 编译产物 (pnpm clean + build:lib + vite)。若 DSH 正在运行会先停止；重建完成后自动做兼容性检查并启动 DSH。" />
+            <Button Name="BtnOpenDsh" Content="🌐 打开" Padding="12,3" FontSize="12" IsEnabled="False" Click="OpenDsh_Click" />
+          </StackPanel>
+        </Grid>
       </GroupBox>
 
       <!-- ── 监测/日志双标签页：标签1 效仿 Strata Monitor 设计（状态卡 + 指标卡带迷你历史曲线 + 数据来源徽标），标签2 原运行日志 ── -->
-      <TabControl Name="MainTabs" Grid.Row="2" Margin="0,6,0,0" Background="Transparent" BorderBrush="#30363d" BorderThickness="1" SelectionChanged="MainTabs_SelectionChanged">
+      <TabControl Name="MainTabs" Grid.Row="1" Margin="0,6,0,0" Background="Transparent" BorderBrush="#30363d" BorderThickness="1" SelectionChanged="MainTabs_SelectionChanged">
         <TabControl.Resources>
           <Style TargetType="TabItem">
             <Setter Property="Foreground" Value="#8b949e" />
@@ -332,12 +342,41 @@
               </Setter.Value>
             </Setter>
           </Style>
+            <Style TargetType="GridViewColumnHeader">
+              <Setter Property="Background" Value="#1d2226" />
+              <Setter Property="Foreground" Value="#8e979f" />
+              <Setter Property="BorderBrush" Value="#30363d" />
+              <Setter Property="BorderThickness" Value="0,0,0,1" />
+              <Setter Property="Padding" Value="6,4" />
+              <Setter Property="FontWeight" Value="Normal" />
+              <Setter Property="Template">
+                <Setter.Value>
+                  <ControlTemplate TargetType="GridViewColumnHeader">
+                    <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}">
+                      <ContentPresenter VerticalAlignment="Center" />
+                    </Border>
+                  </ControlTemplate>
+                </Setter.Value>
+              </Setter>
+            </Style>
+            <Style x:Key="ReqItem" TargetType="ListViewItem">
+              <Setter Property="Background" Value="Transparent" />
+              <Setter Property="Foreground" Value="#c7cdd3" />
+              <Setter Property="BorderThickness" Value="0" />
+              <Setter Property="Padding" Value="0,1" />
+              <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+              <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                  <Setter Property="Background" Value="#1d2226" />
+                </Trigger>
+              </Style.Triggers>
+            </Style>
         </TabControl.Resources>
         <TabItem Header="📊 监测" IsSelected="True">
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel Name="MonitorRoot" Margin="8">
               <!-- 模型状态卡(Strata monitor-state): 标题左/阶段徽标右, 明细行左相位右数据, 进度条 tone 随阶段 -->
-              <Border Background="#161b22" CornerRadius="8" Padding="16,12" BorderBrush="#30363d" BorderThickness="1">
+              <Border Background="#161b22" CornerRadius="8" Padding="12,10" BorderBrush="#30363d" BorderThickness="1">
                 <StackPanel>
                   <DockPanel>
                     <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
@@ -368,14 +407,14 @@
                       <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
                     <TextBlock Name="MonPhaseLabel" Text="等待请求" Foreground="#c7cdd3" FontSize="12" />
-                    <TextBlock Name="MonPhaseDetail" Grid.Column="1" HorizontalAlignment="Right" Foreground="#8e979e" FontSize="12" Text="" />
+                    <TextBlock Name="MonPhaseDetail" Grid.Column="1" HorizontalAlignment="Right" Foreground="#8e979f" FontSize="12" Text="" />
                   </Grid>
                   <ProgressBar Name="MonProgress" Height="5" Margin="0,8,0,0" Minimum="0" Maximum="100" Value="0" Background="#1d2226" Foreground="#34d399" BorderThickness="0" IsIndeterminate="False" />
                 </StackPanel>
               </Border>
               <!-- 指标卡 4×2(Strata monitor-metrics): 标签+来源徽标 / 大数值+副行 / 32px 迷你曲线 -->
-              <UniformGrid Columns="4" Margin="-8,8,-8,-8">
-                <Border Background="#161b22" CornerRadius="8" Padding="14" Margin="8" BorderBrush="#30363d" BorderThickness="1">
+              <UniformGrid Columns="4" Margin="0,6,0,0">
+                <Border Background="#161b22" CornerRadius="8" Padding="12" Margin="4" BorderBrush="#30363d" BorderThickness="1">
                   <StackPanel>
                     <DockPanel>
                       <Border DockPanel.Dock="Right" Background="#1d2226" CornerRadius="5" Padding="6,1" VerticalAlignment="Center">
@@ -406,7 +445,7 @@
                     <svc:SparkChart x:Name="SparkSpeed" Margin="0,8,0,0" />
                   </StackPanel>
                 </Border>
-                <Border Background="#161b22" CornerRadius="8" Padding="14" Margin="8" BorderBrush="#30363d" BorderThickness="1">
+                <Border Background="#161b22" CornerRadius="8" Padding="12" Margin="4" BorderBrush="#30363d" BorderThickness="1">
                   <StackPanel>
                     <DockPanel>
                       <Border DockPanel.Dock="Right" Background="#1d2226" CornerRadius="5" Padding="6,1" VerticalAlignment="Center">
@@ -422,7 +461,7 @@
                     <svc:SparkChart x:Name="SparkGpu" Margin="0,8,0,0" />
                   </StackPanel>
                 </Border>
-                <Border Background="#161b22" CornerRadius="8" Padding="14" Margin="8" BorderBrush="#30363d" BorderThickness="1">
+                <Border Background="#161b22" CornerRadius="8" Padding="12" Margin="4" BorderBrush="#30363d" BorderThickness="1">
                   <StackPanel>
                     <DockPanel>
                       <Border DockPanel.Dock="Right" Background="#1d2226" CornerRadius="5" Padding="6,1" VerticalAlignment="Center">
@@ -438,7 +477,7 @@
                     <svc:SparkChart x:Name="SparkVram" Margin="0,8,0,0" />
                   </StackPanel>
                 </Border>
-                <Border Background="#161b22" CornerRadius="8" Padding="14" Margin="8" BorderBrush="#30363d" BorderThickness="1">
+                <Border Background="#161b22" CornerRadius="8" Padding="12" Margin="4" BorderBrush="#30363d" BorderThickness="1">
                   <StackPanel>
                     <DockPanel>
                       <Border DockPanel.Dock="Right" Background="#1d2226" CornerRadius="5" Padding="6,1" VerticalAlignment="Center">
@@ -454,7 +493,7 @@
                     <svc:SparkChart x:Name="SparkTemp" Margin="0,8,0,0" />
                   </StackPanel>
                 </Border>
-                <Border Background="#161b22" CornerRadius="8" Padding="14" Margin="8" BorderBrush="#30363d" BorderThickness="1">
+                <Border Background="#161b22" CornerRadius="8" Padding="12" Margin="4" BorderBrush="#30363d" BorderThickness="1">
                   <StackPanel>
                     <DockPanel>
                       <Border DockPanel.Dock="Right" Background="#1d2226" CornerRadius="5" Padding="6,1" VerticalAlignment="Center">
@@ -470,7 +509,7 @@
                     <svc:SparkChart x:Name="SparkPower" Margin="0,8,0,0" />
                   </StackPanel>
                 </Border>
-                <Border Background="#161b22" CornerRadius="8" Padding="14" Margin="8" BorderBrush="#30363d" BorderThickness="1">
+                <Border Background="#161b22" CornerRadius="8" Padding="12" Margin="4" BorderBrush="#30363d" BorderThickness="1">
                   <StackPanel>
                     <DockPanel>
                       <Border DockPanel.Dock="Right" Background="#1d2226" CornerRadius="5" Padding="6,1" VerticalAlignment="Center">
@@ -486,7 +525,7 @@
                     <svc:SparkChart x:Name="SparkPcie" Margin="0,8,0,0" />
                   </StackPanel>
                 </Border>
-                <Border Background="#161b22" CornerRadius="8" Padding="14" Margin="8" BorderBrush="#30363d" BorderThickness="1">
+                <Border Background="#161b22" CornerRadius="8" Padding="12" Margin="4" BorderBrush="#30363d" BorderThickness="1">
                   <StackPanel>
                     <DockPanel>
                       <Border DockPanel.Dock="Right" Background="#1d2226" CornerRadius="5" Padding="6,1" VerticalAlignment="Center">
@@ -502,7 +541,7 @@
                     <svc:SparkChart x:Name="SparkCpu" Margin="0,8,0,0" />
                   </StackPanel>
                 </Border>
-                <Border Background="#161b22" CornerRadius="8" Padding="14" Margin="8" BorderBrush="#30363d" BorderThickness="1">
+                <Border Background="#161b22" CornerRadius="8" Padding="12" Margin="4" BorderBrush="#30363d" BorderThickness="1">
                   <StackPanel>
                     <DockPanel>
                       <Border DockPanel.Dock="Right" Background="#1d2226" CornerRadius="5" Padding="6,1" VerticalAlignment="Center">
@@ -520,21 +559,9 @@
                 </Border>
               </UniformGrid>
               <!-- 读数条(Strata monitor-readings): 标签在上/数值在下 -->
-              <Border Background="#161b22" CornerRadius="8" Padding="16,10" Margin="0,8,0,0" BorderBrush="#30363d" BorderThickness="1">
+              <Border Background="#161b22" CornerRadius="8" Padding="12,8" Margin="0,8,0,0" BorderBrush="#30363d" BorderThickness="1">
                 <WrapPanel>
-                  <StackPanel Margin="0,4,28,4" MinWidth="110">
-                    <TextBlock Text="启动以来能耗" Foreground="#8e979f" FontSize="12" />
-                    <TextBlock Name="MonEnergy" Text="—" Foreground="#eef1f3" FontSize="15" FontWeight="SemiBold" />
-                  </StackPanel>
-                  <StackPanel Margin="0,4,28,4" MinWidth="150">
-                    <StackPanel Orientation="Horizontal">
-                      <TextBlock Text="启动以来电费" Foreground="#8e979f" FontSize="12" />
-                      <TextBox Name="TxtElecPrice" Width="40" Text="0.6" FontSize="11" Margin="8,0,0,0" VerticalAlignment="Center" Padding="2,0" ToolTip="电价(元/千瓦时), 0 = 不显示" />
-                      <TextBlock Text="元/kWh" Foreground="#8e979f" FontSize="10" Margin="3,0,0,0" VerticalAlignment="Center" />
-                    </StackPanel>
-                    <TextBlock Name="MonEnergyCost" Text="—" Foreground="#eef1f3" FontSize="15" FontWeight="SemiBold" />
-                  </StackPanel>
-                  <StackPanel Margin="0,4,28,4" MinWidth="80">
+<StackPanel Margin="0,4,28,4" MinWidth="80">
                     <TextBlock Text="GPU 风扇" Foreground="#8e979f" FontSize="12" />
                     <TextBlock Name="MonFan" Text="—" Foreground="#eef1f3" FontSize="15" FontWeight="SemiBold" />
                   </StackPanel>
@@ -546,11 +573,7 @@
                     <TextBlock Text="CPU 温度" Foreground="#8e979f" FontSize="12" />
                     <TextBlock Name="MonCpuTemp" Text="—" Foreground="#eef1f3" FontSize="15" FontWeight="SemiBold" />
                   </StackPanel>
-                  <StackPanel Margin="0,4,28,4" MinWidth="100">
-                    <TextBlock Text="SSD 温度" Foreground="#8e979f" FontSize="12" />
-                    <TextBlock Name="MonSsdTemp" Text="—" Foreground="#eef1f3" FontSize="15" FontWeight="SemiBold" />
-                  </StackPanel>
-                  <StackPanel Margin="0,4,28,4" MinWidth="90">
+                                    <StackPanel Margin="0,4,28,4" MinWidth="90">
                     <TextBlock Text="首 Token" Foreground="#8e979f" FontSize="12" />
                     <TextBlock Name="MonTtft" Text="—" Foreground="#eef1f3" FontSize="15" FontWeight="SemiBold" />
                   </StackPanel>
@@ -562,7 +585,7 @@
                   <ColumnDefinition Width="*" />
                   <ColumnDefinition Width="2.4*" />
                 </Grid.ColumnDefinitions>
-                <Border Grid.Column="0" Background="#161b22" CornerRadius="8" Padding="16,12" Margin="0,0,4,0" BorderBrush="#30363d" BorderThickness="1">
+                <Border Grid.Column="0" Background="#161b22" CornerRadius="8" Padding="12,10" Margin="0,0,3,0" BorderBrush="#30363d" BorderThickness="1">
                   <StackPanel>
                     <TextBlock Text="上下文填充" Foreground="#eef1f3" FontSize="15" FontWeight="Bold" />
                     <Grid Width="120" Height="120" Margin="0,10,0,0" HorizontalAlignment="Center">
@@ -597,7 +620,7 @@
                     </StackPanel>
                   </StackPanel>
                 </Border>
-                <Border Grid.Column="1" Background="#161b22" CornerRadius="8" Padding="16,12" Margin="4,0,0,0" BorderBrush="#30363d" BorderThickness="1">
+                <Border Grid.Column="1" Background="#161b22" CornerRadius="8" Padding="12,10" Margin="3,0,0,0" BorderBrush="#30363d" BorderThickness="1">
                   <Grid>
                     <Grid.RowDefinitions>
                       <RowDefinition Height="Auto" />
@@ -608,7 +631,7 @@
                       <Button DockPanel.Dock="Right" Name="BtnShowAllReq" Content="显示全部" Click="ShowAllReq_Click" Padding="6,2" FontSize="11" Visibility="Collapsed" />
                       <TextBlock Text="最近请求" Foreground="#eef1f3" FontSize="15" FontWeight="Bold" VerticalAlignment="Center" />
                     </DockPanel>
-                    <ListView Name="MonReqList" Grid.Row="1" BorderThickness="0" Background="Transparent" FontSize="12" ScrollViewer.VerticalScrollBarVisibility="Auto">
+                    <ListView Name="MonReqList" Grid.Row="1" BorderThickness="0" Background="Transparent" Foreground="#c7cdd3" FontSize="12" ItemContainerStyle="{StaticResource ReqItem}" ScrollViewer.VerticalScrollBarVisibility="Auto">
                       <ListView.View>
                         <GridView>
                           <GridViewColumn Header="时间" DisplayMemberBinding="{Binding Time}" Width="72" />
@@ -669,7 +692,7 @@
                 </Border>
               </Grid>
               <!-- 对话缓存(Strata monitor-cache): 标题+右汇总, 事实 dl, 说明段 -->
-              <Border Background="#161b22" CornerRadius="8" Padding="16,12" Margin="0,8,0,0" BorderBrush="#30363d" BorderThickness="1">
+              <Border Background="#161b22" CornerRadius="8" Padding="12,10" Margin="0,8,0,0" BorderBrush="#30363d" BorderThickness="1">
                 <StackPanel>
                   <DockPanel>
                     <TextBlock DockPanel.Dock="Right" Name="MonCacheSummary" Text="" Foreground="#8e979f" FontSize="12" VerticalAlignment="Center" />
@@ -691,20 +714,7 @@
                   </Grid>
                   <TextBlock Name="MonCacheDesc" Text="引擎报告 prompt 复用后，这里会显示缓存明细。" Foreground="#8e979f" FontSize="12" Margin="0,8,0,0" TextWrapping="Wrap" />
                 </StackPanel>
-              </Border>
-              <!-- 熔断保护条（保护语义不变） -->
-              <Border Background="#161b22" CornerRadius="8" Padding="12,8" Margin="0,8,0,0" BorderBrush="#30363d" BorderThickness="1">
-                <StackPanel Orientation="Horizontal">
-                  <CheckBox Name="ChkVramBreaker" Content="🔒 显存熔断" Foreground="#c9d1d9" VerticalAlignment="Center" IsChecked="False" ToolTip="显存超过阈值时自动停止 Llama 服务，防止爆显存" />
-                  <local:NoScrollComboBox x:Name="ComboVramBreakerType" Width="120" Margin="8,0,4,0" VerticalAlignment="Center">
-                    <ComboBoxItem Content="百分比 (%)" IsSelected="True" />
-                    <ComboBoxItem Content="固定值 (GB)" />
-                  </local:NoScrollComboBox>
-                  <TextBox Name="TxtVramBreakerVal" Width="60" Text="90" VerticalAlignment="Center" Margin="0,0,4,0" ToolTip="阈值：百分比模式填 0-100，GB 模式填小数如 20.0" />
-                  <TextBlock Name="LblVramBreaker" Text="" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" />
-                </StackPanel>
-              </Border>
-            </StackPanel>
+              </Border>            </StackPanel>
           </ScrollViewer>
         </TabItem>
         <TabItem Header="📜 运行日志">

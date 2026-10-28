@@ -35,16 +35,20 @@ public class SparkChart : Grid
 
 	public SparkChart()
 	{
-		RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Auto) });
 		RowDefinitions.Add(new RowDefinition { Height = new GridLength(32) });
+		// 读数条为悬浮覆盖: 绝不参与布局(否则悬停→增高→鼠标脱离→收起→死循环), 底色保证可读
 		_readout = new TextBlock
 		{
 			FontSize = 11,
 			Foreground = new SolidColorBrush(Color.FromRgb(0xee, 0xf1, 0xf3)),
+			Background = new SolidColorBrush(Color.FromArgb(0xe0, 0x16, 0x1b, 0x22)),
+			Padding = new Thickness(4, 1, 4, 1),
 			Visibility = Visibility.Collapsed,
-			VerticalAlignment = VerticalAlignment.Bottom,
-			Margin = new Thickness(0, 0, 0, 34)
+			VerticalAlignment = VerticalAlignment.Top,
+			Margin = new Thickness(2, -20, 2, 0),
+			IsHitTestVisible = false
 		};
+		System.Windows.Controls.Panel.SetZIndex(_readout, 10);
 		var host = new Grid { ClipToBounds = false, Background = Brushes.Transparent };
 		_emptyLine = new Line { X1 = 0, Y1 = 30, X2 = 100, Y2 = 30, Stroke = new SolidColorBrush(Color.FromRgb(0x2a, 0x30, 0x36)), StrokeThickness = 1, StrokeDashArray = new DoubleCollection { 3, 3 }, Stretch = Stretch.Fill, Visibility = Visibility.Collapsed };
 		_area = new Path { Fill = new SolidColorBrush(Color.FromArgb(31, 0x34, 0xd3, 0x99)), StrokeThickness = 0 };
@@ -58,8 +62,6 @@ public class SparkChart : Grid
 		host.Children.Add(_line);
 		host.Children.Add(_line2);
 		host.Children.Add(_crosshair);
-		SetRow(host, 1);
-		SetRow(_readout, 0);
 		host.MouseMove += OnMouseMove;
 		host.MouseLeave += (_, _) => SetHover(-1);
 		Children.Add(_readout);

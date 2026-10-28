@@ -1,0 +1,267 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Runtime.InteropServices;
+
+namespace LlamaDSH_Launcher.Services;
+
+/// <summary>
+/// NVML 直采(Strata serve/telemetry.py 同源): nvml.dll 由 NVIDIA 驱动自带,
+/// 提供 nvidia-smi 拿不到/常返 N/A 的 PCIe 吞吐(nvmlDeviceGetPcieThroughput, KB/s),
+/// 以及利用率/显存/温度/功率/功耗上限/频率/风扇/链路代数宽度。多卡聚合口径同 UI。
+/// 初始化失败(无驱动/非 NVIDIA)时 TryFill 返回 false, 上层回退 nvidia-smi。
+/// </summary>
+public static class NvmlMonitor
+{
+	private static bool _tried;
+
+	private static bool _ok;
+
+	private static IntPtr _lib;
+
+	private static readonly object Lock = new();
+
+	[DllImport("kernel32", CharSet = CharSet.Ansi, SetLastError = true)]
+	private static extern IntPtr LoadLibrary(string name);
+
+	private delegate int IntFn();
+
+	// NVML API 全部 stdcall(int 返回)
+	private static T GetFn<T>(string name) where T : Delegate
+	{
+	 IntPtr p = GetProcAddressCompat(name);
+		return p == IntPtr.Zero ? null : (T)Marshal.GetDelegateForFunctionPointer(p, typeof(T));
+	}
+
+	private static IntPtr GetProcAddressCompat(string name)
+	{
+		IntPtr p = GetProcAddress(_lib, name);
+		if (p == IntPtr.Zero)
+		{
+			// 旧驱动只导出无 _v2 后缀版本
+			p = GetProcAddress(_lib, name.EndsWith("_v2", StringComparison.Ordinal) ? name[..^3] : name + "_v2");
+		}
+		return p;
+	}
+
+	[DllImport("kernel32", CharSet = CharSet.Ansi, SetLastError = true)]
+	private static extern IntPtr GetProcAddress(IntPtr h, string name);
+
+	[StructLayout(LayoutKind.Sequential)]
+	private struct NvmlUtilization
+	{
+		public uint Gpu;
+		public uint Memory;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	private struct NvmlMemory
+	{
+		public ulong Total;
+		public ulong Used;
+		public ulong Free;
+	}
+
+	private static void EnsureInit()
+	{
+		if (_tried)
+		{
+			return;
+		}
+		_tried = true;
+		try
+		{
+			_lib = LoadLibrary("nvml.dll");
+			if (_lib == IntPtr.Zero)
+			{
+				return;
+			}
+			var init = GetFn<IntFn>("nvmlInit_v2");
+			if (init == null || init() != 0)
+			{
+				_lib = IntPtr.Zero;
+				return;
+			}
+			_ok = true;
+		}
+		catch
+		{
+			_ok = false;
+		}
+	}
+
+	private delegate int DeviceCount(out uint count);
+
+	private delegate int GetHandle(uint index, out IntPtr dev);
+
+	private delegate int GetUint(IntPtr dev, out uint value);
+
+	private delegate int GetUintWith(IntPtr dev, uint arg, out uint value);
+
+	private delegate int GetUtil(IntPtr dev, out NvmlUtilization u);
+
+	private delegate int GetMem(IntPtr dev, out NvmlMemory m);
+
+	private delegate int GetName(IntPtr dev, [Out] byte[] name, uint len);
+
+	/// <summary>聚合全部 GPU: 均值(利用率/风扇/频率), 求和(显存/功率/上限/吞吐), 最热温度, 设备0 的链路代数宽度与名称。</summary>
+	public static bool TryFill(Dictionary<string, string> r)
+	{
+		lock (Lock)
+		{
+			EnsureInit();
+			if (!_ok)
+			{
+				return false;
+			}
+			try
+			{
+				var getCount = GetFn<DeviceCount>("nvmlDeviceGetCount_v2");
+				var getHandle = GetFn<GetHandle>("nvmlDeviceGetHandleByIndex_v2");
+				if (getCount == null || getHandle == null || getCount(out uint n) != 0 || n == 0)
+				{
+					return false;
+				}
+				var getUtil = GetFn<GetUtil>("nvmlDeviceGetUtilizationRates");
+				var getMem = GetFn<GetMem>("nvmlDeviceGetMemoryInfo");
+				var getTemp = GetFn<GetUintWith>("nvmlDeviceGetTemperature");
+				var getPower = GetFn<GetUint>("nvmlDeviceGetPowerUsage");
+				var getLimit = GetFn<GetUint>("nvmlDeviceGetEnforcedPowerLimit");
+				var getGen = GetFn<GetUint>("nvmlDeviceGetCurrPcieLinkGeneration");
+				var getGenMax = GetFn<GetUint>("nvmlDeviceGetMaxPcieLinkGeneration");
+				var getWidth = GetFn<GetUint>("nvmlDeviceGetCurrPcieLinkWidth");
+				var getRx = GetFn<GetUintWith>("nvmlDeviceGetPcieThroughput");
+				var getClock = GetFn<GetUintWith>("nvmlDeviceGetClockInfo");
+				var getFan = GetFn<GetUint>("nvmlDeviceGetFanSpeed");
+				var getName = GetFn<GetName>("nvmlDeviceGetName");
+				double utilS = 0, utilN = 0, fanS = 0, fanN = 0, clockS = 0, clockN = 0;
+				ulong memUsed = 0, memTotal = 0;
+				double powerS = 0, limitS = 0, rxKbS = 0, tempMax = 0;
+				string? gen = null, width = null, name0 = null;
+				for (uint i = 0; i < n; i++)
+				{
+					if (getHandle(i, out IntPtr dev) != 0)
+					{
+						continue;
+					}
+					if (getUtil != null && getUtil(dev, out var u) == 0)
+					{
+						utilS += u.Gpu;
+						utilN++;
+					}
+					if (getMem != null && getMem(dev, out var m) == 0)
+					{
+						memUsed += m.Used;
+						memTotal += m.Total;
+					}
+					if (getTemp != null && getTemp(dev, 0, out var t) == 0 && t > tempMax && t < 150)
+					{
+						tempMax = t;
+					}
+					if (getPower != null && getPower(dev, out var mw) == 0 && mw > 0)
+					{
+						powerS += mw / 1000.0;
+					}
+					if (getLimit != null && getLimit(dev, out var lim) == 0 && lim > 0)
+					{
+						limitS += lim / 1000.0;
+					}
+					if (getFan != null && getFan(dev, out var f) == 0 && f <= 100)
+					{
+						fanS += f;
+						fanN++;
+					}
+					if (getClock != null && getClock(dev, 0, out var ck) == 0 && ck > 0)
+					{
+						clockS += ck;
+						clockN++;
+					}
+					if (gen == null)
+					{
+						// 当前代数空闲时可能降为低功耗值, 取 max(当前, 最大) 与 Strata 一致
+						if (getGen != null && getGen(dev, out var g) == 0 && g > 0)
+						{
+							gen = g.ToString(CultureInfo.InvariantCulture);
+						}
+						else if (getGenMax != null && getGenMax(dev, out var gm) == 0 && gm > 0)
+						{
+							gen = gm.ToString(CultureInfo.InvariantCulture);
+						}
+						if (getWidth != null && getWidth(dev, out var w) == 0 && w > 0)
+						{
+							width = w.ToString(CultureInfo.InvariantCulture);
+						}
+					}
+					if (getRx != null && getRx(dev, 1, out var rx) == 0)
+					{
+						rxKbS += rx;
+					}
+					if (name0 == null && getName != null)
+					{
+						var buf = new byte[96];
+						if (getName(dev, buf, 96) == 0)
+						{
+							name0 = System.Text.Encoding.UTF8.GetString(buf, 0, Array.IndexOf(buf, (byte)0) is int z and >= 0 ? z : 0).Trim();
+						}
+					}
+				}
+				string Inv = CultureInfo.InvariantCulture.Name ?? "";
+				if (utilN > 0)
+				{
+					r["gpu_util"] = (utilS / utilN).ToString("F1", CultureInfo.InvariantCulture);
+				}
+				if (memUsed > 0)
+				{
+					r["vram_used"] = memUsed.ToString(CultureInfo.InvariantCulture);
+				}
+				if (memTotal > 0)
+				{
+					r["vram_total"] = memTotal.ToString(CultureInfo.InvariantCulture);
+				}
+				if (tempMax > 0)
+				{
+					r["gpu_temp"] = tempMax.ToString("F1", CultureInfo.InvariantCulture);
+					r["gpu_temp_src"] = "nvidia";
+				}
+				if (powerS > 0)
+				{
+					r["power_w"] = powerS.ToString("F1", CultureInfo.InvariantCulture);
+				}
+				if (limitS > 0)
+				{
+					r["power_limit_w"] = limitS.ToString("F1", CultureInfo.InvariantCulture);
+				}
+				if (fanN > 0)
+				{
+					r["fan_pct"] = (fanS / fanN).ToString("F1", CultureInfo.InvariantCulture);
+				}
+				if (clockN > 0)
+				{
+					r["clock_mhz"] = (clockS / clockN).ToString("F0", CultureInfo.InvariantCulture);
+				}
+				if (gen != null)
+				{
+					r["pcie_gen"] = gen;
+				}
+				if (width != null)
+				{
+					r["pcie_width"] = width;
+				}
+				if (rxKbS > 0)
+				{
+					r["pcie_rx_kbs"] = rxKbS.ToString("F0", CultureInfo.InvariantCulture);
+				}
+				r["gpu_count"] = n.ToString(CultureInfo.InvariantCulture);
+				if (!string.IsNullOrWhiteSpace(name0))
+				{
+					r["gpu_name"] = name0;
+				}
+				return true;
+			}
+			catch
+			{
+				return false;
+			}
+		}
+	}
+}
