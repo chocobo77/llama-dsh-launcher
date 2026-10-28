@@ -546,6 +546,9 @@ partial class LlamaApiMonitor
 	// 启动块
 	public BootInfo Boot { get; } = new();
 
+	// graphs reused(CUDA graph 复用次数, 上次任务后保留)
+	public long? GraphsReused { get; private set; }
+
 	// MTP 投机解码接受率(draft acceptance 行, 无投机时 null)
 	public double? MtpAcceptance { get; private set; }
 	public long? MtpAccepted { get; private set; }
@@ -705,8 +708,10 @@ partial class LlamaApiMonitor
 			MtpMeanLen = F(m.Groups[4].Value);
 			return;
 		}
-		if (LlamaLogRules.Graphs.IsMatch(msg))
+		m = LlamaLogRules.Graphs.Match(msg);
+		if (m.Success)
 		{
+			GraphsReused = I(m.Groups[1].Value);
 			return;
 		}
 		m = LlamaLogRules.BootSlots.Match(msg);

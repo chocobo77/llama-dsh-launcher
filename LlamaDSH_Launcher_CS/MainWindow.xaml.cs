@@ -6011,7 +6011,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		b.Foreground = new SolidColorBrush(ok ? System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80) : System.Windows.Media.Color.FromRgb(0x8b, 0x94, 0x9e));
 	}
 
-	// Llama 状态卡(llama-lens LlamaStateCard 完整语义): 相位 pill + 三列 stat + 真进度条 + ctx/ETA 行
+	// Llama 状态卡(llama-lens LlamaStateCard 全字段对齐)
 	private void UpdatePhaseCard()
 	{
 		var api = _llamaApi;
@@ -6021,7 +6021,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		var slots = api?.SlotsSnapshot() ?? new List<LlamaApiMonitor.SlotInfo>();
 		var act = slots.FirstOrDefault(x => x.Processing);
 
-		// ctx 合并(= llama-lens build_block): slots API 实时值优先, 日志 release/启动块兜底
+		// ctx 合并(slots API 优先, release/启动块兜底)
 		long ctxUsed = api != null && api.CtxUsed >= 0 ? api.CtxUsed : api?.LogCtxUsed ?? -1;
 		long ctxTotal = api?.CtxTotal ?? 0;
 		if (ctxTotal <= 0)
@@ -6035,44 +6035,45 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		string ctxText = ctxUsed >= 0 && ctxTotal > 0 ? $"{FmtTok(ctxUsed)} / {FmtTok(ctxTotal)}" : "—";
 		string ctxPct = ctxUsed >= 0 && ctxTotal > 0 ? $" ({ctxUsed * 100.0 / ctxTotal:F0}%)" : "";
 
+		// 相位文案与配色(= upstream phaseText/phaseClass: decoding=cyan, prompt=green, 离线=danger)
 		string phaseText;
 		System.Windows.Media.Color pillBg;
 		System.Windows.Media.Color pillFg;
-		if (_vramBreakerTriggered)
+		if (!llamaUp)
 		{
-			phaseText = "已熔断";
+			phaseText = "llama 离线";
 			pillBg = System.Windows.Media.Color.FromArgb(0x2e, 0xff, 0x5a, 0x6e);
 			pillFg = System.Windows.Media.Color.FromRgb(0xff, 0x8a, 0x98);
 		}
-		else if (!llamaUp)
-		{
-			phaseText = "空闲";
-			pillBg = System.Windows.Media.Color.FromRgb(0x1d, 0x22, 0x26);
-			pillFg = System.Windows.Media.Color.FromRgb(0x8e, 0x97, 0x9f);
-		}
 		else if (!online)
 		{
-			phaseText = "离线";
+			phaseText = "未知（API）";
 			pillBg = System.Windows.Media.Color.FromArgb(0x2e, 0xf5, 0xb5, 0x3d);
 			pillFg = System.Windows.Media.Color.FromRgb(0xf8, 0xc9, 0x6a);
 		}
 		else if (phase == "decoding")
 		{
 			phaseText = "生成中";
-			pillBg = System.Windows.Media.Color.FromArgb(0x2e, 0x34, 0xd3, 0x99);
-			pillFg = System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80);
+			pillBg = System.Windows.Media.Color.FromArgb(0x2e, 0x7c, 0xd7, 0xf7);
+			pillFg = System.Windows.Media.Color.FromRgb(0x7c, 0xd7, 0xf7);
 		}
 		else if (phase == "prompt_processing")
 		{
-			phaseText = "预填充中";
-			pillBg = System.Windows.Media.Color.FromArgb(0x2e, 0x3a, 0xa9, 0xff);
-			pillFg = System.Windows.Media.Color.FromRgb(0x7c, 0xc4, 0xff);
+			phaseText = "Prompt 处理中";
+			pillBg = System.Windows.Media.Color.FromArgb(0x2e, 0x34, 0xd3, 0x99);
+			pillFg = System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80);
 		}
 		else
 		{
-			phaseText = "等待请求";
-			pillBg = System.Windows.Media.Color.FromArgb(0x2e, 0x34, 0xd3, 0x99);
-			pillFg = System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80);
+			phaseText = "空闲";
+			pillBg = System.Windows.Media.Color.FromArgb(0x1a, 0x8e, 0x97, 0x9f);
+			pillFg = System.Windows.Media.Color.FromRgb(0x8e, 0x97, 0x9f);
+		}
+		if (_vramBreakerTriggered)
+		{
+			phaseText = "已熔断";
+			pillBg = System.Windows.Media.Color.FromArgb(0x2e, 0xff, 0x5a, 0x6e);
+			pillFg = System.Windows.Media.Color.FromRgb(0xff, 0x8a, 0x98);
 		}
 		MonPhaseText.Text = phaseText;
 		MonPhaseText.Foreground = new SolidColorBrush(pillFg);
@@ -6087,16 +6088,37 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		MonModelName.Text = string.IsNullOrEmpty(modelName) ? (llamaUp ? "已连接 · 模型未报告" : "未加载模型") : modelName;
 
+		// KV 缓存命中(= upstream cacheHit): 活动槽 cached/prompt
+		string cacheHitText = "";
+		if (act != null && act.NPromptTokens > 0 && act.NPromptCache > 0)
+		{
+			cacheHitText = $" · 缓存命中 {Math.Min(100.0, act.NPromptCache * 100.0 / act.NPromptTokens):F1}%";
+		}
+
+		// 任务已运行(= upstream elapsed, started_at 起算)
+		string elapsedText = "";
+		if (online && phase != "idle" && api?.TaskStartedAt is DateTime t0)
+		{
+			double el = (DateTime.Now - t0).TotalSeconds;
+			if (el >= 0)
+			{
+				elapsedText = $"已运行 {FmtEta(el)}";
+			}
+		}
+
+		// n_remain>0 表示设了上限; -1/0 = 不限(= upstream nRemain)
+		bool hasLimit = act != null && act.NRemain > 0;
+		string remainText = hasLimit ? FmtTok(act.NRemain) : "不限";
 		double barPct = -1.0;
 		string leftText;
 		string rightText;
 		if (online && phase == "prompt_processing")
 		{
-			// 预填充(= llama-lens stat3): 已处理/速度/耗时 + 进度条 + ETA
+			// 预填充: 进度/速度/耗时 + ETA(= upstream prefillEta)
 			double prog = api?.PromptProgress ?? 0.0;
 			long total = api?.PromptTotalTokens ?? 0;
 			double spd = api?.LogPromptSpeed ?? 0.0;
-			double processed = total > 0 ? total * prog : 0.0;
+			double processed = act != null && act.NPromptProcessed > 0 ? act.NPromptProcessed : total * prog;
 			Stat1Label.Text = "已处理 Prompt";
 			Stat1Val.Text = processed > 0 ? FmtTok(processed) : "—";
 			Stat1Unit.Text = "tokens";
@@ -6107,14 +6129,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			Stat3Val.Text = elapsed > 0 ? elapsed.ToString("F1") : "—";
 			Stat3Unit.Text = "s";
 			barPct = prog * 100.0;
-			leftText = api?.LogTaskId is long t ? $"预填充中 · 任务 #{t}" : "预填充中";
-			double eta = spd > 0 && total > 0 ? (1.0 - prog) * total / spd : -1.0;
-			rightText = $"prompt {FmtTok(total)} tokens · 上下文 {ctxText}{ctxPct}" + (eta > 0 ? $" · 预计剩余 {FmtEta(eta)}" : "");
+			leftText = api?.LogTaskId is long pt ? $"Prompt 处理中 · 任务 #{pt}" : "Prompt 处理中";
+			double eta = spd > 0 && total > 0 ? Math.Max(0.0, (1.0 - prog) * total / spd) : -1.0;
+			rightText = $"prompt {FmtTok(total)} tokens · 上下文 {ctxText}{ctxPct}" + (eta > 0 ? $" · 预计剩余 {FmtEta(eta)}" : "") + cacheHitText;
 			SetMonBar(true, ToneInfo, barPct);
 		}
 		else if (online && phase == "decoding")
 		{
-			// 生成: 已解码/实时速度(tg_3s)/任务均速(tg) + 进度(decoded/(decoded+remain)) + ETA/剩余
+			// 生成: 已解码/实时速度(tg_3s)/任务均速(tg) + 进度与 ETA(仅设了 n_remain 上限时)
 			Stat1Label.Text = "已解码";
 			Stat1Val.Text = FmtTok(api.LogNDecoded);
 			Stat1Unit.Text = "tokens";
@@ -6123,18 +6145,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			Stat3Label.Text = "任务均速";
 			Stat3Val.Text = api.TgTps is double tt ? FT(tt) : "—";
 			Stat3Unit.Text = "t/s";
-			if (act != null && act.NRemain > 0 && api.LogNDecoded > 0)
+			if (hasLimit && api.LogNDecoded > 0)
 			{
 				barPct = Math.Min(100.0, api.LogNDecoded * 100.0 / (api.LogNDecoded + act.NRemain));
 			}
-			leftText = $"生成中 · 任务 #{api.LogTaskId}";
-			double eta = api.Tg3sTps is double t32 && t32 > 0 && act != null && act.NRemain > 0 ? act.NRemain / t32 : -1.0;
-			rightText = $"剩余 {FmtTok(act?.NRemain ?? 0)} tokens · 上下文 {ctxText}{ctxPct}" + (eta > 0 ? $" · 预计完成 {FmtEta(eta)}" : "");
-			SetMonBar(true, ToneAccent, barPct >= 0 ? barPct : null);
+			leftText = api?.LogTaskId is long dt ? $"生成中 · 任务 #{dt}" + (api.IsChild == true ? " · 子任务" : "") : "生成中";
+			double eta = hasLimit && api.Tg3sTps is double t32 && t32 > 0 ? act.NRemain / t32 : -1.0;
+			rightText = $"剩余 {remainText} tokens · 上下文 {ctxText}{ctxPct}" + (eta > 0 ? $" · 预计完成 {FmtEta(eta)}" : "") + cacheHitText;
+			SetMonBar(true, ToneInfo, barPct >= 0 ? barPct : null);
 		}
 		else
 		{
-			// 空闲/离线/熔断: 上次任务统计 + 上下文
+			// 空闲/离线/熔断: idle-note + 上次任务(= upstream last_task 行)
 			var lt = api?.LastTask;
 			Stat1Label.Text = "上次输出";
 			Stat1Val.Text = (lt?.TotalTokens ?? lt?.DecodedTokens) is long tok && tok > 0 ? FmtTok(tok) : "—";
@@ -6145,19 +6167,49 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			Stat3Val.Text = ctxText;
 			Stat3Unit.Text = ctxPct;
 			SetMonBar(false, ToneAccent, 0.0);
-			leftText = phaseText == "已熔断" ? "显存熔断已触发，llama 已停止" : (llamaUp ? "等待请求" : "llama 未启动");
-			rightText = lt != null && (lt.TotalTokens ?? lt.DecodedTokens) is long ltk && ltk > 0
-				? $"上次: {FmtTok(ltk)} tokens" + (lt.Duration > 0 ? $" · {lt.Duration:F1}s" : "") + ((lt.GenSpeed ?? lt.AvgTps) is double la && la > 0 ? $" @ {FT(la)} tok/s" : "")
-				: "";
+			leftText = _vramBreakerTriggered ? "显存熔断已触发，llama 已停止" : (llamaUp ? "空闲 · 等待新任务" : "llama 未启动");
+			rightText = "";
+			if (lt != null)
+			{
+				var parts = new List<string>();
+				if ((lt.TotalTokens ?? lt.DecodedTokens) is long ltk && ltk > 0)
+				{
+					parts.Add($"{FmtTok(ltk)} tokens");
+				}
+				if (lt.Duration > 0)
+				{
+					parts.Add($"{lt.Duration:F1}s");
+				}
+				if ((lt.GenSpeed ?? lt.AvgTps) is double la && la > 0)
+				{
+					parts.Add($"均速 {FT(la)} t/s");
+				}
+				if (lt.PromptSpeed is double lps && lps > 0)
+				{
+					parts.Add($"预填充 {FT(lps)} t/s");
+				}
+				if (lt.Truncated)
+				{
+					parts.Add("已截断");
+				}
+				if (parts.Count > 0)
+				{
+					rightText = $"上次 #{lt.TaskId}: " + string.Join(" · ", parts);
+				}
+			}
 			if (ctxUsed >= 0 && ctxTotal > 0)
 			{
 				rightText += (rightText.Length > 0 ? " · " : "") + $"上下文 {ctxText}{ctxPct}";
 			}
 		}
-		// llama-lens monitor-state__reading: 左=相位/任务, 右=状态明细
+		if (elapsedText.Length > 0)
+		{
+			rightText += (rightText.Length > 0 ? " · " : "") + elapsedText;
+		}
 		MonPhaseLabel.Text = leftText;
 		MonPhaseLabel.ToolTip = null;
 		MonPhaseDetail.Text = rightText;
+
 		UpdateModelInfoCard(api);
 		UpdateEventFeed(api);
 	}
@@ -6488,8 +6540,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			MtpRing.StrokeDashArray = new System.Windows.Media.DoubleCollection { Math.Max(0.02, 24.74 * acc), 100.0 };
 			MtpRing.Opacity = 1.0;
+			MtpRing.Stroke = new SolidColorBrush(acc < 0.65 ? Color.FromRgb(0xff, 0x5a, 0x6e) : acc < 0.8 ? Color.FromRgb(0xf5, 0xb5, 0x3d) : Color.FromRgb(0x7c, 0xd7, 0xf7));
 			MtpVal.Text = $"{acc * 100.0:F1}%";
-			MtpSub.Text = $"{api.MtpAccepted} / {api.MtpGenerated} · mean {api.MtpMeanLen:0.##}";
+			MtpVal.Foreground = new SolidColorBrush(acc < 0.65 ? Color.FromRgb(0xff, 0x8a, 0x98) : acc < 0.8 ? Color.FromRgb(0xf8, 0xc9, 0x6a) : Color.FromRgb(0xee, 0xf1, 0xf3));
+			MtpSub.Text = $"{api.MtpAccepted} / {api.MtpGenerated} · mean {api.MtpMeanLen:0.##}" + (api.GraphsReused is long gr ? $" · graphs {gr}" : "");
 		}
 		else
 		{
