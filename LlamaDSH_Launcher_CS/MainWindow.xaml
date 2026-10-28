@@ -569,6 +569,10 @@
                 <TextBlock Text="系统资源" Foreground="#eef1f3" FontSize="14" FontWeight="Bold" />
               </Grid>
               <Grid Margin="0,6,0,0">
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="*" />
                   <ColumnDefinition Width="*" />
@@ -590,7 +594,7 @@
                     </DockPanel>
                   </StackPanel>
                 </Border>
-                <Border Grid.Column="1" Background="#161a1d" CornerRadius="10" Padding="16,12" Margin="4,0,0,0" BorderBrush="#2a3036" BorderThickness="1">
+                <Border Grid.Row="0" Grid.Column="1" Background="#161a1d" CornerRadius="10" Padding="16,12" Margin="4,0,0,0" BorderBrush="#2a3036" BorderThickness="1">
                   <StackPanel>
                     <DockPanel Margin="0,0,0,8">
                       <TextBlock DockPanel.Dock="Right" Name="MemHeadSub" Text="" FontSize="11" FontFamily="Consolas" Foreground="#8e979f" VerticalAlignment="Center" />
@@ -610,7 +614,7 @@
                     </StackPanel>
                   </StackPanel>
                 </Border>
-                <Border Grid.Row="0" Grid.Column="0" Background="#161a1d" CornerRadius="10" Padding="16,12" Margin="0,8,4,0" BorderBrush="#2a3036" BorderThickness="1">
+                <Border Grid.Row="1" Grid.Column="0" Background="#161a1d" CornerRadius="10" Padding="16,12" Margin="0,8,4,0" BorderBrush="#2a3036" BorderThickness="1">
                   <StackPanel>
                     <DockPanel Margin="0,0,0,8">
                       <TextBlock DockPanel.Dock="Right" Name="DiskHeadSub" Text="" FontSize="11" FontFamily="Consolas" Foreground="#8e979f" VerticalAlignment="Center" />
@@ -619,7 +623,7 @@
                     <StackPanel Name="DiskRowsHost" />
                   </StackPanel>
                 </Border>
-                <Border Grid.Row="0" Grid.Column="1" Background="#161a1d" CornerRadius="10" Padding="16,12" Margin="4,0,0,0" BorderBrush="#2a3036" BorderThickness="1">
+                <Border Grid.Row="1" Grid.Column="1" Background="#161a1d" CornerRadius="10" Padding="16,12" Margin="4,0,0,0" BorderBrush="#2a3036" BorderThickness="1">
                   <StackPanel>
                     <DockPanel Margin="0,0,0,8">
                       <TextBlock DockPanel.Dock="Right" Name="NetHeadSub" Text="" FontSize="11" FontFamily="Consolas" Foreground="#8e979f" VerticalAlignment="Center" />

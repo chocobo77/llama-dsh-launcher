@@ -6245,8 +6245,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		MiSize.Text = m.FileSize.HasValue ? m.FileSize.Value >= 1073741824L ? $"{m.FileSize.Value / 1073741824.0:F2} GB" : $"{m.FileSize.Value / 1048576.0:F0} MB" : "—";
 		MiEmbd.Text = m.NEmbd?.ToString() ?? "—";
 		MiVocab.Text = m.NVocab?.ToString() ?? "—";
-		MiCtx.Text = m.NCtx?.ToString() ?? "—";
-		MiCtxTrain.Text = m.NCtxTrain?.ToString() ?? "—";
+		long? nctx = m.NCtx ?? api?.Boot?.NCtxSlot;
+		if (nctx == null)
+		{
+			var sl = api?.SlotsSnapshot();
+			var c = sl?.FirstOrDefault(x => x.NCtx > 0);
+			nctx = c?.NCtx;
+		}
+		MiCtx.Text = nctx?.ToString() ?? "—";
+		MiCtxTrain.Text = m.NCtxTrain?.ToString() ?? (nctx != null ? "≥ " + nctx : "—");
 		MiVocabType.Text = string.IsNullOrEmpty(m.VocabType) ? "—" : m.VocabType;
 		var mods = new List<string>();
 		if (m.Vision)
@@ -6460,19 +6467,43 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		MtpSpark.SetSeries(_hMtp.Arr(), null, 100.0, "%", _hMtp.Stamps(), ToneInfo, ToneAccent2, "", "");
 
-		// ── GPU 每卡 + 聚合 ──
+		// ── GPU 每卡 + 聚合(NVML → nvidia-smi → 既有聚合键合成单卡) ──
 		var gpus = NvmlMonitor.SamplePerDevice();
+		if (gpus.Count == 0)
+		{
+			gpus = NvmlMonitor.SampleViaNvidiaSmi();
+		}
+		if (gpus.Count == 0 && d.TryGetValue("gpu_util", out string sGu0))
+		{
+			// 非 NVIDIA/无驱动: 用既有聚合键合成一张卡, 保底不让 GPU 区空白
+			double Num1(string k) => d.TryGetValue(k, out string v) && double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out var vv) ? vv : 0;
+			gpus.Add(new GpuDevInfo
+			{
+				Index = 0,
+				Name = d.TryGetValue("gpu_name", out string gn) ? gn : "GPU(系统聚合)",
+				Util = Num1("gpu_util"),
+				MemUsedMb = Num1("vram_used") / 1024.0,
+				MemTotalMb = Num1("vram_total") / 1024.0,
+				Temp = Num1("gpu_temp"),
+				Power = Num1("power_w"),
+				Limit = Num1("power_limit_w"),
+				Fan = Num1("fan_pct"),
+				Clock = Num1("clock_mhz"),
+			});
+		}
 		if (gpus.Count > 0)
 		{
 			StripGpuVal.Text = gpus.Average(x => x.Util).ToString("F0");
 			StripMemVal.Text = (gpus.Sum(x => x.MemUsedMb) / 1024.0).ToString("F1");
 			StripMemUnit.Text = "GB";
-			StripTempVal.Text = gpus.Max(x => x.Temp).ToString("F0");
-			StripPowerVal.Text = gpus.Sum(x => x.Power).ToString("F0");
+			var temps = gpus.Where(x => x.Temp > 0).ToArray();
+			StripTempVal.Text = temps.Length > 0 ? temps.Max(x => x.Temp).ToString("F0") : "—";
+			double pw = gpus.Sum(x => x.Power);
+			StripPowerVal.Text = pw > 0 ? pw.ToString("F0") : "—";
 			_hGpuUtil.Push(gpus.Average(x => x.Util));
 			_hGpuMem.Push(gpus.Sum(x => x.MemUsedMb) / 1024.0);
-			_hTemp.Push(gpus.Max(x => x.Temp));
-			_hPower.Push(gpus.Sum(x => x.Power));
+			_hTemp.Push(temps.Length > 0 ? temps.Max(x => x.Temp) : null);
+			_hPower.Push(pw > 0 ? pw : null);
 		}
 		else
 		{
@@ -6580,8 +6611,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					sp.Children.Add(new TextBlock { Text = v, FontSize = 12, FontFamily = new FontFamily("Consolas"), Foreground = new SolidColorBrush(c ?? Color.FromRgb(0xc7, 0xcd, 0xd3)) });
 					grid3.Children.Add(sp);
 				}
-				Kv("温度", $"{g.Temp:F0}°C", g.Temp >= 85 ? Color.FromRgb(0xff, 0x8a, 0x98) : null);
-				Kv("功耗", $"{g.Power:F0} / {g.Limit:F0} W");
+				Kv("温度", g.Temp > 0 ? $"{g.Temp:F0}°C" : "—", g.Temp >= 85 ? Color.FromRgb(0xff, 0x8a, 0x98) : null);
+				Kv("功耗", g.Power > 0 ? $"{g.Power:F0} / {g.Limit:F0} W" : "—");
 				Kv("风扇", $"{g.Fan:F0}%");
 				Kv("频率", $"{g.Clock:F0} MHz");
 				Kv("PCIe", g.Gen.HasValue ? $"gen{g.Gen} x{g.Width ?? 0}" : "—");

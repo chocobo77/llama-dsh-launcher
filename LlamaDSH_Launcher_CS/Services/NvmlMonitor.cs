@@ -446,3 +446,60 @@ partial class NvmlMonitor
 		}
 	}
 }
+
+partial class NvmlMonitor
+{
+	/// <summary>NVML 不可用时的回退: nvidia-smi 每卡一行解析(含驱动/P-State)。</summary>
+	public static List<GpuDevInfo> SampleViaNvidiaSmi()
+	{
+		var list = new List<GpuDevInfo>();
+		try
+		{
+			var r = ProcessRunner.Run(
+				"nvidia-smi",
+				new[] { "--query-gpu=index,name,driver_version,pstate,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,enforced.power.limit,fan.speed,clocks.current.graphics,pcie.link.gen.current,pcie.link.width.current", "--format=csv,noheader,nounits" },
+				5000);
+			if (!r.Started || r.TimedOut)
+			{
+				return list;
+			}
+			foreach (var raw in r.StdOut.Split('\n'))
+			{
+				var parts = raw.TrimEnd('\r').Split(',');
+				if (parts.Length < 14)
+				{
+					continue;
+				}
+				var d = new GpuDevInfo
+				{
+					Index = int.TryParse(parts[0].Trim(), out var ix) ? ix : 0,
+					Name = parts[1].Trim(),
+					Driver = parts[2].Trim(),
+					Pstate = parts[3].Trim(),
+				};
+				double Num(int i) => double.TryParse(parts[i].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : 0;
+				d.Util = Num(4);
+				d.MemUsedMb = Num(5);
+				d.MemTotalMb = Num(6);
+				d.Temp = Num(7);
+				d.Power = Num(8);
+				d.Limit = Num(9);
+				d.Fan = Num(10);
+				d.Clock = Num(11);
+				if (double.TryParse(parts[12].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var g) && g > 0)
+				{
+					d.Gen = (int)g;
+				}
+				if (double.TryParse(parts[13].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var w) && w > 0)
+				{
+					d.Width = (int)w;
+				}
+				list.Add(d);
+			}
+		}
+		catch
+		{
+		}
+		return list;
+	}
+}
