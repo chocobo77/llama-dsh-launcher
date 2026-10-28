@@ -6107,7 +6107,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			Stat3Val.Text = elapsed > 0 ? elapsed.ToString("F1") : "—";
 			Stat3Unit.Text = "s";
 			barPct = prog * 100.0;
-			leftText = "预填充中 · 任务 #" + (api?.LogTaskId is long t ? "#" + t : "—");
+			leftText = api?.LogTaskId is long t ? $"预填充中 · 任务 #{t}" : "预填充中";
 			double eta = spd > 0 && total > 0 ? (1.0 - prog) * total / spd : -1.0;
 			rightText = $"prompt {FmtTok(total)} tokens · 上下文 {ctxText}{ctxPct}" + (eta > 0 ? $" · 预计剩余 {FmtEta(eta)}" : "");
 			SetMonBar(true, ToneInfo, barPct);
@@ -6149,14 +6149,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			rightText = lt != null && (lt.TotalTokens ?? lt.DecodedTokens) is long ltk && ltk > 0
 				? $"上次: {FmtTok(ltk)} tokens" + (lt.Duration > 0 ? $" · {lt.Duration:F1}s" : "") + ((lt.GenSpeed ?? lt.AvgTps) is double la && la > 0 ? $" @ {FT(la)} tok/s" : "")
 				: "";
+			if (ctxUsed >= 0 && ctxTotal > 0)
+			{
+				rightText += (rightText.Length > 0 ? " · " : "") + $"上下文 {ctxText}{ctxPct}";
+			}
 		}
-		MonPhaseLabel.Text = $"上下文 {ctxText}{ctxPct}";
+		// llama-lens monitor-state__reading: 左=相位/任务, 右=状态明细
+		MonPhaseLabel.Text = leftText;
+		MonPhaseLabel.ToolTip = null;
 		MonPhaseDetail.Text = rightText;
-		if (!string.IsNullOrEmpty(leftText))
-		{
-			MonPhaseDetail.Text = rightText;
-			MonPhaseLabel.ToolTip = leftText;
-		}
 		UpdateModelInfoCard(api);
 		UpdateEventFeed(api);
 	}
@@ -6412,9 +6413,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		_hMtp.Push(api?.MtpAcceptance);
 
 		// ── 摘要条 ──
-		StripGenVal.Text = decoding && api.Tg3sTps is double sg ? sg.ToString("0.#") : !double.IsNaN(decNow) ? decNow.ToString("0.#") : "—";
-		StripPfVal.Text = prompting && api.LogPromptSpeed is double sp ? sp.ToString("0.#") : !double.IsNaN(pfNow) ? pfNow.ToString("0.#") : "—";
-		StripCtxVal.Text = ctxUsed >= 0 ? FmtTok(ctxUsed) : "—";
 		StripGpuVal.Text = "—";
 		StripMemVal.Text = "—";
 		StripTempVal.Text = "—";
