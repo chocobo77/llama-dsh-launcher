@@ -407,9 +407,20 @@ public static class UpdateService
 			// 覆盖：全部文件/子目录复制到目标目录
 			CopyDirOverwrite(srcBin, targetDir);
 
+			// 落盘自检: 目标目录 llama-server --version 必须报告 build 号,
+			// 否则复制可能被占用/失败留下了旧二进制(stock 版会拒载自定义量化类型)
+			int? localBuild = GetLocalLlamaBuild(targetDir);
+			string verify = localBuild.HasValue
+				? "本地验证 build " + localBuild.Value
+				: "警告: 本地 llama-server --version 未报告 build 号, 二进制可能不完整或为旧版本";
+			if (localBuild.HasValue && release.Build > 0 && localBuild.Value != release.Build)
+			{
+				verify += $"（与上游 build {release.Build} 不一致）";
+			}
+
 			// 清理本次下载/解压临时文件
 			CleanupUpdateTemp();
-			return (true, "llama.cpp 已更新到 " + release.Tag + "（build " + release.Build + "）");
+			return (true, "llama.cpp 已更新到 " + release.Tag + "（build " + release.Build + "）, " + verify);
 		}
 		catch (Exception ex)
 		{

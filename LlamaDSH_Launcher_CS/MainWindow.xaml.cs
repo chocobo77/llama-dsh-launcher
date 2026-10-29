@@ -1336,7 +1336,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			InputLlamaDir.Text = dir;
 			Log($"[变体] 已安装 {name}（{repo}）→ {dir}");
 			Log("[变体] " + msgR);
-			ShowNotice($"变体「{name}」安装完成。\n目录: {dir}\n\n可随时在「Llama 版本」下拉里切换。");
+			// PrismML 模型卡明确其低比特内核只覆盖 CUDA/Metal/CPU，AMD/Intel 无法 GPU 加速
+			string note = repo.Contains("PrismML", StringComparison.OrdinalIgnoreCase)
+				? "\n\n⚠ 注意: PrismML 低比特内核仅覆盖 CUDA/Metal/CPU——NVIDIA/Apple 可 GPU 加速, AMD/Intel 显卡将走 CPU 回退(较慢)。"
+				: "";
+			ShowNotice($"变体「{name}」安装完成。\n目录: {dir}\n\n{msgR}{note}\n\n可随时在「Llama 版本」下拉里切换。");
 			}
 			catch (Exception ex)
 			{
