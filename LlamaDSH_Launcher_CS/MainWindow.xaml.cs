@@ -1349,7 +1349,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		win.Show();
 	}
 
-	/// <summary>仓库链接 → (owner, owner/repo)。支持 主页地址/.git/releases/tree 链接/裸 owner-repo。</summary>
+	/// <summary>仓库链接 → (owner, owner/repo)。支持 主页地址/.git/tree/branch/releases 等深链/裸 owner/repo。</summary>
 	private static (string owner, string repo)? ParseRepoInput(string? input)
 	{
 		string t = (input ?? "").Trim();
@@ -1357,8 +1357,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			return null;
 		}
-		t = t.TrimEnd('/');
-		foreach (var pre in new[] { "https://github.com/", "http://github.com/", "github.com/", "https://www.github.com/", "www.github.com/" })
+		foreach (var pre in new[] { "https://github.com/", "http://github.com/", "https://www.github.com/", "http://www.github.com/", "github.com/", "www.github.com/" })
 		{
 			if (t.StartsWith(pre, StringComparison.OrdinalIgnoreCase))
 			{
@@ -1366,25 +1365,29 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				break;
 			}
 		}
-		int cut = t.IndexOfAny(new[] { '/', '#' });
-		if (cut > 0)
+		int hash = t.IndexOf('#');
+		if (hash >= 0)
 		{
-			// github.com/owner/repo/tree/xxx 或 .../releases 等: 取 owner/repo 两段
-			string rest = t[(cut + 1)..];
-			int slash = rest.IndexOf('/');
-			t = slash > 0 ? t[..(cut + 1 + slash)] : t[..cut];
+			t = t[..hash];
 		}
-		if (t.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
-		{
-			t = t[..^4];
-		}
-		var seg = t.Split('/');
-		if (seg.Length != 2 || seg[0].Length == 0 || seg[1].Length == 0)
+		var seg = t.Split('/', StringSplitOptions.RemoveEmptyEntries);
+		if (seg.Length < 2)
 		{
 			return null;
 		}
-		return (seg[0], seg[0] + "/" + seg[1]);
+		string owner = seg[0];
+		string repo = seg[1];
+		if (repo.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
+		{
+			repo = repo[..^4];
+		}
+		if (owner.Length == 0 || repo.Length == 0)
+		{
+			return null;
+		}
+		return (owner, owner + "/" + repo);
 	}
+
 
 	// ══════════ llama.cpp 变体管理结束 ══════════
 
