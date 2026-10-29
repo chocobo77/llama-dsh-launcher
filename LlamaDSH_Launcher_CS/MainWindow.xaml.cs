@@ -1173,34 +1173,57 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void AddLlamaVariant_Click(object sender, RoutedEventArgs e)
 	{
-		var presets = new (string name, string repo)[]
-		{
-			("标准 llama.cpp", "ggml-org/llama.cpp"),
-			("PrismML-Eng", "PrismML-Eng/llama.cpp"),
-		};
 		var win = new System.Windows.Window
 		{
 			Title = "安装 llama.cpp 变体",
-			Width = 560,
+			Width = 620,
 			SizeToContent = System.Windows.SizeToContent.Height,
 			WindowStartupLocation = System.Windows.WindowStartupLocation.CenterScreen,
 			Background = new SolidColorBrush(Color.FromRgb(0x1a, 0x1a, 0x2e)),
 			ResizeMode = System.Windows.ResizeMode.NoResize,
 		};
 		var root = new StackPanel { Margin = new Thickness(16) };
-		var repoBox = new NoScrollComboBox { Margin = new Thickness(0, 4, 0, 0) };
-		foreach (var (n, r) in presets)
-		{
-			repoBox.Items.Add($"{n}  —  {r}");
-		}
-		repoBox.SelectedIndex = 0;
+		var urlBox = new System.Windows.Controls.TextBox { Margin = new Thickness(0, 4, 0, 0) };
 		var nameBox = new System.Windows.Controls.TextBox { Margin = new Thickness(0, 4, 0, 0) };
-		var dirBox = new System.Windows.Controls.TextBox { Margin = new Thickness(0, 4, 0, 0) };
-		void SyncPreset()
+		var dirRow = new DockPanel { Margin = new Thickness(0, 4, 0, 0) };
+		var dirBox = new System.Windows.Controls.TextBox();
+		var browse = new System.Windows.Controls.Button { Content = "浏览...", Margin = new Thickness(6, 0, 0, 0) };
+		dirRow.Children.Add(browse);
+		dirRow.Children.Add(dirBox);
+		var btnRow = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 0), HorizontalAlignment = HorizontalAlignment.Right };
+		var cancel = new System.Windows.Controls.Button { Content = "取消", Padding = new Thickness(14, 4, 14, 4), Margin = new Thickness(8, 0, 0, 0) };
+		var ok = new System.Windows.Controls.Button { Content = "⬇ 检查并安装", Padding = new Thickness(14, 4, 14, 4), Background = new SolidColorBrush(Color.FromRgb(0x23, 0x86, 0x36)), Foreground = System.Windows.Media.Brushes.White };
+		btnRow.Children.Add(cancel);
+		btnRow.Children.Add(ok);
+		root.Children.Add(new TextBlock
 		{
-			int i = Math.Max(0, repoBox.SelectedIndex);
-			string owner = presets[i].repo.Split('/')[0];
-			nameBox.Text = presets[i].name;
+			Text = "仓库链接（GitHub 仓库主页地址）",
+			Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)),
+			FontSize = 11,
+		});
+		root.Children.Add(urlBox);
+		root.Children.Add(new TextBlock
+		{
+			Text = "示例: https://github.com/PrismML-Eng/llama.cpp",
+			Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)),
+			FontSize = 10,
+			Margin = new Thickness(0, 2, 0, 0),
+		});
+		root.Children.Add(new TextBlock { Text = "显示名称", Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontSize = 11, Margin = new Thickness(0, 10, 0, 0) });
+		root.Children.Add(nameBox);
+		root.Children.Add(new TextBlock { Text = "安装目录（下载解压到此处, 与其它变体并存互不覆盖）", Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontSize = 11, Margin = new Thickness(0, 10, 0, 0) });
+		root.Children.Add(dirRow);
+		root.Children.Add(btnRow);
+		win.Content = root;
+
+		// 名称/目录随仓库链接自动带出(用户手动编辑后不再覆盖)
+		bool nameEdited = false;
+		bool dirEdited = false;
+		nameBox.TextChanged += (_, _) => nameEdited = true;
+		dirBox.TextChanged += (_, _) => dirEdited = true;
+
+		string DefaultDir(string owner)
+		{
 			string parent = "";
 			try
 			{
@@ -1213,32 +1236,54 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			catch
 			{
 			}
-			dirBox.Text = string.IsNullOrEmpty(parent) ? "" : System.IO.Path.Combine(parent, "llama.cpp-" + owner);
+			return string.IsNullOrEmpty(parent) ? "" : System.IO.Path.Combine(parent, "llama.cpp-" + owner);
 		}
-		repoBox.SelectionChanged += (_, _) => SyncPreset();
-		SyncPreset();
-		root.Children.Add(new TextBlock { Text = "仓库分支", Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontSize = 11 });
-		root.Children.Add(repoBox);
-		root.Children.Add(new TextBlock { Text = "显示名称", Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontSize = 11, Margin = new Thickness(0, 8, 0, 0) });
-		root.Children.Add(nameBox);
-		root.Children.Add(new TextBlock { Text = "安装目录（下载解压到此处, 与其它变体并存互不覆盖）", Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontSize = 11, Margin = new Thickness(0, 8, 0, 0) });
-		root.Children.Add(dirBox);
-		var btnRow = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 0), HorizontalAlignment = HorizontalAlignment.Right };
-		var cancel = new System.Windows.Controls.Button { Content = "取消", Padding = new Thickness(14, 4, 14, 4), Margin = new Thickness(8, 0, 0, 0) };
-		var ok = new System.Windows.Controls.Button { Content = "⬇ 检查并安装", Padding = new Thickness(14, 4, 14, 4), Background = new SolidColorBrush(Color.FromRgb(0x23, 0x86, 0x36)), Foreground = System.Windows.Media.Brushes.White };
-		btnRow.Children.Add(cancel);
-		btnRow.Children.Add(ok);
-		root.Children.Add(btnRow);
-		win.Content = root;
+
+		urlBox.TextChanged += (_, _) =>
+		{
+			var m = ParseRepoInput(urlBox.Text);
+			if (m == null)
+			{
+				return;
+			}
+			if (!nameEdited)
+			{
+				nameBox.Text = m.Value.owner;
+			}
+			if (!dirEdited)
+			{
+				dirBox.Text = DefaultDir(m.Value.owner);
+			}
+		};
+		browse.Click += (_, _) =>
+		{
+			string? d = PickFolder("选择变体安装目录", dirBox.Text);
+			if (d != null)
+			{
+				dirBox.Text = d;
+				dirEdited = true;
+			}
+		};
 		cancel.Click += (_, _) => win.Close();
 		ok.Click += async (_, _) =>
 		{
-			string repo = presets[Math.Max(0, repoBox.SelectedIndex)].repo;
-			string name = string.IsNullOrWhiteSpace(nameBox.Text) ? repo.Split('/')[0] : nameBox.Text.Trim();
+			var parsed = ParseRepoInput(urlBox.Text);
+			if (parsed == null)
+			{
+				ShowNotice("仓库链接无法识别。请填 GitHub 仓库主页地址，例如:\nhttps://github.com/PrismML-Eng/llama.cpp", isError: true);
+				return;
+			}
+			string repo = parsed.Value.repo;
+			string name = string.IsNullOrWhiteSpace(nameBox.Text) ? parsed.Value.owner : nameBox.Text.Trim();
 			string dir = dirBox.Text.Trim();
 			if (string.IsNullOrEmpty(dir))
 			{
 				ShowNotice("请填写安装目录。", isError: true);
+				return;
+			}
+			if (_llamaVariants.Any(v => v.Name == name && v.Dir != dir))
+			{
+				ShowNotice($"名称「{name}」已被其它变体占用, 换一个名称。", isError: true);
 				return;
 			}
 			ok.IsEnabled = false;
@@ -1291,6 +1336,43 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			ShowNotice($"变体「{name}」安装完成。\n目录: {dir}\n\n可随时在「Llama 版本」下拉里切换。");
 		};
 		win.Show();
+	}
+
+	/// <summary>仓库链接 → (owner, owner/repo)。支持 主页地址/.git/releases/tree 链接/裸 owner-repo。</summary>
+	private static (string owner, string repo)? ParseRepoInput(string? input)
+	{
+		string t = (input ?? "").Trim();
+		if (t.Length == 0)
+		{
+			return null;
+		}
+		t = t.TrimEnd('/');
+		foreach (var pre in new[] { "https://github.com/", "http://github.com/", "github.com/", "https://www.github.com/", "www.github.com/" })
+		{
+			if (t.StartsWith(pre, StringComparison.OrdinalIgnoreCase))
+			{
+				t = t[pre.Length..];
+				break;
+			}
+		}
+		int cut = t.IndexOfAny(new[] { '/', '#' });
+		if (cut > 0)
+		{
+			// github.com/owner/repo/tree/xxx 或 .../releases 等: 取 owner/repo 两段
+			string rest = t[(cut + 1)..];
+			int slash = rest.IndexOf('/');
+			t = slash > 0 ? t[..(cut + 1 + slash)] : t[..cut];
+		}
+		if (t.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
+		{
+			t = t[..^4];
+		}
+		var seg = t.Split('/');
+		if (seg.Length != 2 || seg[0].Length == 0 || seg[1].Length == 0)
+		{
+			return null;
+		}
+		return (seg[0], seg[0] + "/" + seg[1]);
 	}
 
 	// ══════════ llama.cpp 变体管理结束 ══════════
