@@ -36,6 +36,8 @@ public static class UpdateService
 		public int Build;
 		public string AssetName = "";
 		public string AssetUrl = "";
+		public string CudartName = "";
+		public string CudartUrl = "";
 		/// <summary>稳定版标签（如 v0.4.0）；滚动构建时为空。</summary>
 		public string StableVersion = "";
 	}
@@ -117,7 +119,7 @@ public static class UpdateService
 	/// 因此优先读 stable release 的 nightly-tag.txt → 定位稳定构建资产；
 	/// 失败时回退扫描最近 releases 列表取最新 bNNNNN（滚动构建）。
 	/// </summary>
-	public static LlamaReleaseInfo? FetchLatestLlamaRelease(string repo = "ggml-org/llama.cpp")
+	public static LlamaReleaseInfo? FetchLatestLlamaRelease(string repo = "ggml-org/llama.cpp", string backend = "vulkan")
 	{
 		// 1) 稳定版：latest release 里读 nightly-tag.txt
 		try
@@ -148,7 +150,7 @@ public static class UpdateService
 						int? build = ParseBuildFromTag(content.Trim());
 						if (build != null)
 						{
-							LlamaReleaseInfo? ri = FetchBuildRelease(build.Value, repo);
+							LlamaReleaseInfo? ri = FetchBuildRelease(build.Value, repo, backend);
 							if (ri != null)
 							{
 								ri.StableVersion = stableTag;
@@ -160,7 +162,7 @@ public static class UpdateService
 					int? tagBuild = ParseBuildFromTag(stableTag);
 					if (tagBuild != null)
 					{
-						LlamaReleaseInfo? ri = BuildFromReleaseJson(root, tagBuild.Value);
+						LlamaReleaseInfo? ri = BuildFromReleaseJson(root, tagBuild.Value, backend);
 						if (ri != null)
 						{
 							ri.StableVersion = stableTag;
@@ -190,7 +192,7 @@ public static class UpdateService
 						{
 							continue;
 						}
-						LlamaReleaseInfo? ri = BuildFromReleaseJson(r, build.Value);
+						LlamaReleaseInfo? ri = BuildFromReleaseJson(r, build.Value, backend);
 						if (ri != null)
 						{
 							return ri;
@@ -206,7 +208,7 @@ public static class UpdateService
 	}
 
 	/// <summary>按 bNNNNN 标签拉取对应 release 并解析 Windows 预编译资产。</summary>
-	private static LlamaReleaseInfo? FetchBuildRelease(int build, string repo)
+	private static LlamaReleaseInfo? FetchBuildRelease(int build, string repo, string backend = "vulkan")
 	{
 		string? json = HttpGetString($"https://api.github.com/repos/{repo}/releases/tags/b{build}", 10);
 		if (json == null)
@@ -215,57 +217,99 @@ public static class UpdateService
 		}
 		using (JsonDocument doc = JsonDocument.Parse(json))
 		{
-			return BuildFromReleaseJson(doc.RootElement, build);
+			return BuildFromReleaseJson(doc.RootElement, build, backend);
 		}
 	}
 
-	private static LlamaReleaseInfo? BuildFromReleaseJson(JsonElement release, int build)
+	private static LlamaReleaseInfo? BuildFromReleaseJson(JsonElement release, int build, string backend = "vulkan")
 	{
 		string tag = release.TryGetProperty("tag_name", out JsonElement te) ? te.GetString() ?? ("b" + build) : ("b" + build);
-		string assetName = "";
-		string assetUrl = "";
+		// 收集全部 Windows x64 预编译主包候选（排除 cudart 纯运行库与 arm64）
+		var cands = new List<(string name, string url)>();
 		if (release.TryGetProperty("assets", out JsonElement assets) && assets.ValueKind == JsonValueKind.Array)
 		{
 			foreach (JsonElement a in assets.EnumerateArray())
 			{
 				string name = a.TryGetProperty("name", out JsonElement ne) ? ne.GetString() ?? "" : "";
+				string url = a.TryGetProperty("browser_download_url", out JsonElement ue) ? ue.GetString() ?? "" : "";
 				if (!name.Contains("-bin-win-") || !name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
 				{
 					continue;
 				}
-				// 优先 Vulkan-x64；其次 AVX2-x64（Vulkan 包缺失时的保守回退）
-				if (name.Contains("vulkan-x64"))
+				if (name.Contains("cudart", StringComparison.OrdinalIgnoreCase))
 				{
-					assetName = name;
-					assetUrl = a.TryGetProperty("browser_download_url", out JsonElement ue) ? ue.GetString() ?? "" : "";
-					break;
+					continue;
 				}
-				if (string.IsNullOrEmpty(assetName) && name.Contains("avx2-x64"))
+				if (!name.Contains("x64", StringComparison.OrdinalIgnoreCase) || name.Contains("arm64", StringComparison.OrdinalIgnoreCase))
 				{
-					assetName = name;
-					assetUrl = a.TryGetProperty("browser_download_url", out JsonElement ue2) ? ue2.GetString() ?? "" : "";
+					continue;
 				}
+				cands.Add((name, url));
 			}
 		}
-		if (string.IsNullOrEmpty(assetUrl))
+		// 按显卡挑后端: NVIDIA=CUDA(取最高版本), Intel=SYCL(原生低比特内核), AMD/默认=Vulkan; 依次回退
+		(string name, string url)? chosen = backend switch
 		{
-			// 分支仓库资产命名可能没有 vulkan/avx2 前缀: 兜底取任意 win-x64 zip
-			foreach (JsonElement a in assets.EnumerateArray())
-			{
-				string name = a.TryGetProperty("name", out JsonElement ne2) ? ne2.GetString() ?? "" : "";
-				if (name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) && name.Contains("x64", StringComparison.OrdinalIgnoreCase))
-				{
-					assetName = name;
-					assetUrl = a.TryGetProperty("browser_download_url", out JsonElement ue3) ? ue3.GetString() ?? "" : "";
-					break;
-				}
-			}
-		}
-		if (string.IsNullOrEmpty(assetUrl))
+			"sycl" => PickAsset(cands, "sycl-x64") ?? PickAsset(cands, "vulkan-x64") ?? PickAsset(cands, "avx2-x64"),
+			"cuda" => PickCudaAsset(cands) ?? PickAsset(cands, "vulkan-x64") ?? PickAsset(cands, "avx2-x64"),
+			_ => PickAsset(cands, "vulkan-x64") ?? PickAsset(cands, "avx2-x64"),
+		};
+		chosen ??= cands.Count > 0 ? cands[0] : null;
+		if (chosen == null)
 		{
 			return null;
 		}
-		return new LlamaReleaseInfo { Tag = tag, Build = build, AssetName = assetName, AssetUrl = assetUrl };
+		// CUDA 主包按 cuda-X.Y 版本号配对 cudart 运行库
+		string cudartName = "";
+		string cudartUrl = "";
+		Match cv = Regex.Match(chosen.Value.name, @"cuda-([\d.]+)-x64", RegexOptions.IgnoreCase);
+		if (cv.Success && release.TryGetProperty("assets", out JsonElement assets2) && assets2.ValueKind == JsonValueKind.Array)
+		{
+			string want = "cudart-llama-bin-win-cuda-" + cv.Groups[1].Value + "-x64.zip";
+			foreach (JsonElement a in assets2.EnumerateArray())
+			{
+				string name = a.TryGetProperty("name", out JsonElement ne2) ? ne2.GetString() ?? "" : "";
+				if (string.Equals(name, want, StringComparison.OrdinalIgnoreCase))
+				{
+					cudartName = name;
+					cudartUrl = a.TryGetProperty("browser_download_url", out JsonElement ue2) ? ue2.GetString() ?? "" : "";
+					break;
+				}
+			}
+		}
+		return new LlamaReleaseInfo { Tag = tag, Build = build, AssetName = chosen.Value.name, AssetUrl = chosen.Value.url, CudartName = cudartName, CudartUrl = cudartUrl };
+	}
+
+	private static (string name, string url)? PickAsset(List<(string name, string url)> cands, string token)
+	{
+		foreach (var c in cands)
+		{
+			if (c.name.Contains(token, StringComparison.OrdinalIgnoreCase))
+			{
+				return c;
+			}
+		}
+		return null;
+	}
+
+	private static (string name, string url)? PickCudaAsset(List<(string name, string url)> cands)
+	{
+		(string name, string url)? best = null;
+		Version bestV = new Version(0, 0);
+		foreach (var c in cands)
+		{
+			Match m = Regex.Match(c.name, @"cuda-([\d.]+)-x64", RegexOptions.IgnoreCase);
+			if (!m.Success)
+			{
+				continue;
+			}
+			if (Version.TryParse(m.Groups[1].Value, out Version? v) && v > bestV)
+			{
+				bestV = v;
+				best = c;
+			}
+		}
+		return best;
 	}
 
 	private static string? HttpGetString(string url, int timeoutSec = 30)
@@ -354,41 +398,32 @@ public static class UpdateService
 				"https://ghfast.top/" + release.AssetUrl,
 				"https://ghproxy.net/" + release.AssetUrl
 			};
-			bool downloaded = false;
-			foreach (string u in urls)
-			{
-				try
-				{
-					using CancellationTokenSource dlCts = new(TimeSpan.FromMinutes(20));
-					using (HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Get, u))
-					{
-						req.Headers.TryAddWithoutValidation("User-Agent", "LlamaDSH_Launcher");
-						using (HttpResponseMessage resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, dlCts.Token))
-						{
-							if (!resp.IsSuccessStatusCode)
-							{
-								continue;
-							}
-							using (FileStream fs = File.Create(zipPath))
-							{
-								await resp.Content.CopyToAsync(fs, dlCts.Token);
-							}
-							if (new FileInfo(zipPath).Length < 1000000)
-							{
-								continue;
-							}
-							downloaded = true;
-							break;
-						}
-					}
-				}
-				catch
-				{
-				}
-			}
+			bool downloaded = await DownloadAssetAsync(urls, zipPath);
 			if (!downloaded)
 			{
 				return (false, "下载 llama.cpp 预编译包失败（GitHub/镜像均不可达或文件过小）");
+			}
+
+			// CUDA 主包需配套 cudart 运行库, 一并下载
+			string? cudartDir = null;
+			string cudartNote = "";
+			if (!string.IsNullOrEmpty(release.CudartUrl))
+			{
+				string czip = Path.Combine(UpdateTempRoot, release.CudartName);
+				string cext = Path.Combine(UpdateTempRoot, "extract_cudart_" + release.Build);
+				if (Directory.Exists(cext))
+				{
+					Directory.Delete(cext, true);
+				}
+				if (await DownloadAssetAsync(new[] { release.CudartUrl, "https://gh-proxy.com/" + release.CudartUrl, "https://ghfast.top/" + release.CudartUrl, "https://ghproxy.net/" + release.CudartUrl }, czip))
+				{
+					ZipFile.ExtractToDirectory(czip, cext);
+					cudartDir = FindDirContainingAnyDll(cext);
+				}
+				if (cudartDir == null)
+				{
+					cudartNote = "（警告: 配套 cudart 运行库未就位, 启动 CUDA 版可能报缺 DLL）";
+				}
 			}
 
 			ZipFile.ExtractToDirectory(zipPath, extractDir);
@@ -406,6 +441,10 @@ public static class UpdateService
 
 			// 覆盖：全部文件/子目录复制到目标目录
 			CopyDirOverwrite(srcBin, targetDir);
+			if (cudartDir != null)
+			{
+				CopyDirOverwrite(cudartDir, targetDir);
+			}
 
 			// 落盘自检: 目标目录 llama-server --version 必须报告 build 号,
 			// 否则复制可能被占用/失败留下了旧二进制(stock 版会拒载自定义量化类型)
@@ -420,12 +459,63 @@ public static class UpdateService
 
 			// 清理本次下载/解压临时文件
 			CleanupUpdateTemp();
-			return (true, "llama.cpp 已更新到 " + release.Tag + "（build " + release.Build + "）, " + verify);
+			return (true, "llama.cpp 已更新到 " + release.Tag + "（build " + release.Build + "）[" + release.AssetName + "]" + cudartNote + ", " + verify);
 		}
 		catch (Exception ex)
 		{
 			return (false, "更新失败: " + ex.Message);
 		}
+	}
+
+	/// <summary>按顺序尝试下载（直连 + 镜像），成功写入 destPath 返回 true。</summary>
+	private static async Task<bool> DownloadAssetAsync(IEnumerable<string> urls, string destPath)
+	{
+		foreach (string u in urls)
+		{
+			try
+			{
+				using CancellationTokenSource dlCts = new(TimeSpan.FromMinutes(20));
+				using (HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Get, u))
+				{
+					req.Headers.TryAddWithoutValidation("User-Agent", "LlamaDSH_Launcher");
+					using (HttpResponseMessage resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, dlCts.Token))
+					{
+						if (!resp.IsSuccessStatusCode)
+						{
+							continue;
+						}
+						using (FileStream fs = File.Create(destPath))
+						{
+							await resp.Content.CopyToAsync(fs, dlCts.Token);
+						}
+						if (new FileInfo(destPath).Length < 1000000)
+						{
+							continue;
+						}
+						return true;
+					}
+				}
+			}
+			catch
+			{
+			}
+		}
+		return false;
+	}
+
+	private static string? FindDirContainingAnyDll(string root)
+	{
+		try
+		{
+			foreach (string f in Directory.GetFiles(root, "*.dll", SearchOption.AllDirectories))
+			{
+				return Path.GetDirectoryName(f);
+			}
+		}
+		catch
+		{
+		}
+		return null;
 	}
 
 	private static string? FindDirContaining(string root, string fileName)

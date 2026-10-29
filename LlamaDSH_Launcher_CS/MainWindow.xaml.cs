@@ -1291,7 +1291,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			ok.IsEnabled = false;
 			ok.Content = "⏳ 获取版本...";
-			var latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease(repo));
+			var latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease(repo, LlamaBackendPreference()));
 			if (latest == null)
 			{
 				ok.IsEnabled = true;
@@ -1310,6 +1310,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				ok.Content = "⬇ 检查并安装";
 				ShowNotice("创建目录失败: " + ex.Message, isError: true);
 				return;
+			}
+			if (System.IO.File.Exists(System.IO.Path.Combine(dir, "llama-server.exe")))
+			{
+				Log("[变体] 目标目录已存在 llama-server.exe, 将直接覆盖。若之前装过非 release 渠道的构建(官网/CI), 建议先清空目录避免新旧文件混杂。");
 			}
 			var (okR, msgR) = await UpdateService.ApplyLlamaUpdateAsync(dir, latest);
 			UpdateService.CleanupLauncherTemp();
@@ -1635,7 +1639,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			SetLlamaUpdBtn(true, "⏳ 检查中...");
 			int? local = await Task.Run(() => UpdateService.GetLocalLlamaBuild(dir));
 			string repo = CurrentLlamaRepo();
-			Services.UpdateService.LlamaReleaseInfo? latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease());
+			Services.UpdateService.LlamaReleaseInfo? latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease(repo, LlamaBackendPreference()));
 			SetLlamaUpdBtn(false);
 			if (latest == null)
 			{
@@ -1650,10 +1654,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				string upstream = string.IsNullOrEmpty(latest.StableVersion)
 					? latest.Tag + "（滚动构建）"
 					: latest.Tag + "（" + latest.StableVersion + " 稳定版）";
+				string mismatch = local.Value != latest.Build
+					? "\n\n⚠ 本地 build 与上游 release 不一致——目录里可能是分支/官网 CI 构建（不含该仓库 release 的专属量化类型）。若加载模型报 ggml type 错误, 请删除该目录后重新安装。"
+					: "";
 				Log("[更新] llama.cpp 已是最新: build " + local.Value + "（上游 " + upstream + "）");
 				if (fromButton)
 				{
-					ShowNotice("llama.cpp 已是最新版本。\n当前: build " + local.Value + "\n上游: " + upstream);
+					ShowNotice("llama.cpp 已是最新版本。\n当前: build " + local.Value + "\n上游: " + upstream + mismatch);
 				}
 				return;
 			}
@@ -6591,6 +6598,21 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		_gpuFriendlyName ??= "GPU(系统聚合)";
 		return _gpuFriendlyName;
+	}
+
+	// 按显卡厂商挑 llama.cpp 预编译后端: NVIDIA=CUDA, Intel=SYCL(原生低比特内核), AMD/未知=Vulkan
+	private string LlamaBackendPreference()
+	{
+		string g = GpuFriendlyName();
+		if (g.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase) || g.Contains("GeForce", StringComparison.OrdinalIgnoreCase) || g.Contains("RTX", StringComparison.OrdinalIgnoreCase) || g.Contains("GTX", StringComparison.OrdinalIgnoreCase))
+		{
+			return "cuda";
+		}
+		if (g.Contains("Intel", StringComparison.OrdinalIgnoreCase) || g.Contains("Arc", StringComparison.OrdinalIgnoreCase) || g.Contains("Iris", StringComparison.OrdinalIgnoreCase))
+		{
+			return "sycl";
+		}
+		return "vulkan";
 	}
 
 	// 真进度条: pct 有值=决定填充, 无值=不定态滑块
