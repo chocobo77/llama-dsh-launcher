@@ -122,7 +122,7 @@ public static class UpdateService
 		// 1) 稳定版：latest release 里读 nightly-tag.txt
 		try
 		{
-			string? latestJson = HttpGetString($"https://api.github.com/repos/{repo}/releases/latest");
+			string? latestJson = HttpGetString($"https://api.github.com/repos/{repo}/releases/latest", 10);
 			if (latestJson != null)
 			{
 				using (JsonDocument doc = JsonDocument.Parse(latestJson))
@@ -144,7 +144,7 @@ public static class UpdateService
 					}
 					if (!string.IsNullOrEmpty(nightlyUrl))
 					{
-						string content = HttpGetString(nightlyUrl) ?? "";
+						string content = HttpGetString(nightlyUrl, 10) ?? "";
 						int? build = ParseBuildFromTag(content.Trim());
 						if (build != null)
 						{
@@ -166,7 +166,7 @@ public static class UpdateService
 		// 2) 回退：滚动构建（最新 bNNNNN）
 		try
 		{
-			string? listJson = HttpGetString($"https://api.github.com/repos/{repo}/releases?per_page=20");
+			string? listJson = HttpGetString($"https://api.github.com/repos/{repo}/releases?per_page=20", 10);
 			if (listJson != null)
 			{
 				using (JsonDocument doc = JsonDocument.Parse(listJson))
@@ -197,7 +197,7 @@ public static class UpdateService
 	/// <summary>按 bNNNNN 标签拉取对应 release 并解析 Windows 预编译资产。</summary>
 	private static LlamaReleaseInfo? FetchBuildRelease(int build, string repo)
 	{
-		string? json = HttpGetString($"https://api.github.com/repos/{repo}/releases/tags/b{build}");
+		string? json = HttpGetString($"https://api.github.com/repos/{repo}/releases/tags/b{build}", 10);
 		if (json == null)
 		{
 			return null;
@@ -257,7 +257,7 @@ public static class UpdateService
 		return new LlamaReleaseInfo { Tag = tag, Build = build, AssetName = assetName, AssetUrl = assetUrl };
 	}
 
-	private static string? HttpGetString(string url)
+	private static string? HttpGetString(string url, int timeoutSec = 30)
 	{
 		// 直连 + GitHub 代理镜像；部分网络只封锁 api.github.com，镜像可直接透传 JSON。
 		List<string> candidates = new() { url };
@@ -272,7 +272,7 @@ public static class UpdateService
 			{
 				try
 				{
-					using CancellationTokenSource cts = new(TimeSpan.FromSeconds(30));
+					using CancellationTokenSource cts = new(TimeSpan.FromSeconds(timeoutSec));
 					using HttpRequestMessage req = new(HttpMethod.Get, candidate);
 					req.Headers.TryAddWithoutValidation("User-Agent", "LlamaDSH_Launcher");
 					using HttpResponseMessage resp = Http.Send(req, cts.Token);

@@ -1267,6 +1267,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		cancel.Click += (_, _) => win.Close();
 		ok.Click += async (_, _) =>
 		{
+			try
+			{
 			var parsed = ParseRepoInput(urlBox.Text);
 			if (parsed == null)
 			{
@@ -1274,6 +1276,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				return;
 			}
 			string repo = parsed.Value.repo;
+			Log($"[变体] 查询 {repo} 最新版本...(网络不通时最多约 1 分钟, 请留意按钮状态)");
 			string name = string.IsNullOrWhiteSpace(nameBox.Text) ? parsed.Value.owner : nameBox.Text.Trim();
 			string dir = dirBox.Text.Trim();
 			if (string.IsNullOrEmpty(dir))
@@ -1334,6 +1337,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			Log($"[变体] 已安装 {name}（{repo}）→ {dir}");
 			Log("[变体] " + msgR);
 			ShowNotice($"变体「{name}」安装完成。\n目录: {dir}\n\n可随时在「Llama 版本」下拉里切换。");
+			}
+			catch (Exception ex)
+			{
+				ok.IsEnabled = true;
+				ok.Content = "⬇ 检查并安装";
+				LogError(ex, "安装 llama.cpp 变体");
+				ShowNotice("安装出错: " + ex.Message, isError: true);
+			}
 		};
 		win.Show();
 	}
