@@ -173,7 +173,15 @@
                 <Button Name="BtnSearchLlama" Content="🔍 自动检索" Margin="4,0,0,0" ToolTip="自动检索 llama-server.exe 所在目录" Click="SearchLlama_Click" />
                 <Button Name="BtnCheckLlamaUpdate" Content="🔄 检查更新" Margin="4,0,0,0" ToolTip="检查 llama.cpp 最新预编译版并覆盖更新（Vulkan-x64，需先停止 Llama 服务，不触碰模型）" Click="CheckLlamaUpdate_Click" />
               </StackPanel>
-              <TextBox Name="InputLlamaDir" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+              <TextBox Name="InputLlamaDir" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" TextChanged="InputLlamaDir_TextChanged" />
+            </DockPanel>
+            <DockPanel Margin="0,0,0,6">
+              <Label Content="Llama 版本:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
+              <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                <Button Name="BtnAddLlamaVariant" Content="＋ 安装新变体" Margin="4,0,0,0" Click="AddLlamaVariant_Click" ToolTip="从 GitHub Releases 安装其它 llama.cpp 分支(如 PrismML-Eng), 与标准版并存、可随时切换" />
+                <Button Name="BtnRemoveLlamaVariant" Content="移除" Margin="4,0,0,0" Click="RemoveLlamaVariant_Click" ToolTip="从列表移除当前选中的变体(不删除目录文件)" />
+              </StackPanel>
+              <local:NoScrollComboBox x:Name="ComboLlamaVariant" SelectionChanged="LlamaVariant_SelectionChanged" ToolTip="llama.cpp 变体(分支)。切换即切换上方程序目录; 检查更新按当前变体的仓库进行" />
             </DockPanel>
             <DockPanel Margin="0,0,0,6">
               <Label Content="DSH 项目目录:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />

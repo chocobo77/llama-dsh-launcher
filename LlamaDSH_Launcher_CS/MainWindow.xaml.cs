@@ -1057,6 +1057,244 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	// ==================== 更新：llama.cpp / deepseek-harness ====================
 
+	// ══════════ llama.cpp 变体管理(标准/PrismML 等分支并存切换) ══════════
+	private void LoadLlamaVariants(Models.ProfileConfig c)
+	{
+		_variantGuard = true;
+		try
+		{
+			_llamaVariants = c.LlamaVariants ?? new List<Models.LlamaVariant>();
+			if (_llamaVariants.Count == 0)
+			{
+				// 旧配置迁移: 现有目录注册为标准变体
+				_llamaVariants.Add(new Models.LlamaVariant { Name = "标准 llama.cpp", Repo = "ggml-org/llama.cpp", Dir = c.LlamaDir ?? "" });
+			}
+			_activeVariant = string.IsNullOrEmpty(c.ActiveLlamaVariant) ? _llamaVariants[0].Name : c.ActiveLlamaVariant;
+			if (_llamaVariants.All(v => v.Name != _activeVariant))
+			{
+				_activeVariant = _llamaVariants[0].Name;
+			}
+			var cur = _llamaVariants.FirstOrDefault(v => v.Name == _activeVariant);
+			if (cur != null && !string.IsNullOrWhiteSpace(cur.Dir) && Toolchain.NormalizeDir(cur.Dir) != Toolchain.NormalizeDir(InputLlamaDir.Text))
+			{
+				InputLlamaDir.Text = cur.Dir;
+			}
+			RefreshLlamaVariantCombo();
+		}
+		finally
+		{
+			_variantGuard = false;
+		}
+	}
+
+	private void RefreshLlamaVariantCombo()
+	{
+		_variantGuard = true;
+		try
+		{
+			ComboLlamaVariant.Items.Clear();
+			foreach (var v in _llamaVariants)
+			{
+				ComboLlamaVariant.Items.Add(v.Name + (string.IsNullOrEmpty(v.Dir) ? "（未安装）" : ""));
+			}
+			int i = _llamaVariants.FindIndex(v => v.Name == _activeVariant);
+			ComboLlamaVariant.SelectedIndex = i >= 0 ? i : 0;
+		}
+		finally
+		{
+			_variantGuard = false;
+		}
+	}
+
+	private string CurrentLlamaRepo()
+	{
+		return _llamaVariants.FirstOrDefault(v => v.Name == _activeVariant)?.Repo ?? "ggml-org/llama.cpp";
+	}
+
+	private void LlamaVariant_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+	{
+		if (_variantGuard)
+		{
+			return;
+		}
+		int i = ComboLlamaVariant.SelectedIndex;
+		if (i < 0 || i >= _llamaVariants.Count)
+		{
+			return;
+		}
+		var v = _llamaVariants[i];
+		_activeVariant = v.Name;
+		if (!string.IsNullOrWhiteSpace(v.Dir))
+		{
+			InputLlamaDir.Text = v.Dir;
+		}
+		Log($"[变体] 切换 llama.cpp 版本: {v.Name}（仓库 {v.Repo}）");
+	}
+
+	private void InputLlamaDir_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
+	{
+		if (_variantGuard)
+		{
+			return;
+		}
+		var v = _llamaVariants.FirstOrDefault(x => x.Name == _activeVariant);
+		if (v != null)
+		{
+			v.Dir = InputLlamaDir.Text;
+		}
+	}
+
+	private void RemoveLlamaVariant_Click(object sender, RoutedEventArgs e)
+	{
+		if (_llamaVariants.Count <= 1)
+		{
+			ShowNotice("至少保留一个变体。", isError: true);
+			return;
+		}
+		int i = ComboLlamaVariant.SelectedIndex;
+		if (i < 0 || i >= _llamaVariants.Count)
+		{
+			return;
+		}
+		string name = _llamaVariants[i].Name;
+		if (System.Windows.MessageBox.Show($"从列表移除变体「{name}」？\n（不删除磁盘上的程序文件）", "移除变体", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+		{
+			return;
+		}
+		_llamaVariants.RemoveAt(i);
+		_activeVariant = _llamaVariants[0].Name;
+		RefreshLlamaVariantCombo();
+		if (!string.IsNullOrWhiteSpace(_llamaVariants[0].Dir))
+		{
+			InputLlamaDir.Text = _llamaVariants[0].Dir;
+		}
+		Log($"[变体] 已移除 {name}");
+	}
+
+	private void AddLlamaVariant_Click(object sender, RoutedEventArgs e)
+	{
+		var presets = new (string name, string repo)[]
+		{
+			("标准 llama.cpp", "ggml-org/llama.cpp"),
+			("PrismML-Eng", "PrismML-Eng/llama.cpp"),
+		};
+		var win = new System.Windows.Window
+		{
+			Title = "安装 llama.cpp 变体",
+			Width = 560,
+			SizeToContent = System.Windows.SizeToContent.Height,
+			WindowStartupLocation = System.Windows.WindowStartupLocation.CenterScreen,
+			Background = new SolidColorBrush(Color.FromRgb(0x1a, 0x1a, 0x2e)),
+			ResizeMode = System.Windows.ResizeMode.NoResize,
+		};
+		var root = new StackPanel { Margin = new Thickness(16) };
+		var repoBox = new NoScrollComboBox { Margin = new Thickness(0, 4, 0, 0) };
+		foreach (var (n, r) in presets)
+		{
+			repoBox.Items.Add($"{n}  —  {r}");
+		}
+		repoBox.SelectedIndex = 0;
+		var nameBox = new System.Windows.Controls.TextBox { Margin = new Thickness(0, 4, 0, 0) };
+		var dirBox = new System.Windows.Controls.TextBox { Margin = new Thickness(0, 4, 0, 0) };
+		void SyncPreset()
+		{
+			int i = Math.Max(0, repoBox.SelectedIndex);
+			string owner = presets[i].repo.Split('/')[0];
+			nameBox.Text = presets[i].name;
+			string parent = "";
+			try
+			{
+				string nd = Toolchain.NormalizeDir(InputLlamaDir.Text);
+				if (!string.IsNullOrWhiteSpace(nd))
+				{
+					parent = System.IO.Directory.GetParent(nd.TrimEnd('\\', '/'))?.FullName ?? "";
+				}
+			}
+			catch
+			{
+			}
+			dirBox.Text = string.IsNullOrEmpty(parent) ? "" : System.IO.Path.Combine(parent, "llama.cpp-" + owner);
+		}
+		repoBox.SelectionChanged += (_, _) => SyncPreset();
+		SyncPreset();
+		root.Children.Add(new TextBlock { Text = "仓库分支", Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontSize = 11 });
+		root.Children.Add(repoBox);
+		root.Children.Add(new TextBlock { Text = "显示名称", Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontSize = 11, Margin = new Thickness(0, 8, 0, 0) });
+		root.Children.Add(nameBox);
+		root.Children.Add(new TextBlock { Text = "安装目录（下载解压到此处, 与其它变体并存互不覆盖）", Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontSize = 11, Margin = new Thickness(0, 8, 0, 0) });
+		root.Children.Add(dirBox);
+		var btnRow = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 0), HorizontalAlignment = HorizontalAlignment.Right };
+		var cancel = new System.Windows.Controls.Button { Content = "取消", Padding = new Thickness(14, 4, 14, 4), Margin = new Thickness(8, 0, 0, 0) };
+		var ok = new System.Windows.Controls.Button { Content = "⬇ 检查并安装", Padding = new Thickness(14, 4, 14, 4), Background = new SolidColorBrush(Color.FromRgb(0x23, 0x86, 0x36)), Foreground = System.Windows.Media.Brushes.White };
+		btnRow.Children.Add(cancel);
+		btnRow.Children.Add(ok);
+		root.Children.Add(btnRow);
+		win.Content = root;
+		cancel.Click += (_, _) => win.Close();
+		ok.Click += async (_, _) =>
+		{
+			string repo = presets[Math.Max(0, repoBox.SelectedIndex)].repo;
+			string name = string.IsNullOrWhiteSpace(nameBox.Text) ? repo.Split('/')[0] : nameBox.Text.Trim();
+			string dir = dirBox.Text.Trim();
+			if (string.IsNullOrEmpty(dir))
+			{
+				ShowNotice("请填写安装目录。", isError: true);
+				return;
+			}
+			ok.IsEnabled = false;
+			ok.Content = "⏳ 获取版本...";
+			var latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease(repo));
+			if (latest == null)
+			{
+				ok.IsEnabled = true;
+				ok.Content = "⬇ 检查并安装";
+				ShowNotice($"无法获取 {repo} 的最新版本（网络/GitHub 不可达, 或该仓库未提供 win-x64 预编译包）。", isError: true);
+				return;
+			}
+			ok.Content = "⏳ 下载安装中...";
+			try
+			{
+				System.IO.Directory.CreateDirectory(dir);
+			}
+			catch (Exception ex)
+			{
+				ok.IsEnabled = true;
+				ok.Content = "⬇ 检查并安装";
+				ShowNotice("创建目录失败: " + ex.Message, isError: true);
+				return;
+			}
+			var (okR, msgR) = await UpdateService.ApplyLlamaUpdateAsync(dir, latest);
+			UpdateService.CleanupLauncherTemp();
+			if (!okR)
+			{
+				ok.IsEnabled = true;
+				ok.Content = "⬇ 检查并安装";
+				ShowNotice("安装失败: " + msgR, isError: true);
+				return;
+			}
+			win.Close();
+			var exist = _llamaVariants.FirstOrDefault(v => v.Name == name);
+			if (exist != null)
+			{
+				exist.Repo = repo;
+				exist.Dir = dir;
+			}
+			else
+			{
+				_llamaVariants.Add(new Models.LlamaVariant { Name = name, Repo = repo, Dir = dir });
+			}
+			_activeVariant = name;
+			RefreshLlamaVariantCombo();
+			InputLlamaDir.Text = dir;
+			Log($"[变体] 已安装 {name}（{repo}）→ {dir}");
+			Log("[变体] " + msgR);
+			ShowNotice($"变体「{name}」安装完成。\n目录: {dir}\n\n可随时在「Llama 版本」下拉里切换。");
+		};
+		win.Show();
+	}
+
+	// ══════════ llama.cpp 变体管理结束 ══════════
+
 	private void CheckLlamaUpdate_Click(object s, RoutedEventArgs e)
 	{
 		_ = CheckLlamaUpdateAsync(fromButton: true);
@@ -1296,6 +1534,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			SetLlamaUpdBtn(true, "⏳ 检查中...");
 			int? local = await Task.Run(() => UpdateService.GetLocalLlamaBuild(dir));
+			string repo = CurrentLlamaRepo();
 			Services.UpdateService.LlamaReleaseInfo? latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease());
 			SetLlamaUpdBtn(false);
 			if (latest == null)
@@ -1306,7 +1545,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}
 				return;
 			}
-			if (local.HasValue && latest.Build <= local.Value)
+			if (latest.Build > 0 && local.HasValue && latest.Build <= local.Value)
 			{
 				string upstream = string.IsNullOrEmpty(latest.StableVersion)
 					? latest.Tag + "（滚动构建）"
@@ -1324,6 +1563,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				: latest.Tag + "（" + latest.StableVersion + " 稳定版, build " + latest.Build + "）";
 			string msg = "发现 llama.cpp 新版本:\n\n"
 				+ "  当前: " + current + "\n"
+				+ "  来源仓库: " + repo + "\n"
 				+ "  上游: " + latestDesc + "\n"
 				+ "  预编译包: " + latest.AssetName + "\n\n"
 				+ "将下载并覆盖更新到:\n  " + dir + "\n\n"
@@ -6216,6 +6456,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private bool _synthGpuLogged;
 
+	// llama.cpp 变体(分支): 名称/仓库/目录, 随方案配置持久化
+	private List<Models.LlamaVariant> _llamaVariants = new();
+	private string _activeVariant = "";
+	private bool _variantGuard;
+
 	// WMI 显卡友好名(一次性缓存): "AMD Radeon RX 7900 XTX"
 	private string? _gpuFriendlyName;
 
@@ -7252,6 +7497,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			MmprojUrl = InputMmprojUrl.Text,
 			NoMmprojOffload = (ChkNoMmprojOffload.IsChecked == true),
 			LlamaDir = InputLlamaDir.Text,
+			LlamaVariants = _llamaVariants,
+			ActiveLlamaVariant = _activeVariant,
 			DshDir = InputDshDir.Text,
 			DshMode = ComboDshMode.SelectedIndex,
 			DshAdminMode = (ChkDshAdmin.IsChecked == true),
@@ -7309,6 +7556,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		InputMmprojUrl.Text = c.MmprojUrl;
 		ChkNoMmprojOffload.IsChecked = c.NoMmprojOffload;
 		InputLlamaDir.Text = c.LlamaDir;
+		LoadLlamaVariants(c);
 		InputDshDir.Text = c.DshDir;
 		ComboDshMode.SelectedIndex = c.DshMode;
 		ChkDshAdmin.IsChecked = c.DshAdminMode;

@@ -28,6 +28,11 @@ public class ProfileConfig
 
 	public Dictionary<string, bool> BoolParams { get; set; } = new Dictionary<string, bool>();
 
+	// llama.cpp 变体(分支)列表与当前选中名; Dir 与 LlamaDir 冗余, 以选中项为准
+	public List<LlamaVariant> LlamaVariants { get; set; } = new List<LlamaVariant>();
+
+	public string ActiveLlamaVariant { get; set; } = "";
+
 	public Dictionary<string, ValueParamData> ValueParams { get; set; } = new Dictionary<string, ValueParamData>();
 
 	/// <summary>命令预览是派生数据（ApplyConfig 后由 RefreshCmd 重算），不写入配置；旧文件中的该字段读取时忽略。</summary>
@@ -54,4 +59,14 @@ public class ProfileConfig
 	public int VramBreakerType { get; set; }
 
 	public double VramBreakerValue { get; set; }
+}
+
+public class LlamaVariant
+{
+	public string Name { get; set; } = "";
+
+	/// <summary>GitHub 仓库(owner/repo), 检查更新按此进行。</summary>
+	public string Repo { get; set; } = "ggml-org/llama.cpp";
+
+	public string Dir { get; set; } = "";
 }

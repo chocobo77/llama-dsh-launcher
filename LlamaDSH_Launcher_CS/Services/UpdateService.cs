@@ -117,12 +117,12 @@ public static class UpdateService
 	/// 因此优先读 stable release 的 nightly-tag.txt → 定位稳定构建资产；
 	/// 失败时回退扫描最近 releases 列表取最新 bNNNNN（滚动构建）。
 	/// </summary>
-	public static LlamaReleaseInfo? FetchLatestLlamaRelease()
+	public static LlamaReleaseInfo? FetchLatestLlamaRelease(string repo = "ggml-org/llama.cpp")
 	{
 		// 1) 稳定版：latest release 里读 nightly-tag.txt
 		try
 		{
-			string? latestJson = HttpGetString("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest");
+			string? latestJson = HttpGetString($"https://api.github.com/repos/{repo}/releases/latest");
 			if (latestJson != null)
 			{
 				using (JsonDocument doc = JsonDocument.Parse(latestJson))
@@ -148,7 +148,7 @@ public static class UpdateService
 						int? build = ParseBuildFromTag(content.Trim());
 						if (build != null)
 						{
-							LlamaReleaseInfo? ri = FetchBuildRelease(build.Value);
+							LlamaReleaseInfo? ri = FetchBuildRelease(build.Value, repo);
 							if (ri != null)
 							{
 								ri.StableVersion = stableTag;
@@ -166,7 +166,7 @@ public static class UpdateService
 		// 2) 回退：滚动构建（最新 bNNNNN）
 		try
 		{
-			string? listJson = HttpGetString("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=20");
+			string? listJson = HttpGetString($"https://api.github.com/repos/{repo}/releases?per_page=20");
 			if (listJson != null)
 			{
 				using (JsonDocument doc = JsonDocument.Parse(listJson))
@@ -195,9 +195,9 @@ public static class UpdateService
 	}
 
 	/// <summary>按 bNNNNN 标签拉取对应 release 并解析 Windows 预编译资产。</summary>
-	private static LlamaReleaseInfo? FetchBuildRelease(int build)
+	private static LlamaReleaseInfo? FetchBuildRelease(int build, string repo)
 	{
-		string? json = HttpGetString("https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/b" + build);
+		string? json = HttpGetString($"https://api.github.com/repos/{repo}/releases/tags/b{build}");
 		if (json == null)
 		{
 			return null;
@@ -233,6 +233,20 @@ public static class UpdateService
 				{
 					assetName = name;
 					assetUrl = a.TryGetProperty("browser_download_url", out JsonElement ue2) ? ue2.GetString() ?? "" : "";
+				}
+			}
+		}
+		if (string.IsNullOrEmpty(assetUrl))
+		{
+			// 分支仓库资产命名可能没有 vulkan/avx2 前缀: 兜底取任意 win-x64 zip
+			foreach (JsonElement a in assets.EnumerateArray())
+			{
+				string name = a.TryGetProperty("name", out JsonElement ne2) ? ne2.GetString() ?? "" : "";
+				if (name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) && name.Contains("x64", StringComparison.OrdinalIgnoreCase))
+				{
+					assetName = name;
+					assetUrl = a.TryGetProperty("browser_download_url", out JsonElement ue3) ? ue3.GetString() ?? "" : "";
+					break;
 				}
 			}
 		}
