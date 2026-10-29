@@ -156,6 +156,17 @@ public static class UpdateService
 							}
 						}
 					}
+					// 无 nightly-tag 资产的分支(如 PrismML): latest 的 tag 内嵌 build, 直接用其资产
+					int? tagBuild = ParseBuildFromTag(stableTag);
+					if (tagBuild != null)
+					{
+						LlamaReleaseInfo? ri = BuildFromReleaseJson(root, tagBuild.Value);
+						if (ri != null)
+						{
+							ri.StableVersion = stableTag;
+							return ri;
+						}
+					}
 				}
 			}
 		}
@@ -304,6 +315,12 @@ public static class UpdateService
 		}
 		// 兼容纯数字内容（如 nightly-tag.txt 只写 10809）
 		m = Regex.Match(t, @"^(\d+)$");
+		if (m.Success && int.TryParse(m.Groups[1].Value, out build))
+		{
+			return build;
+		}
+		// 分支 tag 内嵌 build 号（如 PrismML 的 prism-b10831-9d9efea → 10831）
+		m = Regex.Match(t, @"b(\d{3,})", RegexOptions.IgnoreCase);
 		if (m.Success && int.TryParse(m.Groups[1].Value, out build))
 		{
 			return build;
