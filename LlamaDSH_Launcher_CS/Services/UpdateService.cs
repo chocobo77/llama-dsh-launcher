@@ -941,6 +941,20 @@ public static class UpdateService
 				catch
 				{
 				}
+				// 超时强杀会留下 .git/index.lock, 之后所有 git 命令都会报锁存在:
+				// 确认无存活 git 进程时自动清理该锁
+				string lockFile = Path.Combine(repoDir, ".git", "index.lock");
+				if (File.Exists(lockFile) && Process.GetProcessesByName("git").Length == 0)
+				{
+					try
+					{
+						File.Delete(lockFile);
+						return (-1, "git 执行超时（" + timeoutSec + " 秒）; 已自动清理残留的 .git/index.lock, 可直接重试");
+					}
+					catch
+					{
+					}
+				}
 				return (-1, "git 执行超时（" + timeoutSec + " 秒）");
 			}
 			return (p.ExitCode, stdout.GetAwaiter().GetResult() + stderr.GetAwaiter().GetResult());

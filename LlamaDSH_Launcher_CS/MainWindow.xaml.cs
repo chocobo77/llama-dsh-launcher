@@ -8659,8 +8659,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				if (latest == "") throw new Exception("无法查询最新 v24.x 版本号：网络不可用或镜像不可达，请检查网络后重试。");
 
 				var st = NodeSetup.Detect();
-				bool needNode = !st.MeetsRequirement || st.Node24Version != latest;
+				// 版本探测失败(node.exe 存在但 node -v 无输出, 常见于安全软件拦截):
+				// 视作"已安装未知版本"跳过重装, 避免每次点击都白跑一遍 30MB MSI
+				bool versionUnknown = st.Node24Exe != null && string.IsNullOrEmpty(st.Node24Version);
+				bool needNode = !st.MeetsRequirement || (st.Node24Version != latest && !versionUnknown);
 				bool needPnpm = st.PnpmExe == null;
+				if (versionUnknown)
+				{
+					log("⚠ Node " + st.Node24Exe + " 存在但版本探测失败（node -v 无输出）。跳过重装——若确需更新请先手动确认 node 可运行。");
+				}
 
 				if (!needNode && !needPnpm)
 				{
