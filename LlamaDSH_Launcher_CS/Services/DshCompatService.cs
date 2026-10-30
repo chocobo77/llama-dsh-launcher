@@ -3247,18 +3247,19 @@ process.stdout.write(JSON.stringify(out));
                 string prof = string.IsNullOrWhiteSpace(profile) ? report.Profile : profile.Trim();
                 try
                 {
+                        // 0) 统一先重审: 传入的 report 是用户看确认框之前的快照,
+                        //    确认期间 DSH 自身/插件管理窗口可能已改动, 全部修复决策基于当前状态
+                        log?.Invoke("[兼容修复] 重新审计以获取当前状态 ...");
+                        DshCompatReport fresh = Audit(dir, prof, log, includeDumpConfig: true);
+
                         // 1) bundle 激活表
-                        if (report.ManifestRepairNeeded)
+                        if (fresh.ManifestRepairNeeded)
                         {
-                                string msg = RepairManifest(report, log);
+                                string msg = RepairManifest(fresh, log);
                                 res.ManifestChanged = true;
                                 res.Messages.Add(msg);
                                 log?.Invoke("[兼容修复] " + msg);
                         }
-
-                        // 2) 重新审计，拿到修复 manifest 后的失效补丁/链接
-                        log?.Invoke("[兼容修复] 重新审计以刷新补丁目标 ...");
-                        DshCompatReport fresh = Audit(dir, prof, log, includeDumpConfig: true);
 
                         // 3) cordis.patch.yml：改名迁移 + 注释失效 + 删除误停用行（重新启用插件）
                         HashSet<string> removeIds = new HashSet<string>(fresh.OrphanDisableIds, StringComparer.Ordinal);
@@ -4777,10 +4778,46 @@ process.stdout.write(JSON.stringify(out));
                         RegexOptions.Compiled);
         }
 
-        /// <summary>入口文件运行时代码里是否直接访问了 ctx.&lt;服务&gt;。</summary>
+        /// <summary>
+        /// 轻量 JS 词法状态机: 判定 pos 处是否处于"代码"上下文(非字符串/模板/注释)。
+        /// 不识别正则字面量(已知局限), 但足以排除绝大多数字符串/注释里的同名片段误修。
+        /// </summary>
+        private static bool IsInCodeAtContext(string text, int pos)
+        {
+                bool sq = false, dq = false, bt = false, lineC = false, blockC = false;
+                for (int i = 0; i < pos; i++)
+                {
+                        char c = text[i];
+                        char n = i + 1 < text.Length ? text[i + 1] : '\0';
+                        if (lineC) { if (c == '\n') lineC = false; continue; }
+                        if (blockC) { if (c == '*' && n == '/') { blockC = false; i++; } continue; }
+                        if (sq) { if (c == '\\') { i++; continue; } if (c == '\'') sq = false; continue; }
+                        if (dq) { if (c == '\\') { i++; continue; } if (c == '"') dq = false; continue; }
+                        if (bt) { if (c == '\\') { i++; continue; } if (c == '`') bt = false; continue; }
+                        if (c == '/' && n == '/') { lineC = true; i++; continue; }
+                        if (c == '/' && n == '*') { blockC = true; i++; continue; }
+                        if (c == '\'') sq = true;
+                        else if (c == '"') dq = true;
+                        else if (c == '`') bt = true;
+                }
+                return !lineC && !blockC && !sq && !dq && !bt;
+        }
+
+        /// <summary>入口文件运行时代码里是否直接访问了 ctx.&lt;服务&gt;(只认代码上下文的命中)。</summary>
         public static bool HasCtxServiceAccess(string text, string service)
         {
-                return text.Length > 0 && service.Length > 0 && CtxServiceAccessRegex(service).IsMatch(text);
+                if (text.Length == 0 || service.Length == 0)
+                {
+                        return false;
+                }
+                foreach (Match m in CtxServiceAccessRegex(service).Matches(text))
+                {
+                        if (IsInCodeAtContext(text, m.Index))
+                        {
+                                return true;
+                        }
+                }
+                return false;
         }
 
         /// <summary>把入口文件里对 ctx.&lt;旧服务&gt; 的访问改写为 ctx.&lt;新服务&gt;，输出命中次数。</summary>
@@ -4794,6 +4831,11 @@ process.stdout.write(JSON.stringify(out));
                 int n = 0;
                 string result = CtxServiceAccessRegex(service).Replace(text, (Match m) =>
                 {
+                        // 字符串/注释里的同名片段不是运行时访问, 改了就是误修
+                        if (!IsInCodeAtContext(text, m.Index))
+                        {
+                                return m.Value;
+                        }
                         n++;
                         return m.Value.Replace(service, replacement);
                 });

@@ -2402,6 +2402,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 
 	// 模型路径解析：支持 ①单 gguf 文件 ②分片第一片 ③模型目录(MoE 大模型的分片场景)。
+	private static bool stringComparerOl(string a, string b)
+	{
+		return string.Compare(a, b, StringComparison.OrdinalIgnoreCase) < 0;
+	}
+
 	// 目录解析顺序：分片第一片(*-00001-of-*.gguf) → 目录中唯一 gguf → safetensors 报错提示转换。
 	// throwOnError=true 供 BuildCmd 使用(错误显示在命令预览/日志)；false 供显存估算静默失败。
 	private string? ResolveModelPath(bool throwOnError)
@@ -2416,8 +2421,27 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			string[] firstShards = Directory.GetFiles(raw, "*-00001-of-*.gguf");
 			if (firstShards.Length > 0)
 			{
-				Array.Sort(firstShards, StringComparer.OrdinalIgnoreCase);
-				return firstShards[0];
+				// 同目录多套分片时字典序第一片可能属于另一套模型:
+				// 按"同前缀分片数量最多"选家族, 平手再按文件名
+				string best = firstShards[0];
+				int bestCount = -1;
+				foreach (string f in firstShards)
+				{
+					string famDir = Path.GetDirectoryName(f) ?? "";
+					string stem = Path.GetFileNameWithoutExtension(f);
+					int cut = stem.LastIndexOf("-00001-of-", StringComparison.Ordinal);
+					if (cut <= 0)
+					{
+						continue;
+					}
+					int cnt = Directory.GetFiles(famDir, stem.Substring(0, cut) + "-*-of-*.gguf").Length;
+					if (cnt > bestCount || (cnt == bestCount && stringComparerOl(f, best)))
+					{
+						bestCount = cnt;
+						best = f;
+					}
+				}
+				return best;
 			}
 			string[] ggu = Directory.GetFiles(raw, "*.gguf");
 			if (ggu.Length == 1)
@@ -3289,11 +3313,20 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		return null;
 	}
 
-	private static string FmtCmd(List<string> cl)
+	private string FmtCmd(List<string> cl)
 	{
 		if (cl.Count == 0)
 		{
 			return "";
+		}
+		// 旗标是否取值: schema 已知时以 schema 为准(值本身以 -- 开头时纯启发式必然错位)
+		bool TakesValue(string flag)
+		{
+			string f = flag.TrimStart('-');
+			ParamDefinition? d = _paramDefs?.FirstOrDefault((ParamDefinition x) => x.Flag == f
+				|| x.OffFlag == f
+				|| (x.Aliases != null && x.Aliases.Contains(f)));
+			return d != null && d.Type != ParamType.Bool;
 		}
 		List<string> list = new List<string> { QA(cl[0]) };
 		int num = 1;
@@ -3301,7 +3334,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			string text = cl[num];
 			string text2 = QA(text);
-			if (text.StartsWith("--") && num + 1 < cl.Count && !cl[num + 1].StartsWith("--"))
+			bool paired = text.StartsWith("--") && num + 1 < cl.Count
+				&& (TakesValue(text) || !cl[num + 1].StartsWith("--"));
+			if (paired)
 			{
 				list.Add("    " + text2 + " " + QA(cl[num + 1]));
 				num += 2;
