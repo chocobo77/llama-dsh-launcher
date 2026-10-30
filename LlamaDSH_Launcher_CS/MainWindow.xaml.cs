@@ -364,6 +364,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 						System.Windows.Controls.TextBox obj = new System.Windows.Controls.TextBox
 						{
 							Text = (item.DefaultValue.ToString() ?? ""),
+							TextWrapping = TextWrapping.Wrap,
 							ToolTip = item.Tooltip,
 							MinWidth = 70.0,
 							MaxWidth = item.Wide ? double.PositiveInfinity : 420.0,
