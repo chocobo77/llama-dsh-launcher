@@ -96,11 +96,14 @@ public sealed partial class LlamaApiMonitor
 		_http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
 	}
 
+	public long TotalEvents { get; private set; }
+
 	public void AddEvent(string level, string msg)
 	{
 		lock (_lock)
 		{
 			Events.Add(new LlamaEvent { Ts = DateTime.Now, Level = level, Msg = msg });
+			TotalEvents++;
 			if (Events.Count > 200)
 			{
 				Events.RemoveAt(0);
@@ -621,6 +624,13 @@ partial class LlamaApiMonitor
 		LogCtxTruncated = false;
 		_promptMs = _evalMs = _promptSpd = _genSpd = _totalMs = 0;
 		_promptTokens = _decodedTokens = _totalTokens = 0;
+		Online = false;
+		_failCount = 0;
+		_slotStates.Clear();
+		lock (Slots)
+		{
+			Slots.Clear();
+		}
 		Boot.Warnings.Clear();
 	}
 

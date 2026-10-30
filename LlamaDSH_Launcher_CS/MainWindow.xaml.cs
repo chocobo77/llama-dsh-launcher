@@ -574,6 +574,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				foreach (var r in rows)
 				{
 					r.Row.Visibility = hits.Contains(r) ? Visibility.Visible : Visibility.Collapsed;
+					// 回显行是独立 Grid 行, 不随主行折叠会变成无归属的孤儿
+					if (_argLabels.TryGetValue(r.Def.Flag, out System.Windows.Controls.TextBlock? lbl))
+					{
+						lbl.Visibility = r.Row.Visibility;
+					}
 				}
 				panel.Visibility = Visibility.Visible;
 				ParamContent.Children.Add(panel);
@@ -934,7 +939,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			SaveState();
 		}
 		StopPerf();
+		_exiting = true;
+		FlushRunLog();
 		_trayIcon?.Dispose();
+		_trayIcon = null;
 		System.Windows.Application.Current.Shutdown();
 	}
 
@@ -1149,10 +1157,29 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return;
 		}
 		var v = _llamaVariants[i];
+		string prevName = _activeVariant;
+		if (IsLlamaRunning())
+		{
+			ShowNotice("Llama 服务运行中，请先停止再切换变体（切换即切换程序目录）。", isError: true);
+			_variantGuard = true;
+			int pi = _llamaVariants.FindIndex(x => x.Name == prevName);
+			if (pi >= 0)
+			{
+				ComboLlamaVariant.SelectedIndex = pi;
+			}
+			_variantGuard = false;
+			return;
+		}
 		_activeVariant = v.Name;
 		if (!string.IsNullOrWhiteSpace(v.Dir))
 		{
 			InputLlamaDir.Text = v.Dir;
+		}
+		else
+		{
+			// 未安装变体不同步目录会让 UI 标注与实际启动目录不一致: 显式清空
+			InputLlamaDir.Text = "";
+			Log($"[变体] 「{v.Name}」尚未安装，请点“＋ 安装新变体”完成安装后再启动。");
 		}
 		Log($"[变体] 切换 llama.cpp 版本: {v.Name}（仓库 {v.Repo}）");
 	}
@@ -4130,6 +4157,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return;
 		}
 		_vramBreakerTriggered = false;
+		LblVramBreaker.Text = "";
 		_oomSeenInRun = false;
 		if (!_oomRetryActive)
 		{
@@ -4267,9 +4295,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				LblLlamaStatus.Text = "● 运行中";
 				LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
-				// OOM 降层重试成功进入运行态: 重置额度与标志
-				_oomRetryActive = false;
-				_oomRetryLeft = 3;
 			}
 		}
 	}
@@ -4287,6 +4312,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 			}
 			DisposeProc(ref _llamaProc);
+			_llamaApi?.ResetLogMachine(); // 进程退出即清采集状态, 防止"假在线"冻结数据继续进图表
 			BtnLlamaStart.IsEnabled = true;
 			BtnLlamaStop.IsEnabled = false;
 			if (exitCode != 0)
@@ -4308,10 +4334,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				LblLlamaStatus.Text = "● 已停止";
 				LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
 				Log("--- Llama 已退出 ---");
+				_oomRetryLeft = 3; // 干净退出(用户手动停止)才重置重试额度
+				_oomRetryActive = false;
 			}
 			ClearStateFor("llama");
-			_oomRetryLeft = 3;
-			_oomRetryActive = false;
 		}
 	}
 
@@ -4468,7 +4494,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	}
 
 	/// <summary>独立全量重建入口（升级时跳过重建/旧产物状态的恢复手段）：若 DSH 在运行则先停止 → clean + build:lib + build:web → 兼容性检查 → 自动启动。</summary>
-	private void RebuildDsh_Click(object s, RoutedEventArgs e)
+	private async void RebuildDsh_Click(object s, RoutedEventArgs e)
 	{
 		if (ComboDshMode.SelectedIndex != 0)
 		{
@@ -4508,12 +4534,16 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		if (HasDsh())
 		{
 			StopDsh();
-			DateTime stopDeadline = DateTime.Now.AddSeconds(20.0);
-			while ((HasDsh() || ProcessHelper.FindProcessByPort(3080).HasValue) && DateTime.Now < stopDeadline)
+			bool stillRunning = await Task.Run(() =>
 			{
-				System.Threading.Thread.Sleep(500);
-			}
-			if (HasDsh() || ProcessHelper.FindProcessByPort(3080).HasValue)
+				DateTime stopDeadline = DateTime.Now.AddSeconds(20.0);
+				while ((HasDsh() || ProcessHelper.FindProcessByPort(3080).HasValue) && DateTime.Now < stopDeadline)
+				{
+					System.Threading.Thread.Sleep(500);
+				}
+				return HasDsh() || ProcessHelper.FindProcessByPort(3080).HasValue;
+			});
+			if (stillRunning)
 			{
 				BtnRebuildDsh.IsEnabled = true;
 				LblDshStatus.Text = "已停止";
@@ -6618,6 +6648,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	}
 
 	private bool _synthGpuLogged;
+	// 真退出标志: Shutdown 会再次触发 Window_Closing, 没有它托盘分支会重新 Hide 窗口造成僵尸进程
+	private bool _exiting;
 
 	// llama.cpp 变体(分支): 名称/仓库/目录, 随方案配置持久化
 	private List<Models.LlamaVariant> _llamaVariants = new();
@@ -6800,11 +6832,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return;
 		}
 		var evs = api.EventsSnapshot();
-		if (evs.Count == _eventFeedCount)
+		if (api.TotalEvents == _eventFeedCount)
 		{
 			return;
 		}
-		_eventFeedCount = evs.Count;
+		_eventFeedCount = api.TotalEvents;
 		MonEventCount.Text = $"{evs.Count} / 200";
 		var list = new List<object>(evs.Count);
 		for (int i = evs.Count - 1; i >= 0; i--)
@@ -6823,7 +6855,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		MonEventFeed.ItemsSource = list;
 	}
 
-	private int _eventFeedCount;
+	private long _eventFeedCount;
 
 	private static Grid CreateBar(double pct, Color color, double height)
 	{
@@ -7039,6 +7071,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			_hTemp.Push(null);
 			_hPower.Push(null);
 		}
+		CheckVramBreaker(gpus);
 		BuildGpuPanels(gpus);
 
 		// ── 系统资源 ──
@@ -7072,6 +7105,62 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		// ── 历史趋势 ──
 		UpdateTrends();
 		UpdatePhaseCard();
+
+		// OOM 重试成功后真正进入 API 在线态才补重置额度(3 秒进程存活不算数)
+		if (api != null && api.Online && _oomRetryActive)
+		{
+			_oomRetryActive = false;
+			_oomRetryLeft = 3;
+			Log("[OOM] 服务已在线, 重试额度重置为 3");
+		}
+
+	/// <summary>
+	/// 显存熔断: llama 运行中显存越过阈值立即停止服务(整机 OOM 保护, 无防抖、绝不容许突破)。
+	/// 百分比模式=各卡已用/总量; GB 模式=各卡已用合计。
+	/// </summary>
+	void CheckVramBreaker(List<GpuDevInfo> gpus)
+	{
+		if (_vramBreakerTriggered || ChkVramBreaker?.IsChecked != true || gpus.Count == 0)
+		{
+			return;
+		}
+		if (_llamaProc == null || _llamaProc.HasExited)
+		{
+			return;
+		}
+		double usedMb = gpus.Sum(x => x.MemUsedMb);
+		bool hit = false;
+		string desc = "";
+		if (double.TryParse(TxtVramBreakerVal.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double thr))
+		{
+			if (ComboVramBreakerType.SelectedIndex == 1)
+			{
+				double usedGb = usedMb / 1024.0;
+				hit = usedGb >= thr;
+				desc = $"{usedGb:F1}GB ≥ 阈值 {thr:F1}GB";
+			}
+			else
+			{
+				double totalMb = gpus.Sum(x => x.MemTotalMb);
+				if (totalMb > 0)
+				{
+					double pct = usedMb / totalMb * 100.0;
+					hit = pct >= thr;
+					desc = $"{pct:F0}% ≥ 阈值 {thr:F0}%";
+				}
+			}
+		}
+		if (!hit)
+		{
+			return;
+		}
+		_vramBreakerTriggered = true;
+		Log($"[熔断] 显存越过阈值({desc}), 自动停止 Llama 服务");
+		LblVramBreaker.Text = "已触发";
+		LblVramBreaker.Foreground = new SolidColorBrush(Color.FromRgb(0xff, 0x8a, 0x98));
+		ShowNotice("⚠ 显存熔断已触发（" + desc + "），Llama 服务已自动停止。", isError: true);
+		StopLlama();
+	}
 
 	// ============ 构建器: GPU 每卡面板(llama-lens GpuPanel) ============
 		void BuildGpuPanels(List<GpuDevInfo> gpus)
@@ -7469,12 +7558,23 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			try
 			{
-				_llamaProc = Process.GetProcessById(stateFile.LlamaPid.Value);
-				BtnLlamaStart.IsEnabled = false;
-				BtnLlamaStop.IsEnabled = true;
-				LblLlamaStatus.Text = "● 接管运行中";
-				LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
-				Log($"Resumed Llama:{stateFile.LlamaPid.Value}");
+				Process pidProc = Process.GetProcessById(stateFile.LlamaPid.Value);
+				// PID 复用防护: 只有 llama-server 本尊才接管, 否则"停止"会误杀无关进程
+				if (pidProc.HasExited || !pidProc.ProcessName.StartsWith("llama-server", StringComparison.OrdinalIgnoreCase))
+				{
+					Log($"状态文件中的 Llama PID {stateFile.LlamaPid.Value} 已失效(进程退出或 PID 被复用), 跳过接管");
+					pidProc.Dispose();
+					ClearStateFile();
+				}
+				else
+				{
+					_llamaProc = pidProc;
+					BtnLlamaStart.IsEnabled = false;
+					BtnLlamaStop.IsEnabled = true;
+					LblLlamaStatus.Text = "● 接管运行中";
+					LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
+					Log($"Resumed Llama:{stateFile.LlamaPid.Value}");
+				}
 			}
 			catch (Exception ex2)
 			{
@@ -8036,6 +8136,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		string text = ComboProfile.SelectedItem?.ToString();
 		if (!string.IsNullOrEmpty(text) && _profiles.ContainsKey(text))
 		{
+			// 切换前把当前面板状态写回原方案, 避免未点保存的修改静默丢失
+			if (_profiles.ContainsKey(_currentProfile))
+			{
+				try
+				{
+					_profiles[_currentProfile] = BuildConfig();
+				}
+				catch (Exception ex)
+				{
+					LogError(ex, "切换方案前保存当前配置失败, 保留原方案内容");
+				}
+			}
 			_currentProfile = text;
 			ApplyConfig(_profiles[text]);
 			Log("Switched:" + text);
@@ -8260,6 +8372,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		Dispatcher.BeginInvoke((Action)(() =>
 		{
 			NodeLog.Text += "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + line + Environment.NewLine;
+			// 与 LogArea 同款上限: pnpm install 输出可达上千行, 不裁剪会逐渐卡顿
+			var nl = NodeLog.Text.Split('\n');
+			if (nl.Length > 500)
+			{
+				NodeLog.Text = string.Join("\n", nl[^500..]);
+			}
 			NodeLog.CaretIndex = NodeLog.Text.Length;
 		}));
 	}
@@ -8501,6 +8619,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void Window_Closing(object sender, CancelEventArgs e)
 	{
+		if (_exiting)
+		{
+			return; // QuitApp/Shutdown 重入, 放行关闭
+		}
 		if (ChkMinimizeToTray.IsChecked == true && _trayIcon != null)
 		{
 			Hide();

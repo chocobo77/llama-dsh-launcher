@@ -259,7 +259,7 @@ public static class ProcessHelper
 					string text2 = process.MainModule?.FileName?.ToLowerInvariant().Replace('/', '\\') ?? "";
 					if (!text.Contains("pnpm") || !text.Contains("pnpm.mjs"))
 					{
-						if (text.Contains("tsx") || text.Contains("cli/src/bin") || text.Contains("apps/cli"))
+						if (text.Contains("cli/src/bin") || text.Contains("apps/cli") || text.Contains("@deepseek-ai"))
 						{
 							list.Add((5, process.Id));
 						}
