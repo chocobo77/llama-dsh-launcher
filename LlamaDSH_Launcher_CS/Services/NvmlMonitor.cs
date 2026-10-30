@@ -28,7 +28,7 @@ public static partial class NvmlMonitor
 	[UnmanagedFunctionPointer(System.Runtime.InteropServices.CallingConvention.Cdecl)]
 	private delegate int IntFn();
 
-	// NVML API 全部 stdcall(int 返回)
+	// NVML 官方头为 cdecl; x64 下 cdecl 与 stdcall 栈清理等价, 本程序仅 x64 部署
 	private static T GetFn<T>(string name) where T : Delegate
 	{
 	 IntPtr p = GetProcAddressCompat(name);
@@ -252,12 +252,10 @@ public static partial class NvmlMonitor
 				{
 					r["gpu_util"] = (utilS / utilN).ToString("F1", CultureInfo.InvariantCulture);
 				}
-				if (memUsed > 0)
-				{
-					r["vram_used"] = memUsed.ToString(CultureInfo.InvariantCulture);
-				}
+				// 显存全部释放(used=0)是合法读数, 只要总量可读就写键
 				if (memTotal > 0)
 				{
+					r["vram_used"] = memUsed.ToString(CultureInfo.InvariantCulture);
 					r["vram_total"] = memTotal.ToString(CultureInfo.InvariantCulture);
 				}
 				if (tempMax > 0)
@@ -289,7 +287,9 @@ public static partial class NvmlMonitor
 				{
 					r["pcie_width"] = width;
 				}
-				if (rxKbS > 0)
+				// PCIe 空闲吞吐=0 是合法读数, 去掉 >0 门
+				// 单卡循环逐卡累加, 走到这里即至少有一张卡; PCIe 空闲吞吐=0 合法, 不设 >0 门
+				if (r.ContainsKey("gpu_count"))
 				{
 					r["pcie_rx_kbs"] = rxKbS.ToString("F0", CultureInfo.InvariantCulture);
 				}
@@ -455,6 +455,11 @@ partial class NvmlMonitor
 	public static List<GpuDevInfo> SampleViaNvidiaSmi()
 	{
 		var list = new List<GpuDevInfo>();
+		// 失败节流: NVML 已不可用的机器上避免每 3s 一拍都拉起 nvidia-smi(最长 5s)
+		if (Environment.TickCount64 < _smiNextTry)
+		{
+			return list;
+		}
 		try
 		{
 			var r = ProcessRunner.Run(

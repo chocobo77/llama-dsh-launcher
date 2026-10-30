@@ -375,7 +375,8 @@ public class GpuMonitor
 			}
 			if (rxN > 0.0)
 			{
-				r["pcie_rx_kbs"] = (rxSum / rxN).ToString("F0", CultureInfo.InvariantCulture);
+				// 多卡求和口径, 与 NVML 路径一致(原为均值, 多卡时数值缩小 N 倍)
+				r["pcie_rx_kbs"] = rxSum.ToString("F0", CultureInfo.InvariantCulture);
 			}
 			if (count > 0)
 			{

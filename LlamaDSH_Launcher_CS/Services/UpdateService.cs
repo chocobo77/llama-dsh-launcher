@@ -37,6 +37,8 @@ public static class UpdateService
 		public string AssetName = "";
 		public string AssetUrl = "";
 		public string CudartName = "";
+		public long Size;
+		public long CudartSize;
 		public string CudartUrl = "";
 		/// <summary>稳定版标签（如 v0.4.0）；滚动构建时为空。</summary>
 		public string StableVersion = "";
@@ -187,7 +189,10 @@ public static class UpdateService
 					foreach (JsonElement r in doc.RootElement.EnumerateArray())
 					{
 						string tag = r.TryGetProperty("tag_name", out JsonElement te) ? te.GetString() ?? "" : "";
-						int? build = ParseBuildFromTag(tag);
+						// 滚动扫描用严格形态: 纯 bNNNNN 或 内嵌build+hex短哈希(PrismML 形态);
+						// 宽松解析会把 topic-b12345-fix 之类普通 tag 误判成 build
+						Match sm = Regex.Match(tag, @"^(?:b(\d+)$|^[A-Za-z0-9_-]*b(\d{3,})-[0-9a-fA-F]{6,}$)");
+						int? build = sm.Success && int.TryParse(sm.Groups[1].Success ? sm.Groups[1].Value : sm.Groups[2].Value, out int sb2) ? sb2 : null;
 						if (build == null)
 						{
 							continue;
@@ -226,6 +231,7 @@ public static class UpdateService
 		string tag = release.TryGetProperty("tag_name", out JsonElement te) ? te.GetString() ?? ("b" + build) : ("b" + build);
 		// 收集全部 Windows x64 预编译主包候选（排除 cudart 纯运行库与 arm64）
 		var cands = new List<(string name, string url)>();
+		var sizes = new Dictionary<string, long>();
 		if (release.TryGetProperty("assets", out JsonElement assets) && assets.ValueKind == JsonValueKind.Array)
 		{
 			foreach (JsonElement a in assets.EnumerateArray())
@@ -244,7 +250,9 @@ public static class UpdateService
 				{
 					continue;
 				}
+				long aSize = a.TryGetProperty("size", out JsonElement se2) && se2.ValueKind == JsonValueKind.Number ? se2.GetInt64() : 0;
 				cands.Add((name, url));
+				sizes[name] = aSize;
 			}
 		}
 		// 按显卡挑后端: NVIDIA=CUDA(取最高版本), Intel=SYCL(原生低比特内核), AMD/默认=Vulkan; 依次回退
@@ -269,6 +277,10 @@ public static class UpdateService
 			foreach (JsonElement a in assets2.EnumerateArray())
 			{
 				string name = a.TryGetProperty("name", out JsonElement ne2) ? ne2.GetString() ?? "" : "";
+				if (a.TryGetProperty("size", out JsonElement se3) && se3.ValueKind == JsonValueKind.Number)
+				{
+					sizes[name] = se3.GetInt64();
+				}
 				if (string.Equals(name, want, StringComparison.OrdinalIgnoreCase))
 				{
 					cudartName = name;
@@ -277,7 +289,9 @@ public static class UpdateService
 				}
 			}
 		}
-		return new LlamaReleaseInfo { Tag = tag, Build = build, AssetName = chosen.Value.name, AssetUrl = chosen.Value.url, CudartName = cudartName, CudartUrl = cudartUrl };
+		sizes.TryGetValue(chosen.Value.name, out long chosenSz);
+		sizes.TryGetValue(cudartName, out long cudartSz);
+		return new LlamaReleaseInfo { Tag = tag, Build = build, AssetName = chosen.Value.name, AssetUrl = chosen.Value.url, Size = chosenSz, CudartName = cudartName, CudartUrl = cudartUrl, CudartSize = cudartSz };
 	}
 
 	private static (string name, string url)? PickAsset(List<(string name, string url)> cands, string token)
@@ -382,7 +396,35 @@ public static class UpdateService
 			{
 				return (false, "llama.cpp 目录不存在: " + targetDir);
 			}
+			// 目标 exe 被占用(服务运行中)时提前失败, 避免复制到一半留下混合二进制
+			string targetExe = Path.Combine(targetDir, "llama-server.exe");
+			if (File.Exists(targetExe))
+			{
+				try
+				{
+					using (new FileStream(targetExe, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+					{
+					}
+				}
+				catch
+				{
+					return (false, "目标 llama-server.exe 正在运行或被占用, 请先停止 Llama 服务再更新/安装。");
+				}
+			}
 			Directory.CreateDirectory(UpdateTempRoot);
+			// 磁盘空间预检: 主包 + cudart + 解压副本, 按 3 倍估
+			long needBytes = Math.Max(release.Size * 3, 512L * 1024 * 1024);
+			try
+			{
+				DriveInfo di = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(UpdateTempRoot))!);
+				if (di.AvailableFreeSpace < needBytes)
+				{
+					return (false, $"磁盘空间不足: 需要约 {needBytes / 1048576.0:F0}MB, 剩余 {di.AvailableFreeSpace / 1048576.0:F0}MB ({di.Name})");
+				}
+			}
+			catch
+			{
+			}
 			string zipPath = Path.Combine(UpdateTempRoot, release.AssetName);
 			string extractDir = Path.Combine(UpdateTempRoot, "extract_" + release.Build);
 			if (Directory.Exists(extractDir))
@@ -398,7 +440,7 @@ public static class UpdateService
 				"https://ghfast.top/" + release.AssetUrl,
 				"https://ghproxy.net/" + release.AssetUrl
 			};
-			bool downloaded = await DownloadAssetAsync(urls, zipPath);
+			bool downloaded = await DownloadAssetAsync(urls, zipPath, release.Size);
 			if (!downloaded)
 			{
 				return (false, "下载 llama.cpp 预编译包失败（GitHub/镜像均不可达或文件过小）");
@@ -415,7 +457,7 @@ public static class UpdateService
 				{
 					Directory.Delete(cext, true);
 				}
-				if (await DownloadAssetAsync(new[] { release.CudartUrl, "https://gh-proxy.com/" + release.CudartUrl, "https://ghfast.top/" + release.CudartUrl, "https://ghproxy.net/" + release.CudartUrl }, czip))
+				if (await DownloadAssetAsync(new[] { release.CudartUrl, "https://gh-proxy.com/" + release.CudartUrl, "https://ghfast.top/" + release.CudartUrl, "https://ghproxy.net/" + release.CudartUrl }, czip, release.CudartSize))
 				{
 					ZipFile.ExtractToDirectory(czip, cext);
 					cudartDir = FindDirContainingAnyDll(cext);
@@ -449,13 +491,19 @@ public static class UpdateService
 			// 落盘自检: 目标目录 llama-server --version 必须报告 build 号,
 			// 否则复制可能被占用/失败留下了旧二进制(stock 版会拒载自定义量化类型)
 			int? localBuild = GetLocalLlamaBuild(targetDir);
-			string verify = localBuild.HasValue
-				? "本地验证 build " + localBuild.Value
-				: "警告: 本地 llama-server --version 未报告 build 号, 二进制可能不完整或为旧版本";
-			if (localBuild.HasValue && release.Build > 0 && localBuild.Value != release.Build)
+			// 硬校验: build 缺失或不一致都按失败处理 —— 混入旧/异源二进制会导致
+			// 加载模型时报 ggml type 错误(此前只拼警告仍返回成功, 假安装藏不住)
+			if (!localBuild.HasValue)
 			{
-				verify += $"（与上游 build {release.Build} 不一致）";
+				CleanupUpdateTemp();
+				return (false, "安装后本地 llama-server --version 未报告 build 号, 二进制可能不完整; 建议删除该目录后重新安装。");
 			}
+			if (release.Build > 0 && localBuild.Value != release.Build)
+			{
+				CleanupUpdateTemp();
+				return (false, $"安装后本地 build {localBuild.Value} 与上游 release build {release.Build} 不一致, 目录内可能混有旧/异源二进制; 建议删除该目录后重新安装。");
+			}
+			string verify = "本地验证 build " + localBuild.Value;
 
 			// 清理本次下载/解压临时文件
 			CleanupUpdateTemp();
@@ -467,9 +515,13 @@ public static class UpdateService
 		}
 	}
 
-	/// <summary>按顺序尝试下载（直连 + 镜像），成功写入 destPath 返回 true。</summary>
-	private static async Task<bool> DownloadAssetAsync(IEnumerable<string> urls, string destPath)
+	/// <summary>
+	/// 按顺序尝试下载（直连 + 镜像）。写 .part 临时文件, 成功后原子改名;
+	/// expectedSize>0 时校验长度(±1%), 防镜像返回错误页/截断包; 失败删 .part 换下一源。
+	/// </summary>
+	private static async Task<bool> DownloadAssetAsync(IEnumerable<string> urls, string destPath, long expectedSize = 0)
 	{
+		string partPath = destPath + ".part";
 		foreach (string u in urls)
 		{
 			try
@@ -484,20 +536,39 @@ public static class UpdateService
 						{
 							continue;
 						}
-						using (FileStream fs = File.Create(destPath))
+						using (FileStream fs = File.Create(partPath))
 						{
 							await resp.Content.CopyToAsync(fs, dlCts.Token);
 						}
-						if (new FileInfo(destPath).Length < 1000000)
+						long len = new FileInfo(partPath).Length;
+						if (len < 1000000)
 						{
 							continue;
 						}
+						if (expectedSize > 0 && Math.Abs(len - expectedSize) > expectedSize / 100)
+						{
+							continue;
+						}
+						File.Move(partPath, destPath, overwrite: true);
 						return true;
 					}
 				}
 			}
 			catch
 			{
+			}
+			finally
+			{
+				try
+				{
+					if (File.Exists(partPath))
+					{
+						File.Delete(partPath);
+					}
+				}
+				catch
+				{
+				}
 			}
 		}
 		return false;
@@ -541,7 +612,24 @@ public static class UpdateService
 		Directory.CreateDirectory(dst);
 		foreach (string f in Directory.GetFiles(src))
 		{
-			File.Copy(f, Path.Combine(dst, Path.GetFileName(f)), overwrite: true);
+			string dstFile = Path.Combine(dst, Path.GetFileName(f));
+			try
+			{
+				File.Copy(f, dstFile, overwrite: true);
+			}
+			catch (UnauthorizedAccessException)
+			{
+				// 只读目标(压缩包属性带出/安全软件置位): 解只读后重试一次
+				if (File.Exists(dstFile))
+				{
+					File.SetAttributes(dstFile, FileAttributes.Normal);
+					File.Copy(f, dstFile, overwrite: true);
+				}
+				else
+				{
+					throw;
+				}
+			}
 		}
 		foreach (string d in Directory.GetDirectories(src))
 		{

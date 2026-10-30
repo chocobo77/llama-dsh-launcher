@@ -18,20 +18,16 @@ public static class ProcessHelper
 
 	public static void KillProcessTree(int pid, int timeoutMs = 3000)
 	{
-		List<int> ids = new List<int> { pid };
-		CollectProcessTree(pid, ids, 0);
-		if (ids.Count == 0)
+		// Kill(entireProcessTree) 由内核按父子关系整树终止, 无"先收集后击杀"窗口——
+		// 旧 WMI 递归收集在收集与击杀之间子进程退出且 PID 被复用时, 会误杀无辜进程
+		try
 		{
-			return;
+			using Process p = Process.GetProcessById(pid);
+			p.Kill(entireProcessTree: true);
 		}
-		// 先杀叶子再杀父进程，递归收集整棵进程树，确保彻底退出（不会留下孤儿进程）
-		for (int i = ids.Count - 1; i >= 0; i--)
+		catch
 		{
-			TryKillProcess(ids[i]);
-		}
-		for (int i = ids.Count - 1; i >= 0; i--)
-		{
-			TryWaitForExit(ids[i], timeoutMs);
+			// 进程已退出: 无需处理
 		}
 	}
 
@@ -120,6 +116,19 @@ public static class ProcessHelper
 
 	public static int? FindProcessByPort(params int[] ports)
 	{
+		// 优先托管 GetExtendedTcpTable: 不派生 netstat 进程, UI 线程高频调用零开销;
+		// 原生调用失败再回退 netstat 解析
+		try
+		{
+			int? managed = FindPidByPortNative(ports);
+			if (managed.HasValue)
+			{
+				return managed;
+			}
+		}
+		catch
+		{
+		}
 		try
 		{
 			using Process process = Process.Start(new ProcessStartInfo("netstat", "-ano")
@@ -166,6 +175,68 @@ public static class ProcessHelper
 		}
 		return null;
 	}
+
+	#region 端口属主查询(iphlpapi)
+
+	private const int AF_INET = 2;
+	private const int TCP_TABLE_OWNER_PID_LISTENING = 3;
+
+	[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+	private struct MIB_TCPTABLE_OWNER_PID
+	{
+		public uint dwNumEntries;
+		// MIB_TCPROW_OWNER_PID 数组首元素占位, 实际按字节数组解析
+	}
+
+	[System.Runtime.InteropServices.DllImport("iphlpapi.dll", SetLastError = true)]
+	private static extern uint GetExtendedTcpTable(byte[] pTcpTable, ref int dwOutBufLen, bool sort, int ipVersion, int tableClass, int reserved = 0);
+
+	/// <summary>返回任一目标端口 LISTENING 套接字的属主 PID; 不限定进程名(端口被谁占就报谁)。</summary>
+	private static int? FindPidByPortNative(int[] ports)
+	{
+		int size = 0;
+		// 首次调用取所需缓冲区大小
+		uint ret = GetExtendedTcpTable(null, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_LISTENING);
+		if (ret != 0 && ret != 122 /* ERROR_INSUFFICIENT_BUFFER */)
+		{
+			return null;
+		}
+		if (size <= 0)
+		{
+			return null;
+		}
+		byte[] buf = new byte[size];
+		ret = GetExtendedTcpTable(buf, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_LISTENING);
+		if (ret != 0)
+		{
+			return null;
+		}
+		uint entries = BitConverter.ToUInt32(buf, 0);
+		int offset = 4;
+		for (uint i = 0; i < entries && offset + 24 <= buf.Length; i++, offset += 24)
+		{
+			uint state = BitConverter.ToUInt32(buf, offset);
+			if (state != 0x0A) // MIB_TCP_STATE_LISTEN
+			{
+				continue;
+			}
+			// dwLocalPort 为网络字节序 16 位端口
+			uint rawPort = BitConverter.ToUInt32(buf, offset + 12);
+			int port = (int)(((rawPort & 0xFF) << 8) | ((rawPort >> 8) & 0xFF));
+			if (!ports.Contains(port))
+			{
+				continue;
+			}
+			int pid = (int)BitConverter.ToUInt32(buf, offset + 20);
+			if (pid > 0)
+			{
+				return pid;
+			}
+		}
+		return null;
+	}
+
+	#endregion
 
 	public static List<int> FindChildPids(int parentPid)
 	{
