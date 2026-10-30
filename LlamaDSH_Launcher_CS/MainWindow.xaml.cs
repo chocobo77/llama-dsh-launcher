@@ -6494,9 +6494,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private int GetLlamaPort()
 	{
-		// 优先读参数面板的 port 控件(命令编辑态/构建失败时 _lastCmd 不更新甚至为空);
-		// 自定义参数兜底支持 --port N 与 --port=N 两种形态
-		if (_pw.TryGetValue("port", out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) portPair))
+		// 1) 参数面板 port 控件: 仅在该参数已勾选启用时可信
+		//    (禁用时 BuildCmd 不发射 --port, 面板里的默认值 1234 是幌子,
+		//     llama-server 实际按自身默认 8080 或自定义参数监听)
+		if (_pw.TryGetValue("port", out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) portPair)
+			&& portPair.Item1.IsChecked == true)
 		{
 			string ctlText = portPair.Item2 is System.Windows.Controls.ComboBox pcb ? pcb.Text
 				: portPair.Item2 is System.Windows.Controls.TextBox ptb ? ptb.Text : "";
@@ -6505,12 +6507,19 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				return cfgPort;
 			}
 		}
+		// 2) 命令行预览(含自定义参数): --port N 与 --port=N
 		Match match = Regex.Match(_lastCmd ?? "", "--port[= ](\\d+)");
-		if (!match.Success)
+		if (match.Success)
 		{
-			return 1234;
+			return int.Parse(match.Groups[1].Value);
 		}
-		return int.Parse(match.Groups[1].Value);
+		// 3) 采集端自动发现命中的端口
+		if (_llamaApi != null && _llamaApi.ActivePort > 0)
+		{
+			return _llamaApi.ActivePort;
+		}
+		// 4) 未知 → 0, 由采集端自动发现兜底
+		return 0;
 	}
 
 	// ── 监测标签页(Strata Monitor 复刻): 60 秒历史 + 图表/状态卡/Gauge/请求表 ──

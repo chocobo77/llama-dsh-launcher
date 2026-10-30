@@ -129,20 +129,58 @@ public sealed partial class LlamaApiMonitor
 	}
 
 	/// <summary>快轮询: /slots。llama 未起或失败达 3 次 → 离线。返回 false 表示本轮无数据。</summary>
+	// 端口自动发现: 配置端口打不上时探测 llama-server 默认 8080 等候选,
+	// 命中后缓存到 ActivePort 供停止/接管逻辑复用; 全部失败节流 10s 防止每拍空扫
+	private int _activePort;
+	private double _discoverNextTry;
+
+	/// <summary>当前实际连通的 llama-server 端口(自动发现命中后非 0)。</summary>
+	public int ActivePort => _activePort;
+
 	public bool PollFast()
 	{
-		int port = _portGetter();
-		if (port <= 0)
+		double now = Environment.TickCount64 / 1000.0;
+		bool allowDiscover = now >= _discoverNextTry;
+		var ports = new List<int>();
+		void AddPort(int p)
+		{
+			if (p > 0 && p < 65536 && !ports.Contains(p))
+			{
+				ports.Add(p);
+			}
+		}
+		AddPort(_portGetter());
+		AddPort(_activePort);
+		if (allowDiscover)
+		{
+			AddPort(8080); // llama-server 默认
+			AddPort(8081);
+			AddPort(1234);
+		}
+		if (ports.Count == 0)
 		{
 			return false;
 		}
-		string json;
-		try
+		string? json = null;
+		int usedPort = 0;
+		foreach (int p in ports)
 		{
-			json = _http.GetStringAsync($"http://127.0.0.1:{port}/slots").GetAwaiter().GetResult();
+			try
+			{
+				json = _http.GetStringAsync($"http://127.0.0.1:{p}/slots").GetAwaiter().GetResult();
+				usedPort = p;
+				break;
+			}
+			catch
+			{
+			}
 		}
-		catch
+		if (json == null)
 		{
+			if (allowDiscover)
+			{
+				_discoverNextTry = now + 10.0;
+			}
 			_failCount++;
 			if (_failCount >= 3 && Online)
 			{
@@ -160,15 +198,16 @@ public sealed partial class LlamaApiMonitor
 				Phase = "idle";
 				TgTps = Tg3sTps = null;
 				PromptProgress = LogPromptSpeed = null;
-				AddEvent("error", "llama-server 离线(连续 3 次采集失败)");
+				AddEvent("error", "llama-server 离线(连续 3 次采集失败, 尝试过端口 " + string.Join("/", ports) + ")");
 			}
 			return false;
 		}
+		_activePort = usedPort;
 		_failCount = 0;
 		if (!Online)
 		{
 			Online = true;
-			AddEvent("ok", "llama-server 在线");
+			AddEvent("ok", "llama-server 在线(端口 " + usedPort + ")");
 		}
 		try
 		{
