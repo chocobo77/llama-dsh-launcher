@@ -6635,19 +6635,30 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		try
 		{
+			// iGPU/独显混装时 WMI 顺序不保证: 优先取独显特征名(Arc/GeForce/Radeon), 否则退回第一个
+			string first = "";
 			using var mos = new System.Management.ManagementObjectSearcher("SELECT Name FROM Win32_VideoController");
 			foreach (System.Management.ManagementObject o in mos.Get())
 			{
 				using (o)
 				{
-					var nm = o["Name"]?.ToString();
-					if (!string.IsNullOrWhiteSpace(nm))
+					var nm = o["Name"]?.ToString()?.Trim();
+					if (string.IsNullOrWhiteSpace(nm))
 					{
-						_gpuFriendlyName = nm.Trim();
+						continue;
+					}
+					if (first.Length == 0)
+					{
+						first = nm;
+					}
+					if (nm.Contains("Arc", StringComparison.OrdinalIgnoreCase) || nm.Contains("GeForce", StringComparison.OrdinalIgnoreCase) || nm.Contains("Radeon", StringComparison.OrdinalIgnoreCase))
+					{
+						_gpuFriendlyName = nm;
 						break;
 					}
 				}
 			}
+			_gpuFriendlyName ??= first.Length > 0 ? first : null;
 		}
 		catch
 		{

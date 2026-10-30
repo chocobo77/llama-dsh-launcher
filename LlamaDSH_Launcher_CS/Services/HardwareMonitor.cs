@@ -45,6 +45,16 @@ public sealed class HardwareMonitor : IDisposable
 		}
 	}
 
+	private static bool IsDiscreteGpuName(string n)
+	{
+		// 核显特征名; Arc 是 Intel 独显线, 不在列
+		if (n.Contains("UHD", StringComparison.OrdinalIgnoreCase) || n.Contains("Iris", StringComparison.OrdinalIgnoreCase) || n.Contains("HD Graphics", StringComparison.OrdinalIgnoreCase))
+		{
+			return false;
+		}
+		return true;
+	}
+
 	/// <summary>聚合所有 GPU 的指标键: gpu_util/gpu_temp/gpu_temp_src/power_w/fan_pct/clock_mhz/cpu_temp/cpu_temp_src。minIntervalMs 控制硬件刷新频率。</summary>
 	public Dictionary<string, string> Sample(int minIntervalMs = 800)
 	{
@@ -80,6 +90,20 @@ public sealed class HardwareMonitor : IDisposable
 						HardwareType.GpuAmd => "amd",
 						_ => "intel"
 					};
+					// 精确型号直取 LHM 的 hw.Name; 独显优先, 核显(UHD/Iris/HD)仅作无独显时的兜底
+					string hwName = (hw.Name ?? "").Trim();
+					if (hwName.Length > 0)
+					{
+						if (IsDiscreteGpuName(hwName))
+						{
+							r["gpu_name"] = hwName;
+							r.Remove("gpu_name_igpu");
+						}
+						else if (!r.ContainsKey("gpu_name") && !r.ContainsKey("gpu_name_igpu"))
+						{
+							r["gpu_name_igpu"] = hwName;
+						}
+					}
 					foreach (ISensor s in hw.Sensors)
 					{
 						if (!s.Value.HasValue)
@@ -161,6 +185,12 @@ public sealed class HardwareMonitor : IDisposable
 			}
 			if (anyGpu)
 			{
+				// 无独显时核显型号兜底转正
+				if (!r.ContainsKey("gpu_name") && r.TryGetValue("gpu_name_igpu", out string? ig))
+				{
+					r["gpu_name"] = ig;
+				}
+				r.Remove("gpu_name_igpu");
 				if (utilN > 0)
 				{
 					r["gpu_util"] = (utilSum / utilN).ToString("F1", CultureInfo.InvariantCulture);
