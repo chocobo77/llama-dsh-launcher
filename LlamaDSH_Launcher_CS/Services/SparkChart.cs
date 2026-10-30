@@ -119,7 +119,20 @@ public class SparkChart : Grid
 		{
 			return;
 		}
-		SetHover((int)Math.Round(Math.Max(0, Math.Min(1, pos.X / w)) * (_primary.Length - 1)));
+		// 时间映射下按"最近样本点"反查索引(点数 ≤60, 线性扫描即可)
+		double frac = Math.Max(0, Math.Min(1, pos.X / w));
+		int best = 0;
+		double bestD = double.MaxValue;
+		for (int i = 0; i < _primary.Length; i++)
+		{
+			double d = Math.Abs(XAt(i, _primary.Length) / w - frac);
+			if (d < bestD)
+			{
+				bestD = d;
+				best = i;
+			}
+		}
+		SetHover(best);
 	}
 
 	private void SetHover(int idx)
@@ -153,11 +166,10 @@ public class SparkChart : Grid
 				_readout.Text = text + (ago > 0 ? $" · {ago}s前" : " · 现在");
 			}
 		}
-		// 十字线 x 位置按控制像素宽换算
+		// 十字线 x 与索引反查同用 XAt, 时间映射下保持一致
 		if (_crosshair != null && idx >= 0 && _primary.Length > 1)
 		{
-			double w = RenderSize.Width;
-			double x = idx / (double)(_primary.Length - 1) * w;
+			double x = XAt(idx, _primary.Length);
 			_crosshair.X1 = x;
 			_crosshair.X2 = x;
 		}
@@ -275,7 +287,7 @@ public class SparkChart : Grid
 						if (end == start && !closeArea)
 						{
 							// 单点副曲线: 画短横线段
-							Point p = Pt(start, data[start]!.Value, top, w);
+							Point p = Pt(start, data[start]!.Value, top, data.Length);
 							lctx.BeginFigure(new Point(p.X - 1, p.Y), false, false);
 							lctx.LineTo(new Point(p.X + 1, p.Y), true, false);
 							anySeg = true;
@@ -283,18 +295,18 @@ public class SparkChart : Grid
 						start = -1;
 						continue;
 					}
-					Point p0 = Pt(start, data[start]!.Value, top, w);
+					Point p0 = Pt(start, data[start]!.Value, top, data.Length);
 					lctx.BeginFigure(p0, false, false);
 					actx?.BeginFigure(p0, false, false);
 					for (int j = start + 1; j <= end; j++)
 					{
-						Point pj = Pt(j, data[j]!.Value, top, w);
+						Point pj = Pt(j, data[j]!.Value, top, data.Length);
 						lctx.LineTo(pj, true, false);
 						actx?.LineTo(pj, true, false);
 					}
 					if (actx != null)
 					{
-						actx.LineTo(new Point(Pt(end, 0, top, w).X, 32), true, false);
+						actx.LineTo(new Point(Pt(end, 0, top, data.Length).X, 32), true, false);
 						actx.LineTo(new Point(p0.X, 32), true, false);
 					}
 					anySeg = true;
@@ -313,10 +325,32 @@ public class SparkChart : Grid
 	}
 
 	// 100×32 逻辑坐标映射到控制像素
-	private Point Pt(int idx, double v, double top, double w)
+	private Point Pt(int idx, double v, double top, int count)
 	{
-		double x = _primary.Length > 1 ? idx / (double)(_primary.Length - 1) * w : 0;
+		double x = XAt(idx, count);
 		double y = 30 - v / top * 26;
 		return new Point(x, y);
+	}
+
+	/// <summary>
+	/// x 坐标: 时间戳与序列等长且跨度有效时按真实时间映射(采样间隔不均匀/混合节奏不失真),
+	/// 否则按索引均匀分布。
+	/// </summary>
+	private double XAt(int idx, int count)
+	{
+		double w = RenderSize.Width;
+		if (count <= 1)
+		{
+			return 0;
+		}
+		if (_stamps.Length == count && _stamps.Length > 1)
+		{
+			double span = (_stamps[^1] - _stamps[0]).TotalSeconds;
+			if (span > 0.01)
+			{
+				return (_stamps[idx] - _stamps[0]).TotalSeconds / span * w;
+			}
+		}
+		return idx / (double)(count - 1) * w;
 	}
 }

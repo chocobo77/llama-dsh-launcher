@@ -147,7 +147,24 @@ public class TrendChart : Grid
 			return;
 		}
 		int maxLen = MaxLen();
-		int idx = (int)Math.Round(Math.Max(0, Math.Min(1, pos.X / w)) * Math.Max(1, maxLen - 1));
+		// 时间映射下按最近样本点反查索引
+		double frac = Math.Max(0, Math.Min(1, pos.X / w));
+		int idx = 0;
+		double bestD = double.MaxValue;
+		for (int i = 0; i < maxLen; i++)
+		{
+			double xi = _stampsForFoot.Length == maxLen && maxLen > 1
+				&& (_stampsForFoot[^1] - _stampsForFoot[0]).TotalSeconds > 0.01
+				? (_stampsForFoot[i] - _stampsForFoot[0]).TotalSeconds
+				/ (_stampsForFoot[^1] - _stampsForFoot[0]).TotalSeconds * w
+				: maxLen > 1 ? i / (double)(maxLen - 1) * w : 0;
+			double d = Math.Abs(xi - frac * w);
+			if (d < bestD)
+			{
+				bestD = d;
+				idx = i;
+			}
+		}
 		_hover = idx;
 		if (_crosshair != null)
 		{
@@ -177,7 +194,18 @@ public class TrendChart : Grid
 			double? v = idx(data, _hover);
 			parts.Add($"{name} {(v.HasValue ? v.Value.ToString("0.#") : "—")}");
 		}
-		_hoverTip.Text = string.Join("  ", parts) + (_hover >= 55 ? "  · now" : $"  · -{60 - _hover}s");
+		// 读数时间标签按真实时间跨度(混合采样下 60-idx 恒等式不成立)
+		string agoTip;
+		if (_stampsForFoot.Length > 1 && _hover < _stampsForFoot.Length)
+		{
+			int ago = (int)Math.Max(0, (_stampsForFoot[^1] - _stampsForFoot[_hover]).TotalSeconds);
+			agoTip = ago > 0 ? $"  · -{ago}s" : "  · now";
+		}
+		else
+		{
+			agoTip = _hover >= 55 ? "  · now" : $"  · -{60 - _hover}s";
+		}
+		_hoverTip.Text = string.Join("  ", parts) + agoTip;
 		_hoverTip.Visibility = Visibility.Visible;
 	}
 
@@ -324,6 +352,9 @@ public class TrendChart : Grid
 		_lines.Clear();
 		_areas.Clear();
 		int maxLen = MaxLen();
+		bool timeX = _stampsForFoot.Length == maxLen && maxLen > 1
+			&& (_stampsForFoot[^1] - _stampsForFoot[0]).TotalSeconds > 0.01;
+		double stampSpan = timeX ? (_stampsForFoot[^1] - _stampsForFoot[0]).TotalSeconds : 0;
 		foreach (var (name, color, data) in _series)
 		{
 			var line = new Path
@@ -356,7 +387,11 @@ public class TrendChart : Grid
 					int end = valid ? i : i - 1;
 					if (end > start)
 					{
-						Point P(int k) => new Point(maxLen > 1 ? k / (double)(maxLen - 1) * w : 0, h - ((data[k]!.Value - bot) / span) * (h - 6) - 3);
+						// 时间戳有效时按真实时间映射 x(混合采样节奏不失真)
+						double XAt(int k) => timeX
+							? (_stampsForFoot[k] - _stampsForFoot[0]).TotalSeconds / stampSpan * w
+							: maxLen > 1 ? k / (double)(maxLen - 1) * w : 0;
+						Point P(int k) => new Point(XAt(k), h - ((data[k]!.Value - bot) / span) * (h - 6) - 3);
 						ctx.BeginFigure(P(start), false, false);
 						actx?.BeginFigure(P(start), false, false);
 						for (int j = start + 1; j <= end; j++)

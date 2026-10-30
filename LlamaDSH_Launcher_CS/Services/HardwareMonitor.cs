@@ -71,9 +71,10 @@ public sealed class HardwareMonitor : IDisposable
 				return r;
 			}
 			_lastUpdateUtc = DateTime.UtcNow;
-		}
-		try
-		{
+			// 计算全程在锁内: LHM 不支持并发 Update, perf 线程与 UI 点击同时错过
+			// 缓存时并发采样会导致传感器读数错乱
+			try
+			{
 			// 多卡聚合: 负载/风扇/频率均值, 功率求和, 温度取最高
 			double utilSum = 0, utilN = 0, powerSum = 0, fanSum = 0, fanN = 0, clockSum = 0, clockN = 0, tempMax = 0;
 			bool anyGpu = false;
@@ -218,8 +219,9 @@ public sealed class HardwareMonitor : IDisposable
 				r["cpu_temp_src"] = "lhm";
 			}
 		}
-		catch
-		{
+			catch
+			{
+			}
 		}
 		return r;
 	}
