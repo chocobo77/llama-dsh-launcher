@@ -6896,7 +6896,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 		}
 		_hCtx.Push(ctxUsed >= 0 ? ctxUsed : null);
-		_hMtp.Push(api?.MtpAcceptance);
+		// MtpAcceptance 是 0-1 小数(圆环显示时 ×100); 历史序列按百分数入库, 供迷你曲线/趋势图共用
+		_hMtp.Push(api?.MtpAcceptance is double accPct ? accPct * 100.0 : null);
 
 		// ── 摘要条 ──
 		StripGpuVal.Text = "—";
