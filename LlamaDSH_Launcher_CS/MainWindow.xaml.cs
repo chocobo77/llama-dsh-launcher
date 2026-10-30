@@ -7342,7 +7342,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			TrendCpu.StampsRef = _hCpu.Stamps();
 			TrendMem.StampsRef = _hRam.Stamps();
 			TrendNet.StampsRef = _hNet.Stamps();
-			TrendGen.SetSeries("tok/s", new List<(string, Color, double?[])> { ("生成", Color.FromRgb(0x7c, 0xd7, 0xf7), _hTps.Arr()), ("预填充", Color.FromRgb(0x4a, 0xde, 0x80), _hPf.Arr()) }, double.NaN, double.NaN);
+			TrendGen.SetSeries("tok/s", new List<(string, Color, double?[])> { ("生成", Color.FromRgb(0x7c, 0xd7, 0xf7), _hTps.Arr()) }, double.NaN, double.NaN);
 			TrendPf.SetSeries("tok/s", new List<(string, Color, double?[])> { ("预填充", Color.FromRgb(0x4a, 0xde, 0x80), _hPf.Arr()) }, double.NaN, double.NaN);
 			TrendCtx.SetSeries("tokens", new List<(string, Color, double?[])> { ("上下文", Color.FromRgb(0xf5, 0xb5, 0x3d), _hCtx.Arr()) }, 0, ctxTotal > 0 ? ctxTotal : double.NaN);
 			TrendMtp.SetSeries("%", new List<(string, Color, double?[])> { ("接受率", Color.FromRgb(0x7c, 0xd7, 0xf7), _hMtp.Arr()) }, 0, 100);
