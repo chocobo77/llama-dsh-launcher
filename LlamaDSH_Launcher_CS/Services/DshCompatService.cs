@@ -621,16 +621,17 @@ public static class DshCompatService
 
         public static void PinInactive(string profile, string name)
         {
-            Dictionary<string, List<string>> all = new(StringComparer.Ordinal);
+            Dictionary<string, List<string>> all;
             try
             {
-                if (File.Exists(PinnedPluginsPath))
-                {
-                    all = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(File.ReadAllText(PinnedPluginsPath, Encoding.UTF8)) ?? new();
-                }
+                // 同 ExemptPlugin: 解析失败中止, 不以空表覆盖历史锁定
+                all = File.Exists(PinnedPluginsPath)
+                    ? JsonSerializer.Deserialize<Dictionary<string, List<string>>>(File.ReadAllText(PinnedPluginsPath, Encoding.UTF8)) ?? new()
+                    : new(StringComparer.Ordinal);
             }
             catch
             {
+                return;
             }
             List<string> list = all.TryGetValue(profile, out List<string>? v) ? v : new List<string>();
             if (!list.Contains(name, StringComparer.Ordinal))
@@ -638,7 +639,18 @@ public static class DshCompatService
                 list.Add(name);
             }
             all[profile] = list;
-            File.WriteAllText(PinnedPluginsPath, JsonSerializer.Serialize(all, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }), new UTF8Encoding(false));
+            string json = JsonSerializer.Serialize(all, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
+            try
+            {
+                if (File.Exists(PinnedPluginsPath))
+                {
+                    File.Copy(PinnedPluginsPath, PinnedPluginsPath + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmssfff"), true);
+                }
+            }
+            catch
+            {
+            }
+            WriteFileAtomic(PinnedPluginsPath, json);
         }
 
         public static void UnpinInactive(string profile, string name)
@@ -654,7 +666,7 @@ public static class DshCompatService
                 {
                     list.RemoveAll((string x) => x == name);
                     all[profile] = list;
-                    File.WriteAllText(PinnedPluginsPath, JsonSerializer.Serialize(all, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }), new UTF8Encoding(false));
+                    WriteFileAtomic(PinnedPluginsPath, JsonSerializer.Serialize(all, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
                 }
             }
             catch
@@ -702,7 +714,7 @@ public static class DshCompatService
                 }
                 root!["dsh"]!["profile"]!["bundles"] = rebuilt;
                 JsonSerializerOptions opt = new() { WriteIndented = true, TypeInfoResolver = new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver() };
-                File.WriteAllText(manifest, root.ToJsonString(opt) + Environment.NewLine, new UTF8Encoding(false));
+                WriteFileAtomic(manifest, root.ToJsonString(opt) + Environment.NewLine);
                 if (active)
                 {
                     UnpinInactive(profile, name);
@@ -1280,20 +1292,39 @@ public static class DshCompatService
                         .ToList();
         }
 
+        /// <summary>
+        /// 原子写文本文件: 先写同目录 .tmp-atomic 再 File.Replace/Move。
+        /// 进程被杀/断电时不会留下截断的目标文件(修复类写回的第一安全属性)。
+        /// </summary>
+        private static void WriteFileAtomic(string path, string content)
+        {
+            string tmp = path + ".tmp-atomic";
+            File.WriteAllText(tmp, content, new UTF8Encoding(false));
+            if (File.Exists(path))
+            {
+                File.Replace(tmp, path, null);
+            }
+            else
+            {
+                File.Move(tmp, path);
+            }
+        }
+
         /// <summary>写入版本豁免（compatibility.json）：name@version → dsh 版本。</summary>
         public static string ExemptPlugin(string profile, string name, string version, string dshVersion)
         {
             string path = Path.Combine(ResolveProfileDir(profile), "compatibility.json");
-            Dictionary<string, List<string>> map = new(StringComparer.Ordinal);
+            Dictionary<string, List<string>> map;
             try
             {
-                if (File.Exists(path))
-                {
-                    map = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(File.ReadAllText(path, Encoding.UTF8)) ?? new();
-                }
+                // 损坏文件静默清空重写会丢光历史豁免: 解析失败直接中止
+                map = File.Exists(path)
+                    ? JsonSerializer.Deserialize<Dictionary<string, List<string>>>(File.ReadAllText(path, Encoding.UTF8)) ?? new()
+                    : new(StringComparer.Ordinal);
             }
-            catch
+            catch (Exception ex)
             {
+                return "豁免写入已中止（compatibility.json 解析失败，文件可能已损坏：" + ex.Message + "）";
             }
             string key = name + "@" + version;
             List<string> versions = map.TryGetValue(key, out List<string>? v) ? v : new List<string>();
@@ -1308,7 +1339,7 @@ public static class DshCompatService
             {
                 try
                 {
-                    backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                    backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmssfff");
                     File.Copy(path, backup, true);
                 }
                 catch (Exception ex)
@@ -1316,7 +1347,7 @@ public static class DshCompatService
                     return "豁免写入已中止（无法备份 compatibility.json：" + ex.Message + "）";
                 }
             }
-            File.WriteAllText(path, JsonSerializer.Serialize(map, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }), new UTF8Encoding(false));
+            WriteFileAtomic(path, JsonSerializer.Serialize(map, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
             return "已豁免 " + key + " @ dsh " + dshVersion
                 + (backup.Length > 0 ? "（改前已备份 " + Path.GetFileName(backup) + "）" : "");
         }
@@ -1434,6 +1465,7 @@ public static class DshCompatService
                         if (!p.WaitForExit(Math.Max(5, timeoutSec) * 1000))
                         {
                                 try { p.Kill(true); } catch { }
+                                p.WaitForExit(); // 等 async 输出回调随进程终止落定, 再读 StringBuilder
                                 return (-1, stdout.ToString(), "timeout");
                         }
                         p.WaitForExit();
@@ -3359,7 +3391,7 @@ process.stdout.write(JSON.stringify(out));
                 {
                         return "package.json 不存在，跳过 bundle 修复";
                 }
-                string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmssfff");
                 File.Copy(path, backup, true);
                 JsonNode? root = JsonNode.Parse(File.ReadAllText(path, Encoding.UTF8));
                 if (root == null)
@@ -3402,7 +3434,7 @@ process.stdout.write(JSON.stringify(out));
                         WriteIndented = true,
                         TypeInfoResolver = new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver()
                 };
-                File.WriteAllText(path, root.ToJsonString(opt) + Environment.NewLine, new UTF8Encoding(false));
+                WriteFileAtomic(path, root.ToJsonString(opt) + Environment.NewLine);
                 return "bundle 激活表已更新（补 " + report.BundlesToAdd.Count + "，移除 " + removed + "），备份: " + Path.GetFileName(backup);
         }
 
@@ -3444,7 +3476,7 @@ process.stdout.write(JSON.stringify(out));
                         {
                                 return "market state.json 无需清理";
                         }
-                        string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                        string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmssfff");
                         File.Copy(path, backup, true);
                         root["disabled"] = next;
                         JsonSerializerOptions opt = new JsonSerializerOptions
@@ -3452,7 +3484,7 @@ process.stdout.write(JSON.stringify(out));
                                 WriteIndented = false,
                                 TypeInfoResolver = new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver()
                         };
-                        File.WriteAllText(path, root.ToJsonString(opt) + Environment.NewLine, new UTF8Encoding(false));
+                        WriteFileAtomic(path, root.ToJsonString(opt) + Environment.NewLine);
                         return "market 停用记录已清理: " + string.Join(", ", removedNames) + "（已备份 state.json）";
                 }
                 catch (Exception ex)
@@ -3559,7 +3591,7 @@ process.stdout.write(JSON.stringify(out));
                 {
                         return (0, 0, 0, false);
                 }
-                string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmssfff");
                 File.Copy(path, backup, true);
                 if (deleteLines.Count > 0)
                 {
@@ -3573,7 +3605,7 @@ process.stdout.write(JSON.stringify(out));
                         }
                         lines = kept.ToArray();
                 }
-                File.WriteAllText(path, string.Join(nl, lines), new UTF8Encoding(false));
+                WriteFileAtomic(path, string.Join(nl, lines));
                 return (commented, migrated, removed, true);
         }
 
@@ -5059,9 +5091,9 @@ process.stdout.write(JSON.stringify(out));
                                 {
                                         continue;
                                 }
-                                string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                                string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmssfff");
                                 File.Copy(path, backup, true);
-                                File.WriteAllText(path, text, new UTF8Encoding(false));
+                                WriteFileAtomic(path, text);
                                 files++;
                                 log?.Invoke("[兼容修复] inject 已改写: " + path + "（备份 " + Path.GetFileName(backup) + "）");
                         }
@@ -5112,14 +5144,14 @@ process.stdout.write(JSON.stringify(out));
                                 {
                                         continue; // 声明已不存在，无需改写
                                 }
-                                string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                                string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmssfff");
                                 File.Copy(path, backup, true);
                                 string text = JsonSerializer.Serialize(jo, new JsonSerializerOptions
                                 {
                                         WriteIndented = true,
                                         Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
                                 });
-                                File.WriteAllText(path, text, new UTF8Encoding(false));
+                                WriteFileAtomic(path, text);
                                 files++;
                                 changed += group.Count();
                                 log?.Invoke("[兼容修复] 死依赖已移除: " + path + "（" + string.Join(", ", group.Select((DshDeadPeerFix f) => f.PeerName)) + "，备份 " + Path.GetFileName(backup) + "）");
@@ -5164,14 +5196,14 @@ process.stdout.write(JSON.stringify(out));
                         {
                                 return 0;
                         }
-                        string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                        string backup = path + ".bak-compat-" + DateTime.Now.ToString("yyyyMMdd-HHmmssfff");
                         File.Copy(path, backup, true);
                         string text = JsonSerializer.Serialize(jo, new JsonSerializerOptions
                         {
                                 WriteIndented = true,
                                 Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
                         });
-                        File.WriteAllText(path, text, new UTF8Encoding(false));
+                        WriteFileAtomic(path, text);
                         log?.Invoke("[兼容修复] 陈旧豁免已移除: " + path + "（" + string.Join(", ", report.StaleExemptions) + "，备份 " + Path.GetFileName(backup) + "）");
                 }
                 catch (Exception ex)
