@@ -25,6 +25,9 @@ public sealed class ParamBuildResult
 {
 	public List<string> Args { get; } = new List<string>();
 
+	/// <summary>每个参数旗标实际发射进命令行的片段（含关闭语义发射），用于 UI 逐参数回显。</summary>
+	public Dictionary<string, List<string>> FlagArgs { get; } = new Dictionary<string, List<string>>();
+
 	/// <summary>被剔除的参数及原因（前置不满足/互斥/校验失败）。</summary>
 	public List<string> Violations { get; } = new List<string>();
 }
@@ -184,6 +187,7 @@ public static class ParamRules
 			if (d.Type == ParamType.Bool)
 			{
 				res.Args.Add("--" + d.Flag);
+				res.FlagArgs[d.Flag] = new List<string> { "--" + d.Flag };
 			}
 			else
 			{
@@ -196,6 +200,7 @@ public static class ParamRules
 				{
 					res.Args.Add("--" + d.Flag);
 					res.Args.Add(v);
+					res.FlagArgs[d.Flag] = new List<string> { "--" + d.Flag, v };
 				}
 			}
 		}
@@ -216,12 +221,14 @@ public static class ParamRules
 				if (!string.IsNullOrEmpty(d.OffFlag))
 				{
 					res.Args.Add("--" + d.OffFlag);
+					res.FlagArgs[d.Flag] = new List<string> { "--" + d.OffFlag };
 				}
 			}
 			else if (!string.IsNullOrEmpty(d.OffValue))
 			{
 				res.Args.Add("--" + d.Flag);
 				res.Args.Add(d.OffValue!);
+				res.FlagArgs[d.Flag] = new List<string> { "--" + d.Flag, d.OffValue! };
 			}
 		}
 		return res;

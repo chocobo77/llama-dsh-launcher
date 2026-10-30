@@ -143,21 +143,21 @@
                 <Button Content="浏览..." Margin="4,0,0,0" Click="BrowseModel_Click" />
                 <Button Content="📁 目录" Margin="4,0,0,0" Click="BrowseModelDir_Click" ToolTip="MoE/分片大模型包含多个文件——直接选择模型目录即可：自动使用分片第一片(*-00001-of-*.gguf，其余分片需在同目录)，或目录中唯一的 gguf。safetensors 需先转换为 GGUF。" />
               </StackPanel>
-              <TextBox Name="InputModelPath" ToolTip="支持三种形式：① 单 gguf 文件；② 分片第一片(*-00001-of-*.gguf，自动加载其余分片)；③ 模型目录(自动解析)。safetensors 需先用 convert_hf_to_gguf.py 转为 GGUF。" />
+              <TextBox Name="InputModelPath" TextWrapping="Wrap" ToolTip="支持三种形式：① 单 gguf 文件；② 分片第一片(*-00001-of-*.gguf，自动加载其余分片)；③ 模型目录(自动解析)。safetensors 需先用 convert_hf_to_gguf.py 转为 GGUF。" />
             </DockPanel>
             <DockPanel Margin="0,0,0,6">
               <Label Content="草稿模型 (MTP):" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
               <Button Content="浏览..." DockPanel.Dock="Right" Margin="4,0,0,0" Click="BrowseMtp_Click" />
-              <TextBox Name="InputMtpPath" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+              <TextBox Name="InputMtpPath" TextWrapping="Wrap" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
             </DockPanel>
             <DockPanel Margin="0,0,0,6">
               <Label Content="mmproj 路径:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
               <Button Content="浏览..." DockPanel.Dock="Right" Margin="4,0,0,0" Click="BrowseMmproj_Click" />
-              <TextBox Name="InputMmprojPath" ToolTip="多模态投影仪(视觉编码器)gguf 文件，用于图像理解。必须与主模型严格匹配(同一仓库下载，否则 n_embd mismatch 报错)。精度选 F16 优先于 BF16(老卡)。留空=纯文本模式。选择主模型后会自动关联同目录 mmproj 文件。" />
+              <TextBox Name="InputMmprojPath" TextWrapping="Wrap" ToolTip="多模态投影仪(视觉编码器)gguf 文件，用于图像理解。必须与主模型严格匹配(同一仓库下载，否则 n_embd mismatch 报错)。精度选 F16 优先于 BF16(老卡)。留空=纯文本模式。选择主模型后会自动关联同目录 mmproj 文件。" />
             </DockPanel>
             <DockPanel Margin="0,0,0,6">
               <Label Content="mmproj URL:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
-              <TextBox Name="InputMmprojUrl" ToolTip="远程 mmproj 地址(可选)。本地 mmproj 路径为空时使用 --mmproj-url。一般建议直接用本地文件。" />
+              <TextBox Name="InputMmprojUrl" TextWrapping="Wrap" ToolTip="远程 mmproj 地址(可选)。本地 mmproj 路径为空时使用 --mmproj-url。一般建议直接用本地文件。" />
             </DockPanel>
             <DockPanel Margin="0,0,0,6">
               <Label Content="" DockPanel.Dock="Left" Width="110" />
@@ -173,7 +173,7 @@
                 <Button Name="BtnSearchLlama" Content="🔍 自动检索" Margin="4,0,0,0" ToolTip="自动检索 llama-server.exe 所在目录" Click="SearchLlama_Click" />
                 <Button Name="BtnCheckLlamaUpdate" Content="🔄 检查更新" Margin="4,0,0,0" ToolTip="检查 llama.cpp 最新预编译版并覆盖更新（Vulkan-x64，需先停止 Llama 服务，不触碰模型）" Click="CheckLlamaUpdate_Click" />
               </StackPanel>
-              <TextBox Name="InputLlamaDir" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" TextChanged="InputLlamaDir_TextChanged" />
+              <TextBox Name="InputLlamaDir" TextWrapping="Wrap" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" TextChanged="InputLlamaDir_TextChanged" />
             </DockPanel>
             <DockPanel Margin="0,0,0,6">
               <Label Content="Llama 版本:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
@@ -190,7 +190,7 @@
                 <Button Name="BtnSearchDsh" Content="🔍 自动检索" Margin="4,0,0,0" ToolTip="自动检索 DSH 项目目录（deepseek-harness）" Click="SearchDsh_Click" />
                 <Button Name="BtnCheckDshUpdate" Content="🔄 检查更新" Margin="4,0,0,0" ToolTip="检查 deepseek-harness 上游更新并全量重建（git pull + clean + build:lib + build:web，需先停止 DSH）" Click="CheckDshUpdate_Click" />
               </StackPanel>
-              <TextBox Name="InputDshDir" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+              <TextBox Name="InputDshDir" TextWrapping="Wrap" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
             </DockPanel>
 
             <!-- ── DSH 选项 ─────────────────────────────── -->
@@ -230,7 +230,7 @@
           </StackPanel>
             <DockPanel x:Name="SecParam" Visibility="Collapsed">
               <DockPanel DockPanel.Dock="Top" Margin="0,6,0,0">
-          <Button Name="BtnClearParamFilter" Content="✕" DockPanel.Dock="Right" Width="26" Margin="4,0,0,0" Visibility="Collapsed" Click="ClearParamFilter_Click" ToolTip="清除过滤，显示全部参数" />
+          <Button Name="BtnClearParamFilter" Content="✕" DockPanel.Dock="Right" Width="26" Padding="2,0" FontSize="11" Margin="4,0,0,0" Visibility="Collapsed" Click="ClearParamFilter_Click" ToolTip="清除过滤，显示全部参数" />
           <Label Content="🔍 过滤参数:" DockPanel.Dock="Left" Width="86" VerticalAlignment="Center" Foreground="#8b949e" Padding="0" />
           <TextBox Name="InputParamFilter" TextWrapping="Wrap" ToolTip="输入关键词即时过滤参数，跨所有分类匹配名称/说明/分组（如: kv、量化、推测、flash）" />
         </DockPanel>
@@ -309,8 +309,8 @@
               <RowDefinition Height="Auto" />
               <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
-            <Button Grid.Row="0" Grid.Column="0" Name="BtnLlamaStart" Content="▶ 启动 Llama" Background="#238636" Foreground="#FFFFFFFF" Height="30" FontSize="12" Margin="0,0,10,8" HorizontalAlignment="Left" Click="StartLlama_Click" />
-            <Button Grid.Row="0" Grid.Column="1" Name="BtnLlamaStop" Content="⏹ 停止 Llama" Background="#da3633" Foreground="#FFFFFFFF" Height="30" FontSize="12" IsEnabled="False" Click="StopLlama_Click" />
+            <Button Grid.Row="0" Grid.Column="0" Name="BtnLlamaStart" Content="▶ 启动 Llama" Background="#238636" Foreground="#FFFFFFFF" Height="30" Width="122" FontSize="12" Margin="0,0,10,8" HorizontalAlignment="Left" Click="StartLlama_Click" />
+            <Button Grid.Row="0" Grid.Column="1" Name="BtnLlamaStop" Content="⏹ 停止 Llama" Background="#da3633" Foreground="#FFFFFFFF" Height="30" Width="122" FontSize="12" Margin="0,0,0,8" HorizontalAlignment="Left" IsEnabled="False" Click="StopLlama_Click" />
             <TextBlock Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Name="LblLlamaStatus" Text="● 已停止" Foreground="#8b949e" FontSize="12" Margin="0,0,0,8" />
             <CheckBox Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" Name="ChkOomRetry" Content="OOM 自动降层重试" IsChecked="True" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" Margin="0,0,0,8" ToolTip="启动因显存不足失败时，自动降低 --gpu-layers（每次 ×0.85，最多 3 次）并重新启动；需要重新勾选参数面板后手动保存才会持久化" />
             <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal">
@@ -336,12 +336,12 @@
               <RowDefinition Height="Auto" />
               <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
-            <Button Grid.Row="0" Grid.Column="0" Name="BtnDshStart" Content="▶ 启动 DSH" Background="#238636" Foreground="#FFFFFFFF" Height="30" FontSize="12" Margin="0,0,10,8" HorizontalAlignment="Left" Click="StartDsh_Click" />
-            <Button Grid.Row="0" Grid.Column="1" Name="BtnDshStop" Content="⏹ 停止 DSH" Background="#da3633" Foreground="#FFFFFFFF" Height="30" FontSize="12" IsEnabled="False" Click="StopDsh_Click" />
+            <Button Grid.Row="0" Grid.Column="0" Name="BtnDshStart" Content="▶ 启动 DSH" Background="#238636" Foreground="#FFFFFFFF" Height="30" Width="122" FontSize="12" Margin="0,0,10,8" HorizontalAlignment="Left" Click="StartDsh_Click" />
+            <Button Grid.Row="0" Grid.Column="1" Name="BtnDshStop" Content="⏹ 停止 DSH" Background="#da3633" Foreground="#FFFFFFFF" Height="30" Width="122" FontSize="12" Margin="0,0,0,8" HorizontalAlignment="Left" IsEnabled="False" Click="StopDsh_Click" />
             <TextBlock Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Name="LblDshStatus" Text="● 已停止" Foreground="#8b949e" FontSize="12" Margin="0,0,0,8" />
             <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal">
-              <Button Name="BtnRebuildDsh" Content="🔨 重建 DSH" Height="30" FontSize="12" Margin="0,0,10,0" Click="RebuildDsh_Click" ToolTip="全量重建 DSH 编译产物 (pnpm clean + build:lib + vite)。若 DSH 正在运行会先停止；重建完成后自动做兼容性检查并启动 DSH。" />
-              <Button Name="BtnOpenDsh" Content="🌐 打开 Web" Height="30" FontSize="12" IsEnabled="False" Click="OpenDsh_Click" />
+              <Button Name="BtnRebuildDsh" Content="🔨 重建 DSH" Height="30" Width="122" FontSize="12" Margin="0,0,10,0" HorizontalAlignment="Left" Click="RebuildDsh_Click" ToolTip="全量重建 DSH 编译产物 (pnpm clean + build:lib + vite)。若 DSH 正在运行会先停止；重建完成后自动做兼容性检查并启动 DSH。" />
+              <Button Name="BtnOpenDsh" Content="🌐 打开 Web" Height="30" Width="122" FontSize="12" HorizontalAlignment="Left" IsEnabled="False" Click="OpenDsh_Click" />
             </StackPanel>
           </Grid>
         </Grid>

@@ -167,6 +167,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	/// <summary>参数行索引（过滤用）：每行记录所属组、子组与行元素。</summary>
 	private readonly List<(string GrpId, string GrpTitle, string Sub, UIElement Row, ParamDefinition Def)> _paramRows = new();
+	// 每个参数行下方的真实启动参数回显标签
+	private readonly Dictionary<string, System.Windows.Controls.TextBlock> _argLabels = new Dictionary<string, System.Windows.Controls.TextBlock>();
+	private ParamBuildResult? _lastParamBuild;
 
 	/// <summary>子组内容面板缓存（key = 组id + 子组名），导航切换时挂到 ParamContent。</summary>
 	private readonly Dictionary<string, FrameworkElement> _subPanels = new();
@@ -254,6 +257,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private void BuildParamGroups()
 	{
 		_paramRows.Clear();
+		_argLabels.Clear();
 		_subPanels.Clear();
 		_navItems.Clear();
 		_currentSub = null;
@@ -308,6 +312,17 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 						_pbw[item.Flag] = checkBox;
 						PlaceParamRow(grid, checkBox, ref idx);
 						_paramRows.Add((g.Id, g.Title, sg.Key, checkBox, item));
+						System.Windows.Controls.TextBlock boolArg = new System.Windows.Controls.TextBlock
+						{
+							Text = "--" + item.Flag,
+							FontFamily = new System.Windows.Media.FontFamily("Consolas"),
+							FontSize = 11.0,
+							TextWrapping = TextWrapping.Wrap,
+							Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(110, 118, 129)),
+							Margin = new Thickness(20.0, 0.0, 0.0, 4.0)
+						};
+						_argLabels[item.Flag] = boolArg;
+						PlaceParamRow(grid, boolArg, ref idx);
 						continue;					}
 					DockPanel dockPanel = new DockPanel
 					{
@@ -392,6 +407,16 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					_pw[item.Flag] = (checkBox2, control);
 					PlaceParamRow(grid, dockPanel, ref idx, item.Wide);
 					_paramRows.Add((g.Id, g.Title, sg.Key, dockPanel, item));
+					System.Windows.Controls.TextBlock argLbl = new System.Windows.Controls.TextBlock
+					{
+						FontFamily = new System.Windows.Media.FontFamily("Consolas"),
+						FontSize = 11.0,
+						TextWrapping = TextWrapping.Wrap,
+						Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(110, 118, 129)),
+						Margin = new Thickness(184.0, 0.0, 0.0, 4.0)
+					};
+					_argLabels[item.Flag] = argLbl;
+					PlaceParamRow(grid, argLbl, ref idx);
 				}
 				_subPanels[g.Id + "\u0001" + sg.Key] = grid;
 				AddNavItem(g, sg.Key, sg.Count());
@@ -2414,6 +2439,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		// 参数依赖引擎：纯逻辑在 ParamRules（可单测）。前置未满足的参数连 off 语义都不发射，
 		// 避免"前置已取消勾选、后置仍被注入启动行"（如 spec-type=none 时仍发 offFlag）。
 		ParamBuildResult paramBuild = ParamRules.Build(_paramDefs, this);
+		_lastParamBuild = paramBuild;
 		list.AddRange(paramBuild.Args);
 		_lastViolations = paramBuild.Violations;
 		if (includeCustomArgs && _customArgs.Count > 0)
@@ -3277,6 +3303,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				CmdPreview.Text += Environment.NewLine + "⚠ " + qw;
 			}
+			UpdateParamArgLabels(_lastParamBuild);
 		}
 		catch (Exception ex)
 		{
@@ -3284,7 +3311,35 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			CmdPreview.Text = "Error:" + ex.Message;
 			CmdCustomPreview.Text = "";
 			CmdCustomPreview.Visibility = Visibility.Collapsed;
+			UpdateParamArgLabels(null);
 			LogError(ex, "命令构建失败");
+		}
+	}
+
+	/// <summary>逐参数回显真实启动参数：绿色=已发射进命令行，灰色=未发射（显示的是"若启用会是什么"）。</summary>
+	private void UpdateParamArgLabels(ParamBuildResult? res)
+	{
+		if (_paramDefs == null)
+		{
+			return;
+		}
+		foreach (KeyValuePair<string, System.Windows.Controls.TextBlock> kv in _argLabels)
+		{
+			ParamDefinition? d = _paramDefs.FirstOrDefault((ParamDefinition p) => p.Flag == kv.Key);
+			if (d == null)
+			{
+				continue;
+			}
+			bool emitted = res != null && res.FlagArgs.ContainsKey(kv.Key);
+			string args = emitted && res != null
+				? string.Join(" ", res.FlagArgs[kv.Key])
+				: (d.Type == ParamType.Bool
+					? "--" + kv.Key
+					: ("--" + kv.Key + " " + (((IParamState)this).EffectiveValue(d) ?? "").Trim()).TrimEnd());
+			kv.Value.Text = args;
+			kv.Value.Foreground = new SolidColorBrush(emitted
+				? System.Windows.Media.Color.FromRgb(63, 185, 80)
+				: System.Windows.Media.Color.FromRgb(110, 118, 129));
 		}
 	}
 
