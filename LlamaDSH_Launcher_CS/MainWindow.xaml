@@ -412,24 +412,24 @@
               <Border Background="#161a1d" CornerRadius="10" Padding="14,10" BorderBrush="#2a3036" BorderThickness="1">
                 <DockPanel>
                   <Button DockPanel.Dock="Right" Name="BtnSnapshot" Content="📷" Click="Snapshot_Click" ToolTip="保存监测页截图为 PNG" Padding="8,3" VerticalAlignment="Center" />
-                  <WrapPanel>
+                  <UniformGrid Columns="4">
                     <StackPanel Margin="0,0,22,0">
                       <StackPanel Orientation="Horizontal"><Ellipse Width="7" Height="7" Fill="#f0883e" VerticalAlignment="Center" /><TextBlock Text=" GPU 利用率" Foreground="#8e979f" FontSize="11" /></StackPanel>
                       <StackPanel Orientation="Horizontal"><TextBlock Name="StripGpuVal" Text="—" Foreground="#eef1f3" FontSize="19" FontWeight="Bold" FontFamily="Consolas" /><TextBlock Text="%" Foreground="#8e979f" FontSize="10" VerticalAlignment="Bottom" Margin="3,0,0,3" /></StackPanel>
                     </StackPanel>
                     <StackPanel Margin="0,0,22,0">
-                      <StackPanel Orientation="Horizontal"><Ellipse Width="7" Height="7" Fill="#f0883e" VerticalAlignment="Center" /><TextBlock Text=" 显存" Foreground="#8e979f" FontSize="11" /></StackPanel>
+                      <StackPanel Orientation="Horizontal"><Ellipse Width="7" Height="7" Fill="#58a6ff" VerticalAlignment="Center" /><TextBlock Text=" 显存" Foreground="#8e979f" FontSize="11" /></StackPanel>
                       <StackPanel Orientation="Horizontal"><TextBlock Name="StripMemVal" Text="—" Foreground="#eef1f3" FontSize="19" FontWeight="Bold" FontFamily="Consolas" /><TextBlock Name="StripMemUnit" Text="GB" Foreground="#8e979f" FontSize="10" VerticalAlignment="Bottom" Margin="3,0,0,3" /></StackPanel>
                     </StackPanel>
                     <StackPanel Margin="0,0,22,0">
-                      <StackPanel Orientation="Horizontal"><Ellipse Width="7" Height="7" Fill="#f0883e" VerticalAlignment="Center" /><TextBlock Text=" GPU 温度" Foreground="#8e979f" FontSize="11" /></StackPanel>
+                      <StackPanel Orientation="Horizontal"><Ellipse Width="7" Height="7" Fill="#ff7b72" VerticalAlignment="Center" /><TextBlock Text=" GPU 温度" Foreground="#8e979f" FontSize="11" /></StackPanel>
                       <StackPanel Orientation="Horizontal"><TextBlock Name="StripTempVal" Text="—" Foreground="#eef1f3" FontSize="19" FontWeight="Bold" FontFamily="Consolas" /><TextBlock Text="°C" Foreground="#8e979f" FontSize="10" VerticalAlignment="Bottom" Margin="3,0,0,3" /></StackPanel>
                     </StackPanel>
                     <StackPanel>
-                      <StackPanel Orientation="Horizontal"><Ellipse Width="7" Height="7" Fill="#f0883e" VerticalAlignment="Center" /><TextBlock Text=" 功耗" Foreground="#8e979f" FontSize="11" /></StackPanel>
+                      <StackPanel Orientation="Horizontal"><Ellipse Width="7" Height="7" Fill="#d2a8ff" VerticalAlignment="Center" /><TextBlock Text=" 功耗" Foreground="#8e979f" FontSize="11" /></StackPanel>
                       <StackPanel Orientation="Horizontal"><TextBlock Name="StripPowerVal" Text="—" Foreground="#eef1f3" FontSize="19" FontWeight="Bold" FontFamily="Consolas" /><TextBlock Text="W" Foreground="#8e979f" FontSize="10" VerticalAlignment="Bottom" Margin="3,0,0,3" /></StackPanel>
                     </StackPanel>
-                  </WrapPanel>
+                  </UniformGrid>
                 </DockPanel>
               </Border>
 
@@ -467,7 +467,7 @@
                 </Border>
                 <Border Background="#161a1d" CornerRadius="10" Padding="14" Margin="4" BorderBrush="#2a3036" BorderThickness="1">
                   <StackPanel>
-                    <TextBlock Text="MTP 接受率" Foreground="#c7cdd3" FontSize="12" />
+                    <DockPanel><TextBlock DockPanel.Dock="Right" Text="spec-decode" FontSize="10" FontFamily="Consolas" Foreground="#8e979f" VerticalAlignment="Center" /><TextBlock Text="MTP 接受率" Foreground="#c7cdd3" FontSize="12" /></DockPanel>
                     <Grid Margin="0,4,0,0">
                       <Grid Width="92" Height="92" HorizontalAlignment="Center">
                         <Ellipse Stroke="#1d2226" StrokeThickness="8" StrokeDashCap="Round" StrokeDashArray="24.74 100" RenderTransformOrigin="0.5,0.5">
@@ -509,10 +509,11 @@
                       <Border DockPanel.Dock="Right" Background="#1d2226" BorderBrush="#2a3036" BorderThickness="1" CornerRadius="999" Padding="12,3" VerticalAlignment="Center">
                         <TextBlock Name="MonModelName" Text="未加载模型" FontSize="11" Foreground="#8e979f" />
                       </Border>
-                      <Border Name="MonPhasePill" Background="#1d2226" BorderBrush="#2a3036" BorderThickness="1" CornerRadius="999" Padding="14,4" VerticalAlignment="Center">
-                        <TextBlock Name="MonPhaseText" Text="空闲" FontSize="13" FontWeight="Bold" Foreground="#8e979f" />
-                      </Border>
+                      <TextBlock Text="推理状态" Foreground="#eef1f3" FontSize="14" FontWeight="Bold" VerticalAlignment="Center" />
                     </DockPanel>
+                    <Border Name="MonPhasePill" Background="#1d2226" BorderBrush="#2a3036" BorderThickness="1" CornerRadius="999" Padding="14,4" HorizontalAlignment="Left" Margin="0,10,0,0">
+                      <TextBlock Name="MonPhaseText" Text="空闲" FontSize="13" FontWeight="Bold" Foreground="#8e979f" />
+                    </Border>
                     <Grid Margin="0,12,0,0">
                       <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />
@@ -584,7 +585,7 @@
                         <TextBlock Name="CpuBigVal" Text="—" Foreground="#eef1f3" FontSize="30" FontWeight="Bold" FontFamily="Consolas" />
                         <TextBlock Text="利用率" Foreground="#8e979f" FontSize="10" />
                       </StackPanel>
-                      <ScrollViewer HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Hidden" MaxHeight="76">
+                      <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled" MaxHeight="76">
                         <StackPanel Name="CpuCoresHost" Orientation="Horizontal" VerticalAlignment="Bottom" />
                       </ScrollViewer>
                     </DockPanel>
@@ -648,14 +649,14 @@
                     <TextBlock Name="MiName" Text="—" Foreground="#eef1f3" FontSize="15" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
                     <TextBlock Name="MiPath" Text="路径 —" Foreground="#8e979f" FontSize="11" Margin="0,3,0,8" TextTrimming="CharacterEllipsis" />
                     <UniformGrid Columns="2">
-                      <StackPanel Margin="0,3,8,3"><TextBlock Text="参数量" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiParams" Text="—" FontSize="12" /></StackPanel>
-                      <StackPanel Margin="0,3,0,3"><TextBlock Text="文件体积" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiSize" Text="—" FontSize="12" /></StackPanel>
-                      <StackPanel Margin="0,3,8,3"><TextBlock Text="嵌入维度" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiEmbd" Text="—" FontSize="12" /></StackPanel>
-                      <StackPanel Margin="0,3,0,3"><TextBlock Text="词表大小" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiVocab" Text="—" FontSize="12" /></StackPanel>
-                      <StackPanel Margin="0,3,8,3"><TextBlock Text="n_ctx" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiCtx" Text="—" FontSize="12" /></StackPanel>
-                      <StackPanel Margin="0,3,0,3"><TextBlock Text="n_ctx_train" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiCtxTrain" Text="—" FontSize="12" /></StackPanel>
-                      <StackPanel Margin="0,3,8,3"><TextBlock Text="vocab_type" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiVocabType" Text="—" FontSize="12" /></StackPanel>
-                      <StackPanel Margin="0,3,0,3"><TextBlock Text="模态" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiModal" Text="—" FontSize="12" /></StackPanel>
+                      <StackPanel Margin="0,3,8,3"><TextBlock Text="参数量" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiParams" Text="—" FontSize="12" FontFamily="Consolas" Foreground="#e6edf3" /></StackPanel>
+                      <StackPanel Margin="0,3,0,3"><TextBlock Text="文件体积" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiSize" Text="—" FontSize="12" FontFamily="Consolas" Foreground="#e6edf3" /></StackPanel>
+                      <StackPanel Margin="0,3,8,3"><TextBlock Text="嵌入维度" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiEmbd" Text="—" FontSize="12" FontFamily="Consolas" Foreground="#e6edf3" /></StackPanel>
+                      <StackPanel Margin="0,3,0,3"><TextBlock Text="词表大小" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiVocab" Text="—" FontSize="12" FontFamily="Consolas" Foreground="#e6edf3" /></StackPanel>
+                      <StackPanel Margin="0,3,8,3"><TextBlock Text="n_ctx" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiCtx" Text="—" FontSize="12" FontFamily="Consolas" Foreground="#e6edf3" /></StackPanel>
+                      <StackPanel Margin="0,3,0,3"><TextBlock Text="n_ctx_train" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiCtxTrain" Text="—" FontSize="12" FontFamily="Consolas" Foreground="#e6edf3" /></StackPanel>
+                      <StackPanel Margin="0,3,8,3"><TextBlock Text="vocab_type" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiVocabType" Text="—" FontSize="12" FontFamily="Consolas" Foreground="#e6edf3" /></StackPanel>
+                      <StackPanel Margin="0,3,0,3"><TextBlock Text="模态" Foreground="#8e979f" FontSize="11" /><TextBlock Name="MiModal" Text="—" FontSize="12" FontFamily="Consolas" Foreground="#e6edf3" /></StackPanel>
                     </UniformGrid>
                   </StackPanel>
                 </Border>
@@ -678,23 +679,23 @@
                 <StackPanel>
                   <TextBlock Text="llama" Foreground="#8e979f" FontSize="11" FontFamily="Consolas" Margin="4,2,0,2" />
                   <UniformGrid Columns="2">
-                    <svc:TrendChart x:Name="TrendGen" Title="Token 生成速度" Unit="tok/s" Height="170" Margin="4" />
-                    <svc:TrendChart x:Name="TrendPf" Title="预填充速度" Unit="tok/s" Height="170" Margin="4" />
-                    <svc:TrendChart x:Name="TrendCtx" Title="上下文占用" Unit="tokens" Height="170" Margin="4" />
-                    <svc:TrendChart x:Name="TrendMtp" Title="MTP 接受率" Unit="%" Height="170" Margin="4" />
+                    <svc:TrendChart x:Name="TrendGen" Title="Token 生成速度" Unit="tok/s" Height="160" Margin="4" />
+                    <svc:TrendChart x:Name="TrendPf" Title="预填充速度" Unit="tok/s" Height="160" Margin="4" />
+                    <svc:TrendChart x:Name="TrendCtx" Title="上下文占用" Unit="tokens" Height="160" Margin="4" />
+                    <svc:TrendChart x:Name="TrendMtp" Title="MTP 接受率" Unit="%" Height="160" Margin="4" />
                   </UniformGrid>
                   <TextBlock Text="GPU" Foreground="#8e979f" FontSize="11" FontFamily="Consolas" Margin="4,6,0,2" />
                   <UniformGrid Columns="2">
-                    <svc:TrendChart x:Name="TrendGpuUtil" Title="GPU 利用率" Unit="%" Height="170" Margin="4" />
-                    <svc:TrendChart x:Name="TrendGpuMem" Title="GPU 显存" Unit="GB" Height="170" Margin="4" />
-                    <svc:TrendChart x:Name="TrendGpuTemp" Title="GPU 温度" Unit="°C" Height="170" Margin="4" />
-                    <svc:TrendChart x:Name="TrendGpuPower" Title="GPU 功耗" Unit="W" Height="170" Margin="4" />
+                    <svc:TrendChart x:Name="TrendGpuUtil" Title="GPU 利用率" Unit="%" Height="160" Margin="4" />
+                    <svc:TrendChart x:Name="TrendGpuMem" Title="GPU 显存" Unit="GB" Height="160" Margin="4" />
+                    <svc:TrendChart x:Name="TrendGpuTemp" Title="GPU 温度" Unit="°C" Height="160" Margin="4" />
+                    <svc:TrendChart x:Name="TrendGpuPower" Title="GPU 功耗" Unit="W" Height="160" Margin="4" />
                   </UniformGrid>
                   <TextBlock Text="系统" Foreground="#8e979f" FontSize="11" FontFamily="Consolas" Margin="4,6,0,2" />
                   <UniformGrid Columns="2">
-                    <svc:TrendChart x:Name="TrendCpu" Title="CPU" Unit="%" Height="170" Margin="4" />
-                    <svc:TrendChart x:Name="TrendMem" Title="内存" Unit="GB" Height="170" Margin="4" />
-                    <svc:TrendChart x:Name="TrendNet" Title="网络" Unit="MB/s" Height="170" Margin="4" />
+                    <svc:TrendChart x:Name="TrendCpu" Title="CPU" Unit="%" Height="160" Margin="4" />
+                    <svc:TrendChart x:Name="TrendMem" Title="内存" Unit="GB" Height="160" Margin="4" />
+                    <svc:TrendChart x:Name="TrendNet" Title="网络" Unit="MB/s" Height="160" Margin="4" />
                     <Grid Margin="4" />
                   </UniformGrid>
                 </StackPanel>
