@@ -51,6 +51,13 @@
             <Setter Property="FontSize" Value="12"/>
             <Setter Property="CaretBrush" Value="#c9d1d9"/>
             <Setter Property="SelectionBrush" Value="#264f78"/>
+            <Style.Triggers>
+                <!-- 禁用态: 不加触发会回落系统浅灰默认观感, 与暗色主题突兀 -->
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="Background" Value="#161b22"/>
+                    <Setter Property="Foreground" Value="#6e7681"/>
+                </Trigger>
+            </Style.Triggers>
         </Style>
 
         <!-- 细滚动条: 8px 透明轨道, 深灰滑块, 悬停提亮 —— 替代 WPF 默认的粗浅灰滚动条 -->
@@ -244,6 +251,8 @@
             <Setter Property="Foreground" Value="#c9d1d9"/>
             <Setter Property="BorderBrush" Value="#30363d"/>
             <Setter Property="Padding" Value="8"/>
+            <!-- 超长 tooltip 限宽自动换行, 不再撑满整屏宽 -->
+            <Setter Property="MaxWidth" Value="460"/>
         </Style>
 
         <Style TargetType="ScrollViewer" BasedOn="{x:Null}">

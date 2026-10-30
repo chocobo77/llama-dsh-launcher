@@ -1342,14 +1342,26 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				ShowNotice($"名称「{name}」已被其它变体占用, 换一个名称。", isError: true);
 				return;
 			}
+			if (IsLlamaRunning())
+			{
+				ShowNotice("Llama 服务运行中，请先停止再安装/更新变体。", isError: true);
+				return;
+			}
+			if (_llamaUpdBusy)
+			{
+				ShowNotice("已有更新/安装任务进行中，请稍候。", isError: true);
+				return;
+			}
+			_llamaUpdBusy = true;
 			ok.IsEnabled = false;
 			ok.Content = "⏳ 获取版本...";
 			var latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease(repo, LlamaBackendPreference()));
 			if (latest == null)
 			{
+				_llamaUpdBusy = false;
 				ok.IsEnabled = true;
 				ok.Content = "⬇ 检查并安装";
-				ShowNotice($"无法获取 {repo} 的最新版本（网络/GitHub 不可达, 或该仓库未提供 win-x64 预编译包）。", isError: true);
+				ShowNotice($"无法获取 {repo} 的最新版本（网络不通/GitHub 限流, 或该仓库未提供 win-x64 预编译包）。", isError: true);
 				return;
 			}
 			ok.Content = "⏳ 下载安装中...";
@@ -1372,11 +1384,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			UpdateService.CleanupLauncherTemp();
 			if (!okR)
 			{
+				_llamaUpdBusy = false;
 				ok.IsEnabled = true;
 				ok.Content = "⬇ 检查并安装";
 				ShowNotice("安装失败: " + msgR, isError: true);
 				return;
 			}
+			_llamaUpdBusy = false;
 			win.Close();
 			var exist = _llamaVariants.FirstOrDefault(v => v.Name == name);
 			if (exist != null)
@@ -1401,6 +1415,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			catch (Exception ex)
 			{
+				_llamaUpdBusy = false;
 				ok.IsEnabled = true;
 				ok.Content = "⬇ 检查并安装";
 				LogError(ex, "安装 llama.cpp 变体");
@@ -1689,6 +1704,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}
 				return;
 			}
+			if (_llamaUpdBusy)
+			{
+				SetLlamaUpdBtn(false);
+				return;
+			}
+			_llamaUpdBusy = true;
 			SetLlamaUpdBtn(true, "⏳ 检查中...");
 			int? local = await Task.Run(() => UpdateService.GetLocalLlamaBuild(dir));
 			string repo = CurrentLlamaRepo();
@@ -1698,7 +1719,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				if (fromButton)
 				{
-					ShowNotice("无法获取 llama.cpp 最新版本（网络/GitHub 不可达）。", isError: true);
+					ShowNotice("无法获取 llama.cpp 最新版本（网络不通, 或 GitHub 限流——匿名 API 每小时 60 次）。", isError: true);
 				}
 				return;
 			}
@@ -1733,6 +1754,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				Log("[更新] 用户取消 llama.cpp 更新");
 				return;
 			}
+			// 确认框期间服务可能已被启动: 复检, 不带锁覆盖运行中的 exe
+			if (IsLlamaRunning())
+			{
+				SetLlamaUpdBtn(false);
+				ShowNotice("Llama 已在运行，更新已取消。请先停止服务再更新。", isError: true);
+				return;
+			}
 			SetLlamaUpdBtn(true, "⏳ 下载更新中...");
 			(bool ok, string m) = await UpdateService.ApplyLlamaUpdateAsync(dir, latest);
 			SetLlamaUpdBtn(false);
@@ -1751,6 +1779,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			LogError(ex, "llama.cpp 更新");
 			SetLlamaUpdBtn(false);
+		}
+		finally
+		{
+			_llamaUpdBusy = false;
 		}
 	}
 
@@ -3285,11 +3317,44 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private static string QA(string a)
 	{
-		if (a.Contains(' ') || a.Contains('"'))
+		// MSVCRT/CommandLineToArgvW 引号规则: 值含空白/引号时加引号;
+		// 引号前的连续反斜杠翻倍并追加转义引号; 结尾引号前的反斜杠翻倍。
+		// 旧实现只把 " 换成 \" —— 路径以 \ 结尾时 "D:\dir\" 的闭引号被吃掉。
+		if (string.IsNullOrEmpty(a))
 		{
-			return "\"" + a.Replace("\"", "\\\"") + "\"";
+			return "\"\"";
 		}
-		return a;
+		bool needQuote = a.IndexOfAny(new[] { ' ', '\t', '"' }) >= 0;
+		var sb = new System.Text.StringBuilder();
+		if (needQuote)
+		{
+			sb.Append('"');
+		}
+		int backslashes = 0;
+		foreach (char c in a)
+		{
+			if (c == '\\')
+			{
+				backslashes++;
+				sb.Append('\\');
+				continue;
+			}
+			if (c == '"')
+			{
+				sb.Append('\\', backslashes * 2 + 1);
+				sb.Append('"');
+				backslashes = 0;
+				continue;
+			}
+			backslashes = 0;
+			sb.Append(c);
+		}
+		if (needQuote)
+		{
+			sb.Append('\\', backslashes * 2);
+			sb.Append('"');
+		}
+		return sb.ToString();
 	}
 
 	private void RefreshCmd()
@@ -3500,53 +3565,73 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		return true;
 	}
 
-	/// <summary>按 Windows 命令行习惯拆分：空格分隔，支持单/双引号；反斜杠只在引号/反斜杠前作为转义。</summary>
+	/// <summary>
+	/// 按 CommandLineToArgvW 规则拆分（与 QA 严格互逆）：反斜杠成对时取一半、
+	/// 反斜杠+引号按奇偶决定字面引号或引号切换；引号在片段中段切换而非必须包裹整段。
+	/// </summary>
 	private static List<string> SplitCommandLine(string text)
 	{
 		List<string> result = new List<string>();
-		StringBuilder current = new StringBuilder();
-		bool inQuote = false;
-		char quoteChar = '\0';
-		for (int i = 0; i < text.Length; i++)
+		int i = 0;
+		while (i < text.Length)
 		{
-			char c = text[i];
-			if (c == '\\' && i + 1 < text.Length && (text[i + 1] == '"' || text[i + 1] == '\\'))
+			while (i < text.Length && char.IsWhiteSpace(text[i]))
 			{
-				current.Append(text[i + 1]);
 				i++;
-				continue;
 			}
-			if (inQuote)
+			if (i >= text.Length)
 			{
-				if (c == quoteChar)
-				{
-					inQuote = false;
-				}
-				else
-				{
-					current.Append(c);
-				}
-				continue;
+				break;
 			}
-			if (c == '"' || c == '\'')
+			StringBuilder current = new StringBuilder();
+			bool quoted = text[i] == '"';
+			if (quoted)
 			{
-				inQuote = true;
-				quoteChar = c;
-				continue;
+				i++;
 			}
-			if (char.IsWhiteSpace(c))
+			while (i < text.Length)
 			{
-				if (current.Length > 0)
+				char c = text[i];
+				if (c == '\\')
 				{
-					result.Add(current.ToString());
-					current.Clear();
+					int n = 0;
+					while (i < text.Length && text[i] == '\\')
+					{
+						n++;
+						i++;
+					}
+					if (i < text.Length && text[i] == '"')
+					{
+						// N 个反斜杠 + 引号: 偶数 → N/2 个反斜杠, 引号生效; 奇数 → N/2 个反斜杠 + 字面引号
+						current.Append('\\', n / 2);
+						if (n % 2 == 1)
+						{
+							current.Append('"');
+							i++;
+						}
+						else
+						{
+							quoted = !quoted;
+							i++;
+						}
+						continue;
+					}
+					current.Append('\\', n);
+					continue;
 				}
-				continue;
+				if (c == '"')
+				{
+					quoted = !quoted;
+					i++;
+					continue;
+				}
+				if (!quoted && char.IsWhiteSpace(c))
+				{
+					break;
+				}
+				current.Append(c);
+				i++;
 			}
-			current.Append(c);
-		}
-		if (current.Length > 0)
-		{
 			result.Add(current.ToString());
 		}
 		return result;
@@ -3883,7 +3968,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			string? py = null;
 			string pyPre = "";
-			(string exe, string pre)? detected = DetectPython();
+			(string exe, string pre)? detected = await Task.Run(() => DetectPython());
 			if (detected.HasValue)
 			{
 				py = detected.Value.exe;
@@ -4156,6 +4241,29 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			ShowNotice("Already running");
 			return;
 		}
+		// 预检 1: 端口被占(上次会话遗留的孤儿 llama-server) → 直接启动必然 bind 失败
+		int prePort;
+		try { prePort = GetLlamaPort(); } catch { prePort = 1234; }
+		if (ProcessHelper.FindProcessByPort(prePort).HasValue)
+		{
+			ShowNotice($"端口 {prePort} 已被占用（可能是遗留的 llama-server 进程）。\n请重启启动器以接管，或手动结束后再启动。", isError: true);
+			Log("[启动] 端口 " + prePort + " 已被占用, 放弃启动");
+			return;
+		}
+		// 预检 2: 本地模型路径不存在时提前失败, 而不是等 llama 运行期报错
+		try
+		{
+			string? preModel = ResolveModelPath(throwOnError: false);
+			if (!string.IsNullOrEmpty(preModel) && !preModel.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+				&& !File.Exists(preModel) && !Directory.Exists(preModel))
+			{
+				ShowNotice("模型路径不存在: " + preModel, isError: true);
+				return;
+			}
+		}
+		catch
+		{
+		}
 		_vramBreakerTriggered = false;
 		LblVramBreaker.Text = "";
 		_oomSeenInRun = false;
@@ -4354,8 +4462,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			int baseNgl;
 			if (!int.TryParse(cur, out int curNgl) || curNgl <= 0)
 			{
-				// auto/全层: 以上一轮 offloaded 总层数为基准
-				baseNgl = _totalLayers > 0 ? _totalLayers : 0;
+				// auto/全层: 优先用上一轮实际 offload 的层数, 更符合"上次实际的 85%"语义
+				baseNgl = _offloadedLayers > 0 ? _offloadedLayers : (_totalLayers > 0 ? _totalLayers : 0);
 				if (baseNgl <= 0)
 				{
 					return false;
@@ -4421,7 +4529,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(240, 136, 62));
 		if (pid.HasValue)
 		{
-			ProcessHelper.KillProcessTree(pid.Value);
+			// WMI 杀树可达数秒, 移出 UI 线程(后续收尾由 FinishStop 轮询驱动)
+			int killPid = pid.Value;
+			Task.Run(() => ProcessHelper.KillProcessTree(killPid));
 		}
 		DisposeProc(ref _llamaProc);
 		ClearStateFor("llama");
@@ -4478,6 +4588,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void StartDsh_Click(object s, RoutedEventArgs e)
 	{
+		// 目录含引号会破坏 cmd 命令行拼接(且可被构造成注入), 提前拒绝
+		string dshDirGuard = EffectiveDshDir();
+		if (dshDirGuard != null && dshDirGuard.Contains('"'))
+		{
+			ShowNotice("DSH 目录路径含引号字符，无法用于命令行，请更换目录。", isError: true);
+			return;
+		}
 		// 每次手动点击启动都允许重新尝试一次"链接自愈"
 		_dshModuleHealTried = false;
 		int? existing = ProcessHelper.FindProcessByPort(3080);
@@ -5505,18 +5622,23 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		if (_dshProc != null)
 		{
 			Log("--- 正在停止 DSH ---");
-			ProcessHelper.KillProcessTree(_dshProc.Id);
+			int killPid1 = _dshProc.Id;
+			Task.Run(() => ProcessHelper.KillProcessTree(killPid1));
 		}
 		if (_dshTracker != null)
 		{
-			try
+			int killPid2 = _dshTracker.Pid;
+			Task.Run(() =>
 			{
-				ProcessHelper.KillProcessTree(_dshTracker.Pid);
-			}
-			catch (Exception ex)
-			{
-				LogError(ex, "停止 DSH 进程失败");
-			}
+				try
+				{
+					ProcessHelper.KillProcessTree(killPid2);
+				}
+				catch (Exception ex)
+				{
+					Console.WriteLine(ex.Message); // 后台线程无处 Log, 降级
+				}
+			});
 		}
 		if (adminKillPid.HasValue)
 		{
@@ -5864,15 +5986,17 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			return false;
 		}
+		// 白名单收敛为强特征: 旧表含 started/ready/server/web/plugin 等宽子串,
+		// node 启动横幅几乎全部命中, 隐藏功能形同虚设(2000 行上限很快滚掉关键报错)
 		string lower = content.ToLowerInvariant();
-		if (lower.Contains("dsh web") || lower.Contains("http") || lower.Contains("127.0.0.1") ||
-			lower.Contains("localhost") || lower.Contains("listen") || lower.Contains("port") ||
-			lower.Contains("eaddrinuse") || lower.Contains("error") || lower.Contains("fail") ||
-			lower.Contains("exception") || lower.Contains("warn") || lower.Contains("started") ||
-			lower.Contains("ready") || lower.Contains("loaded") || lower.Contains("plugin") ||
-			lower.Contains("exit") || lower.Contains("browser") || lower.Contains("open") ||
-			lower.Contains("server") || lower.Contains("version") || lower.Contains("status") ||
-			lower.Contains("web"))
+		if (lower.Contains("dsh web") ||
+			lower.Contains("listening on") ||
+			lower.Contains("eaddrinuse") ||
+			lower.Contains("127.0.0.1") ||
+			lower.Contains("localhost") ||
+			trimmed.StartsWith("ready in", StringComparison.Ordinal) ||
+			lower.Contains("http://") ||
+			lower.Contains("https://"))
 		{
 			return false;
 		}
@@ -6282,9 +6406,19 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					{
 						d[item.Key] = item.Value;
 					}
+					// NVML/回退采样含进程外调用, 留在 perf 线程; UI 线程只做渲染
+					var gpusNow = NvmlMonitor.SamplePerDevice();
+					if (gpusNow.Count == 0)
+					{
+						gpusNow = NvmlMonitor.SampleViaNvidiaSmi();
+					}
+					List<GpuDevInfo> gpusSnapshot = gpusNow;
+					Dictionary<string, string> dSnap = d;
+					_lastPerfDict = dSnap;
+					_lastPerfGpus = gpusSnapshot;
 					((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
 					{
-						OnPerf(d);
+						OnPerf(dSnap, gpusSnapshot);
 					}, Array.Empty<object>());
 					num++;
 				}
@@ -6325,7 +6459,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private int GetLlamaPort()
 	{
-		Match match = Regex.Match(_lastCmd, "--port\\s+(\\d+)");
+		// 优先读参数面板的 port 控件(命令编辑态/构建失败时 _lastCmd 不更新甚至为空);
+		// 自定义参数兜底支持 --port N 与 --port=N 两种形态
+		if (_pw.TryGetValue("port", out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) portPair))
+		{
+			string ctlText = portPair.Item2 is System.Windows.Controls.ComboBox pcb ? pcb.Text
+				: portPair.Item2 is System.Windows.Controls.TextBox ptb ? ptb.Text : "";
+			if (int.TryParse((ctlText ?? "").Trim(), out int cfgPort) && cfgPort > 0 && cfgPort < 65536)
+			{
+				return cfgPort;
+			}
+		}
+		Match match = Regex.Match(_lastCmd ?? "", "--port[= ](\\d+)");
 		if (!match.Success)
 		{
 			return 1234;
@@ -6340,6 +6485,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private void MainTabs_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
 	{
 		_monitorTabVisible = MainTabs?.SelectedIndex == 0;
+		// 切回监测页立即用最近一拍数据重绘, 不等下一个采样周期(不可见时节奏最长达 30s)
+		if (_monitorTabVisible && _lastPerfDict != null)
+		{
+			OnPerf(_lastPerfDict, _lastPerfGpus ?? new List<GpuDevInfo>());
+		}
 	}
 
 	// 指标历史(Strata: 60 点窗口 + 时间戳, 传感器缺口用 null 分段)
@@ -6648,6 +6798,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	}
 
 	private bool _synthGpuLogged;
+	// llama 更新/变体安装互斥: 后台检查、按钮检查、变体窗口三个入口共用
+	private bool _llamaUpdBusy;
 	// 真退出标志: Shutdown 会再次触发 Window_Closing, 没有它托盘分支会重新 Hide 窗口造成僵尸进程
 	private bool _exiting;
 
@@ -6893,7 +7045,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 	}
 
-	private void OnPerf(Dictionary<string, string> d)
+	private Dictionary<string, string>? _lastPerfDict;
+	private List<GpuDevInfo>? _lastPerfGpus;
+
+	private void OnPerf(Dictionary<string, string> d, List<GpuDevInfo> gpusPre)
 	{
 		// 速度历史: 日志 tg_3s / prompt 行 > /slots 差分 (llama-lens speeds())
 		var api = _llamaApi;
@@ -7021,11 +7176,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		MtpSpark.SetSeries(_hMtp.Arr(), null, 100.0, "%", _hMtp.Stamps(), ToneInfo, ToneAccent2, "", "");
 
 		// ── GPU 每卡 + 聚合(NVML → nvidia-smi → 既有聚合键合成单卡) ──
-		var gpus = NvmlMonitor.SamplePerDevice();
-		if (gpus.Count == 0)
-		{
-			gpus = NvmlMonitor.SampleViaNvidiaSmi();
-		}
+		// gpus 由 perf 线程采样后传入(UI 线程不再做进程外调用)
+		var gpus = gpusPre;
 		if (gpus.Count == 0 && d.TryGetValue("gpu_util", out string sGu0))
 		{
 			if (!_synthGpuLogged)
@@ -7071,8 +7223,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			_hTemp.Push(null);
 			_hPower.Push(null);
 		}
-		CheckVramBreaker(gpus);
-		BuildGpuPanels(gpus);
+		CheckVramBreaker(gpus); // 熔断判定任何可见性下都必须生效
+		if (_monitorTabVisible)
+		{
+			BuildGpuPanels(gpus);
+		}
 
 		// ── 系统资源 ──
 		if (d.TryGetValue("cpu", out string vCpu) && double.TryParse(vCpu, out var cpuPct))
@@ -7097,13 +7252,22 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		_hNet.Push(_netRxMbs > 0 ? _netRxMbs : null);
 		_hNetTx.Push(txSum > 0 ? txSum : null);
-		BuildSysPanels(d, ramUsedGb, ramTotalGb);
+		if (_monitorTabVisible)
+		{
+			BuildSysPanels(d, ramUsedGb, ramTotalGb);
+		}
 
 		// ── 模型与 Slot ──
-		BuildSlotCards(slotsNow, llamaUp: IsAlive(_llamaProc));
+		if (_monitorTabVisible)
+		{
+			BuildSlotCards(slotsNow, llamaUp: IsAlive(_llamaProc));
+		}
 
 		// ── 历史趋势 ──
-		UpdateTrends();
+		if (_monitorTabVisible)
+		{
+			UpdateTrends();
+		}
 		UpdatePhaseCard();
 
 		// OOM 重试成功后真正进入 API 在线态才补重置额度(3 秒进程存活不算数)
@@ -7112,6 +7276,17 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			_oomRetryActive = false;
 			_oomRetryLeft = 3;
 			Log("[OOM] 服务已在线, 重试额度重置为 3");
+			// 降层值落盘: 否则下次启动回到 OOM 原值, 重演崩溃循环
+			try
+			{
+				_profiles[_currentProfile] = BuildConfig();
+				SaveConfigFile();
+				Log("[OOM] 降层后的配置已写入当前方案");
+			}
+			catch (Exception exPer)
+			{
+				LogError(exPer, "OOM 降层配置持久化失败");
+			}
 		}
 
 	/// <summary>
@@ -7897,7 +8072,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				Directory.CreateDirectory(_configDir);
 			}
-			File.WriteAllText(path, JsonSerializer.Serialize(new ConfigFile
+			// 原子写: 半写入(进程被杀/断电)不再产生截断的配置文件
+			string tmpPath = path + ".tmp";
+			File.WriteAllText(tmpPath, JsonSerializer.Serialize(new ConfigFile
 			{
 				Profiles = _profiles,
 				CurrentProfile = _currentProfile,
@@ -7908,6 +8085,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				WriteIndented = true,
 				Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
 			}));
+			if (File.Exists(path))
+			{
+				File.Replace(tmpPath, path, null);
+			}
+			else
+			{
+				File.Move(tmpPath, path);
+			}
 		}
 		catch (Exception ex)
 		{
@@ -7993,6 +8178,17 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		catch (Exception ex2)
 		{
 			LogError(ex2, "读取配置文件失败");
+			// 损坏文件留底: 否则下一次保存用默认状态覆盖, 多方案数据永久丢失且无感知
+			try
+			{
+				string bak = path + ".corrupt-" + DateTime.Now.ToString("yyyyMMdd-HHmmssfff") + ".bak";
+				File.Copy(path, bak, true);
+				Log("[配置] 已把损坏的配置文件备份为: " + bak);
+				ShowNotice("配置文件损坏无法读取，已备份为 " + Path.GetFileName(bak) + "，本次使用默认配置。", isError: true);
+			}
+			catch
+			{
+			}
 			return null;
 		}
 	}

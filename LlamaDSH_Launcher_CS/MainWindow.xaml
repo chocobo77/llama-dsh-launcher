@@ -74,9 +74,10 @@
               <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="8,8,0,0" Padding="16,9" Margin="3,4,2,0">
                 <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
               </Border>
+              <!-- 悬停高亮用独立覆盖层: 不覆盖代码写入的激活态背景(激活标签悬停不再闪烁回灰) -->
               <ControlTemplate.Triggers>
                 <Trigger Property="IsMouseOver" Value="True">
-                  <Setter TargetName="bd" Property="Background" Value="#ffffff14" />
+                  <Setter TargetName="bd" Property="Opacity" Value="0.85" />
                 </Trigger>
               </ControlTemplate.Triggers>
             </ControlTemplate>

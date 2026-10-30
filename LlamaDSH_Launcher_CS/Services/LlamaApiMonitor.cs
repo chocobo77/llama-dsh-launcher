@@ -76,6 +76,7 @@ public sealed partial class LlamaApiMonitor
 	private readonly Dictionary<int, SlotState> _slotStates = new();
 	private int _failCount;
 	private double _lastSlowPoll;
+	private bool _slowPollBusy;
 	private int _llamaPortCache = -1;
 
 	public bool Online { get; private set; }
@@ -204,11 +205,31 @@ public sealed partial class LlamaApiMonitor
 	public void PollSlowIfNeeded()
 	{
 		double now = Environment.TickCount64 / 1000.0;
-		if (now - _lastSlowPoll < 30.0)
+		if (now - _lastSlowPoll < 30.0 || _slowPollBusy)
 		{
 			return;
 		}
 		_lastSlowPoll = now;
+		_slowPollBusy = true;
+		// 两次 HTTP 最长各 2s, 不再串行阻塞快轮询拍(3s 周期被拉到 ~7s 导致 tps 差分抖动)
+		Task.Run(() =>
+		{
+			try
+			{
+				PollSlowCore();
+			}
+			catch
+			{
+			}
+			finally
+			{
+				_slowPollBusy = false;
+			}
+		});
+	}
+
+	private void PollSlowCore()
+	{
 		int port = _portGetter();
 		if (port <= 0)
 		{
