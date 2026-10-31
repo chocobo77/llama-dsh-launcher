@@ -6492,20 +6492,21 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		_cpuCounter = null;
 	}
 
+	// 配置端口缓存: 采集线程读, 只在 UI 线程写(GetLlamaPort 直接读控件会跨线程异常,
+	// 被 _portGetter 吞掉后配置端口永远到不了采集器——模型信息/生成速度全灭的根因)
+	private volatile int _cachedLlamaPort;
+
 	private int GetLlamaPort()
 	{
-		// 1) 参数面板 port 控件: 仅在该参数已勾选启用时可信
-		//    (禁用时 BuildCmd 不发射 --port, 面板里的默认值 1234 是幌子,
-		//     llama-server 实际按自身默认 8080 或自定义参数监听)
-		if (_pw.TryGetValue("port", out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) portPair)
-			&& portPair.Item1.IsChecked == true)
+		// UI 线程调用时刷新缓存; 采集线程只读缓存值
+		if (Dispatcher.CheckAccess())
 		{
-			string ctlText = portPair.Item2 is System.Windows.Controls.ComboBox pcb ? pcb.Text
-				: portPair.Item2 is System.Windows.Controls.TextBox ptb ? ptb.Text : "";
-			if (int.TryParse((ctlText ?? "").Trim(), out int cfgPort) && cfgPort > 0 && cfgPort < 65536)
-			{
-				return cfgPort;
-			}
+			CacheLlamaPort();
+		}
+		// 1) 参数面板缓存的配置端口
+		if (_cachedLlamaPort > 0)
+		{
+			return _cachedLlamaPort;
 		}
 		// 2) 命令行预览(含自定义参数): --port N 与 --port=N
 		Match match = Regex.Match(_lastCmd ?? "", "--port[= ](\\d+)");
@@ -6520,6 +6521,30 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		// 4) 未知 → 0, 由采集端自动发现兜底
 		return 0;
+	}
+
+	/// <summary>读参数面板 port 控件值缓存下来。仅 UI 线程调用。</summary>
+	private void CacheLlamaPort()
+	{
+		try
+		{
+			if (_pw.TryGetValue("port", out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) portPair)
+				&& portPair.Item1.IsChecked == true)
+			{
+				// 勾选启用时控件值才可信(禁用时 BuildCmd 不发射 --port, 默认值 1234 是幌子)
+				string ctlText = portPair.Item2 is System.Windows.Controls.ComboBox pcb ? pcb.Text
+					: portPair.Item2 is System.Windows.Controls.TextBox ptb ? ptb.Text : "";
+				if (int.TryParse((ctlText ?? "").Trim(), out int cfgPort) && cfgPort > 0 && cfgPort < 65536)
+				{
+					_cachedLlamaPort = cfgPort;
+					return;
+				}
+			}
+			_cachedLlamaPort = 0;
+		}
+		catch
+		{
+		}
 	}
 
 	// ── 监测标签页(Strata Monitor 复刻): 60 秒历史 + 图表/状态卡/Gauge/请求表 ──
