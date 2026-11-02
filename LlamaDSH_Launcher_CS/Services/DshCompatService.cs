@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Formats.Tar;
@@ -1298,15 +1298,24 @@ public static class DshCompatService
         /// </summary>
         private static void WriteFileAtomic(string path, string content)
         {
-            string tmp = path + ".tmp-atomic";
-            File.WriteAllText(tmp, content, new UTF8Encoding(false));
-            if (File.Exists(path))
+            // 唯一 tmp 名: 固定名下两个并发写者会互相截断对方的 tmp,
+            // 随后 File.Replace 把半截 JSON "原子地"写进目标
+            string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp-atomic";
+            try
             {
-                File.Replace(tmp, path, null);
+                File.WriteAllText(tmp, content, new UTF8Encoding(false));
+                if (File.Exists(path))
+                {
+                    File.Replace(tmp, path, null);
+                }
+                else
+                {
+                    File.Move(tmp, path);
+                }
             }
-            else
+            finally
             {
-                File.Move(tmp, path);
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
             }
         }
 

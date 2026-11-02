@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.CodeDom.Compiler;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -4471,6 +4471,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 						return;
 					}
 				}
+				// 重试未执行(额度耗尽/开关关闭/降层失败): 必须复位, 否则
+				// _oomRetryActive 卡死 → 之后手动启动永久跳过显存预算确认弹窗
+				_oomRetryActive = false;
 			}
 			else
 			{
@@ -6352,7 +6355,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}
 			});
 			int num = 0;
-			while (!_perfCts.Token.IsCancellationRequested)
+			// 捕获局部引用: StopPerf 的 Join(3s) 超时后把 _perfCts 置 null, 而本线程
+			// 可能还在 Sleep(监测页隐藏时最长 30s) —— 循环条件重读共享字段会 NRE 崩进程
+			var perfCts = _perfCts;
+			while (perfCts != null && !perfCts.IsCancellationRequested)
 			{
 				try
 				{
@@ -7823,6 +7829,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			catch (Exception ex2)
 			{
 				LogError(ex2, "接管 Llama 进程失败");
+				// PID 已不存在(GetProcessById 抛异常)是最常见失效场景:
+				// 不清状态文件会让每次启动都报一遍接管失败
+				ClearStateFile();
 			}
 		}
 		string dd = stateFile?.DshDir ?? EffectiveDshDir();
@@ -8925,10 +8934,25 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			flag3 = messageBoxResult == MessageBoxResult.Yes;
 		}
+		_exiting = true; // Shutdown 会再次触发 Closing, 入口守卫放行(此处先置位防重入二次弹窗)
 		if (flag3)
 		{
+			// 记录退出前 pid, Stop 的异步杀树若未及完成, Shutdown 前同步补杀
+			// (Shutdown 不等后台线程池, fire-and-forget 会让"停止并退出"落空)
+			int? llamaPid = _llamaProc?.Id;
+			int? dshPid = _dshTracker?.Pid ?? _dshProc?.Id;
 			StopLlama();
 			StopDsh();
+			try
+			{
+				if (llamaPid.HasValue) ProcessHelper.KillProcessTree(llamaPid.Value);
+			}
+			catch { }
+			try
+			{
+				if (dshPid.HasValue) ProcessHelper.KillProcessTree(dshPid.Value);
+			}
+			catch { }
 			ClearStateFile();
 		}
 		else
@@ -8938,6 +8962,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		StopPerf();
 		FlushRunLog();
 		_trayIcon?.Dispose();
+		_trayIcon = null; // 重入的托盘分支会对已 Dispose 的 NotifyIcon 调方法
 		System.Windows.Application.Current.Shutdown();
 	}
 

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Net.Http;
@@ -187,7 +187,7 @@ public sealed partial class LlamaApiMonitor
 				Online = false;
 				GenTps = 0;
 				PromptTps = 0;
-				lock (Slots)
+				lock (_lock)
 				{
 					foreach (var sl in Slots)
 					{
@@ -686,9 +686,11 @@ partial class LlamaApiMonitor
 		_promptTokens = _decodedTokens = _totalTokens = 0;
 		Online = false;
 		_failCount = 0;
-		_slotStates.Clear();
-		lock (Slots)
+		// 与 ProcessSlots 同一把 _lock: 此前 _slotStates 无锁 Clear 且 Slots 用另一把
+		// 锁, 与采集线程的写入并发会损坏 Dictionary 桶链(死循环/异常)
+		lock (_lock)
 		{
+			_slotStates.Clear();
 			Slots.Clear();
 		}
 		Boot.Warnings.Clear();

@@ -1,4 +1,6 @@
+﻿using System;
 using System.Diagnostics;
+using System.Security.Cryptography;
 using System.IO;
 using System.IO.Compression;
 using System.Net.Http;
@@ -30,6 +32,8 @@ public static class UpdateService
 
 	// ==================== llama.cpp ====================
 
+	private static Dictionary<string, string> digests = new();
+
 	public sealed class LlamaReleaseInfo
 	{
 		public string Tag = "";
@@ -40,6 +44,9 @@ public static class UpdateService
 		public long Size;
 		public long CudartSize;
 		public string CudartUrl = "";
+		/// <summary>GitHub API 提供的资产完整性摘要(sha256:...); 镜像链防篡改。</summary>
+		public string Digest = "";
+		public string CudartDigest = "";
 		/// <summary>稳定版标签（如 v0.4.0）；滚动构建时为空。</summary>
 		public string StableVersion = "";
 	}
@@ -230,8 +237,9 @@ public static class UpdateService
 	{
 		string tag = release.TryGetProperty("tag_name", out JsonElement te) ? te.GetString() ?? ("b" + build) : ("b" + build);
 		// 收集全部 Windows x64 预编译主包候选（排除 cudart 纯运行库与 arm64）
-		var cands = new List<(string name, string url)>();
+		var cands = new List<(string, string, string)>();
 		var sizes = new Dictionary<string, long>();
+		digests = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 		if (release.TryGetProperty("assets", out JsonElement assets) && assets.ValueKind == JsonValueKind.Array)
 		{
 			foreach (JsonElement a in assets.EnumerateArray())
@@ -251,8 +259,10 @@ public static class UpdateService
 					continue;
 				}
 				long aSize = a.TryGetProperty("size", out JsonElement se2) && se2.ValueKind == JsonValueKind.Number ? se2.GetInt64() : 0;
-				cands.Add((name, url));
+				string aDigest = a.TryGetProperty("digest", out JsonElement de2) && de2.ValueKind == JsonValueKind.String ? de2.GetString() ?? "" : "";
+				cands.Add((name, url, aDigest));
 				sizes[name] = aSize;
+				digests[name] = aDigest;
 			}
 		}
 		// 按显卡挑后端: NVIDIA=CUDA(取最高版本), Intel=SYCL(原生低比特内核), AMD/默认=Vulkan; 依次回退
@@ -291,7 +301,9 @@ public static class UpdateService
 		}
 		sizes.TryGetValue(chosen.Value.name, out long chosenSz);
 		sizes.TryGetValue(cudartName, out long cudartSz);
-		return new LlamaReleaseInfo { Tag = tag, Build = build, AssetName = chosen.Value.name, AssetUrl = chosen.Value.url, Size = chosenSz, CudartName = cudartName, CudartUrl = cudartUrl, CudartSize = cudartSz };
+		string chosenDigest = digests.TryGetValue(chosen.Value.name, out var cd) ? cd : "";
+		string cudartDigest = cudartName.Length > 0 && digests.TryGetValue(cudartName, out var cdd) ? cdd : "";
+		return new LlamaReleaseInfo { Tag = tag, Build = build, AssetName = chosen.Value.name, AssetUrl = chosen.Value.url, Size = chosenSz, CudartName = cudartName, CudartUrl = cudartUrl, CudartSize = cudartSz, Digest = chosenDigest, CudartDigest = cudartDigest };
 	}
 
 	private static (string name, string url)? PickAsset(List<(string name, string url)> cands, string token)
@@ -440,7 +452,7 @@ public static class UpdateService
 				"https://ghfast.top/" + release.AssetUrl,
 				"https://ghproxy.net/" + release.AssetUrl
 			};
-			bool downloaded = await DownloadAssetAsync(urls, zipPath, release.Size);
+			bool downloaded = await DownloadAssetAsync(urls, zipPath, release.Size, release.Digest);
 			if (!downloaded)
 			{
 				return (false, "下载 llama.cpp 预编译包失败（GitHub/镜像均不可达或文件过小）");
@@ -457,7 +469,7 @@ public static class UpdateService
 				{
 					Directory.Delete(cext, true);
 				}
-				if (await DownloadAssetAsync(new[] { release.CudartUrl, "https://gh-proxy.com/" + release.CudartUrl, "https://ghfast.top/" + release.CudartUrl, "https://ghproxy.net/" + release.CudartUrl }, czip, release.CudartSize))
+				if (await DownloadAssetAsync(new[] { release.CudartUrl, "https://gh-proxy.com/" + release.CudartUrl, "https://ghfast.top/" + release.CudartUrl, "https://ghproxy.net/" + release.CudartUrl }, czip, release.CudartSize, release.CudartDigest))
 				{
 					ZipFile.ExtractToDirectory(czip, cext);
 					cudartDir = FindDirContainingAnyDll(cext);
@@ -519,7 +531,7 @@ public static class UpdateService
 	/// 按顺序尝试下载（直连 + 镜像）。写 .part 临时文件, 成功后原子改名;
 	/// expectedSize>0 时校验长度(±1%), 防镜像返回错误页/截断包; 失败删 .part 换下一源。
 	/// </summary>
-	private static async Task<bool> DownloadAssetAsync(IEnumerable<string> urls, string destPath, long expectedSize = 0)
+	private static async Task<bool> DownloadAssetAsync(IEnumerable<string> urls, string destPath, long expectedSize = 0, string expectedDigest = "")
 	{
 		string partPath = destPath + ".part";
 		foreach (string u in urls)
@@ -548,6 +560,23 @@ public static class UpdateService
 						if (expectedSize > 0 && Math.Abs(len - expectedSize) > expectedSize / 100)
 						{
 							continue;
+						}
+						// 内容哈希校验: 镜像链(gh-proxy/ghfast/ghproxy)任一环可返回等长篡改内容,
+						// GitHub API 的 asset digest(sha256:...)是唯一强校验来源
+						if (!string.IsNullOrEmpty(expectedDigest))
+						{
+							string want = expectedDigest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase)
+								? expectedDigest[7..].ToLowerInvariant() : expectedDigest.ToLowerInvariant();
+							using (var sha = System.Security.Cryptography.SHA256.Create())
+							using (FileStream fs = File.OpenRead(partPath))
+							{
+								string got = Convert.ToHexString(sha.ComputeHash(fs)).ToLowerInvariant();
+								if (got != want)
+								{
+									AppLog.WriteError($"下载校验失败({u}): sha256 不匹配(得 {got[..16]}… 期望 {want[..16]}…), 换下一镜像");
+									continue;
+								}
+							}
 						}
 						File.Move(partPath, destPath, overwrite: true);
 						return true;

@@ -440,6 +440,21 @@ def api_status(_):
         dsh_pid = DSH.tracker.pid
     elif DSH.proc is not None:
         dsh_pid = DSH.proc.pid
+    if MON.lightweight:
+        return {
+            "llama": {"status": LLAMA.status, "pid": LLAMA.proc.pid if LLAMA.proc else None},
+            "dsh": {"status": DSH.status, "pid": DSH.tracker.pid if DSH.tracker else None,
+                    "url": "http://127.0.0.1:%d" % DSH_PORT,
+                    "rebuilding": DSH.rebuild_running(),
+                    "converting": CONVERTER.running},
+            "monitor": {"lightweight": True, "llama_status": LLAMA.status,
+                        "dsh_status": DSH.status,
+                        "vram": MON.snapshot.get("vram", {"used": 0, "total": 0, "pct": 0}),
+                        "breaker_triggered": MON.breaker_triggered},
+            "profile": name,
+            "lightweight": True,
+            "dsh_stale_lock": DSH.stale_lock_present(),
+        }
     return {
         "llama": {"status": LLAMA.status, "pid": LLAMA.proc.pid if LLAMA.proc else None},
         "dsh": {"status": DSH.status, "pid": dsh_pid,
@@ -454,7 +469,10 @@ def api_status(_):
 
 
 def api_logs(body):
-    after = int(body.get("after") or 0)
+    try:
+        after = int(body.get("after") or 0)
+    except (TypeError, ValueError):
+        after = 0
     items, new_after = HUB.since(after, 400)
     return {"lines": [{"seq": s, "text": t} for s, t in items], "after": new_after}
 
@@ -931,6 +949,7 @@ def main():
     for i in range(20):
         try:
             server = ThreadingHTTPServer(("127.0.0.1", port + i), Handler)
+            server.daemon_threads = True
             port = port + i
             break
         except OSError:

@@ -159,11 +159,9 @@ public static class ProcessHelper
 				}
 				try
 				{
-					string text3 = Process.GetProcessById(result2).ProcessName.ToLowerInvariant();
-					if ((text3 == "node" || text3 == "node.exe") ? true : false)
-					{
-						return result2;
-					}
+					// 不限进程名: 本回退路径与 iphlpapi 主路径语义一致 ——
+					// llama 端口预检也走这里, 按 node 过滤会让预检在降级机器上失效
+					return result2;
 				}
 				catch
 				{

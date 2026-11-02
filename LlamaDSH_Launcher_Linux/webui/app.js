@@ -417,16 +417,17 @@ const describeRule = (r) => (r.op === "enabled" ? `--${r.flag} 已启用` :
 
 /* ------------------- 逐参数真实启动参数回显(48a9a2f) ------------------- */
 function updateArgEcho() {
-  for (const d of SCHEMA.params) {
-    if (d.hidden || d.flag === "model" || d.flag === "model-draft") continue;
-    const el = $("ae_" + cssId(d.flag));
-    if (!el) continue;
+  // 只遍历当前挂载的回显行(导航式渲染下其余子组本就不在 DOM)
+  const byId = {};
+  for (const d of SCHEMA.params) byId[cssId(d.flag)] = d;
+  for (const el of document.querySelectorAll(".argEcho")) {
+    const d = byId[el.id.slice(3)];
+    if (!d) continue;
     const emitted = FLAG_ARGS[d.flag];
     if (emitted && emitted.length) {
       el.textContent = emitted.join(" ");
       el.classList.add("on");
     } else {
-      // 未发射 → 灰色"若启用"预览
       const ok = requiresOk(d);
       let txt;
       if (d.type === "Bool") {
@@ -483,6 +484,7 @@ async function editCustomArgs() {
   if (v !== "__ok__") return;
   PROF.CustomArgs = box.querySelector("#customArgs").value.split("\n")
     .map(s => s.trim()).filter(Boolean);
+  CFG.Profiles[CFG.CurrentProfile] = PROF;
   updateCustomPreview();
   refreshPreview();
 }
@@ -523,6 +525,8 @@ async function pollStatus() {
   $("btnDshStart").disabled = dshBusy;
   $("btnDshStop").disabled = !dshBusy;
   $("btnOpenDsh").disabled = !["running", "running_admin", "taken_over"].includes(s.dsh.status);
+  const lw = $("lblLightweight");
+  if (lw) lw.style.display = s.lightweight ? "" : "none";
 }
 
 /* ============================== 监测页 ================================= */
@@ -849,7 +853,8 @@ function renderModelSlots(m) {
   const mi = m.model || {};
   setTxt("miName", mi.name || mi.path ? (mi.name || (mi.path || "").split("/").pop()) : "—");
   setTxt("miPath", mi.path ? "路径 " + mi.path : "");
-  setTxt("miFtype", mi.ftype || "");
+  setTxt("miFtype", mi.ftype || "");  // C# 同语义恒 "", 空时隐藏徽章
+  $("miFtype").style.display = mi.ftype ? "" : "none";
   setTxt("miParams", mi.n_params != null ? fmtTok(mi.n_params) : "—");
   setTxt("miSize", mi.size != null ? (mi.size >= GIB ? fmtN(mi.size / GIB, 2) + " GB" : fmtN(mi.size / 1048576, 0) + " MB") : "—");
   setTxt("miEmbd", mi.n_embd ?? "—");
@@ -1036,19 +1041,20 @@ function histPair(m, key) {
 
 function renderTrends(m) {
   const H = m.hists || {};
+  const pair = (k) => H[k] || [[], []];
   const cfgs = [
-    ["trendGen", "Token 生成速度", "tok/s", [["生成", "#7cd7f7", (H.tps || [[], []])[0]]], (H.tps || [[], []])[1], null, null],
-    ["trendPf", "预填充速度", "tok/s", [["预填充", "#4ade80", (H.pf || [[], []])[0]]], (H.pf || [[], []])[1], null, null],
-    ["trendCtx", "上下文占用", "tokens", [["上下文", "#f5b53d", (H.ctx || [[], []])[0]]], (H.ctx || [[], []])[1], 0, (m.ctx?.total || null)],
-    ["trendMtp", "MTP 接受率", "%", [["接受率", "#7cd7f7", (H.mtp || [[], []])[0]]], (H.mtp || [[], []])[1], 0, 100],
-    ["trendGpuUtil", "GPU 利用率", "%", [["利用率", "#f0883e", (H.gpu_util || [[], []])[0]]], (H.gpu_util || [[], []])[1], 0, 100],
-    ["trendGpuMem", "GPU 显存", "GB", [["显存", "#f0883e", (H.gpu_mem || [[], []])[0]]], (H.gpu_mem || [[], []])[1], 0, null],
-    ["trendGpuTemp", "GPU 温度", "°C", [["温度", "#f5b53d", (H.gpu_temp || [[], []])[0]]], (H.gpu_temp || [[], []])[1], 0, 110],
-    ["trendGpuPower", "GPU 功耗", "W", [["功耗", "#d29916", (H.gpu_power || [[], []])[0]]], (H.gpu_power || [[], []])[1], 0, null],
-    ["trendCpu", "CPU", "%", [["CPU", "#58a6ff", (H.cpu || [[], []])[0]]], (H.cpu || [[], []])[1], 0, 100],
-    ["trendMem", "内存", "GB", [["内存", "#58a6ff", (H.ram || [[], []])[0]]], (H.ram || [[], []])[1], 0, null],
-    ["trendNet", "网络", "MB/s", [["下行", "#7cd7f7", (H.net_rx || [[], []])[0]], ["上行", "#4ade80", (H.net_tx || [[], []])[0]]],
-      (H.net_rx || [[], []])[1], 0, null],
+    ["trendGen", "Token 生成速度", "tok/s", [["生成", "#7cd7f7", pair('tps')[0]]], pair('tps')[1], null, null],
+    ["trendPf", "预填充速度", "tok/s", [["预填充", "#4ade80", pair('pf')[0]]], pair('pf')[1], null, null],
+    ["trendCtx", "上下文占用", "tokens", [["上下文", "#f5b53d", pair('ctx')[0]]], pair('ctx')[1], 0, (m.ctx?.total || null)],
+    ["trendMtp", "MTP 接受率", "%", [["接受率", "#7cd7f7", pair('mtp')[0]]], pair('mtp')[1], 0, 100],
+    ["trendGpuUtil", "GPU 利用率", "%", [["利用率", "#f0883e", pair('gpu_util')[0]]], pair('gpu_util')[1], 0, 100],
+    ["trendGpuMem", "GPU 显存", "GB", [["显存", "#f0883e", pair('gpu_mem')[0]]], pair('gpu_mem')[1], 0, null],
+    ["trendGpuTemp", "GPU 温度", "°C", [["温度", "#f5b53d", pair('gpu_temp')[0]]], pair('gpu_temp')[1], 0, 110],
+    ["trendGpuPower", "GPU 功耗", "W", [["功耗", "#d29916", pair('gpu_power')[0]]], pair('gpu_power')[1], 0, null],
+    ["trendCpu", "CPU", "%", [["CPU", "#58a6ff", pair('cpu')[0]]], pair('cpu')[1], 0, 100],
+    ["trendMem", "内存", "GB", [["内存", "#58a6ff", pair('ram')[0]]], pair('ram')[1], 0, null],
+    ["trendNet", "网络", "MB/s", [["下行", "#7cd7f7", pair('net_rx')[0]], ["上行", "#4ade80", pair('net_tx')[0]]],
+      pair('net_rx')[1], 0, null],
   ];
   for (const [id, title, unit, series, stamps, ymin, ymax] of cfgs) {
     const svg = $(id);

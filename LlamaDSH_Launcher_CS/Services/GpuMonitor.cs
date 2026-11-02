@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -925,6 +925,14 @@ public class GpuMonitor
 		if (_gpuTempThread != null && _gpuTempThread.IsAlive)
 		{
 			_gpuTempThread.Join(2000);
+		}
+		// 进程对象是非托管句柄包装: 每次托盘显隐都会 Stop/Start, 不 Dispose 会累积泄漏
+		try
+		{
+			_gpuTempProc?.Dispose();
+		}
+		catch
+		{
 		}
 		_gpuTempProc = null;
 		_gpuTempThread = null;

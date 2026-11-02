@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -48,6 +48,9 @@ public static partial class NvmlMonitor
 
 	[DllImport("kernel32", CharSet = CharSet.Ansi, SetLastError = true)]
 	private static extern IntPtr GetProcAddress(IntPtr h, string name);
+
+	[DllImport("kernel32", SetLastError = true)]
+	private static extern bool FreeLibrary(IntPtr hLibModule);
 
 	[StructLayout(LayoutKind.Sequential)]
 	private struct NvmlUtilization
@@ -103,6 +106,9 @@ public static partial class NvmlMonitor
 			var init = GetFn<IntFn>("nvmlInit_v2");
 			if (init == null || init() != 0)
 			{
+				// 已 LoadLibrary 成功的句柄要释放: 失败路径每 60s 重试一次,
+				// 不释放会随进程存活持续泄漏 nvml.dll 引用计数
+				FreeLibrary(_lib);
 				_lib = IntPtr.Zero;
 				AppLog.WriteError("NVML 初始化失败: nvmlInit 非零返回");
 				return;
@@ -289,11 +295,10 @@ public static partial class NvmlMonitor
 				}
 				// PCIe 空闲吞吐=0 是合法读数, 去掉 >0 门
 				// 单卡循环逐卡累加, 走到这里即至少有一张卡; PCIe 空闲吞吐=0 合法, 不设 >0 门
-				if (r.ContainsKey("gpu_count"))
-				{
-					r["pcie_rx_kbs"] = rxKbS.ToString("F0", CultureInfo.InvariantCulture);
-				}
+				// gpu_count 必须先写入(下方 pcie_rx 以它为门槛); 原顺序颠倒导致 NVML 直采
+				// 的 PCIe 吞吐永不产出
 				r["gpu_count"] = n.ToString(CultureInfo.InvariantCulture);
+				r["pcie_rx_kbs"] = rxKbS.ToString("F0", CultureInfo.InvariantCulture);
 				if (!string.IsNullOrWhiteSpace(name0))
 				{
 					r["gpu_name"] = name0;
@@ -444,6 +449,24 @@ partial class NvmlMonitor
 			}
 			return list;
 		}
+
+		/// <summary>进程退出时调用: 释放 NVML 资源(与 nvmlInit_v2 配对)。</summary>
+		public static void ShutdownNvml()
+		{
+			try
+			{
+				if (!_ok)
+				{
+					return;
+				}
+				var fn = GetFn<IntFn>("nvmlShutdown");
+				fn?.Invoke();
+				_ok = false;
+			}
+			catch
+			{
+			}
+		}
 	}
 }
 
@@ -512,3 +535,4 @@ partial class NvmlMonitor
 		return list;
 	}
 }
+

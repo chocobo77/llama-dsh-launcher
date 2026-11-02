@@ -373,6 +373,8 @@ class LlamaRunner:
         self.proc = None
         self.status = "stopped"
         self.api.reset_log_machine()
+        self.mem_state = {"oom_seen": False, "offloaded": 0, "total_layers": 0, "buffers": {}}
+        self.oom_retry_active = False
         self.hub.log("--- 已停止 ---")
         state.clear_state_for("LlamaPid")
 
