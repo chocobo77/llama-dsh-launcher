@@ -31,8 +31,18 @@ def default_profile():
         "DshAdminMode": False,  # Linux 版默认关闭(原版 true 为读取 Windows 游戏内存所需)
         "MinimizeToTray": False,
         "BoolParams": {}, "ValueParams": {},
-        "CmdPreview": "",
+        # CmdPreview 为派生数据不落盘(与 CS [JsonIgnore] 语义一致)
         "VramBreakerEnabled": False, "VramBreakerType": 0, "VramBreakerValue": 90.0,
+        # llama.cpp 变体(分支)列表与当前激活名;Dir 与 LlamaDir 冗余,以激活项为准
+        "LlamaVariants": [], "ActiveLlamaVariant": "",
+        # 命令行末尾原样追加的自定义参数
+        "CustomArgs": [],
+        # 实测设备侧显存(MiB)与指纹,换模型后作废
+        "VramMeasuredMiB": 0.0, "VramMeasuredModel": "", "VramMeasuredFp": "",
+        # OOM 自动降层重试(默认开)
+        "OomRetryEnabled": True,
+        # llama.cpp 后端: ""=按显卡自动;可显式指定 vulkan/rocm/cuda/sycl
+        "LlamaBackend": "",
     }
 
 
@@ -97,15 +107,24 @@ def load_config():
         return {"Profiles": {"Default": base}, "CurrentProfile": "Default",
                 "WindowWidth": 0, "WindowHeight": 0}, None
     except Exception as ex:
-        return default_config(), str(ex)
+        # 损坏配置留底 .corrupt-*.bak,避免好配置被静默覆盖丢失(4f2ccf5 同款)
+        try:
+            bak = "%s.corrupt-%s.bak" % (path, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+            os.replace(path, bak)
+        except OSError:
+            bak = "(留底失败)"
+        return default_config(), "%s(原文件已留底: %s)" % (ex, bak)
 
 
 def save_config(cfg):
+    """原子写: 先写 .tmp 再 os.replace,进程被杀/断电不留截断文件(be42658 同款)。"""
     path = config_file_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     with _lock:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
     return path
 
 

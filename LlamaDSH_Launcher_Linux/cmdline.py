@@ -111,6 +111,12 @@ def rule_met(st, r):
     return compare_values(st.effective_value(d), op, r.get("value") or "")
 
 
+def requires_met(st, d):
+    """全部 requires 满足才返回 True(off 语义发射与生效段共用此守卫)。"""
+    req = d.get("requires") or []
+    return all(rule_met(st, r) for r in req)
+
+
 def check_param(st, d, on):
     """单参数依赖/互斥/校验。返回 None=通过,否则剔除原因。"""
     req = d.get("requires") or []
@@ -167,9 +173,9 @@ def resolve_model_path(model_raw, log_fn=None):
     if not raw:
         return None, None
     if os.path.isdir(raw):
-        first_shards = sorted(glob.glob(os.path.join(raw, "*-00001-of-*.gguf")))
+        first_shards = _pick_shard_family(glob.glob(os.path.join(raw, "*-00001-of-*.gguf")))
         if first_shards:
-            return first_shards[0], None
+            return first_shards, None
         ggu = glob.glob(os.path.join(raw, "*.gguf"))
         if len(ggu) == 1:
             return ggu[0], None
@@ -193,6 +199,32 @@ def resolve_model_path(model_raw, log_fn=None):
             return None, msg
         return raw, None
     return raw, None  # 原版行为:不存在的路径原样透传
+
+
+def _pick_shard_family(cands):
+    """同目录多套 *-00001-of-*.gguf 时按"同前缀分片数最多"选家族(平手按文件名)。
+    868253e:纯字典序会选错家族——例如 A-00001-of-00002 与 B-00001-of-00009 应选 B。"""
+    if not cands:
+        return None
+    fams = {}  # lower(key) -> (原始前缀, paths)
+    for c in cands:
+        m = re.match(r"^(.*)-\d{5}-of-\d{5}\.gguf$", os.path.basename(c), re.I)
+        if m:
+            key = m.group(1)
+        else:
+            key = os.path.basename(c)
+        fams.setdefault(key.lower(), (key, []))[1].append(c)
+    # 家族总分片数 = 该前缀下完整 glob 的数量(含全部分片,不只第一片)
+    def fam_size(orig_key, sample):
+        d = os.path.dirname(sample)
+        return len(glob.glob(os.path.join(d, orig_key + "-*-of-*.gguf")))
+    best = None
+    for low, (orig_key, paths) in fams.items():
+        n = fam_size(orig_key, paths[0])
+        cand = (n, min(os.path.basename(p) for p in paths))
+        if best is None or cand[0] > best[0][0] or (cand[0] == best[0][0] and cand[1] < best[0][1]):
+            best = (cand, paths)
+    return sorted(best[1])[0]
 
 
 def detect_safetensors_dir(model_raw):
@@ -231,17 +263,25 @@ def _skip_gguf_value(f, vt):
 
 
 def read_gguf_arch(model_path):
-    """返回 dict(ok, layers, kv_heads, head_dim, context_len, architecture)。"""
-    r = {"ok": False, "layers": 0, "kv_heads": 0, "head_dim": 0, "context_len": 0, "architecture": ""}
+    """GGUF 头解析,返回 GgufArchInfo 等价 dict。
+
+    键: ok/layers/kv_heads/head_dim/head_count/embed/context_len/architecture/
+    sliding_window/full_attention_interval/nextn_predict_layers/expert_count/
+    ssm_inner_size/ssm_state_size/ssm_conv_kernel/vocab_size
+    (键表对齐 CS ReadGgufArch 当前版,含混合注意力/线性注意力/MTP 头)
+    """
+    r = {"ok": False, "layers": 0, "kv_heads": 0, "head_dim": 0, "head_count": 0,
+         "embed": 0, "context_len": 0, "architecture": "",
+         "sliding_window": 0, "full_attention_interval": 0, "nextn_predict_layers": 0,
+         "expert_count": 0, "ssm_inner_size": 0, "ssm_state_size": 0, "ssm_conv_kernel": 0,
+         "vocab_size": 0}
     try:
         with open(model_path, "rb") as f:
-            magic = f.read(4)
-            if magic != b"GGUF":
+            if f.read(4) != b"GGUF":
                 return r
             f.read(4)      # version
             f.read(8)      # tensor_count(u64)
             (kv_count,) = struct.unpack("<Q", f.read(8))
-            embed = heads = 0
             for _ in range(kv_count):
                 key = _read_gguf_string(f)
                 (vt,) = struct.unpack("<I", f.read(4))
@@ -252,15 +292,29 @@ def read_gguf_arch(model_path):
                     elif key.endswith(".attention.head_count_kv"):
                         r["kv_heads"] = v
                     elif key.endswith(".attention.head_count"):
-                        heads = v
+                        r["head_count"] = v
                     elif key.endswith(".attention.key_length"):
                         r["head_dim"] = v
                     elif key.endswith(".attention.value_length") and r["head_dim"] == 0:
                         r["head_dim"] = v
                     elif key.endswith(".embedding_length"):
-                        embed = v
+                        r["embed"] = v
                     elif key.endswith(".context_length"):
                         r["context_len"] = v
+                    elif key.endswith(".attention.sliding_window"):
+                        r["sliding_window"] = v
+                    elif key.endswith(".full_attention_interval"):
+                        r["full_attention_interval"] = v
+                    elif key.endswith(".nextn_predict_layers"):
+                        r["nextn_predict_layers"] = v
+                    elif key.endswith(".expert_count"):
+                        r["expert_count"] = v
+                    elif key.endswith(".ssm.inner_size"):
+                        r["ssm_inner_size"] = v
+                    elif key.endswith(".ssm.state_size"):
+                        r["ssm_state_size"] = v
+                    elif key.endswith(".ssm.conv_kernel"):
+                        r["ssm_conv_kernel"] = v
                 elif vt in (10, 11):
                     (v,) = struct.unpack("<Q", f.read(8))
                     if key.endswith(".context_length"):
@@ -269,15 +323,42 @@ def read_gguf_arch(model_path):
                     v = _read_gguf_string(f)
                     if key == "general.architecture":
                         r["architecture"] = v
+                elif vt == 9:
+                    # 数组: 只关心 tokenizer.ggml.tokens 的长度(词表大小)
+                    (et,) = struct.unpack("<I", f.read(4))
+                    (cnt,) = struct.unpack("<Q", f.read(8))
+                    if key == "tokenizer.ggml.tokens":
+                        r["vocab_size"] = cnt
+                        _skip_gguf_array_fast(f, et, cnt)
+                    else:
+                        for _ in range(cnt):
+                            _skip_gguf_value(f, et)
                 else:
                     _skip_gguf_value(f, vt)
-            if r["head_dim"] == 0 and heads > 0 and embed > 0:
-                r["head_dim"] = int(round(embed / heads))
+            # head_dim 回退链: key_length > value_length > round(embed/head_count) > 128
+            if r["head_dim"] == 0 and r["head_count"] > 0 and r["embed"] > 0:
+                r["head_dim"] = int(round(r["embed"] / r["head_count"]))
+            if r["head_dim"] == 0:
+                r["head_dim"] = 128
             if r["layers"] > 0 and r["kv_heads"] > 0 and r["head_dim"] > 0:
                 r["ok"] = True
     except Exception:
         r["ok"] = False
     return r
+
+
+def _skip_gguf_array_fast(f, et, cnt):
+    """跳过数组;对定长元素类型走 seek 快路径(tokenizer.ggml.tokens 可达 15 万条)。"""
+    fixed = {0: 1, 1: 1, 7: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 10: 8, 11: 8, 12: 8}
+    if et in fixed:
+        f.seek(fixed[et] * cnt, 1)
+    elif et == 8:
+        for _ in range(cnt):
+            (ln,) = struct.unpack("<Q", f.read(8))
+            f.seek(ln, 1)
+    else:
+        for _ in range(cnt):
+            _skip_gguf_value(f, et)
 
 
 def cache_bytes_per_elem(cache_type):
@@ -320,29 +401,42 @@ def is_spec_decoding_active(st, defs):
 
 
 def build_cmd(profile, defs):
-    """返回 (cmd_list, violations)。异常直接抛出(与原版一致,由调用方弹窗)。"""
+    """返回 (cmd_list, violations, flag_args)。
+
+    flag_args: {flag: [命令行片段...]} — 每个旗标实际发射的片段,
+    供逐参数真实启动参数回显(未发射参数由前端显示灰色预览)。
+    """
     st = ParamState(profile, defs)
+    if not (profile.get("LlamaDir") or "").strip().strip('"'):
+        # CS 语义: 目录为空 → 空命令(前端显示 "Empty"), 不抛错
+        return [], [], {}
     exe, err = find_llama_server(profile.get("LlamaDir"))
     if err:
         raise FileNotFoundError(err)
     lst = [exe]
+    flag_args = {"model": ["--model"], "model-draft": ["--model-draft"]}
 
     model_path, m_err = resolve_model_path(profile.get("ModelPath"))
     if m_err:
         raise FileNotFoundError(m_err)
     if model_path:
         lst += ["--model", model_path]
+        flag_args["model"] = ["--model", model_path]
     mtp = (profile.get("MtpPath") or "").strip().strip('"').strip()
     if mtp and is_spec_decoding_active(st, defs):
         lst += ["--model-draft", mtp]
+        flag_args["model-draft"] = ["--model-draft", mtp]
     mmproj_file = (profile.get("MmprojPath") or "").strip().strip('"').strip()
     mmproj_url = (profile.get("MmprojUrl") or "").strip().strip('"').strip()
     if mmproj_file:
         lst += ["--mmproj", mmproj_file]
+        flag_args["mmproj"] = ["--mmproj", mmproj_file]
     elif mmproj_url:
         lst += ["--mmproj-url", mmproj_url]
+        flag_args["mmproj-url"] = ["--mmproj-url", mmproj_url]
     if profile.get("NoMmprojOffload") and (mmproj_file or mmproj_url):
         lst.append("--no-mmproj-offload")
+        flag_args["__no_mmproj_offload"] = ["--no-mmproj-offload"]
 
     violations = []
     on = set()
@@ -361,23 +455,44 @@ def build_cmd(profile, defs):
             continue
         if d["type"] == "Bool":
             lst.append("--" + flag)
+            flag_args[flag] = ["--" + flag]
         else:
             v = st.effective_value(d)
             if d.get("role") == "ctx_size":
                 v = norm_tok(v)
             if v:
                 lst += ["--" + flag, v]
+                flag_args[flag] = ["--" + flag, v]
     # "取消勾选=关闭"语义: 配置了 off 语义的参数,未勾选时显式发射关闭值/否定旗标,
-    # 覆盖 llama-server 默认值不是"关闭"的选项(--no-jinja / --flash-attn off / --spec-type none 等)
+    # 覆盖 llama-server 默认值不是"关闭"的选项(--no-jinja / --flash-attn off / --spec-type none 等)。
+    # 前置未满足者跳过——否则"前置已取消、后置仍被注入"(如 spec-type=none 时仍发
+    # --no-spec-draft-backend-sampling)。这是 ParamRules.Build 的头号回归点(v4 修正)。
     for d in defs:
         flag = d["flag"]
         if flag in ("model", "model-draft") or d.get("hidden") or flag in on:
             continue
+        if not requires_met(st, d):
+            continue
         if d["type"] == "Bool":
             if d.get("offFlag"):
                 lst.append("--" + d["offFlag"])
+                flag_args[flag] = ["--" + d["offFlag"]]
         elif d.get("offValue"):
             lst += ["--" + flag, d["offValue"]]
+            flag_args[flag] = ["--" + flag, d["offValue"]]
+    # 自定义参数原样追加到末尾(48a9a2f 语义)
+    custom = profile.get("CustomArgs") or []
+    if isinstance(custom, list):
+        for a in custom:
+            a = str(a).strip()
+            if a:
+                lst.append(a)
+    return lst, violations, flag_args
+
+
+def build_cmd_simple(profile, defs):
+    """兼容旧调用:只返回 (cmd_list, violations)。"""
+    lst, violations, _ = build_cmd(profile, defs)
     return lst, violations
 
 
@@ -404,14 +519,30 @@ def qa(a):
     return a
 
 
-def fmt_cmd(cmd_list):
+def fmt_cmd(cmd_list, defs=None):
+    """命令预览格式化。868253e: 值以 -- 开头时纯启发式必然错位,
+    改为按 schema 已知旗标判断取值类型,未知旗标回退启发式。"""
     if not cmd_list:
         return ""
+    value_flags = set()
+    if defs:
+        for d in defs:
+            if d.get("type") != "Bool":
+                value_flags.add(d["flag"].lower())
+            for a in (d.get("aliases") or []):
+                value_flags.add(a.lower())
     out = [qa(cmd_list[0])]
     i = 1
     while i < len(cmd_list):
         t = cmd_list[i]
-        if t.startswith("--") and i + 1 < len(cmd_list) and not cmd_list[i + 1].startswith("--"):
+        takes = False
+        if t.startswith("--") and i + 1 < len(cmd_list):
+            name = t[2:].split("=", 1)[0].lower()
+            if name in value_flags:
+                takes = True
+            elif not cmd_list[i + 1].startswith("--"):
+                takes = True  # 未知旗标: 旧启发式兜底
+        if takes:
             out.append("    %s %s" % (qa(t), qa(cmd_list[i + 1])))
             i += 2
         else:
@@ -420,96 +551,303 @@ def fmt_cmd(cmd_list):
     return "\n".join(out)
 
 
+
+
 # ---------------------------------------------------------------- 显存估算 --
 
+def ggml_bpe(t):
+    """GGML 数据类型 → 每元素字节数(bytes per block / elems per block)。
+    表对齐 CS GgmlBpe(36 项, 未知类型 1.0 保守)。"""
+    table = {
+        0: 4.0, 1: 2.0, 2: 20.0 / 32, 3: 24.0 / 32, 4: 24.0 / 32, 5: 24.0 / 32,
+        6: 24.0 / 32, 7: 28.0 / 32, 8: 34.0 / 32, 9: 36.0 / 32,
+        10: 84.0 / 256, 11: 110.0 / 256, 12: 144.0 / 256, 13: 176.0 / 256,
+        14: 210.0 / 256, 15: 200.0 / 256,
+        16: 66.0 / 256, 17: 74.0 / 256, 18: 98.0 / 256, 19: 50.0 / 256,
+        20: 20.0 / 32, 21: 110.0 / 256, 22: 98.0 / 256, 23: 136.0 / 256,
+        24: 1.0, 25: 2.0, 26: 4.0, 27: 8.0, 28: 8.0, 29: 56.0 / 256, 30: 2.0,
+        31: 20.0 / 32, 32: 20.0 / 32, 33: 20.0 / 32, 34: 18.0 / 64, 35: 84.0 / 256,
+        36: 17.0 / 32,
+    }
+    return table.get(t, 1.0)
+
+
+def gguf_shard_paths(model_path):
+    """官方分片加载约定下 --model 只给第一片;枚举全部同族分片。"""
+    p = model_path
+    m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", os.path.basename(p), re.I)
+    if not m:
+        return [p]
+    stem = os.path.basename(p)[:m.start()]
+    d = os.path.dirname(p) or "."
+    total = int(m.group(2))
+    out = []
+    for i in range(1, total + 1):
+        cand = os.path.join(d, "%s-%05d-of-%05d.gguf" % (stem, i, total))
+        if os.path.isfile(cand):
+            out.append(cand)
+    return out or [p]
+
+
+def gguf_shard_bytes(model_path):
+    return float(sum(os.path.getsize(s) for s in gguf_shard_paths(model_path) if os.path.isfile(s)))
+
+
+def read_gguf_tensor_stats(model_path, layer_count):
+    """解析 GGUF 张量表,按张量名的层号与是否专家精确拆分字节。
+
+    分片模型的张量表在各分片头部各自列出,逐片累加;单分片失败继续其余。
+    返回 dict: ok/embed_output_bytes/dense_per_layer/expert_per_layer/expert_total_bytes/layer_count
+    """
+    r = {"ok": False, "embed_output_bytes": 0.0,
+         "dense_per_layer": [0.0] * layer_count if layer_count > 0 else [],
+         "expert_per_layer": [0.0] * layer_count if layer_count > 0 else [],
+         "expert_total_bytes": 0.0, "layer_count": layer_count}
+    for shard in gguf_shard_paths(model_path):
+        try:
+            with open(shard, "rb") as f:
+                if f.read(4) != b"GGUF":
+                    continue
+                f.read(4)  # version
+                (tensor_count,) = struct.unpack("<Q", f.read(8))
+                (kv_count,) = struct.unpack("<Q", f.read(8))
+                for _ in range(kv_count):
+                    _read_gguf_string(f)
+                    (vt,) = struct.unpack("<I", f.read(4))
+                    _skip_gguf_value(f, vt)
+                # KV 之后直接是 tensor infos(alignment 只影响数据区起点,无填充)
+                for _ in range(tensor_count):
+                    name = _read_gguf_string(f)
+                    (n_dims,) = struct.unpack("<I", f.read(4))
+                    elems = 1
+                    for _ in range(n_dims):
+                        (d,) = struct.unpack("<Q", f.read(8))
+                        elems *= d
+                    (ttype,) = struct.unpack("<I", f.read(4))
+                    f.read(8)  # offset
+                    nbytes = elems * ggml_bpe(ttype)
+                    expert = "ffn_" in name and ("exps" in name or "shexp" in name)
+                    lm = re.search(r"(?:^|\.)blk\.(\d+)\.", name)
+                    if lm:
+                        l = int(lm.group(1))
+                        if expert:
+                            r["expert_total_bytes"] += nbytes
+                            if l < r["layer_count"]:
+                                r["expert_per_layer"][l] += nbytes
+                        elif l < r["layer_count"]:
+                            r["dense_per_layer"][l] += nbytes
+                    else:
+                        r["embed_output_bytes"] += nbytes
+                    r["ok"] = True
+        except Exception:
+            continue
+    return r
+
+
 def estimate_vram_needed(profile, defs, query_gpu_fn):
-    """返回 dict 或 None:est_bytes/model_bytes/kv_bytes/avail_bytes/detail/ok。"""
+    """显存预算(公式,对齐 llama breakdown;A.1 最终算法)。
+
+    total = 权重(GPU)×0.95 + KV + 计算图 + 运行时基线 + 视觉编码器 + 草稿模型
+    返回 dict 或 None;warnings 列出元数据缺失等告警,detail 为展示文本。
+    """
     try:
         st = ParamState(profile, defs)
         model_path, m_err = resolve_model_path(profile.get("ModelPath"))
         if m_err or not model_path or not os.path.isfile(model_path):
             return None
-        model_bytes = float(os.path.getsize(model_path))
-        if model_bytes <= 0:
+        file_bytes = gguf_shard_bytes(model_path)
+        if file_bytes <= 0:
             return None
-        m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", os.path.basename(model_path), re.I)
-        if m:
-            sdir = os.path.dirname(model_path)
-            sbase = os.path.basename(model_path)
-            dash = sbase.rfind("-" + m.group(1))
-            if dash > 0:
-                sbase = sbase[:dash]
-                for sh in glob.glob(os.path.join(sdir, sbase + "-*-of-*.gguf")):
-                    if os.path.abspath(sh) != os.path.abspath(model_path):
-                        model_bytes += os.path.getsize(sh)
-        mmpp = (profile.get("MmprojPath") or "").strip().strip('"')
-        mm_cpu = bool(profile.get("NoMmprojOffload"))
-        if not mm_cpu and mmpp and os.path.isfile(mmpp):
-            model_bytes += os.path.getsize(mmpp)
 
+        mmproj_bytes = 0.0
+        mmpp = (profile.get("MmprojPath") or "").strip().strip('"')
+        if not profile.get("NoMmprojOffload") and mmpp and os.path.isfile(mmpp):
+            mmproj_bytes = float(os.path.getsize(mmpp))
+
+        gi = read_gguf_arch(model_path)
+        layers = gi["layers"]
+        head_dim = gi["head_dim"] if gi["head_dim"] > 0 else (
+            int(gi["embed"] / gi["head_count"]) if gi["embed"] > 0 and gi["head_count"] > 0 else 128)
+        full_layers = layers
+        if layers > 0 and gi["full_attention_interval"] > 0:
+            full_layers = max(1, -(-layers // gi["full_attention_interval"]))  # ceil
+
+        # 上 GPU 的层数: ngl=-1/auto/缺失 视为全层(fit 会下调,预算偏保守)
+        gpu_layers = layers
+        gpu_frac = 1.0
+        ngl_str = st.role_text("ngl")
+        if ngl_str:
+            ngl_v = _try_float(ngl_str.strip())
+            if ngl_v is not None and ngl_v >= 0.0:
+                gpu_layers = int(min(ngl_v, layers)) if layers > 0 else int(ngl_v)
+                if layers > 0:
+                    gpu_frac = min(1.0, max(0.0, ngl_v / layers))
+        # 移 CPU 的专家层数: --cpu-moe=全部; --n-cpu-moe N=前 N 层专家
+        ncm_str = st.role_text("n_cpu_moe")
+        ncm_v = 0.0
+        try:
+            ncm_v = float(ncm_str)
+        except (TypeError, ValueError):
+            ncm_v = 0.0
+        has_ncm = ncm_v > 0.0
+        moe_cpu_layers = 0
+        if st.role_bool("cpu_moe"):
+            moe_cpu_layers = layers
+        elif has_ncm:
+            moe_cpu_layers = int(min(max(round(ncm_v), 0), layers)) if layers > 0 else 0
+
+        ts = read_gguf_tensor_stats(model_path, layers)
+        expert_gpu_bytes = 0.0
+        if ts["ok"]:
+            # 非 blk 张量(token_embd/output 等)在 ngl>0 时上 GPU
+            embed_out = ts["embed_output_bytes"] if gpu_layers > 0 else 0.0
+            dense_gpu = 0.0
+            for l in range(min(gpu_layers, ts["layer_count"])):
+                dense_gpu += ts["dense_per_layer"][l]
+                if l >= moe_cpu_layers:
+                    expert_gpu_bytes += ts["expert_per_layer"][l]
+            # moe-cache-mib: 专家权重显存缓存上限(MiB),超出部分驻留 CPU
+            moe_detail = ""
+            mcm_str = st.raw_value("moe-cache-mib")
+            mcm_v = _try_float(mcm_str) if mcm_str else None
+            if mcm_v is not None and mcm_v > 0.0 and expert_gpu_bytes > mcm_v * 1048576.0:
+                expert_gpu_bytes = mcm_v * 1048576.0
+                moe_detail = "(受 --moe-cache-mib 限制)"
+            expert_cpu_bytes = ts["expert_total_bytes"] - expert_gpu_bytes
+            gpu_weights = embed_out + dense_gpu + expert_gpu_bytes
+            if ts["expert_total_bytes"] > 0.0:
+                moe_detail = "(专家 %.2f GiB,其中 CPU 保留 %.2f GiB%s)" % (
+                    ts["expert_total_bytes"] / GIB, expert_cpu_bytes / GIB,
+                    (" " + moe_detail) if moe_detail else "")
+            else:
+                moe_detail = "(dense 模型,无专家张量)"
+        else:
+            # 张量表解析失败回退: 旧的层数比例近似
+            weights = file_bytes
+            if layers > 0 and has_ncm:
+                weights *= min(1.0, max(0.02, 1.0 - ncm_v / layers))
+            elif st.role_bool("cpu_moe"):
+                weights *= 0.12
+            gpu_weights = weights * gpu_frac
+            moe_detail = "(张量表解析失败,按层比例近似)"
+
+        # KV: 只有全注意力层随上下文线性增长;FA 关闭时 V 量化回退 f16
+        ck = st.role_text("cache_type_k") or "f16"
+        cv = st.role_text("cache_type_v") or "f16"
+        kv_note = ""
+        fa_str = (st.raw_value("flash-attn") or "").strip()
+        if fa_str == "off" and cv != "f16":
+            cv = "f16"
+            kv_note = "(FA 关闭,V 量化回退 f16)"
         ctx = 0
         ctx_str = st.role_text("ctx_size")
         if ctx_str:
-            ctx_str = norm_tok(ctx_str)
             try:
-                ctx = int(float(ctx_str))
+                ctx = int(float(norm_tok(ctx_str)))
             except ValueError:
                 ctx = 0
-        ck = st.role_text("cache_type_k") or "f16"
-        cv = st.role_text("cache_type_v") or "f16"
-        bytes_k = cache_bytes_per_elem(ck)
-        bytes_v = cache_bytes_per_elem(cv)
-        gi = read_gguf_arch(model_path)
-        gpu_frac = 1.0
-        ngl = st.role_text("ngl")
-        ngl_v = _try_float(ngl) if ngl else None
-        if ngl_v is not None and ngl_v >= 0.0 and gi["ok"] and gi["layers"] > 0:
-            gpu_frac = min(1.0, max(0.0, ngl_v / gi["layers"]))
-        cpu_moe_on = st.role_bool("cpu_moe")
-        moe_factor = 1.0
-        if cpu_moe_on:
-            moe_factor = 0.12
-        else:
-            ncm = st.role_text("n_cpu_moe")
-            ncm_v = _try_float(ncm) if ncm else None
-            if ncm_v is not None and ncm_v > 0 and gi["ok"] and gi["layers"] > 0:
-                moe_factor = min(1.0, 0.12 + 0.88 * (ncm_v / gi["layers"]))
-        model_file_bytes = model_bytes
-        if moe_factor < 1.0:
-            model_bytes *= moe_factor
-        if gi["ok"]:
-            kv_per_token = gi["kv_heads"] * gi["head_dim"] * (bytes_k + bytes_v) * gi["layers"]
-        else:
-            kv_per_token = 64.0 * 8.0 * 128.0 * (bytes_k + bytes_v)
-        kv_bytes = kv_per_token * ctx * gpu_frac
-        buffer_bytes = 1.5 * GIB
-        est_vram = model_bytes * gpu_frac + kv_bytes + buffer_bytes
+        kv_per_tok = full_layers * gi["kv_heads"] * head_dim * (cache_bytes_per_elem(ck) + cache_bytes_per_elem(cv))
+        kv_bytes = kv_per_tok * ctx * gpu_frac
+
+        # SWA/混合注意力层三分类: 滑动窗口 / 线性注意力(SSM) / 未知(警告)
+        swa_layers = max(0, layers - full_layers)
+        swa_kv_bytes = 0.0
+        rec_state_bytes = 0.0
+        swa_note = ""
+        meta_warn = []
+        swa_full = st.bools.get("swa-full", False)
+        if swa_layers > 0:
+            if gi["sliding_window"] > 0 and gi["kv_heads"] > 0 and head_dim > 0 and ctx > 0:
+                swa_ctx = ctx if swa_full else min(ctx, gi["sliding_window"])
+                swa_kv_bytes = swa_layers * gi["kv_heads"] * head_dim * (
+                    cache_bytes_per_elem(ck) + cache_bytes_per_elem(cv)) * swa_ctx * gpu_frac
+                swa_note = "(含 SWA %d 层 × %s: %.0f MiB)" % (
+                    swa_layers, "全 ctx" if swa_full else "窗口 %d" % gi["sliding_window"],
+                    swa_kv_bytes / 1048576.0)
+            elif gi["ssm_inner_size"] > 0 and gi["ssm_state_size"] > 0:
+                # conv 状态 + recurrent 状态(f32),常数级/层,不随 ctx 线性但随槽数增长
+                rec_state_bytes = swa_layers * (
+                    gi["ssm_inner_size"] * gi["ssm_conv_kernel"] + gi["ssm_inner_size"] * gi["ssm_state_size"]) * 4.0 * gpu_frac
+                swa_note = "(含线性注意力 %d 层,state 不随 ctx 增长: %.0f MiB)" % (
+                    swa_layers, rec_state_bytes / 1048576.0)
+            else:
+                meta_warn.append("⚠ %d 个混合注意力层(窗口/状态未知)KV 未计入预算(如遇 OOM 请实测)" % swa_layers)
+        # 线性注意力 state 按槽数线性增长(实测 149.62 MiB = 1 seq;--parallel N → N 份)
+        if rec_state_bytes > 0.0:
+            par_str = (st.raw_value("parallel") or "").strip()
+            par_n = _try_int(par_str)
+            if par_n is not None and par_n > 1:
+                rec_state_bytes *= par_n
+                swa_note = swa_note.replace("MiB)", "MiB × %d 槽)" % par_n)
+            elif par_n is not None and par_n < 0:
+                meta_warn.append("⚠ --parallel -1(auto):槽数由 ctx 自动推导,线性注意力 state 会成倍增长(预算按 1 槽计)")
+        kv_bytes += swa_kv_bytes + rec_state_bytes
+
+        # 计算图: n_ubatch × n_embd × 173B(实测校准: qwen35/ubatch512 = 432 MiB;±50%)
+        ubatch = 512.0
+        ub_str = st.role_text("ubatch_size")
+        ub_v = _try_float(ub_str) if ub_str else None
+        if ub_v is not None and ub_v > 0.0:
+            ubatch = ub_v
+        embed = gi["embed"] if gi["embed"] > 0 else 4096.0
+        compute_bytes = ubatch * embed * 173.0
+        # 输出 logits 缓冲不占显卡 VRAM(0.7.0 起放 host 侧,动态分配),不计入
+        # 草稿模型(推测解码激活时)整体进显存;--spec-draft-ngl 0 时驻留 CPU 不计入
+        draft_bytes = 0.0
+        if is_spec_decoding_active(st, defs):
+            dp = (profile.get("MtpPath") or "").strip().strip('"')
+            sdm = st.raw_value("spec-draft-model")
+            if sdm:
+                dp = sdm
+            draft_on_cpu = (st.raw_value("spec-draft-ngl") or "").strip() == "0"
+            if not draft_on_cpu and dp and os.path.isfile(dp):
+                draft_bytes = gguf_shard_bytes(dp)
+        # 运行时基线(后端 context/队列等): Vulkan 实测 ~300 MiB
+        runtime_bytes = 300.0 * 1048576.0
+        # 权重显存 = 张量字节 × 0.95(CPU 回退 + 对齐损耗,实测 breakdown ~95%)
+        total = gpu_weights * 0.95 + kv_bytes + compute_bytes + runtime_bytes + mmproj_bytes + draft_bytes
 
         g = query_gpu_fn() or {}
-        total = _try_float(g.get("vram_total")) or 0.0
-        used = _try_float(g.get("vram_used")) or 0.0
-        avail = max(0.0, total - used)
+        total_vram = _try_float(g.get("vram_total")) or 0.0
+        used_vram = _try_float(g.get("vram_used")) or 0.0
+        avail = max(0.0, total_vram - used_vram)
 
-        safe_ctx = 0
-        gpu_kv_per_token = kv_per_token * gpu_frac
-        if gpu_frac > 0.0 and gpu_kv_per_token > 0.0 and avail > 0.0:
-            safe_ctx = int((avail - model_bytes * gpu_frac - buffer_bytes) / gpu_kv_per_token)
-            if safe_ctx < 0:
-                safe_ctx = 0
-            safe_ctx = (safe_ctx // 1024) * 1024
+        if layers <= 0 or gi["kv_heads"] <= 0 or ctx <= 0:
+            meta_warn.append("⚠ KV 元数据不完整(层数=%d KV头=%d ctx=%d),KV 可能算成 0,预算仅供参考" % (layers, gi["kv_heads"], ctx))
+        fa_auto = (st.raw_value("flash-attn") or "").strip()
+        if fa_auto == "auto" and cv != "f16":
+            meta_warn.append("⚠ FA=auto:若后端不支持 FA,V 缓存会回退 f16,实际占用更高")
+        lora_str = st.raw_value("lora")
+        if lora_str:
+            meta_warn.append("⚠ LoRA 适配器占用未计入(按文件大小预留)")
 
-        detail = ("模型文件: %.1f GiB\n" % (model_file_bytes / GIB)
-                  + "上下文: %d token (%dK)\n" % (ctx, ctx // 1024)
-                  + "KV 缓存(按当前缓存类型估算): %.2f GiB\n" % (kv_bytes / GIB)
-                  + "预计总占用: %.1f GiB\n" % (est_vram / GIB)
-                  + "可用显存: %.1f GiB" % (avail / GIB))
-        if moe_factor < 1.0:
-            detail += "\nMoE 专家在 CPU: 显存按系数 %.2f 折算" % moe_factor
-        if safe_ctx > 0:
-            detail += "\n建议: 当前显存下安全上下文约 %d token (%dK)" % (safe_ctx, safe_ctx // 1024)
-        return {"est_bytes": est_vram, "model_bytes": model_bytes, "kv_bytes": kv_bytes,
-                "avail_bytes": avail, "detail": detail, "ok": True}
+        detail = ("显存预算(公式,对齐 llama breakdown)\n"
+                  + "权重(GPU): %.2f GiB%s\n" % (gpu_weights * 0.95 / GIB, moe_detail)
+                  + "KV(%s/%s, %d 层全注意力): %.2f GiB%s\n" % (ck, cv, full_layers, kv_bytes / GIB, swa_note)
+                  + "计算图(ubatch %.0f): %.0f MiB\n" % (ubatch, compute_bytes / 1048576.0)
+                  + (("草稿模型: %.2f GiB\n" % (draft_bytes / GIB)) if draft_bytes > 0.0 else "")
+                  + "运行时基线: %.0f MiB\n" % (runtime_bytes / 1048576.0)
+                  + (("视觉编码器: %.0f MiB\n" % (mmproj_bytes / 1048576.0)) if mmproj_bytes > 0 else "")
+                  + "预计总占用: %.2f GiB\n" % (total / GIB)
+                  + "可用显存: %.2f GiB" % (avail / GIB))
+        if meta_warn:
+            detail = "\n".join(meta_warn) + "\n" + detail
+        if kv_note:
+            detail = detail.replace("KV(%s/%s" % (ck, cv), "KV(%s/%s%s" % (ck, cv, kv_note.replace("(FA 关闭", "(FA 关闭")))
+        return {"est_bytes": total, "model_bytes": file_bytes, "kv_bytes": kv_bytes,
+                "avail_bytes": avail, "detail": detail, "ok": True,
+                "warnings": meta_warn, "fits": avail <= 0.0 or total <= avail,
+                "breakdown": {"weights": gpu_weights * 0.95, "kv": kv_bytes,
+                              "compute": compute_bytes, "runtime": runtime_bytes,
+                              "mmproj": mmproj_bytes, "draft": draft_bytes}}
     except Exception:
+        return None
+
+
+def _try_int(s):
+    try:
+        return int(str(s).strip())
+    except (TypeError, ValueError):
         return None
 
 

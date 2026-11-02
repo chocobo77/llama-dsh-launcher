@@ -1348,7 +1348,7 @@ params:
     group: spec
     enabled: true
     offValue: "none"
-    options: [none, draft-simple, draft-eagle3, draft-mtp, draft-dflash, draft-dspark, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, ngram-cache]
+    options: [none, draft-simple, draft-eagle3, draft-mtp, draft-dflash, draft-dspark, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, ngram-cache,"ngram-mod,draft-mtp"]
     tooltip: "推测解码类型。none=禁用（默认，取消勾选本项等同设为 none）；draft-simple=简单外部草稿模型；draft-eagle3=EAGLE-3 草稿；draft-mtp=模型自带 MTP 层（Qwen3 推荐，可加速 2~3 倍）；draft-dflash/draft-dspark=DFlash 草稿（NVIDIA 系，需专用草稿 GGUF）；ngram-*=无草稿模型的 ngram 推测。draft-mtp 需模型自带 MTP 层（Qwen3 系列推荐，可加速 2~3 倍）。取消勾选本项即显式关闭推测解码。"
 
   - flag: spec-default

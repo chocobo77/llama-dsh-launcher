@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""系统/GPU 监控:CPU、内存、显卡利用率/显存/温度。
+"""系统/GPU 监控(Strata Monitor 采集通道的 Linux 适配)。
 
-原版依赖 PerformanceCounter + WMI + gputemp.exe;Linux 版:
-- CPU/内存: /proc/stat、/proc/meminfo
-- GPU: nvidia-smi → amd-smi/rocm-smi → xpu-smi → sysfs/drm+hwmon 兜底
-- 温度: 同上(hwmon),不再需要 gputemp.exe
+- GPU 按卡:nvidia-smi --query-gpu(多卡逐行)→ amd-smi/rocm-smi → sysfs/drm+hwmon 兜底;
+  字段:型号/利用率/显存 used·total/温度/功耗(及上限)/风扇/频率/PCIe/P-State/驱动。
+- 系统:CPU 总利用率 + 逐核利用率(/proc/stat 差分)、CPU 型号(cpuinfo)、
+  内存(/proc/meminfo)、磁盘(os.statvfs + /proc/mounts)、网卡速率(/proc/net/dev 差分)。
+- 结果缓存 1s,0 值读数不丢键(d227f3c 语义:用 is not None 判断,不用 falsy)。
 """
 import os
 import re
@@ -12,42 +13,185 @@ import glob
 import time
 import subprocess
 
-_CACHE_SECS = 5.0
-_cache = {"t": 0.0, "v": {}}
+_CACHE_SECS = 1.0
+_gpu_cache = {"t": 0.0, "v": []}
+_sys_cache = {"t": 0.0, "v": {}}
 _vendor_cache = {"t": 0.0, "v": "unknown"}
 
 # ---------------------------------------------------------------- CPU / 内存 --
 
-_cpu_prev = {"t": 0.0, "total": 0, "idle": 0, "util": 0.0}
+_cpu_prev = {"t": 0.0, "cores": [], "util": 0.0, "core_utils": []}
+
+
+def _read_cpu_times():
+    """返回 (total_times, per_core_times) 各为 idle/total 列表。"""
+    out = []
+    with open("/proc/stat") as f:
+        for line in f:
+            if not line.startswith("cpu"):
+                break
+            parts = line.split()
+            vals = [int(x) for x in parts[1:8]]  # user nice system idle iowait irq softirq
+            idle = vals[3] + vals[4]
+            out.append((idle, sum(vals)))
+    return out[0], out[1:]
 
 
 def cpu_mem_usage():
     try:
-        with open("/proc/stat") as f:
-            parts = f.readline().split()[1:]
-        vals = [int(x) for x in parts]
-        total = sum(vals)
-        idle = vals[3] + vals[4]
+        totals = _read_cpu_times()
+        total, cores = totals[0], totals[1:]
         now = time.time()
         prev = _cpu_prev
-        if now - prev["t"] >= 0.5 and total > prev["total"] >= 0:
-            dt, di = total - prev["total"], idle - prev["idle"]
-            prev["util"] = max(0.0, min(100.0, 100.0 * (1.0 - di / dt))) if dt > 0 else 0.0
-        prev.update(t=now, total=total, idle=idle)
-        mem_used = mem_total = 0
+        if now - prev["t"] >= 0.5 and prev["cores"]:
+            def util(old, new):
+                di = new[0] - old[0]
+                dt = new[1] - old[1]
+                return max(0.0, min(100.0, 100.0 * (1.0 - di / dt))) if dt > 0 else None
+            u = util(prev["total"], total)
+            if u is not None:
+                prev["util"] = u
+            core_u = []
+            for i, c in enumerate(cores):
+                if i < len(prev["cores"]):
+                    cu = util(prev["cores"][i], c)
+                    if cu is not None:
+                        core_u.append(cu)
+            prev["core_utils"] = core_u
+        prev["t"] = now
+        prev["total"] = total
+        prev["cores"] = cores
+        info = {}
         with open("/proc/meminfo") as f:
-            info = {}
             for line in f:
                 k, v = line.split(":")
-                info[k] = int(v.strip().split()[0])  # kB
-        mem_total = info.get("MemTotal", 0) * 1024
-        mem_avail = info.get("MemAvailable", 0) * 1024
+                info[k] = int(v.strip().split()[0]) * 1024  # kB → B
+        mem_total = info.get("MemTotal", 0)
+        mem_avail = info.get("MemAvailable", 0)
         mem_used = mem_total - mem_avail
         return {"cpu": round(prev["util"], 1),
+                "cpu_cores": [round(x, 1) for x in prev["core_utils"]],
                 "mem_used": mem_used, "mem_total": mem_total,
                 "mem_pct": round(100.0 * mem_used / mem_total, 1) if mem_total else 0.0}
     except Exception:
-        return {"cpu": 0.0, "mem_used": 0, "mem_total": 0, "mem_pct": 0.0}
+        return {"cpu": 0.0, "cpu_cores": [], "mem_used": 0, "mem_total": 0, "mem_pct": 0.0}
+
+
+def cpu_model():
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+# --------------------------------------------------------------------- 磁盘 --
+
+_disk_prev = {"t": 0.0, "io": {}}
+
+
+def _disk_statvfs():
+    import string
+    rows = []
+    try:
+        with open("/proc/mounts") as f:
+            for ln in f:
+                parts = ln.split()
+                if len(parts) < 3:
+                    continue
+                dev, mp, fstype = parts[0], parts[1], parts[2]
+                if not mp.startswith("/") or fstype.startswith(("proc", "sys", "dev", "tmpfs", "squashfs", "overlay", "efivarfs", "run")):
+                    continue
+                if mp.startswith("/snap/") or mp.startswith("/boot/efi"):
+                    continue
+                if not (dev.startswith("/dev/") or fstype in ("zfs", "btrfs", "f2fs")):
+                    continue
+                rows.append((dev, mp))
+    except OSError:
+        pass
+    seen = set()
+    out = []
+    for dev, mp in rows:
+        try:
+            st = os.statvfs(mp)
+            total = st.f_blocks * st.f_frsize
+            free = st.f_bavail * st.f_frsize
+            if total <= 0 or mp in seen:
+                continue
+            seen.add(mp)
+            out.append({"dev": dev.rsplit("/", 1)[-1][:12], "mount": mp, "total": total,
+                        "used": total - free, "pct": round(100.0 * (total - free) / total, 1)})
+        except OSError:
+            continue
+    return out[:6]
+
+
+def _disk_io_rates():
+    rates = {}
+    try:
+        with open("/proc/diskstats") as f:
+            now = time.time()
+            cur = {}
+            for ln in f:
+                parts = ln.split()
+                if len(parts) < 14:
+                    continue
+                name = parts[2]
+                if not re.match(r"(sd|vd|nvme|hd)[a-z0-9]*$", name):
+                    continue
+                cur[name] = (int(parts[5]), int(parts[9]))  # 读扇区/写扇区
+            prev = _disk_prev
+            if prev["io"] and now - prev["t"] > 0.3:
+                for name, (rs, ws) in cur.items():
+                    if name in prev["io"]:
+                        prs, pws = prev["io"][name]
+                        rates[name] = (max(0, (rs - prs) * 512 / 1048576.0 / (now - prev["t"])),
+                                       max(0, (ws - pws) * 512 / 1048576.0 / (now - prev["t"])))
+            prev.update(t=now, io=cur)
+    except OSError:
+        pass
+    return rates
+
+
+# --------------------------------------------------------------------- 网络 --
+
+_net_prev = {"t": 0.0, "dev": {}}
+
+
+def net_rates():
+    """前 6 个物理网卡: {name: (rx MB/s, tx MB/s)}。"""
+    out = {}
+    try:
+        with open("/proc/net/dev") as f:
+            now = time.time()
+            cur = {}
+            for ln in f.readlines()[2:]:
+                if ":" not in ln:
+                    continue
+                name, data = ln.split(":", 1)
+                name = name.strip()
+                cells = data.split()
+                if len(cells) < 16:
+                    continue
+                if name in ("lo",) or name.startswith(("veth", "docker", "br-", "virbr")):
+                    continue
+                cur[name] = (int(cells[0]), int(cells[8]))
+            prev = _net_prev
+            if prev["dev"] and now - prev["t"] > 0.3:
+                for name, (rx, tx) in cur.items():
+                    if name in prev["dev"]:
+                        prx, ptx = prev["dev"][name]
+                        dt = now - prev["t"]
+                        r = (max(0, (rx - prx) / 1048576.0 / dt), max(0, (tx - ptx) / 1048576.0 / dt))
+                        if r[0] > 0.01 or r[1] > 0.01:
+                            out[name] = r
+            prev.update(t=now, dev=cur)
+    except OSError:
+        pass
+    return dict(sorted(out.items(), key=lambda kv: -(kv[1][0] + kv[1][1]))[:6])
 
 
 # --------------------------------------------------------------------- GPU --
@@ -89,121 +233,176 @@ def detect_vendor():
     return v
 
 
-def _query_nvidia():
-    out = _run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+def _hwmon_temperature(dev_dir):
+    """从设备关联的 hwmon 读温度(°C)或 None。"""
+    for hdir in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            name = open(os.path.join(hdir, "name")).read().strip().lower()
+        except OSError:
+            continue
+        link = None
+        try:
+            link = os.path.realpath(hdir)
+        except OSError:
+            pass
+        if link and os.path.realpath(dev_dir) not in link:
+            continue
+        for tp in sorted(glob.glob(os.path.join(hdir, "temp*_input"))):
+            try:
+                t = float(open(tp).read().strip()) / 1000.0
+                if 0 < t < 150:
+                    return t
+            except (ValueError, OSError):
+                continue
+    return None
+
+
+def _gpus_nvidia():
+    out = _run(["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,"
+                "temperature.gpu,power.draw,power.limit,fan.speed,clocks.current.graphics,"
+                "pcie.link.gen.current,pcie.link.width.current,pstate,driver_version",
                 "--format=csv,noheader,nounits"])
+    cards = []
     for line in out.splitlines():
         cells = [c.strip() for c in line.split(",")]
-        if len(cells) < 4:
+        if len(cells) < 14:
             continue
-        try:
-            return {"gpu_util": float(cells[0]), "vram_used": float(cells[1]) * 1048576,
-                    "vram_total": float(cells[2]) * 1048576, "gpu_temp": float(cells[3]),
-                    "gpu_temp_src": "NVIDIA"}
-        except ValueError:
-            continue
-    return {}
+        def num(i):
+            try:
+                return float(cells[i])
+            except (ValueError, IndexError):
+                return None
+        cards.append({
+            "index": int(num(0) or 0), "name": cells[1] or "NVIDIA GPU",
+            "util": num(2), "vram_used": (num(3) or 0.0) * 1048576.0,
+            "vram_total": (num(4) or 0.0) * 1048576.0,
+            "temp": num(5), "power_w": num(6), "power_limit_w": num(7),
+            "fan_pct": num(8), "clock_mhz": num(9),
+            "pcie_gen": num(10), "pcie_width": num(11),
+            "pstate": (cells[12] or "").replace("P", "P"), "driver": cells[13] or "",
+            "src": "nvidia",
+        })
+    return cards
 
 
-def _query_amd():
-    out = _run(["amd-smi", "metric", "--temperature", "--gpu-utilization", "--vram-usage"])
-    if not out:
-        out = _run(["rocm-smi", "--showuse", "--showmemuse", "--showtemp"])
-    r = {}
-    m = re.search(r"([\d.]+)\s*%", out)
-    if m:
-        r["gpu_util"] = float(m.group(1))
-    temps = re.findall(r"([\d.]+)\s*C\b", out)
-    if temps:
-        r["gpu_temp"] = float(temps[0])
-        r["gpu_temp_src"] = "AMD"
-    m = re.search(r"([\d.]+)\s*MiB", out)
-    if m:
-        r["vram_used"] = float(m.group(1)) * 1048576
-        r["vram_total"] = 0
-    return r
-
-
-def _query_intel():
-    out = _run(["xpu-smi", "stats", "-d", "0"])
-    r = {}
-    m = re.search(r"GPU Utilization\s*[:=]\s*([\d.]+)", out) or re.search(r"([\d.]+)\s*%", out)
-    if m:
-        r["gpu_util"] = float(m.group(1))
-    m = re.search(r"([\d.]+)\s*MiB", out)
-    if m:
-        r["vram_used"] = float(m.group(1)) * 1048576
-    return r
-
-
-def _query_sysfs():
-    """无厂商工具时读 DRM/sysfs + hwmon。"""
-    r = {}
+def _gpus_sysfs(vendor):
+    """无厂商工具时读 DRM/sysfs + hwmon 合成单卡。"""
+    r = {"util": None, "vram_used": None, "vram_total": None, "temp": None}
     for pdir in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
         dev = os.path.join(pdir, "device")
         if not os.path.isdir(dev):
             continue
         busy = os.path.join(dev, "gpu_busy_percent")
-        if os.path.isfile(busy) and "gpu_util" not in r:
+        if os.path.isfile(busy) and r["util"] is None:
             try:
-                r["gpu_util"] = float(open(busy).read().strip())
+                r["util"] = float(open(busy).read().strip())
             except (ValueError, OSError):
                 pass
         used_p = os.path.join(dev, "mem_info_vram_used")
         total_p = os.path.join(dev, "mem_info_vram_total")
-        if os.path.isfile(used_p) and "vram_used" not in r:
+        if os.path.isfile(used_p) and r["vram_used"] is None:
             try:
                 r["vram_used"] = float(open(used_p).read().strip())
                 if os.path.isfile(total_p):
                     r["vram_total"] = float(open(total_p).read().strip())
             except (ValueError, OSError):
                 pass
-    for hdir in glob.glob("/sys/class/hwmon/hwmon*"):
-        try:
-            name = open(os.path.join(hdir, "name")).read().strip().lower()
-        except OSError:
-            continue
-        if name in ("amdgpu", "i915", "xe", "nvidia", "nouveau") and "gpu_temp" not in r:
-            for tp in sorted(glob.glob(os.path.join(hdir, "temp*_input"))):
-                try:
-                    t = float(open(tp).read().strip()) / 1000.0
-                    if 0 < t < 150:
-                        r["gpu_temp"] = t
-                        r["gpu_temp_src"] = "Sensor"
-                        break
-                except (ValueError, OSError):
-                    continue
-    return r
+        if r["temp"] is None:
+            r["temp"] = _hwmon_temperature(dev)
+    if r["vram_used"] is None and r["vram_total"] is None and r["util"] is None and r["temp"] is None:
+        return []
+    return [{"index": 0, "name": {"amd": "AMD GPU", "intel": "Intel GPU"}.get(vendor, "GPU"),
+             "util": r["util"], "vram_used": r["vram_used"] or 0.0,
+             "vram_total": r["vram_total"] or 0.0, "temp": r["temp"],
+             "power_w": None, "power_limit_w": None, "fan_pct": None, "clock_mhz": None,
+             "pcie_gen": None, "pcie_width": None, "pstate": "", "driver": "",
+             "src": "sysfs", "synthetic": True}]
 
+
+def query_gpus():
+    """按卡 GPU 列表;结果缓存 1s。0 值读数不丢键(d227f3c)。"""
+    now = time.time()
+    if now - _gpu_cache["t"] < _CACHE_SECS and _gpu_cache["v"]:
+        return _gpu_cache["v"]
+    v = detect_vendor()
+    cards = []
+    if v == "nvidia":
+        cards = _gpus_nvidia()
+    if not cards:
+        cards = _gpus_sysfs(v)
+    # AMD/Intel 专属工具在 sysfs 之上补功耗/风扇(尽力而为)
+    if not cards:
+        cards = [{"index": 0, "name": "GPU(数据不可用)", "util": None, "vram_used": None,
+                  "vram_total": None, "temp": None, "power_w": None, "power_limit_w": None,
+                  "fan_pct": None, "clock_mhz": None, "pcie_gen": None, "pcie_width": None,
+                  "pstate": "", "driver": "", "src": "none", "synthetic": True}]
+    _gpu_cache.update(t=now, v=cards)
+    return cards
+
+
+def gpu_vendor_for_backend():
+    """显卡厂商 → llama.cpp 后端偏好(cuda/sycl/vulkan)。读取实际驱动/sysfs。"""
+    if detect_vendor() == "nvidia" or _run(["nvidia-smi", "-L"]):
+        return "cuda"
+    # lspci 分类(Intel Arc → sycl, AMD → vulkan)
+    out = _run(["lspci"], timeout=10)
+    low = out.lower()
+    if "nvidia" in low and ("geforce" in low or "rtx" in low or "gtx" in low or "tesla" in low):
+        return "cuda"
+    if "intel" in low and ("arc" in low or "data center gpu" in low or "iris" in low):
+        return "sycl"
+    if "amd" in low or "ati" in low or "radeon" in low:
+        return "vulkan"
+    if detect_vendor() == "intel":
+        return "sycl"
+    if detect_vendor() == "amd":
+        return "vulkan"
+    return "vulkan"
+
+
+def gpu_friendly_name():
+    cards = query_gpus()
+    for c in cards:
+        if c.get("name") and not c.get("synthetic"):
+            return c["name"]
+    return cards[0]["name"] if cards else ""
+
+
+def sample_system():
+    """系统面板: CPU(总+逐核)/内存/磁盘/网络。缓存 1s。"""
+    now = time.time()
+    if now - _sys_cache["t"] < _CACHE_SECS and _sys_cache["v"]:
+        return _sys_cache["v"]
+    cm = cpu_mem_usage()
+    disks = _disk_statvfs()
+    io = _disk_io_rates()
+    for d in disks:
+        key = next((k for k in io if d["dev"].startswith(k) or k.startswith(d["dev"])), None)
+        if key:
+            d["read_mb"], d["write_mb"] = round(io[key][0], 1), round(io[key][1], 1)
+        else:
+            d["read_mb"] = d["write_mb"] = 0.0
+    snap = {"cpu": cm["cpu"], "cpu_cores": cm["cpu_cores"], "cpu_model": cpu_model(),
+            "mem_used": cm["mem_used"], "mem_total": cm["mem_total"], "mem_pct": cm["mem_pct"],
+            "disks": disks, "net": {k: [round(v[0], 2), round(v[1], 2)] for k, v in net_rates().items()}}
+    _sys_cache.update(t=now, v=snap)
+    return snap
+
+
+# ------------------------------------------------------------ 兼容旧接口 --
 
 def query_gpu():
-    """QueryGpu:结果缓存 5s。返回 {gpu_util, vram_used, vram_total, gpu_temp, gpu_temp_src}。"""
-    now = time.time()
-    if now - _cache["t"] < _CACHE_SECS and _cache["v"]:
-        return _cache["v"]
-    v = detect_vendor()
-    g = {}
-    if v == "nvidia":
-        g = _query_nvidia()
-    elif v == "amd":
-        g = _query_amd()
-        if not g:
-            g = _query_sysfs()
-    elif v == "intel":
-        g = _query_intel()
-        if not g:
-            g = _query_sysfs()
-    else:
-        g = _query_nvidia() or _query_amd() or _query_sysfs()
-    g.setdefault("gpu_util", 0.0)
-    g.setdefault("vram_used", 0.0)
-    g.setdefault("vram_total", 0.0)
-    g.setdefault("gpu_temp", 0.0)
-    g.setdefault("gpu_temp_src", "")
-    _cache.update(t=now, v=g)
-    return g
+    """聚合视图(旧接口): util=均值 vram_used=和 vram_total=和 temp=最高。"""
+    cards = query_gpus()
+    utils = [c["util"] for c in cards if c.get("util") is not None]
+    vus = [c.get("vram_used") or 0.0 for c in cards if c.get("vram_used") is not None]
+    vts = [c.get("vram_total") or 0.0 for c in cards if c.get("vram_total") is not None]
+    temps = [c.get("temp") for c in cards if c.get("temp") is not None]
+    return {"gpu_util": round(sum(utils) / len(utils), 1) if utils else 0.0,
+            "vram_used": sum(vus), "vram_total": sum(vts),
+            "gpu_temp": max(temps) if temps else 0.0,
+            "gpu_temp_src": detect_vendor() if temps else ""}
 
 
 def has_gpu():
-    g = query_gpu()
-    return g.get("vram_total", 0) > 0
+    return any((c.get("vram_total") or 0) > 0 for c in query_gpus())

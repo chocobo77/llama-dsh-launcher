@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """启动器核心运行时:日志管线、Llama/DSH 进程运行器、监控循环、显存熔断、
-safetensors 转换、DSH 重建。等价原版 MainWindow.xaml.cs 的运行部分。
+OOM 自动降层重试、safetensors 转换、DSH 重建。
+
+f564fe7 语义: 旧日志解析层(ParseTimings//metrics 兜底/TTFT)已删除,
+统一由 llapimon.LlamaApiMonitor 承接。
 """
 import os
 import re
@@ -14,6 +17,7 @@ import collections
 
 import applog
 import cmdline
+import llapimon
 import monitor
 import procman
 import state
@@ -26,29 +30,20 @@ CONVERT_LOG_NAME = "llamadsh_convert.log"
 TOOLS_DIR = os.path.join(os.path.expanduser("~"), ".dsh_launcher_tools")
 
 DSH_PORT = 3080
-
-_RE_PROMPT_TPS = re.compile(r"prompt eval time\s+=\s*([\d.]+)\s*ms\s*/\s*(\d+)\s*tokens")
-_RE_EVAL_TPS = re.compile(r"(?<!prompt )eval time\s+=\s*[\d.]+\s*ms\s*/\s*\d+\s*(?:new tokens|tokens|runs)\s*\([^)]*?([\d.]+)\s*(?:tokens? per second|tok/s)")
-_RE_PROMPT_MS = re.compile(r"prompt eval time\s+=\s*([\d.]+)\s*ms")
-_RE_EVAL_RAW = re.compile(r"(?<!prompt )eval time\s+=\s*([\d.]+)\s*ms\s*/\s*(\d+)")
-
-# IsDshNoise:错误/诊断行一律保留,其余普通行视为噪声(批次末尾汇总隐藏数)
-_DSH_NOISE_FORCE_KEEP = ("at ", "^", "node:internal", "file:///", "imported from",
-                         "cannot find", "module", "require", "resolve", "throw")
-_DSH_NOISE_KEEP_IF = ("dsh web", "http", "127.0.0.1", "localhost", "listen", "port",
-                      "eaddrinuse", "error", "fail", "exception", "warn", "started",
-                      "ready", "loaded", "plugin", "exit", "browser", "open", "server",
-                      "version", "status", "web")
+GIB = 1073741824.0
 
 
 def is_dsh_noise(content):
     if not content or not content.strip():
         return False
-    trimmed = content.strip()
-    low = trimmed.lower()
-    if any(k in low for k in _DSH_NOISE_FORCE_KEEP):
-        return False
-    if any(k in low for k in _DSH_NOISE_KEEP_IF):
+    low = content.strip().lower()
+    force_keep = ("at ", "^", "node:internal", "file:///", "imported from",
+                  "cannot find", "module", "require", "resolve", "throw")
+    keep_if = ("dsh web", "http", "127.0.0.1", "localhost", "listen", "port",
+               "eaddrinuse", "error", "fail", "exception", "warn", "started",
+               "ready", "loaded", "plugin", "exit", "browser", "open", "server",
+               "version", "status", "web")
+    if any(k in low for k in force_keep) or any(k in low for k in keep_if):
         return False
     return True
 
@@ -74,7 +69,6 @@ class LogHub:
             return
         self._last_line = text
         ts = time.strftime("%H:%M:%S")
-        # [dsh] 噪声行合并为一条汇总(等价原版 FlushLogs 的批次过滤)
         if text.startswith("[dsh] ") and is_dsh_noise(text[len("[dsh] "):]):
             self._dsh_hidden += 1
             return
@@ -94,7 +88,6 @@ class LogHub:
             self.log("    " + ln)
 
     def since(self, after, max_items=400):
-        """返回 (lines, new_after):seq > after 的条目,最多 max_items 条。"""
         out = [it for it in self.ring if it[0] > after]
         if len(out) > max_items:
             out = out[-max_items:]
@@ -110,62 +103,133 @@ class LlamaRunner:
         self.proc = None
         self.status = "stopped"  # stopped/starting/running/failed/crashed/taken_over
         self.exit_code = None
-        self.port = 1234
-        self._tps = collections.deque(maxlen=20)
-        self._ttft = collections.deque(maxlen=20)
-        self._pf = collections.deque(maxlen=20)
-        self._perf_buf = ""
-        self._pump_threads = []
-        self._metrics_last = {}
         self.last_cmd = ""
+        self.last_cmd_list = []
+        self.last_profile = {}
+        # 端口缓存: 仅在配置/命令构建侧(HTTP 处理线程)解析,采集线程只读缓存
+        # (58247ff: 跨线程读 UI 控件是采集全灭的根因)
+        self._cached_port = 0
+        self._port_lock = threading.Lock()
+        self.api = llapimon.LlamaApiMonitor(self._port_getter)
+        # OOM 自动降层重试(0314b6b + 4bf9416)
+        self.oom_retry_left = 3
+        self.oom_retry_active = False
+        self.mem_state = {"oom_seen": False, "offloaded": 0, "total_layers": 0, "buffers": {}}
+        self.persist_config = None  # main.py 注入: 降层落盘
+        self._pump_threads = []
 
     @property
     def running(self):
         return self.proc is not None and self.proc.poll() is None
 
-    # ---- 启动前置检查(供 API 的确认链) ----
-    def precheck(self, profile):
-        """返回 need_confirm dict 或 None;与原版 StartLlama 弹窗顺序一致。"""
+    # ------------------------------------------------------------ 端口 ------
+    def cache_port_from_profile(self, profile):
+        """配置侧解析端口并缓存: 勾选启用才可信(禁用时 BuildCmd 不发射 --port,
+        面板默认 1234 是幌子 — f919fd5 根因)。"""
         defs = self.schema["defs"]
         st = cmdline.ParamState(profile, defs)
+        port = 0
+        d = st.role_def("port")
+        if d is not None:
+            v = st.raw_value(d["flag"])
+            try:
+                v = int(cmdline.norm_tok(v) or 0)
+                if 0 < v < 65536:
+                    port = v
+            except (TypeError, ValueError):
+                port = 0
+        with self._port_lock:
+            self._cached_port = port
+
+    def _port_getter(self):
+        """采集线程专用: 只读缓存 → 命令行 → API 自动发现 → 0(交盲扫)。"""
+        with self._port_lock:
+            cached = self._cached_port
+        if cached > 0:
+            return cached
+        m = re.search(r"--port[= ](\d+)", self.last_cmd or "")
+        if m:
+            return int(m.group(1))
+        if self.api._active_port > 0:
+            return self.api._active_port
+        return 0
+
+    def get_port(self):
+        return self._port_getter()
+
+    # ------------------------------------------------------------ 前置检查 --
+    def precheck(self, profile):
+        """启动前置检查(确认链)。返回 dict;kind:
+        safetensors/empty/build_error/confirm/ok。"""
+        defs = self.schema["defs"]
         st_dir = cmdline.detect_safetensors_dir(profile.get("ModelPath"))
         if st_dir:
             return {"kind": "safetensors", "dir": st_dir,
                     "message": ("检测到 safetensors 模型分片,llama.cpp 无法直接加载。\n\n"
                                 "是否自动转换为 GGUF?(大模型耗时较长,30B 级约 10~40 分钟)\n\n"
                                 "F16(精度优先,磁盘≈源文件大小) / Q8_0(磁盘约省一半) / 取消")}
-
+        mp, m_err = cmdline.resolve_model_path(profile.get("ModelPath"))
+        if m_err:
+            return {"kind": "build_error", "message": "Build failed:" + m_err}
+        if mp and not os.path.isfile(mp):
+            return {"kind": "build_error", "message": "Build failed:模型文件不存在: %s" % mp}
         try:
-            lst, violations = cmdline.build_cmd(profile, defs)
+            lst, violations, flag_args = cmdline.build_cmd(profile, defs)
         except Exception as ex:
             return {"kind": "build_error", "message": "Build failed:%s" % ex}
         self.last_cmd = " ".join(cmdline.qa(x) for x in lst)
+        self.last_cmd_list = lst
+        self.cache_port_from_profile(profile)
         if not lst:
             return {"kind": "empty", "message": "Empty"}
+        occ = procman.find_process_by_port(self.get_port(), name_filter=None) if self.get_port() else None
+        if occ:
+            return {"kind": "build_error",
+                    "message": "端口 %d 已被占用(PID %d, 可能是遗留的 llama-server 进程)。请先停止或更换端口。" % (self.get_port(), occ)}
         confirm = {}
         if violations:
             confirm["violations"] = violations
         est = cmdline.estimate_vram_needed(profile, defs, monitor.query_gpu)
-        if est and est["avail_bytes"] > 0 and est["est_bytes"] > est["avail_bytes"]:
+        if est:
             confirm["vram"] = est["detail"]
+            confirm["vram_fits"] = bool(est.get("fits"))
         qw = cmdline.qwen35_partial_offload_warning(profile, defs)
         if qw:
             confirm["qwen35"] = qw
         if confirm:
-            return {"kind": "confirm", "cmd": lst, **confirm}
-        return {"kind": "ok", "cmd": lst}
+            return {"kind": "confirm", "cmd": lst, "flag_args": flag_args, **confirm}
+        return {"kind": "ok", "cmd": lst, "flag_args": flag_args}
 
-    def start(self, profile, cmd_list=None):
+    def args_map(self, profile):
+        """逐参数发射片段表(逐参数真实启动参数回显)。"""
+        try:
+            _, _, flag_args = cmdline.build_cmd(profile, self.schema["defs"])
+            return flag_args
+        except Exception:
+            return {}
+
+    # ------------------------------------------------------------ 启动 ------
+    def start(self, profile, cmd_list=None, skip_vram_confirm=False):
         defs = self.schema["defs"]
-        if cmd_list is None:
-            cmd_list, violations = cmdline.build_cmd(profile, defs)
-            if violations:
-                return False, "参数依赖检查未通过"
         if self.running:
             return False, "Already running"
-        self._vram_breaker_reset()
-        self._tps.clear(); self._ttft.clear(); self._pf.clear()
-        self._metrics_last = {}
+        self.last_profile = profile
+        self.cache_port_from_profile(profile)
+        if cmd_list is None:
+            try:
+                lst, violations, _ = cmdline.build_cmd(profile, defs)
+            except Exception as ex:
+                return False, "Build failed:%s" % ex
+            if violations and not skip_vram_confirm:
+                return False, "参数依赖检查未通过"
+            cmd_list = lst
+        self.last_cmd_list = cmd_list
+        self.last_cmd = " ".join(cmdline.qa(x) for x in cmd_list)
+        # OOM 额度: 用户手动启动重置为 3(4bf9416);重试路径保持
+        if not self.oom_retry_active:
+            self.oom_retry_left = 3
+        self.mem_state = {"oom_seen": False, "offloaded": 0, "total_layers": 0, "buffers": {}}
+        self.api.reset_log_machine()
         try:
             env = dict(os.environ)
             env["GGML_CUDA_GRAPH_OPT"] = "1"
@@ -181,46 +245,33 @@ class LlamaRunner:
         self.status = "starting"
         st = cmdline.ParamState(profile, defs)
         cmdline.log_param_hints(st, defs, self.hub.log)
-        m = re.search(r"--port\s+(\d+)", self.last_cmd)
-        self.port = int(m.group(1)) if m else int(cmdline.norm_tok(
-            st.role_text("port") or "1234") or 1234)
-        self._pump(cmd_list)
+        self._pump()
         threading.Thread(target=self._verify_after, args=(3.0,), daemon=True).start()
-        self.hub.log("--- 正在启动 Llama ---\n" + cmdline.fmt_cmd(cmd_list))
+        self.hub.log("--- 正在启动 Llama ---\n" + cmdline.fmt_cmd(cmd_list, defs))
         state.save_state({"LlamaPid": p.pid})
         return True, None
 
-    def _pump(self, cmd_list):
+    def _pump(self):
         p = self.proc
-        for stream, tag in ((p.stdout, "[llama] "), (p.stderr, "[llama] ")):
-            t = threading.Thread(target=self._pump_line, args=(stream, tag), daemon=True)
+        for stream in (p.stdout, p.stderr):
+            t = threading.Thread(target=self._pump_line, args=(stream,), daemon=True)
             t.start()
             self._pump_threads.append(t)
         threading.Thread(target=self._wait_exit, daemon=True).start()
 
-    def _pump_line(self, stream, tag):
+    def _pump_line(self, stream):
         try:
             for line in stream:
                 line = line.rstrip("\r\n")
                 if not line:
                     continue
-                self.hub.log(tag + line)
-                self._parse_timings(line)
+                self.hub.log("[llama] " + line)
+                self.api.feed_log_line(line)
+                hint = self.api.note_memory_line(line, self.mem_state)
+                if hint:
+                    self.hub.log(hint)
         except Exception:
             pass
-
-    def _wait_exit(self):
-        code = self.proc.wait()
-        self.exit_code = code
-        self.status = "crashed" if code != 0 else "stopped"
-        if code != 0:
-            self.hub.log("--- Llama 异常退出 (退出码 %s) --- 请查看上方日志,通常是显存不足或参数错误导致 ---" % code)
-            self.status = "crashed"
-        else:
-            self.hub.log("--- Llama 已退出 ---")
-            self.status = "stopped"
-        self.proc = None
-        state.clear_state_for("LlamaPid")
 
     def _verify_after(self, secs):
         time.sleep(secs)
@@ -233,67 +284,97 @@ class LlamaRunner:
         else:
             self.status = "running"
 
+    def _wait_exit(self):
+        code = self.proc.wait()
+        self.exit_code = code
+        # 假在线冻结数据修复(4bf9416): 退出即清采集态,图表不吃冻结数据
+        self.api.reset_log_machine()
+        self.proc = None
+        state.clear_state_for("LlamaPid")
+        if code != 0:
+            self.status = "crashed"
+            self.hub.log("--- Llama 异常退出 (退出码 %s) --- 请查看上方日志,通常是显存不足或参数错误导致 ---" % code)
+            self._maybe_oom_retry()
+        else:
+            self.status = "stopped"
+            self.hub.log("--- Llama 已退出 ---")
+            # 干净退出才重置 OOM 额度(4bf9416)
+            self.oom_retry_left = 3
+
+    # ------------------------------------------------------------ OOM 降层 --
+    def _maybe_oom_retry(self):
+        """退出码非 0 且检测到 OOM → --gpu-layers ×0.85(下限 4)自动重启,最多 3 次。"""
+        st = self.mem_state
+        if not (st.get("oom_seen") and self.oom_retry_left > 0 and self.last_profile):
+            return
+        if not self.last_profile.get("OomRetryEnabled", True):
+            return
+        defs = self.schema["defs"]
+        sp = cmdline.ParamState(self.last_profile, defs)
+        ngl_def = sp.role_def("ngl")
+        cur = None
+        if ngl_def is not None:
+            v = sp.raw_value(ngl_def["flag"])
+            cur = cmdline._try_float(v)
+        base = None
+        if cur is not None and cur > 0:
+            base = int(cur)
+        elif st.get("offloaded", 0) > 0:
+            base = st["offloaded"]
+        elif st.get("total_layers", 0) > 0:
+            base = st["total_layers"]
+        if not base:
+            self.hub.log("[OOM] 无法确定当前卸载层数,放弃自动降层(请手动调小 --gpu-layers 或上下文)")
+            return
+        new_ngl = max(4, int(base * 0.85))
+        if new_ngl >= base:
+            new_ngl = base - 1
+        if new_ngl < 4:
+            self.hub.log("[OOM] 降层后仍低于 4 层,放弃重试。请调小 ctx、量化 KV 或换更小的量化。")
+            return
+        flag = ngl_def["flag"] if ngl_def is not None else "gpu-layers"
+        vp = self.last_profile.setdefault("ValueParams", {})
+        vp[flag] = {"Enabled": True, "Value": str(new_ngl)}
+        self.oom_retry_left -= 1
+        self.oom_retry_active = True
+        self.hub.log("[OOM] 自动降层重试: --gpu-layers %d → %d(剩余重试 %d 次)" % (base, new_ngl, self.oom_retry_left))
+        threading.Thread(target=self._relaunch, daemon=True).start()
+
+    def _relaunch(self):
+        time.sleep(1.0)
+        ok, msg = self.start(self.last_profile, skip_vram_confirm=True)
+        if not ok:
+            self.hub.log("[OOM] 重试启动失败: %s" % msg)
+            self.oom_retry_active = False
+
+    def oom_recredit(self):
+        """API 在线补重置 + 降层值落盘(4bf9416: 否则下次启动回到 OOM 原值重演崩溃循环)。"""
+        if self.oom_retry_active and self.api.online:
+            self.oom_retry_active = False
+            self.oom_retry_left = 3
+            self.hub.log("[OOM] 服务已稳定在线,重试额度已恢复,降层值已写入方案")
+            if self.persist_config:
+                try:
+                    self.persist_config()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------ 停止 ------
     def stop(self):
-        if self.proc is None:
+        port = self.get_port()
+        if self.proc is not None:
+            pid = self.proc.pid
+        elif port > 0:
+            pid = procman.find_process_by_port(port, name_filter=("llama-server",))
+        else:
             return
         self.hub.log("--- 正在停止 Llama ---")
-        procman.kill_process_tree(self.proc.pid)
+        procman.kill_process_tree(pid)
         self.proc = None
         self.status = "stopped"
+        self.api.reset_log_machine()
         self.hub.log("--- 已停止 ---")
         state.clear_state_for("LlamaPid")
-
-    # ---- 性能解析(Prompt/首Token/Prefill/TPS) ----
-    def _parse_timings(self, line):
-        self._perf_buf = (self._perf_buf + "\n" + line)[-4000:] if self._perf_buf else line
-        for m in _RE_PROMPT_TPS.finditer(self._perf_buf):
-            ms, toks = float(m.group(1)), int(m.group(2))
-            if ms > 0:
-                self._ttft.append(ms)
-                self._pf.append(toks / (ms / 1000.0))
-        for m in _RE_EVAL_TPS.finditer(self._perf_buf):
-            self._tps.append(float(m.group(1)))
-        if self._perf_buf.count("\n") > 8:
-            self._perf_buf = self._perf_buf.split("\n", 4)[-1]
-
-    def perf_snapshot(self):
-        def avg(dq):
-            return round(sum(dq) / len(dq), 1) if dq else None
-        return {"tps": avg(self._tps), "ttft": avg(self._ttft), "prefill": avg(self._pf)}
-
-    def _metrics_fallback(self):
-        """日志无样本时从 /metrics 计数差值估算(原版同款兜底)。"""
-        if not self.running:
-            self._metrics_last = {}
-            return {}
-        try:
-            import urllib.request
-            req = urllib.request.Request("http://127.0.0.1:%d/metrics" % self.port)
-            body = urllib.request.urlopen(req, timeout=2).read().decode("utf-8", "replace")
-        except Exception:
-            return {}
-        vals = {}
-        for key in ("llamacpp:prompt_tokens_total", "llamacpp:prompt_seconds_total",
-                    "llamacpp:tokens_predicted_total", "llamacpp:tokens_predicted_seconds_total"):
-            m = re.search(r"^%s\s+([\d.]+)" % re.escape(key), body, re.M)
-            if m:
-                vals[key] = float(m.group(1))
-        prev = self._metrics_last
-        out = {}
-        if prev:
-            dt_tok = vals.get("llamacpp:tokens_predicted_total", 0) - prev.get("llamacpp:tokens_predicted_total", 0)
-            dt_sec = vals.get("llamacpp:tokens_predicted_seconds_total", 0) - prev.get("llamacpp:tokens_predicted_seconds_total", 0)
-            pf_tok = vals.get("llamacpp:prompt_tokens_total", 0) - prev.get("llamacpp:prompt_tokens_total", 0)
-            pf_sec = vals.get("llamacpp:prompt_seconds_total", 0) - prev.get("llamacpp:prompt_seconds_total", 0)
-            if dt_sec > 0 and dt_tok >= 0:
-                out["tps"] = round(dt_tok / dt_sec, 1)
-            if pf_sec > 0 and pf_tok >= 0:
-                out["prefill"] = round(pf_tok / pf_sec, 1)
-        self._metrics_last = vals
-        return out
-
-    def _vram_breaker_reset(self):
-        self._breaker = False
 
 
 # ================================================================== DSH =====
@@ -309,10 +390,10 @@ class DshRunner:
         self.tailer_stop = threading.Event()
         self.verify_stop = threading.Event()
         self.rebuild_stop = threading.Event()
-        self.rebuild_thread = None
         self.retries_left = 0
         self.last_profile = {}
         self._tailer_fh = None
+        self._deadline = 0.0
 
     @property
     def running(self):
@@ -320,7 +401,6 @@ class DshRunner:
             return self.tracker.poll() is None
         return self.proc is not None and self.proc.poll() is None
 
-    # ------------------------------------------------------------ 锁/基线 --
     @staticmethod
     def lock_path():
         return os.path.join(os.path.expanduser("~"), ".dsh", "task-board", "ledger-v2.lock")
@@ -345,7 +425,6 @@ class DshRunner:
         return ""
 
     def resolve_mode(self, profile):
-        """返回 'compiled-js'/'compiled-tsx'/'npx'。"""
         if (profile.get("DshMode") or 0) == 1:
             return "npx"
         dsh_dir = (profile.get("DshDir") or "").strip().strip('"') or "deepseek-harness"
@@ -353,11 +432,16 @@ class DshRunner:
             return "compiled-js"
         return "compiled-tsx"
 
-    # ------------------------------------------------------------ 启动 ------
     def start(self, profile):
         if self.running:
             return False, "Already running"
         self.last_profile = profile
+        # 每次启动会话截断 boot log: append 模式下旧失败(ERR_MODULE_NOT_FOUND 等)
+        # 会毒化后续所有尝试的快速失败判定
+        try:
+            open(DSH_BOOT_LOG, "wb").close()
+        except OSError:
+            pass
         existing = procman.find_process_by_port(DSH_PORT)
         if existing:
             self.attach(existing, "检测到端口 %d 已有 DSH 在运行,直接接管" % DSH_PORT)
@@ -396,7 +480,6 @@ class DshRunner:
         self._deadline = time.time() + 30.0
 
         if profile.get("DshAdminMode"):
-            # Linux 版管理员模式 = sudo -n(非交互);失败不回退普通启动(与原版原则一致)
             inner = {"compiled-js": "node apps/cli/lib/bin.js web",
                      "compiled-tsx": "pnpm dsh web",
                      "npx": "npx --yes @deepseek-ai/dsh web"}[mode]
@@ -471,7 +554,7 @@ class DshRunner:
             try:
                 if os.path.exists(DSH_BOOT_LOG):
                     size = os.path.getsize(DSH_BOOT_LOG)
-                    if size < pos:  # 日志被轮转/清空
+                    if size < pos:
                         pos = 0
                     if size > pos:
                         with open(DSH_BOOT_LOG, "r", encoding="utf-8", errors="replace") as f:
@@ -547,9 +630,7 @@ class DshRunner:
         self.hub.log("--- 已停止 DSH ---")
         state.clear_state_for("DshPid")
 
-    # ------------------------------------------------------------ 重建 ------
     def rebuild(self, profile, on_done=None):
-        """三步重建:pnpm clean → build:lib → vite build(原版等价)。返回 (ok, msg)。"""
         dsh_dir = (profile.get("DshDir") or "").strip().strip('"')
         if not dsh_dir or not os.path.isdir(os.path.join(dsh_dir, "apps", "cli")):
             return False, "无效的 DSH 目录(缺少 apps/cli): %s" % dsh_dir
@@ -558,7 +639,7 @@ class DshRunner:
             return False, "无法读取 git HEAD(不是有效的 git 仓库)"
         if self.running:
             self.stop()
-            for _ in range(10):  # 等待 ≤20s
+            for _ in range(10):
                 if not self.running:
                     break
                 time.sleep(2)
@@ -630,61 +711,202 @@ class DshRunner:
 # ============================================================ 监控/熔断 =====
 
 class Monitor:
+    """性能采集线程: GPU/系统 + LlamaApiMonitor 轮询 + 60 点历史序列 + 显存熔断。
+
+    采样节奏(CS 语义): llama 运行中或监测页可见 → 3s;否则 30s。
+    """
+
     def __init__(self, hub, llama: LlamaRunner, dsh: DshRunner):
         self.hub = hub
         self.llama = llama
         self.dsh = dsh
         self.active_profile = {}
         self.breaker_triggered = False
+        self.monitor_visible = False
+        # 轻量化模式(QQ/微信式最小化到托盘): 大幅降低采样频率, 无服务存活时不做任何
+        # 子进程采样——llama/dsh 都没跑时后台几乎零占用
+        self.lightweight = False
         self.snapshot = {}
+        self.h = {k: llapimon.Hist() for k in
+                  ("tps", "pf", "ctx", "mtp", "gpu_util", "gpu_mem", "gpu_temp", "gpu_power",
+                   "cpu", "ram", "net_rx", "net_tx")}
+
+    def clear_llama_hists(self):
+        for k in ("tps", "pf", "ctx", "mtp"):
+            self.h[k].clear()
+
+    def _active_slot(self):
+        for s in self.llama.api.slots:
+            if s.get("processing"):
+                return s
+        return None
 
     def loop(self):
         while True:
             try:
-                cm = monitor.cpu_mem_usage()
-                g = monitor.query_gpu()
+                # 存活判定(CS IsLlamaRunning 语义): 进程对象 或 端口属主 或 API 在线
                 llama_alive = self.llama.running
+                api_online = self.llama.api.online
+                dsh_alive = self.dsh.running
+                if not llama_alive and not api_online:
+                    port = self.llama.get_port()
+                    if port and procman.find_process_by_port(port, name_filter=("llama-server",)):
+                        llama_alive = True
                 if not llama_alive:
                     self.breaker_triggered = False
-                if llama_alive and not self.llama._tps:
-                    met = self.llama._metrics_fallback()
-                    for k, v in met.items():
-                        dq = {"tps": self.llama._tps, "prefill": self.llama._pf}.get(k)
-                        if dq is not None:
-                            dq.append(v)
-                perf = self.llama.perf_snapshot()
-                snap = {
-                    "cpu": cm["cpu"], "mem_pct": cm["mem_pct"],
-                    "mem_used": cm["mem_used"], "mem_total": cm["mem_total"],
-                    "gpu_util": g.get("gpu_util"), "gpu_temp": g.get("gpu_temp"),
-                    "gpu_temp_src": g.get("gpu_temp_src"),
-                    "vram_used": g.get("vram_used"), "vram_total": g.get("vram_total"),
-                    **perf,
-                }
-                # 显存熔断
+                if self.lightweight:
+                    # 轻量化: 有服务存活 → 30s(保熔断/接管安全); 无服务 → 60s 纯休眠,
+                    # 不做任何子进程采样(nvidia-smi/ss/statvfs 全部跳过)
+                    busy = llama_alive or api_online or dsh_alive
+                    interval = 30.0 if busy else 60.0
+                    if busy:
+                        if llama_alive or api_online:
+                            self.llama.api.poll_fast()
+                            self.llama.api.poll_slow_if_needed()
+                            self.llama.oom_recredit()
+                        gpus = monitor.query_gpus()
+                        sysi = monitor.sample_system()
+                        vt_sum, vu_sum = self._vram_sums(gpus)
+                        brk = self.active_profile or {}
+                        if (brk.get("VramBreakerEnabled") and llama_alive and vt_sum > 0
+                                and not self.breaker_triggered):
+                            val = brk.get("VramBreakerValue", 90.0)
+                            hit = ((brk.get("VramBreakerType", 0) == 0 and vu_sum / vt_sum * 100.0 >= val)
+                                   or (brk.get("VramBreakerType", 0) == 1 and vu_sum / GIB >= val))
+                            if hit:
+                                self.breaker_triggered = True
+                                self.hub.log("[熔断] 显存使用超限,自动停止 Llama 服务")
+                                self.llama.stop()
+                        gen, prompt, _src = self._collect_speeds()
+                        self.snapshot = self._build_snapshot(gpus, sysi, gen, prompt,
+                            "api", -1, 0, vt_sum, vu_sum)
+                    else:
+                        self.snapshot.update({"lightweight": True,
+                                              "llama_status": self.llama.status,
+                                              "dsh_status": self.dsh.status})
+                    time.sleep(interval)
+                    continue
+                interval = 3.0 if (llama_alive or api_online or self.monitor_visible) else 30.0
+                if llama_alive or api_online or self.monitor_visible:
+                    self.llama.api.poll_fast()
+                    self.llama.api.poll_slow_if_needed()
+                    self.llama.oom_recredit()
+                gpus, sysi, (gen, prompt, src) = self._sample_all()
+                self.h["tps"].push(gen if gen > 0 else None)
+                self.h["pf"].push(prompt if prompt > 0 else None)
+                ctx_used, ctx_total = self.llama.api.ctx_view()
+                self.h["ctx"].push(ctx_used if ctx_used >= 0 else None)
+                acc = self.llama.api.mtp_acceptance
+                self.h["mtp"].push(acc * 100.0 if acc is not None else None)  # b3d3527: 历史按百分数
+                utils = [c["util"] for c in gpus if c.get("util") is not None]
+                vus = [c.get("vram_used") for c in gpus if c.get("vram_used") is not None]
+                vts = [c.get("vram_total") for c in gpus if c.get("vram_total") is not None]
+                temps = [c.get("temp") for c in gpus if c.get("temp") is not None]
+                pws = [c.get("power_w") for c in gpus if c.get("power_w") is not None]
+                self.h["gpu_util"].push(round(sum(utils) / len(utils), 1) if utils else None)
+                self.h["gpu_mem"].push(round(sum(vus) / GIB, 2) if vus else None)
+                self.h["gpu_temp"].push(max(temps) if temps else None)
+                self.h["gpu_power"].push(round(sum(pws), 1) if pws else None)
+                self.h["cpu"].push(sysi.get("cpu"))
+                self.h["ram"].push(round((sysi.get("mem_used") or 0) / GIB, 2))
+                nets = sysi.get("net") or {}
+                rx = round(sum(v[0] for v in nets.values()), 2) if nets else None
+                tx = round(sum(v[1] for v in nets.values()), 2) if nets else None
+                self.h["net_rx"].push(rx)
+                self.h["net_tx"].push(tx)
+                # 显存熔断: 百分比=各卡 used 和/total 和;GB 模式=used 和
                 brk = self.active_profile or {}
-                if (brk.get("VramBreakerEnabled") and llama_alive
-                        and g.get("vram_total", 0) > 0 and not self.breaker_triggered):
-                    used, total = g.get("vram_used", 0), g.get("vram_total")
+                vt_sum = sum(vts) if vts else 0.0
+                vu_sum = sum(vus) if vus else 0.0
+                if (brk.get("VramBreakerEnabled") and llama_alive and vt_sum > 0
+                        and not self.breaker_triggered):
                     val = brk.get("VramBreakerValue", 90.0)
-                    hit = ((brk.get("VramBreakerType", 0) == 0 and used / total * 100.0 >= val)
-                           or (brk.get("VramBreakerType", 0) == 1 and used / (1 << 30) >= val))
+                    hit = ((brk.get("VramBreakerType", 0) == 0 and vu_sum / vt_sum * 100.0 >= val)
+                           or (brk.get("VramBreakerType", 0) == 1 and vu_sum / GIB >= val))
                     if hit:
                         self.breaker_triggered = True
                         self.hub.log("[熔断] 显存使用超限,自动停止 Llama 服务")
                         self.llama.stop()
-                snap["breaker_pct"] = round(100.0 * g.get("vram_used", 0) / g["vram_total"], 1) if g.get("vram_total") else 0.0
-                snap["breaker_triggered"] = self.breaker_triggered
-                self.snapshot = snap
+                self.snapshot = self._build_snapshot(gpus, sysi, gen, prompt, src,
+                                                     ctx_used, ctx_total, vt_sum, vu_sum)
             except Exception as ex:
                 self.hub.log("[Perf] Error: %s" % ex)
-            time.sleep(2.0)
+            time.sleep(interval)
+
+    def _collect_speeds(self):
+        return self.llama.api.speeds()
+
+    def _vram_sums(self, gpus):
+        vus = [c.get("vram_used") for c in gpus if c.get("vram_used") is not None]
+        vts = [c.get("vram_total") for c in gpus if c.get("vram_total") is not None]
+        return (sum(vus) if vus else 0.0), (sum(vts) if vts else 0.0)
+
+    def _sample_all(self):
+        gpus = monitor.query_gpus()
+        sysi = monitor.sample_system()
+        return gpus, sysi, self.llama.api.speeds()
+
+    def _phase_pill(self, alive_effective):
+        api = self.llama.api
+        if self.breaker_triggered:
+            return "已熔断", "#ff8a98", "#2eff5a6e"
+        if not alive_effective:
+            return "llama 离线", "#ff8a98", "#2eff5a6e"
+        if not api.online:
+            return "未知(API)", "#f8c96a", "#2ef5b53d"
+        if api.phase == "decoding":
+            return "生成中", "#7cd7f7", "#2e7cd7f7"
+        if api.phase == "prompt_processing":
+            return "Prompt 处理中", "#4ade80", "#2e34d399"
+        return "空闲", "#8e979f", "#1a8e979f"
+
+    def _build_snapshot(self, gpus, sysi, gen, prompt, src, ctx_used, ctx_total, vt_sum, vu_sum):
+        api = self.llama.api
+        pill = self._phase_pill(self.llama.running or api.online)
+        events, total_events = api.events_snapshot()
+        hists = {k: h.snapshot() for k, h in self.h.items()}
+        return {
+            "llama_status": self.llama.status,
+            "llama_alive": self.llama.running or self.llama.api.online,
+            "online": api.online,
+            "active_port": api._active_port,
+            "phase": api.phase,
+            "pill": {"text": pill[0], "fg": pill[1], "bg": pill[2]},
+            "speeds": {"gen": gen, "prompt": prompt, "source": src,
+                       "gen_ft": llapimon.fmt_tps(gen), "prompt_ft": llapimon.fmt_tps(prompt)},
+            "gen_detail": {"tg": api.tg_tps, "tg3": api.tg3s_tps,
+                           "log_prompt": api.log_prompt_speed,
+                           "decoded": api.log_n_decoded,
+                           "last_prefill": api.last_prefill_speed},
+            "ctx": {"used": ctx_used, "total": ctx_total,
+                    "pct": round(ctx_used * 100.0 / ctx_total, 1) if ctx_used >= 0 and ctx_total > 0 else None},
+            "mtp": {"acc": api.mtp_acceptance, "accepted": api.mtp_accepted,
+                    "generated": api.mtp_generated, "mean_len": api.mtp_mean_len,
+                    "graphs": api.graphs_reused},
+            "progress": {"prompt_progress": api.prompt_progress,
+                         "prompt_total": api.prompt_total_tokens,
+                         "prompt_elapsed": api.prompt_elapsed_s},
+            "task": api.last_task,
+            "task_started_at": api.task_started_at,
+            "slots": api.slots,
+            "events": list(reversed(events)),   # 新 → 旧
+            "total_events": total_events,
+            "model": api.model_info(),
+            "boot": api.boot,
+            "gpus": gpus,
+            "sys": sysi,
+            "hists": hists,
+            "monitor_visible": self.monitor_visible,
+            "breaker_triggered": self.breaker_triggered,
+            "vram": {"used": vu_sum, "total": vt_sum,
+                     "pct": round(100.0 * vu_sum / vt_sum, 1) if vt_sum > 0 else 0.0},
+        }
 
 
 # ====================================================== safetensors 转换 ====
 
 class Converter:
-    """safetensors → GGUF 分离转换(Linux:python convert_hf_to_gguf.py,输出走日志文件)。"""
+    """safetensors → GGUF 分离转换(python3 convert_hf_to_gguf.py,EXITCODE 标记判结束)。"""
 
     def __init__(self, hub):
         self.hub = hub
@@ -692,10 +914,7 @@ class Converter:
         self._log_pos = 0
 
     def find_convert_script(self):
-        cands = [
-            os.path.join(TOOLS_DIR, "convert_hf_to_gguf.py"),
-        ]
-        # llama.cpp 仓库自带脚本
+        cands = [os.path.join(TOOLS_DIR, "convert_hf_to_gguf.py")]
         for root in (os.path.join(os.path.expanduser("~"), "llama.cpp"), "/opt/llama.cpp", "/usr/local/share/llama.cpp"):
             cands.append(os.path.join(root, "convert_hf_to_gguf.py"))
         for c in cands:
@@ -731,7 +950,6 @@ class Converter:
             self.hub.log("[转换] 磁盘空间不足(需要 %.1f GiB,可用 %.1f GiB),中止" % (need / cmdline.GIB, free / cmdline.GIB))
             on_done(None)
             return
-        # 依赖检查:gguf/torch/transformers
         try:
             subprocess.run(["python3", "-c", "import gguf, torch, transformers"],
                            capture_output=True, timeout=60)

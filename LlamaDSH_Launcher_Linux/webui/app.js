@@ -1,14 +1,35 @@
-/* LlamaDSH Launcher(Linux 复刻版)前端逻辑。
- * 复刻原版 MainWindow.xaml 的交互:方案/参数面板/命令预览/确认链/监控/日志。 */
+/* LlamaDSH Launcher(Linux 复刻版)前端逻辑 — 2026-10 同步版。
+ * 复刻 MainWindow.xaml 终版交互: 左栏三标签(运行环境/参数配置/命令预览) +
+ * 右栏运行控制 + 监测页(Strata 风格)/运行日志 + 逐参数回显 + 通知条。 */
 "use strict";
 
 const $ = (id) => document.getElementById(id);
 let SCHEMA = { groups: [], params: [] };
 let CFG = { Profiles: {}, CurrentProfile: "默认方案" };
-let PROF = null;            // 当前编辑中的方案(引用 CFG.Profiles[名字] 的拷贝)
+let PROF = null;
 let LOG_AFTER = 0, LOG_LINES = [];
-let MON_STOP = false;
 let CFG_DIR = "";
+let FLAG_ARGS = {};          // 逐参数发射片段(preview 下发)
+let LAST_TOTAL_EVENTS = -1;  // 事件流增量指纹(4bf9416: 单调序号)
+let MON_TAB = "mon";
+let NAV_SEL = null;          // {grp, sub}
+/* 参数 UI 状态表(等价 CS _pbw/_pw 控件字典): 导航式渲染下只有当前子组挂载 DOM,
+ * collect/apply/依赖评估一律读写状态表, DOM 仅作展示层 */
+const UI_BOOL = {};   // flag -> bool
+const UI_VAL = {};    // flag -> {Enabled, Value}
+
+function initState() {
+  for (const d of SCHEMA.params) {
+    if (d.hidden || d.flag === "model" || d.flag === "model-draft") continue;
+    if (d.type === "Bool") {
+      UI_BOOL[d.flag] = d.default === "true";
+    } else {
+      UI_VAL[d.flag] = { Enabled: !!d.enabled, Value: d.default || "" };
+    }
+  }
+}
+let NODE_SEEN_LOG = new Set();
+const GIB = 1073741824;
 
 async function api(path, body) {
   const r = await fetch("/api/" + path, {
@@ -40,19 +61,31 @@ function showModal({ title, body = "", buttons = [], extra = null }) {
     $("overlay").classList.add("show");
   });
 }
-const mEsc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const mEsc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+/* ================================ 通知条 ================================= */
+let noticeTimer = null;
+function showNotice(text, isError) {
+  if (text === undefined || text === null || String(text).trim() === "") {
+    text = isError ? "(操作失败,详情见运行日志)" : "已完成";
+  }
+  $("noticeText").textContent = String(text);
+  const bar = $("noticeBar");
+  bar.classList.toggle("error", !!isError);
+  bar.classList.add("show");
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => bar.classList.remove("show"), isError ? 12000 : 8000);
+}
 
 /* ============================ 目录/文件浏览 ============================= */
 async function browsePicker(mode) {
-  let cur = null;
-  let sel = null;
+  let cur = null, sel = null;
   const box = document.createElement("div");
   box.innerHTML = `<input type="text" id="browserPath"><div id="browser"></div>
     <div class="tiny" id="browserSel" style="margin-top:4px"></div>`;
   const list = box.querySelector("#browser");
   const pathIn = box.querySelector("#browserPath");
   const selInfo = box.querySelector("#browserSel");
-
   async function load(p) {
     const r = await api("browse", { path: p });
     if (r.error) { selInfo.textContent = r.error; return; }
@@ -76,10 +109,14 @@ async function browsePicker(mode) {
       list.appendChild(d);
     }
     for (const f of r.files || []) {
+      const isTgz = /\.(tgz|tar\.gz)$/i.test(f.name);
       if (mode === "dir") continue;
+      if (mode === "plugin_src" && !isTgz) continue;
       const d = document.createElement("div");
       d.className = "item";
-      d.innerHTML = `<span>📄 ${mEsc(f.name)}</span><span class="tiny">${(f.size / 1073741824).toFixed(2)} GB</span>`;
+      const sz = f.size > 1073741824 ? (f.size / GIB).toFixed(2) + " GB"
+        : (f.size / 1048576).toFixed(1) + " MB";
+      d.innerHTML = `<span>${isTgz ? "📦" : "📄"} ${mEsc(f.name)}</span><span class="tiny">${sz}</span>`;
       d.onclick = () => {
         list.querySelectorAll(".item").forEach(x => x.classList.remove("sel"));
         d.classList.add("sel");
@@ -90,13 +127,17 @@ async function browsePicker(mode) {
     }
   }
   pathIn.addEventListener("keydown", (e) => { if (e.key === "Enter") load(pathIn.value); });
-  await load(mode === "model" ? "" : "");
+  await load("");
   const v = await showModal({
-    title: "选择文件 / 目录", body: "", extra: box,
+    title: mode === "plugin_src" ? "选择插件包(.tgz)或插件目录" : "选择文件 / 目录",
+    body: mode === "plugin_src" ? "选中一个 .tgz 文件后点确定;或直接点「选择当前目录」安装目录形态的插件。" : "",
+    extra: box,
     buttons: [{ label: "取消", value: null },
-      { label: mode === "dir" ? "选择当前目录" : "确定", cls: "primary", value: "__ok__" }]
+      { label: mode === "dir" ? "选择当前目录" : "确定", cls: "primary", value: "__ok__" },
+      ...(mode === "plugin_src" ? [{ label: "选择当前目录", value: "__dir__" }] : [])]
   });
   if (v === null) return null;
+  if (v === "__dir__") return cur;
   if (mode === "dir") return cur;
   return sel || pathIn.value;
 }
@@ -107,12 +148,16 @@ function collectProfile() {
   for (const d of SCHEMA.params) {
     if (d.hidden || d.flag === "model" || d.flag === "model-draft") continue;
     if (d.type === "Bool") {
-      bp[d.flag] = $("pb_" + cssId(d.flag)).checked;
+      bp[d.flag] = !!UI_BOOL[d.flag];
     } else {
-      vp[d.flag] = { Enabled: $("pe_" + cssId(d.flag)).checked, Value: $("pv_" + cssId(d.flag)).value.trim() };
+      const rec = UI_VAL[d.flag] || { Enabled: false, Value: "" };
+      vp[d.flag] = { Enabled: !!rec.Enabled, Value: String(rec.Value ?? "").trim() };
     }
   }
-  return {
+  // 以现有方案为底(保留 LlamaVariants/ActiveLlamaVariant/CustomArgs/VramMeasured* 等
+  // 服务器侧字段), UI 管理的字段覆盖其上
+  const base = (typeof PROF === "object" && PROF) ? JSON.parse(JSON.stringify(PROF)) : {};
+  return Object.assign(base, {
     ModelPath: $("inModel").value.trim(), MtpPath: $("inMtp").value.trim(),
     MmprojPath: $("inMmproj").value.trim(), MmprojUrl: $("inMmprojUrl").value.trim(),
     NoMmprojOffload: $("chkNoMmprojOffload").checked,
@@ -120,11 +165,13 @@ function collectProfile() {
     DshMode: parseInt($("comboDshMode").value) || 0,
     DshAdminMode: $("chkDshAdmin").checked,
     MinimizeToTray: false,
-    BoolParams: bp, ValueParams: vp, CmdPreview: $("cmdPreview").value,
+    BoolParams: bp, ValueParams: vp,
     VramBreakerEnabled: $("chkBreaker").checked,
     VramBreakerType: parseInt($("comboBreakerType").value) || 0,
     VramBreakerValue: parseFloat($("txtBreakerVal").value) || 90,
-  };
+    OomRetryEnabled: $("chkOomRetry").checked,
+    LlamaBackend: $("comboBackend").value,
+  });
 }
 
 function applyProfile(p) {
@@ -137,67 +184,50 @@ function applyProfile(p) {
   $("chkBreaker").checked = !!p.VramBreakerEnabled;
   $("comboBreakerType").value = String(p.VramBreakerType || 0);
   $("txtBreakerVal").value = p.VramBreakerValue ?? 90;
+  $("chkOomRetry").checked = p.OomRetryEnabled !== false;
+  $("comboBackend").value = (p.LlamaBackend || "").toLowerCase();
   for (const d of SCHEMA.params) {
     if (d.hidden || d.flag === "model" || d.flag === "model-draft") continue;
     if (d.type === "Bool") {
-      const el = $("pb_" + cssId(d.flag));
       const on = (p.BoolParams || {})[d.flag];
-      if (el) el.checked = on === undefined ? d.default === "true" : !!on;
+      UI_BOOL[d.flag] = on === undefined ? d.default === "true" : !!on;
     } else {
-      const e = $("pe_" + cssId(d.flag)), v = $("pv_" + cssId(d.flag));
       const rec = (p.ValueParams || {})[d.flag];
-      if (e) e.checked = rec ? !!rec.Enabled : !!d.enabled;
-      if (v) v.value = rec ? (rec.Value ?? "") : (d.default || "");
+      UI_VAL[d.flag] = rec
+        ? { Enabled: !!rec.Enabled, Value: rec.Value ?? "" }
+        : { Enabled: !!d.enabled, Value: d.default || "" };
     }
   }
+  renderCurrentSubgroup();
+  updateCustomPreview();
   depEval();
+  updateArgEcho();
+}
+
+function renderCurrentSubgroup() {
+  if (!NAV_SEL) return;
+  const entry = NAV_INDEX.find(x => x.g.id === NAV_SEL.grp && x.sub === NAV_SEL.sub);
+  if (entry) {
+    const host = $("paramContent");
+    host.innerHTML = "";
+    for (const d of entry.items) buildParamRow(d, host);
+  }
 }
 
 const cssId = (s) => s.replace(/[^a-zA-Z0-9_-]/g, "_");
 
-function buildParamRow(d, container) {
-  const row = document.createElement("div");
-  row.className = "prow" + (d.wide ? " wide" : "");
-  row.id = "pr_" + cssId(d.flag);
-  const tip = (d.tooltip || "") + (d.deprecated ? "\n⚠ 已废弃" : "");
-  if (d.type === "Bool") {
-    row.innerHTML = `<span><input type="checkbox" id="pb_${cssId(d.flag)}"></span>
-      <span class="plabel" title="${mEsc(tip)}">${mEsc(d.label)}</span><span></span>`;
-  } else {
-    row.innerHTML = `<span><input type="checkbox" id="pe_${cssId(d.flag)}"></span>
-      <span class="plabel" title="${mEsc(tip)}">${mEsc(d.label)}</span><span id="pw_${cssId(d.flag)}"></span>`;
-    const wrap = row.querySelector("#pw_" + cssId(d.flag));
-    if (d.type === "Combo" && (d.options || []).length) {
-      const sel = document.createElement("select");
-      sel.id = "pv_" + cssId(d.flag);
-      for (const o of d.options) {
-        const op = document.createElement("option"); op.value = o; op.textContent = o;
-        sel.appendChild(op);
-      }
-      sel.value = d.default || (d.options[0] || "");
-      wrap.appendChild(sel);
-    } else {
-      const inp = document.createElement("input");
-      inp.type = "text"; inp.id = "pv_" + cssId(d.flag);
-      inp.value = d.default || "";
-      inp.title = mEsc(tip);
-      wrap.appendChild(inp);
-    }
-  }
-  container.appendChild(row);
-}
-
-function renderParams() {
-  const host = $("paramGroups");
+/* ------------------- 参数导航(组→子组)与渲染 ------------------- */
+function buildNav() {
+  const host = $("paramNavPanel");
   host.innerHTML = "";
+  const navIndex = [];
   for (const g of SCHEMA.groups) {
     const params = SCHEMA.params.filter(p => p.group === g.id && !p.hidden);
     if (!params.length) continue;
-    const det = document.createElement("details");
-    det.className = "grp";
-    det.innerHTML = `<summary>${mEsc(g.title)}</summary><div class="body"></div>`;
-    const body = det.querySelector(".body");
-    // 子组聚合: 同一子组的参数聚拢(即使 yml 中不连续), 子组标题可点击折叠
+    const gt = document.createElement("div");
+    gt.className = "navGrpTitle";
+    gt.textContent = g.title;
+    host.appendChild(gt);
     const bySub = new Map();
     for (const d of params) {
       const k = d.subgroup || "";
@@ -205,77 +235,142 @@ function renderParams() {
       bySub.get(k).push(d);
     }
     for (const [sub, items] of bySub) {
-      if (sub) {
-        const h = document.createElement("div");
-        h.className = "subgroup";
-        h.style.cursor = "pointer";
-        h.title = "点击折叠/展开该小节";
-        h.textContent = "▾ " + sub;
-        const wrap = document.createElement("div");
-        wrap.className = "subwrap";
-        h.addEventListener("click", () => {
-          const hide = wrap.style.display !== "none";
-          wrap.style.display = hide ? "none" : "";
-          wrap.dataset.collapsed = hide ? "1" : "";
-          h.textContent = (hide ? "▸ " : "▾ ") + sub;
-        });
-        body.appendChild(h);
-        body.appendChild(wrap);
-        for (const d of items) buildParamRow(d, wrap);
-      } else {
-        for (const d of items) buildParamRow(d, body);
-      }
+      const item = document.createElement("div");
+      item.className = "navItem";
+      const label = sub || "其它";
+      item.innerHTML = `<span>${mEsc(label)}</span><span class="navBadge">${items.length}</span>`;
+      item.onclick = () => selectSubgroup(g, sub, items);
+      item.dataset.key = g.id + "|" + sub;
+      host.appendChild(item);
+      navIndex.push({ g, sub, items, el: item });
     }
-    host.appendChild(det);
   }
-  // 事件绑定 → 依赖评估 + 预览刷新
-  host.addEventListener("change", () => { depEval(); schedulePreview(); });
-  host.addEventListener("input", (e) => {
-    if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") { depEval(); schedulePreview(); }
-  });
+  NAV_INDEX = navIndex;
+  if (navIndex.length) selectSubgroup(navIndex[0].g, navIndex[0].sub, navIndex[0].items);
+}
+let NAV_INDEX = [];
+
+function selectSubgroup(g, sub, items) {
+  NAV_SEL = { grp: g.id, sub };
+  document.querySelectorAll(".navItem").forEach(x =>
+    x.classList.toggle("active", x.dataset.key === g.id + "|" + sub));
+  const label = sub || "其它";
+  $("paramBreadcrumb").textContent = `${g.title} ▸ ${label} · ${items.length} 个参数`;
+  const host = $("paramContent");
+  host.innerHTML = "";
+  for (const d of items) buildParamRow(d, host);
+  depEval();
+  updateArgEcho();
+}
+
+
+function buildParamRow(d, container) {
+  const row = document.createElement("div");
+  row.className = "prow" + (d.wide ? " wide" : "");
+  row.id = "pr_" + cssId(d.flag);
+  const tip = (d.tooltip || "") + (d.deprecated ? "\n⚠ 已废弃" : "");
+  if (d.type === "Bool") {
+    const on = UI_BOOL[d.flag];
+    row.innerHTML = `<span><input type="checkbox" id="pb_${cssId(d.flag)}"${on ? " checked" : ""}></span>
+      <span class="plabel" title="${mEsc(tip)}">${mEsc(d.label)}</span>`;
+    const cb = row.querySelector("input");
+    cb.addEventListener("change", () => { UI_BOOL[d.flag] = cb.checked; depEval(); schedulePreview(); });
+    const echo = document.createElement("div");
+    echo.className = "argEcho boolEcho";
+    echo.id = "ae_" + cssId(d.flag);
+    row.appendChild(echo);
+  } else {
+    const rec = UI_VAL[d.flag] || { Enabled: false, Value: d.default || "" };
+    row.innerHTML = `<span><input type="checkbox" id="pe_${cssId(d.flag)}"${rec.Enabled ? " checked" : ""}></span>
+      <span class="plabel" title="${mEsc(tip)}">${mEsc(d.label)}</span><span id="pw_${cssId(d.flag)}" style="flex:1;display:flex"></span>`;
+    const wrap = row.querySelector("#pw_" + cssId(d.flag));
+    let inp;
+    if (d.type === "Combo" && (d.options || []).length) {
+      inp = document.createElement("select");
+      for (const o of d.options) {
+        const op = document.createElement("option"); op.value = o; op.textContent = o;
+        inp.appendChild(op);
+      }
+      inp.value = rec.Value || d.default || (d.options[0] || "");
+    } else {
+      inp = document.createElement("input");
+      inp.type = "text";
+      inp.value = rec.Value ?? (d.default || "");
+      inp.classList.add("wrap");
+    }
+    inp.id = "pv_" + cssId(d.flag);
+    inp.title = mEsc(tip);
+    inp.addEventListener("input", () => { UI_VAL[d.flag].Value = inp.value.trim(); depEval(); schedulePreview(); });
+    inp.addEventListener("change", () => { UI_VAL[d.flag].Value = inp.value.trim(); depEval(); schedulePreview(); });
+    wrap.appendChild(inp);
+    const en = row.querySelector("#pe_" + cssId(d.flag));
+    en.addEventListener("change", () => { UI_VAL[d.flag].Enabled = en.checked; depEval(); schedulePreview(); });
+    const echo = document.createElement("div");
+    echo.className = "argEcho";
+    echo.id = "ae_" + cssId(d.flag);
+    row.appendChild(echo);
+  }
+  container.appendChild(row);
 }
 
 /* --------------------- 参数过滤 --------------------- */
 function applyParamFilter() {
-  const q = ($("paramFilter").value || "").trim().toLowerCase();
-  $("paramFilterClear").style.display = q ? "" : "none";
+  const q = ($("inputParamFilter").value || "").trim().toLowerCase();
+  $("btnClearParamFilter").style.display = q ? "" : "none";
   const matches = (d) => !q
     || d.flag.toLowerCase().includes(q)
     || (d.label || "").toLowerCase().includes(q)
     || (d.subgroup || "").toLowerCase().includes(q)
     || (d.tooltip || "").toLowerCase().includes(q);
-  for (const det of document.querySelectorAll("#paramGroups > details")) {
-    let anyVisible = false;
-    const subs = new Map();
-    for (const row of det.querySelectorAll(".prow")) {
-      const d = SCHEMA.params.find((p) => "pr_" + cssId(p.flag) === row.id);
-      const show = !d || matches(d);
-      row.style.display = show ? "" : "none";
-      if (show) anyVisible = true;
-      const subwrap = row.closest(".subwrap");
-      const headerEl = subwrap ? subwrap.previousElementSibling : row.previousElementSibling;
-      if (headerEl && headerEl.classList.contains("subgroup")) {
-        const arr = subs.get(headerEl) || [];
-        arr.push(show);
-        subs.set(headerEl, arr);
-        if (q && show && subwrap) subwrap.style.display = ""; // 过滤命中时强制展开所在子组
-        if (!q && subwrap) subwrap.style.display = subwrap.dataset.collapsed ? "none" : ""; // 清空过滤后还原用户折叠状态
-      }
+  const host = $("paramContent");
+  if (q) {
+    // 过滤模式: 跨分类命中列表
+    const hits = SCHEMA.params.filter(d => !d.hidden && matches(d));
+    const cats = new Set(hits.map(d => d.group));
+    $("paramBreadcrumb").innerHTML =
+      `🔍 "${mEsc(q)}" · 命中 ${hits.length} 个参数 / ${cats.size} 个分类`;
+    host.innerHTML = "";
+    for (const d of hits) {
+      const div = document.createElement("div");
+      div.className = "filterHit";
+      div.innerHTML = `<b>${mEsc(d.label)}</b> <code>${mEsc(d.flag)}</code>
+        <span class="fhit-sub">· ${mEsc(groupTitle(d.group))}${d.subgroup ? " ▸ " + mEsc(d.subgroup) : ""}</span>`;
+      div.onclick = () => { jumpToParam(d); };
+      host.appendChild(div);
     }
-    for (const [h, arr] of subs) h.style.display = arr.some(Boolean) ? "" : "none";
-    det.style.display = anyVisible ? "" : "none";
-    if (q && anyVisible) det.open = true;
+    return;
+  }
+  // 非过滤: 回到当前导航选择
+  const cur = NAV_INDEX.find(x => NAV_SEL && x.g.id === NAV_SEL.grp && x.sub === NAV_SEL.sub);
+  if (cur) selectSubgroup(cur.g, cur.sub, cur.items);
+}
+
+function groupTitle(gid) {
+  const g = SCHEMA.groups.find(x => x.id === gid);
+  return g ? g.title : gid;
+}
+
+function jumpToParam(d) {
+  const entry = NAV_INDEX.find(x => x.g.id === d.group && x.sub === (d.subgroup || ""));
+  if (entry) selectSubgroup(entry.g, entry.sub, entry.items);
+  const el = $("pr_" + cssId(d.flag));
+  if (el) {
+    el.scrollIntoView({ block: "center" });
+    el.style.outline = "1px solid var(--accent)";
+    setTimeout(() => { el.style.outline = ""; }, 1200);
   }
 }
 
 /* --------------------- 依赖评估(EvaluateDepUI 复刻) --------------------- */
 function isOn(d) {
-  if (d.type === "Bool") return $("pb_" + cssId(d.flag))?.checked || false;
-  return ($("pe_" + cssId(d.flag))?.checked && ($("pv_" + cssId(d.flag))?.value.trim().length > 0)) || false;
+  if (d.type === "Bool") return !!UI_BOOL[d.flag];
+  const rec = UI_VAL[d.flag] || {};
+  return !!rec.Enabled && String(rec.Value ?? "").trim().length > 0;
 }
 function effVal(d) {
-  if (d.type === "Bool") return $("pb_" + cssId(d.flag))?.checked ? "true" : "false";
-  const en = $("pe_" + cssId(d.flag))?.checked, v = $("pv_" + cssId(d.flag))?.value.trim() || "";
+  if (d.type === "Bool") return UI_BOOL[d.flag] ? "true" : "false";
+  const rec = UI_VAL[d.flag] || {};
+  const en = !!rec.Enabled, v = String(rec.Value ?? "").trim();
   if (en && v.length) return v;
   return d.offValue || d.default || "";
 }
@@ -291,8 +386,11 @@ function ruleMet(r) {
   else c = (effVal(d) < r.value ? -1 : effVal(d) > r.value ? 1 : 0);
   return { "==": c === 0, "!=": c !== 0, ">": c > 0, "<": c < 0, ">=": c >= 0, "<=": c <= 0 }[op] ?? true;
 }
+function requiresOk(d) {
+  if (!d.requires || !d.requires.length) return true;
+  return d.requires.every(ruleMet);
+}
 function depEval() {
-  // implies 联动
   for (const d of SCHEMA.params) {
     if (d.hidden || !d.implies || !isOn(d)) continue;
     for (const t of d.implies) {
@@ -301,20 +399,47 @@ function depEval() {
       if (te) te.checked = true;
     }
   }
-  // requires 灰显
   for (const d of SCHEMA.params) {
     if (d.hidden || !d.requires || !d.requires.length) continue;
-    const ok = d.requires.every(ruleMet);
+    const ok = requiresOk(d);
     const row = $("pr_" + cssId(d.flag));
-    if (row) row.classList.toggle("dep-off", !ok);
-    const why = d.requires.map(r => describeRule(r)).join(" 且 ");
-    for (const id of ["pb_" + cssId(d.flag), "pe_" + cssId(d.flag), "pv_" + cssId(d.flag)]) {
-      const el = $(id); if (el) { el.disabled = !ok; el.title = ok ? (d.tooltip || "") : (d.tooltip || "") + "\n⚠ 前置未满足: " + why; }
+    if (row) {
+      row.classList.toggle("dep-off", !ok);
+      const why = d.requires.map(r => describeRule(r)).join(" 且 ");
+      for (const id of ["pb_" + cssId(d.flag), "pe_" + cssId(d.flag), "pv_" + cssId(d.flag)]) {
+        const el = $(id); if (el) { el.disabled = !ok; el.title = ok ? (d.tooltip || "") : (d.tooltip || "") + "\n⚠ 前置未满足: " + why; }
+      }
     }
   }
 }
 const describeRule = (r) => (r.op === "enabled" ? `--${r.flag} 已启用` :
   r.op === "disabled" ? `--${r.flag} 已停用` : `--${r.flag} ${r.op} ${r.value}`);
+
+/* ------------------- 逐参数真实启动参数回显(48a9a2f) ------------------- */
+function updateArgEcho() {
+  for (const d of SCHEMA.params) {
+    if (d.hidden || d.flag === "model" || d.flag === "model-draft") continue;
+    const el = $("ae_" + cssId(d.flag));
+    if (!el) continue;
+    const emitted = FLAG_ARGS[d.flag];
+    if (emitted && emitted.length) {
+      el.textContent = emitted.join(" ");
+      el.classList.add("on");
+    } else {
+      // 未发射 → 灰色"若启用"预览
+      const ok = requiresOk(d);
+      let txt;
+      if (d.type === "Bool") {
+        txt = d.offFlag && !ok ? "" : "--" + d.flag;
+      } else {
+        const v = effVal(d);
+        txt = "--" + d.flag + (v ? " " + v : "");
+      }
+      el.textContent = txt;
+      el.classList.remove("on");
+    }
+  }
+}
 
 /* ============================== 命令预览 ================================ */
 let previewTimer = null;
@@ -326,9 +451,40 @@ async function refreshPreview() {
   try {
     const r = await api("preview", { profile: collectProfile() });
     $("cmdPreview").value = r.fmt_cmd || "";
+    FLAG_ARGS = r.flag_args || {};
+    updateArgEcho();
   } catch (e) {
     $("cmdPreview").value = "Error:" + e.message;
   }
+}
+
+/* ------------------- 自定义参数(仅追加) ------------------- */
+function updateCustomPreview() {
+  const args = (PROF && PROF.CustomArgs) || [];
+  const el = $("cmdCustomPreview");
+  if (args.length) {
+    el.style.display = "";
+    el.textContent = "+ " + args.join(" ");
+    $("btnCancelCmd").style.display = "";
+  } else {
+    el.style.display = "none";
+    $("btnCancelCmd").style.display = "none";
+  }
+}
+async function editCustomArgs() {
+  const box = document.createElement("div");
+  const cur = (PROF && PROF.CustomArgs || []).join("\n");
+  box.innerHTML = `<div class="tiny" style="margin-bottom:6px">每行一条,原样追加到命令行末尾(示意 --x=y 或位置参数):</div>
+    <textarea id="customArgs" class="mono" style="width:100%;height:120px;resize:vertical">${mEsc(cur)}</textarea>`;
+  const v = await showModal({
+    title: "✏ 编辑命令(仅追加自定义参数)", body: "", extra: box,
+    buttons: [{ label: "取消", value: null }, { label: "保存", cls: "primary", value: "__ok__" }]
+  });
+  if (v !== "__ok__") return;
+  PROF.CustomArgs = box.querySelector("#customArgs").value.split("\n")
+    .map(s => s.trim()).filter(Boolean);
+  updateCustomPreview();
+  refreshPreview();
 }
 
 /* ================================ 日志 ================================== */
@@ -345,7 +501,7 @@ async function pollLogs() {
   } catch (e) { /* ignore */ }
 }
 
-/* ================================ 状态轮询 ============================== */
+/* ============================ 服务状态轮询 ============================== */
 function setStatus(el, st) {
   const map = {
     running: ["● 运行中", "st-run"], running_admin: ["● 运行中(提权)", "st-run"],
@@ -367,24 +523,649 @@ async function pollStatus() {
   $("btnDshStart").disabled = dshBusy;
   $("btnDshStop").disabled = !dshBusy;
   $("btnOpenDsh").disabled = !["running", "running_admin", "taken_over"].includes(s.dsh.status);
-  const m = s.monitor || {};
-  const f1 = (x, suf = "") => (x === null || x === undefined || x === 0 && suf === "") ? "—" : x + suf;
-  $("pCpu").textContent = m.cpu != null ? m.cpu.toFixed(0) + "%" : "—";
-  $("pMem").textContent = m.mem_pct != null ? m.mem_pct.toFixed(0) + "%" : "—";
-  $("pGpu").textContent = m.gpu_util != null ? Number(m.gpu_util).toFixed(0) + "%" : "—";
-  const vu = m.vram_used || 0, vt = m.vram_total || 0;
-  $("pVram").textContent = vt > 0 ? (vu / 1073741824).toFixed(1) + "/" + (vt / 1073741824).toFixed(0) + "G" : "—";
-  $("pVram").title = vt > 0 ? "已用 " + (100 * vu / vt).toFixed(1) + "%" : "";
-  $("pTemp").textContent = m.gpu_temp ? Number(m.gpu_temp).toFixed(0) + "°C" : "—";
-  $("pTemp").title = m.gpu_temp_src ? "来源: " + m.gpu_temp_src : "";
-  $("pTps").textContent = m.tps != null ? m.tps : "—";
-  $("pTtft").textContent = m.ttft != null ? m.ttft.toFixed(0) + "ms" : "—";
-  $("pPf").textContent = m.prefill != null ? m.prefill.toFixed(0) + " t/s" : "—";
-  // 熔断标签
-  const lb = $("lblVramBreaker");
-  if (m.breaker_triggered) lb.textContent = `⚠ ${m.breaker_pct}% 已熔断`;
-  else if (vt > 0) lb.textContent = `${m.breaker_pct}% 正常`;
-  else lb.textContent = "";
+}
+
+/* ============================== 监测页 ================================= */
+const FT = (t) => (t == null ? null : (t < 10 ? (Math.round(t * 10) / 10) : Math.round(t)));
+const fmtN = (x, d = 1) => (x == null ? "—" : Number(x).toFixed(d));
+const fmtTok = (n) => (n == null ? "—" :
+  n >= 1e9 ? (n / 1e9).toFixed(1) + "B" :
+  n >= 1e6 ? (n / 1e6).toFixed(1) + "M" :
+  n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : String(Math.round(n)));
+const fmtEta = (sec) => {
+  if (sec == null || sec < 0) return "—";
+  sec = Math.round(sec);
+  if (sec < 60) return sec + "s";
+  if (sec < 3600) return Math.floor(sec / 60) + "m" + String(sec % 60).padStart(2, "0") + "s";
+  return Math.floor(sec / 3600) + "h" + String(Math.floor((sec % 3600) / 60)).padStart(2, "0") + "m";
+};
+const setTxt = (id, t) => { $(id).textContent = t; };
+
+let monTimer = null;
+async function pollMonitor() {
+  if (MON_TAB !== "mon") return;  // 页面不可见由采样端降频(这里不主动拉)
+  let m;
+  try { m = await api("monitor", { visible: true }); } catch (e) { return; }
+  renderMonitor(m);
+}
+
+function renderMonitor(m) {
+  /* ---- 摘要条 ---- */
+  const gpus = m.gpus || [];
+  const utils = gpus.map(g => g.util).filter(v => v != null);
+  const mems = gpus.map(g => g.vram_used).filter(v => v != null);
+  const temps = gpus.map(g => g.temp).filter(v => v != null);
+  const pws = gpus.map(g => g.power_w).filter(v => v != null);
+  setTxt("stripGpu", utils.length ? fmtN(utils.reduce((a, b) => a + b, 0) / utils.length, 0) + "%" : "—");
+  setTxt("stripMem", mems.length ? fmtN(mems.reduce((a, b) => a + b, 0) / GIB) + " GB" : "—");
+  setTxt("stripTemp", temps.length ? fmtN(Math.max(...temps), 0) + "°C" : "—");
+  setTxt("stripPower", pws.length ? fmtN(pws.reduce((a, b) => a + b, 0), 0) + " W" : "—");
+
+  /* ---- 核心指标卡 ---- */
+  const gen = m.speeds?.gen ?? 0, prompt = m.speeds?.prompt ?? 0;
+  const gd = m.gen_detail || {};
+  setTxt("genSub", m.phase === "decoding" ? "decoding" : "");
+  setTxt("pfSub", m.phase === "prompt_processing" ? "prefilling" : "");
+  setTxt("genVal", FT(gen) != null ? FT(gen) : "—");
+  setTxt("pfVal", FT(prompt) != null ? FT(prompt) : "—");
+  setTxt("genFoot", (m.phase === "decoding" && gd.tg != null)
+    ? `tg ${fmtN(gd.tg, 2)} · tg3 ${fmtN(gd.tg3, 2)} tok/s`
+    : (m.online ? "来源 " + (m.speeds.source === "log" ? "日志" : "/slots 差分") : ""));
+  setTxt("pfFoot", (m.phase === "prompt_processing" && m.progress?.log)
+    ? "" : (gd.last_prefill != null ? `上次预填充 ${fmtN(gd.last_prefill)} tok/s` : ""));
+  if (m.progress && m.progress.prompt_elapsed != null) {
+    setTxt("pfFoot", `已耗时 ${fmtN(m.progress.prompt_elapsed)}s · 总量 ${fmtTok(m.progress.prompt_total)} tok`);
+  }
+  const actSlot = (m.slots || []).find(s => s.processing);
+  if (actSlot && actSlot.n_decoded != null && actSlot.n_remain > 0) {
+    const pct = Math.min(100, actSlot.n_decoded * 100 / (actSlot.n_decoded + actSlot.n_remain));
+    $("genBar").style.width = pct.toFixed(1) + "%";
+    $("genMax").textContent = fmtTok(actSlot.n_decoded + actSlot.n_remain) + " tok";
+  } else { $("genBar").style.width = "0"; $("genMax").textContent = "—"; }
+  if (m.progress && m.progress.prompt_progress != null) {
+    $("pfBar").style.width = (m.progress.prompt_progress * 100).toFixed(1) + "%";
+    $("pfMax").textContent = fmtTok(m.progress.prompt_total) + " tok";
+  } else { $("pfBar").style.width = "0"; $("pfMax").textContent = "—"; }
+
+  // 上下文卡
+  const cu = m.ctx || {};
+  const pct = cu.pct;
+  const cv = $("ctxVal");
+  cv.style.color = pct == null ? "var(--bright)" : pct >= 90 ? "var(--err)" : pct >= 70 ? "var(--warn)" : "var(--bright)";
+  cv.innerHTML = `<span>${cu.used >= 0 ? fmtTok(cu.used) : "—"}</span><span class="munit">tok</span>`;
+  $("ctxBar").style.width = pct != null ? Math.min(100, pct).toFixed(1) + "%" : "0";
+  $("ctxBar").style.background = pct == null ? "var(--ok)" : pct >= 90 ? "var(--err)" : pct >= 70 ? "var(--warn)" : "var(--ok)";
+  setTxt("ctxMax", cu.total > 0 ? fmtTok(cu.total) + " tok" : "—");
+  setTxt("ctxFoot", pct != null ? `${fmtN(pct)}% · 剩余 ${fmtTok(Math.max(0, cu.total - cu.used))} tokens`
+    : (m.online ? "无请求记录" : ""));
+  $("ctxBadge").style.display = pct != null && pct >= 90 ? "" : "none";
+
+  // MTP 环
+  const acc = m.mtp?.acc;
+  const ring = $("mtpRing");
+  ring.setAttribute("pathLength", 100);
+  if (acc != null) {
+    ring.style.strokeDasharray = `${Math.max(0.02, 24.74 * acc).toFixed(2)} 100`;
+    ring.style.stroke = acc < 0.65 ? "var(--err)" : acc < 0.8 ? "var(--warn)" : "var(--cyan)";
+    ring.style.opacity = 1;
+    setTxt("mtpVal", (acc * 100).toFixed(1) + "%");   // b3d3527: 显示统一 ×100
+    let sub = `${m.mtp.accepted} / ${m.mtp.generated} · mean ${fmtN(m.mtp.mean_len, 2)}`;
+    if (m.mtp.graphs != null) sub += ` · graphs ${m.mtp.graphs}`;
+    setTxt("mtpSub", sub);
+  } else {
+    ring.style.strokeDasharray = "0 100";
+    ring.style.opacity = 0.25;
+    setTxt("mtpVal", "—");
+    setTxt("mtpSub", "启用投机解码后显示");
+  }
+  drawSpark($("sparkGen"), (m.hists?.tps || [[], []])[0], (m.hists?.tps || [[], []])[1], null, "#3aa9ff", "t/s");
+  drawSpark($("sparkPf"), (m.hists?.pf || [[], []])[0], (m.hists?.pf || [[], []])[1], null, "#34d399", "t/s");
+  drawSpark($("sparkCtx"), (m.hists?.ctx || [[], []])[0], (m.hists?.ctx || [[], []])[1], cu.total > 0 ? cu.total : null, "#f5b53d", "tok");
+  drawSpark($("sparkMtp") || null, [], [], null, "#3aa9ff", "");
+
+  /* ---- GPU 按卡面板 ---- */
+  renderGpuPanels(gpus);
+
+  /* ---- 相位卡 ---- */
+  renderPhaseCard(m);
+
+  /* ---- 事件流(按单调序号判增量) ---- */
+  if (m.total_events !== LAST_TOTAL_EVENTS || !$("monEventFeed").childElementCount) {
+    LAST_TOTAL_EVENTS = m.total_events;
+    const feed = $("monEventFeed");
+    feed.innerHTML = "";
+    for (const ev of (m.events || []).slice(0, 200)) {
+      const div = document.createElement("div");
+      div.className = "evt evt-" + (ev.level || "info");
+      div.textContent = `${ev.ts}  ${ev.msg}`;
+      feed.appendChild(div);
+    }
+    setTxt("monEventCount", `${m.total_events} / 200`);
+  }
+
+  /* ---- 系统资源 ---- */
+  renderSystem(m.sys || {});
+
+  /* ---- 模型与 Slot ---- */
+  renderModelSlots(m);
+
+  /* ---- 趋势图 ---- */
+  renderTrends(m);
+}
+
+function renderGpuPanels(gpus) {
+  const host = $("gpuPanelsHost");
+  if (!gpus.length) {
+    host.innerHTML = `<div class="gpuNone">▣ 数据不可用</div>`;
+    return;
+  }
+  host.innerHTML = "";
+  for (const g of gpus) {
+    const card = document.createElement("div");
+    card.className = "gpuCard";
+    const util = g.util;
+    const vu = g.vram_used, vt = g.vram_total;
+    const vpct = (vu != null && vt > 0) ? vu / vt * 100 : null;
+    const ringColor = util == null ? "var(--muted)" : util >= 90 ? "var(--err)" : util >= 70 ? "var(--warn)" : "var(--ok)";
+    card.innerHTML = `
+      <div class="gpuHead">${mEsc("GPU" + g.index + " · " + (g.name || "GPU"))}</div>
+      <div class="gpuBody">
+        <div class="utilRingWrap">
+          <svg viewBox="0 0 104 104">
+            <circle cx="52" cy="52" r="44" pathLength="100" fill="none" stroke="var(--track)" stroke-width="8"
+              stroke-dasharray="75 100" transform="rotate(135 52 52)" stroke-linecap="round"/>
+            <circle cx="52" cy="52" r="44" pathLength="100" fill="none" stroke="${ringColor}" stroke-width="8"
+              stroke-dasharray="${(0.75 * (util || 0)).toFixed(2)} 100" transform="rotate(135 52 52)" stroke-linecap="round"/>
+          </svg>
+          <div class="utilCenter"><div class="utilVal">${util == null ? "—" : Math.round(util)}</div><div class="utilSub">利用率</div></div>
+        </div>
+        <div>
+          <div class="gvram">显存 ${vu != null ? fmtN(vu / GIB) : "—"} / ${vt > 0 ? fmtN(vt / GIB) : "—"} GB${vpct != null ? " (" + vpct.toFixed(1) + "%)" : ""}</div>
+          <div class="mbar" style="margin-top:4px"><div class="mbarfill" style="width:${vpct != null ? Math.min(100, vpct).toFixed(1) : 0}%;
+            background:${vpct != null && vpct >= 90 ? "var(--err)" : vpct != null && vpct >= 70 ? "var(--warn)" : "var(--ok)"}"></div></div>
+          <div class="gpuKv">
+            <div><span class="mlbl">温度</span><span class="mvalS" style="${g.temp != null && g.temp >= 85 ? "color:var(--err)" : ""}">${g.temp != null ? Math.round(g.temp) + "°C" : "—"}</span></div>
+            <div><span class="mlbl">功耗</span><span class="mvalS">${g.power_w != null ? fmtN(g.power_w) + (g.power_limit_w != null ? " / " + fmtN(g.power_limit_w) : "") : "—"} W</span></div>
+            <div><span class="mlbl">风扇</span><span class="mvalS">${g.fan_pct != null ? Math.round(g.fan_pct) + "%" : "—"}</span></div>
+            <div><span class="mlbl">频率</span><span class="mvalS">${g.clock_mhz != null ? Math.round(g.clock_mhz) + " MHz" : "—"}</span></div>
+            <div><span class="mlbl">PCIe</span><span class="mvalS">${g.pcie_gen != null ? "gen " + g.pcie_gen + " x" + (g.pcie_width ?? "?") : "—"}</span></div>
+            <div><span class="mlbl">P-State</span><span class="mvalS">${mEsc(g.pstate || "—")}</span></div>
+            <div><span class="mlbl">驱动</span><span class="mvalS">${mEsc(g.driver || "—")}</span></div>
+            <div><span class="mlbl">显存占比</span><span class="mvalS">${vpct != null ? vpct.toFixed(1) + "%" : "—"}</span></div>
+            <div><span class="mlbl">来源</span><span class="mvalS">${mEsc(g.src || "—")}${g.synthetic ? "(合成)" : ""}</span></div>
+          </div>
+        </div>
+      </div>`;
+    host.appendChild(card);
+  }
+}
+
+function renderPhaseCard(m) {
+  // 模型名: /props 别名 > boot.model 基名
+  const mi = m.model || {};
+  const name = mi.name || (m.boot?.model || "").split(/[\\/]/).pop() || "";
+  setTxt("monModelName", name || "未加载模型");
+  const pill = $("monPhasePill");
+  setTxt("monPhaseText", m.pill?.text || "—");
+  pill.style.background = m.pill?.bg || "#1a8e979f";
+  pill.style.color = m.pill?.fg || "#8e979f";
+
+  const api = m;
+  const phase = m.phase;
+  const act = (m.slots || []).find(s => s.processing);
+  const s1l = $("stat1Lbl"), s1v = $("stat1Val"), s2l = $("stat2Lbl"), s2v = $("stat2Val"),
+        s3l = $("stat3Lbl"), s3v = $("stat3Val");
+  const bar = $("monBar");
+  const cacheHit = act && act.n_prompt_tokens > 0 && act.n_prompt_cache > 0
+    ? ` · 缓存命中 ${Math.min(100, act.n_prompt_cache * 100 / act.n_prompt_tokens).toFixed(1)}%` : "";
+  const ctxTxt = `上下文 ${m.ctx.used >= 0 ? fmtTok(m.ctx.used) : "—"}/${m.ctx.total > 0 ? fmtTok(m.ctx.total) : "—"}${m.ctx.pct != null ? " (" + m.ctx.pct + "%)" : ""}`;
+  const t0 = m.task_started_at ? (Date.now() / 1000 - m.task_started_at) : null;
+  let s1 = 0, s2 = 0, s3 = 0;
+  if (phase === "prompt_processing") {
+    s1l.textContent = "已处理 Prompt"; s2l.textContent = "Prompt 速度"; s3l.textContent = "已耗时";
+    s1 = (act && act.n_prompt_processed > 0) ? act.n_prompt_processed :
+      (m.progress?.prompt_total && m.progress?.prompt_progress != null
+        ? Math.round(m.progress.prompt_total * m.progress.prompt_progress) : 0);
+    s2 = (m.gen_detail?.log_prompt ?? 0);
+    s3 = m.progress?.prompt_elapsed ?? 0;
+    s1v.className = "statval c-cyan"; s2v.className = "statval c-cyan"; s3v.className = "statval c-light";
+    s1v.textContent = fmtTok(s1); s2v.textContent = fmtN(s2) + " t/s"; s3v.textContent = fmtN(s3) + "s";
+    const prog = (m.progress?.prompt_progress ?? 0) * 100;
+    bar.style.width = prog.toFixed(1) + "%";
+    bar.style.background = "#f5b53d";
+    const eta = (m.progress?.prompt_progress != null && m.progress.prompt_progress > 0 && m.gen_detail?.log_prompt)
+      ? fmtEta((1 - m.progress.prompt_progress) * m.progress.prompt_total / m.gen_detail.log_prompt) : "—";
+    setTxt("monPhaseLabel", `Prompt 处理中 · 任务 #${m.task ?? "—"}`);
+    setTxt("monPhaseDetail", `prompt ${fmtTok(m.progress?.prompt_total)} tokens · ${ctxTxt} · 预计剩余 ${eta}${cacheHit}`);
+  } else if (phase === "decoding") {
+    s1l.textContent = "已解码"; s2l.textContent = "实时速度 (3s)"; s3l.textContent = "任务均速";
+    s1 = m.task?.decoded_tokens ?? 0; // 日志解码数由 detail 通道提供
+    s1 = m.gen_detail?.decoded ?? s1;
+    s2 = m.gen_detail?.tg3 ?? 0; s3 = m.gen_detail?.tg ?? 0;
+    s1v.className = "statval c-cyan"; s2v.className = "statval c-cyan"; s3v.className = "statval c-light";
+    s1v.textContent = fmtTok(s1); s2v.textContent = fmtN(s2) + " t/s"; s3v.textContent = fmtN(s3) + " t/s";
+    if (act && act.n_remain > 0 && act.n_decoded != null) {
+      const pct = Math.min(100, act.n_decoded * 100 / (act.n_decoded + act.n_remain));
+      bar.style.width = pct.toFixed(1) + "%";
+      const eta = m.speeds?.gen > 0 ? fmtEta(act.n_remain / m.speeds.gen) : "—";
+      setTxt("monPhaseDetail", `剩余 ${fmtTok(act.n_remain)} tokens · ${ctxTxt} · 预计完成 ${eta}${cacheHit}`);
+    } else {
+      bar.style.width = "40%"; bar.style.background = "var(--cyan)";  // 不定态
+      setTxt("monPhaseDetail", `${ctxTxt}${cacheHit}`);
+    }
+    setTxt("monPhaseLabel", `生成中 · 任务 #${m.task?.task_id ?? act?.task_id ?? "—"}`);
+  } else {
+    s1l.textContent = "上次输出"; s2l.textContent = "任务均速"; s3l.textContent = "上下文占用";
+    s1 = m.task ? (m.task.total_tokens ?? m.task.decoded_tokens ?? 0) : 0;
+    s2 = m.task ? (m.task.gen_speed ?? m.task.avg_tps ?? 0) : 0;
+    s3 = m.ctx.used >= 0 ? m.ctx.used : 0;
+    s1v.className = "statval c-cyan"; s2v.className = "statval c-cyan"; s3v.className = "statval c-light";
+    s1v.textContent = fmtTok(s1); s2v.textContent = fmtN(s2) + " t/s"; s3v.textContent = fmtTok(s3);
+    bar.style.width = "0";
+    if (m.breaker_triggered) {
+      setTxt("monPhaseLabel", "已熔断");
+      setTxt("monPhaseDetail", "显存使用超限,已自动停止 Llama");
+    } else if (!m.llama_alive) {
+      setTxt("monPhaseLabel", "llama 未启动");
+      setTxt("monPhaseDetail", ctxTxt);
+    } else {
+      setTxt("monPhaseLabel", "空闲 · 等待新请求");
+      const lt = m.task;
+      setTxt("monPhaseDetail", lt ? `上次 #${lt.task_id}: ${fmtTok(lt.total_tokens ?? lt.decoded_tokens ?? 0)} tokens · ${lt.duration ?? 0}s · 均速 ${fmtN(lt.avg_tps)} t/s · 预填充 ${fmtN(lt.prompt_speed)} t/s${lt.truncated ? " · 已截断" : ""} · ${ctxTxt}` : ctxTxt);
+    }
+  }
+  // 已运行后缀
+  if (m.online && phase !== "idle" && t0 != null) {
+    $("monPhaseLabel").textContent += ` · 已运行 ${fmtEta(t0)}`;
+  }
+}
+
+function renderSystem(sys) {
+  setTxt("cpuHeadSub", sys.cpu_model || "");
+  const cpu = sys.cpu;
+  const cv = $("cpuBigVal");
+  setTxt("cpuBigVal", cpu != null ? cpu.toFixed(0) + "%" : "—");
+  cv.className = "bigVal" + (cpu >= 90 ? " err" : cpu >= 70 ? " warn" : "");
+  const host = $("cpuCoresHost");
+  const cores = sys.cpu_cores || [];
+  const dense = cores.length > 16;
+  if (host.childElementCount !== cores.length) {
+    host.innerHTML = "";
+    for (let i = 0; i < cores.length; i++) {
+      const col = document.createElement("div");
+      col.className = "coreCol" + (dense ? " dense" : "");
+      col.innerHTML = `<div class="fill"></div>`;
+      host.appendChild(col);
+    }
+  }
+  [...host.children].forEach((col, i) => {
+    const v = cores[i] ?? 0;
+    col.firstChild.style.height = Math.min(100, v).toFixed(0) + "%";
+    col.firstChild.style.background = v >= 90 ? "var(--err)" : v >= 70 ? "var(--warn)" : "var(--ok)";
+  });
+  // 内存
+  const mu = sys.mem_used, mt = sys.mem_total;
+  const mpct = mt > 0 ? mu / mt * 100 : 0;
+  const mv = $("memBigVal");
+  setTxt("memBigVal", mt > 0 ? mpct.toFixed(0) + "%" : "—");
+  mv.className = "bigVal" + (mpct >= 90 ? " err" : mpct >= 70 ? " warn" : "");
+  $("memStackUsed").style.width = mpct.toFixed(1) + "%";
+  $("memStackUsed").style.background = mpct >= 90 ? "var(--err)" : mpct >= 70 ? "var(--warn)" : "var(--ok)";
+  setTxt("memUsedSub", mu != null ? `${fmtN(mu / GIB)} / ${fmtN((mt || 0) / GIB)} GB` : "");
+  setTxt("memLegendUsed", `已用 ${fmtN((mu || 0) / GIB)} GB`);
+  setTxt("memLegendAvail", `可用 ${fmtN(((mt || 0) - (mu || 0)) / GIB)} GB`);
+  // 磁盘
+  const disks = sys.disks || [];
+  setTxt("diskHeadSub", disks.length ? `读 ${fmtN(disks.reduce((a, d) => a + (d.read_mb || 0), 0))} MB/s · 写 ${fmtN(disks.reduce((a, d) => a + (d.write_mb || 0), 0))} MB/s` : "—");
+  const dh = $("diskRowsHost");
+  dh.innerHTML = "";
+  for (const d of disks.slice(0, 6)) {
+    const row = document.createElement("div");
+    row.className = "drow";
+    const color = d.pct >= 90 ? "var(--err)" : d.pct >= 70 ? "var(--warn)" : "var(--ok)";
+    row.innerHTML = `<span class="dname">${mEsc(d.dev)}</span>
+      <div class="dbar"><div class="dbarfill" style="width:${Math.min(100, d.pct).toFixed(1)}%;background:${color}"></div></div>
+      <span class="dinfo">${fmtN(d.used / GIB, 0)}G / ${fmtN(d.total / GIB, 0)}G (${d.pct}%)</span>`;
+    dh.appendChild(row);
+  }
+  if (!disks.length) dh.innerHTML = `<div class="tiny">—</div>`;
+  // 网络
+  const net = sys.net || {};
+  const keys = Object.keys(net);
+  setTxt("netHeadSub", keys.length ? `${keys.length} 个网卡` : "—");
+  const nh = $("netRowsHost");
+  nh.innerHTML = "";
+  for (const k of keys.slice(0, 6)) {
+    const row = document.createElement("div");
+    row.className = "nrow";
+    row.innerHTML = `<span class="nname">${mEsc(k)}</span>
+      <span class="nrx">↓ ${fmtN(net[k][0], 2)} MB/s</span><span class="ntx">↑ ${fmtN(net[k][1], 2)} MB/s</span>`;
+    nh.appendChild(row);
+  }
+  if (!keys.length) nh.innerHTML = `<div class="tiny">—</div>`;
+}
+
+function renderModelSlots(m) {
+  const mi = m.model || {};
+  setTxt("miName", mi.name || mi.path ? (mi.name || (mi.path || "").split("/").pop()) : "—");
+  setTxt("miPath", mi.path ? "路径 " + mi.path : "");
+  setTxt("miFtype", mi.ftype || "");
+  setTxt("miParams", mi.n_params != null ? fmtTok(mi.n_params) : "—");
+  setTxt("miSize", mi.size != null ? (mi.size >= GIB ? fmtN(mi.size / GIB, 2) + " GB" : fmtN(mi.size / 1048576, 0) + " MB") : "—");
+  setTxt("miEmbd", mi.n_embd ?? "—");
+  setTxt("miVocab", mi.n_vocab ?? "—");
+  const nctx = mi.n_ctx ?? m.boot?.n_ctx_slot ?? (m.slots || []).find(s => s.n_ctx > 0)?.n_ctx;
+  setTxt("miCtx", nctx ?? "—");
+  setTxt("miCtxTrain", mi.n_ctx_train ?? (nctx ? "≥ " + nctx : "—"));
+  setTxt("miVocabType", mi.vocab_type || "—");
+  const mods = [mi.vision && "vision", mi.video && "video", mi.audio && "audio"].filter(Boolean);
+  setTxt("miModal", mods.length ? mods.join(" · ") : (mi.capabilities || []).join(" · ") || "—");
+  // Slot 卡
+  const host = $("slotCardsHost");
+  const slots = m.slots || [];
+  const proc = slots.filter(s => s.processing).length;
+  setTxt("monSlotSummary", !m.online ? "llama 未启动" : slots.length ? `${slots.length} 槽 · ${proc} 处理中` : "无活动槽位");
+  host.innerHTML = "";
+  for (const s of slots) {
+    const box = document.createElement("div");
+    box.className = "slotBox";
+    const ctxTxt = `${s.ctx_used} / ${s.n_ctx}${s.ctx_pct != null ? " (" + s.ctx_pct + "%)" : ""}`;
+    const ctxCls = s.ctx_pct != null ? (s.ctx_pct >= 90 ? "ctxErr" : s.ctx_pct >= 70 ? "ctxWarn" : "") : "";
+    box.innerHTML = `
+      <div class="slotHead"><span class="slotTitle">Slot ${s.id}</span>
+        <span class="slotPill ${s.processing ? "busy" : "idle"}">${s.processing ? "处理中" : "空闲"}</span></div>
+      <div class="slotKv">
+        <div><span class="mlbl">任务</span><span class="mvalS mono">#${s.task_id ?? "—"}</span></div>
+        <div><span class="mlbl">n_ctx</span><span class="mvalS mono">${s.n_ctx}</span></div>
+        <div><span class="mlbl">Prompt</span><span class="mvalS mono">${fmtTok(s.n_prompt_tokens)}</span></div>
+        <div><span class="mlbl">已处理·缓存</span><span class="mvalS mono">${fmtTok(s.n_prompt_processed)} · ${fmtTok(s.n_prompt_cache)}</span></div>
+        <div><span class="mlbl">已解码</span><span class="mvalS mono">${fmtTok(s.n_decoded)}</span></div>
+        <div><span class="mlbl">剩余</span><span class="mvalS mono">${s.n_remain > 0 ? fmtTok(s.n_remain) : "不限"}</span></div>
+        <div><span class="mlbl">上下文占用</span><span class="mvalS mono ${ctxCls}">${ctxTxt}</span></div>
+        <div><span class="mlbl">投机解码</span><span class="mvalS mono">${s.speculative ? "on" : "—"}</span></div>
+      </div>
+      <div class="slotFoot">gen ${fmtN(s.gen_speed)} t/s · prompt ${fmtN(s.prompt_speed)} t/s</div>`;
+    host.appendChild(box);
+  }
+}
+
+/* --------------------------- 图表(SVG) --------------------------- */
+function svgEl(tag, attrs) {
+  const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  return e;
+}
+
+/* 时间映射(584f243 真实时间轴): stamps 跨度>0.01s 才按时间映射 */
+function xAt(i, n, stamps, w) {
+  if (stamps && stamps.length === n && stamps.length > 1 && stamps[stamps.length - 1] - stamps[0] > 0.01) {
+    return (stamps[i] - stamps[0]) / (stamps[stamps.length - 1] - stamps[0]) * w;
+  }
+  return n > 1 ? i / (n - 1) * w : 0;
+}
+
+function drawSpark(svg, values, stamps, max, tone, unit) {
+  if (!svg) return;
+  const W = 100, H = 32, base = 30;
+  svg.innerHTML = "";
+  const n = values.length;
+  let top = max;
+  if (top == null || top <= 0) {
+    top = Math.max(0, ...values.filter(v => v != null));
+    if (top <= 0) top = 1e-9;
+  }
+  // 面积 + 折线(分段断点)
+  let dLine = "", dArea = "";
+  let started = false;
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    const v = values[i];
+    if (v == null) {
+      if (started) { dLine += " "; started = false; }
+      continue;
+    }
+    const x = xAt(i, n, stamps, W);
+    const y = base - (v / top) * 26;
+    pts.push([x, y]);
+    dLine += (started ? "L" : "M") + x.toFixed(2) + " " + y.toFixed(2) + " ";
+    started = true;
+  }
+  if (pts.length > 1) {
+    const first = pts[0], last = pts[pts.length - 1];
+    dArea = dLine + `L ${last[0].toFixed(2)} ${base} L ${first[0].toFixed(2)} ${base} Z`;
+    svg.appendChild(svgEl("path", { d: dArea, fill: tone, class: "area" }));
+  }
+  if (dLine.trim()) {
+    svg.appendChild(svgEl("path", { d: dLine, stroke: tone, class: "series" }));
+  } else {
+    svg.appendChild(svgEl("line", { x1: 0, y1: base, x2: W, y2: base, stroke: "#2a3036", "stroke-dasharray": "3 3" }));
+  }
+}
+
+function drawTrend(svg, unit, series, stamps, yMin, yMax, legendHost) {
+  const W = 320, H = 160;
+  svg.innerHTML = "";
+  const pad = 3;
+  const all = series.flatMap(s => s.data.filter(v => v != null));
+  let top = yMax, bot = yMin;
+  if (top == null || isNaN(top)) top = all.length ? Math.max(...all) : 1;
+  if (bot == null || isNaN(bot)) bot = Math.min(0, all.length ? Math.min(...all) : 0);
+  if (top - bot <= 1e-9) top = bot + 1;
+  // 3 条网格线
+  for (let i = 1; i <= 3; i++) {
+    const y = H * i / 4;
+    svg.appendChild(svgEl("line", { x1: 0, y1: y, x2: W, y2: y, class: "gridline" }));
+  }
+  const n = Math.max(...series.map(s => s.data.length), 1);
+  for (const s of series) {
+    const vals = s.data;
+    let dLine = "", started = false;
+    const pts = [];
+    for (let i = 0; i < vals.length; i++) {
+      const v = vals[i];
+      if (v == null) { if (started) { dLine += " "; started = false; } continue; }
+      const x = xAt(i, vals.length, stamps, W);
+      const y = H - ((v - bot) / (top - bot)) * (H - 6) - pad;
+      pts.push([x, y]);
+      dLine += (started ? "L" : "M") + x.toFixed(2) + " " + y.toFixed(2) + " ";
+      started = true;
+    }
+    if (pts.length > 1) {
+      const first = pts[0], last = pts[pts.length - 1];
+      svg.appendChild(svgEl("path", { d: dLine + `L ${last[0].toFixed(2)} ${H - pad} L ${first[0].toFixed(2)} ${H - pad} Z`, fill: s.color, class: "area" }));
+    }
+    if (dLine.trim()) svg.appendChild(svgEl("path", { d: dLine, stroke: s.color, class: "series" }));
+  }
+  if (!all.length) {
+    svg.appendChild(svgEl("line", { x1: 0, y1: H - pad, x2: W, y2: H - pad, stroke: "#2a3036", "stroke-dasharray": "3 3" }));
+  }
+  // 底部时间标签(真实跨度) + 悬停十字线
+  let windowSec = 60;
+  if (stamps && stamps.length > 1 && stamps[stamps.length - 1] - stamps[0] > 0.01) {
+    windowSec = stamps[stamps.length - 1] - stamps[0];
+  }
+  const box = svg.closest(".trendBox");
+  let axis = box.querySelector(".taxis");
+  if (!axis) {
+    axis = document.createElement("div");
+    axis.className = "taxis";
+    box.appendChild(axis);
+  }
+  axis.innerHTML = `<span>-${Math.round(windowSec)}s</span><span>-${Math.round(windowSec / 2)}s</span><span>now</span>`;
+  // 悬停十字线 + 读数
+  svg.onmousemove = (ev) => {
+    const rect = svg.getBoundingClientRect();
+    const fx = (ev.clientX - rect.left) / rect.width * W;
+    const frac = Math.max(0, Math.min(1, fx / W));
+    let hover = svg.querySelector(".hoverline");
+    if (!hover) {
+      hover = svgEl("line", { y1: 0, y2: H, class: "hoverline" });
+      svg.appendChild(hover);
+    }
+    hover.setAttribute("x1", frac * W);
+    hover.setAttribute("x2", frac * W);
+    // 反查最近样本点
+    let parts = [];
+    for (const s of series) {
+      const vals = s.data;
+      if (!vals.length) continue;
+      let idx = Math.round(frac * (vals.length - 1));
+      idx = Math.max(0, Math.min(vals.length - 1, idx));
+      let v = vals[idx], step = 1;
+      while (v == null && idx >= 0 && idx < vals.length) { v = vals[idx - step] ?? vals[idx + step]; step++; if (step > 5) break; }
+      parts.push(`${s.name} ${v == null ? "—" : (Math.round(v * 10) / 10) + " " + unit}`);
+    }
+    let ago = "";
+    if (stamps && stamps.length > 1) {
+      const t = stamps[0] + frac * (stamps[stamps.length - 1] - stamps[0]);
+      const diff = stamps[stamps.length - 1] - t;
+      ago = diff < 1.5 ? "now" : `-${Math.round(diff)}s`;
+    }
+    if (legendHost) legendHost.textContent = parts.join("  ") + (ago ? "  · " + ago : "");
+  };
+  svg.onmouseleave = () => {
+    const h = svg.querySelector(".hoverline");
+    if (h) h.remove();
+  };
+}
+
+function histPair(m, key) {
+  const h = (m.hists || {})[key];
+  return h ? [h[0] || [], h[1] || []] : [[], []];
+}
+
+function renderTrends(m) {
+  const H = m.hists || {};
+  const cfgs = [
+    ["trendGen", "Token 生成速度", "tok/s", [["生成", "#7cd7f7", (H.tps || [[], []])[0]]], (H.tps || [[], []])[1], null, null],
+    ["trendPf", "预填充速度", "tok/s", [["预填充", "#4ade80", (H.pf || [[], []])[0]]], (H.pf || [[], []])[1], null, null],
+    ["trendCtx", "上下文占用", "tokens", [["上下文", "#f5b53d", (H.ctx || [[], []])[0]]], (H.ctx || [[], []])[1], 0, (m.ctx?.total || null)],
+    ["trendMtp", "MTP 接受率", "%", [["接受率", "#7cd7f7", (H.mtp || [[], []])[0]]], (H.mtp || [[], []])[1], 0, 100],
+    ["trendGpuUtil", "GPU 利用率", "%", [["利用率", "#f0883e", (H.gpu_util || [[], []])[0]]], (H.gpu_util || [[], []])[1], 0, 100],
+    ["trendGpuMem", "GPU 显存", "GB", [["显存", "#f0883e", (H.gpu_mem || [[], []])[0]]], (H.gpu_mem || [[], []])[1], 0, null],
+    ["trendGpuTemp", "GPU 温度", "°C", [["温度", "#f5b53d", (H.gpu_temp || [[], []])[0]]], (H.gpu_temp || [[], []])[1], 0, 110],
+    ["trendGpuPower", "GPU 功耗", "W", [["功耗", "#d29916", (H.gpu_power || [[], []])[0]]], (H.gpu_power || [[], []])[1], 0, null],
+    ["trendCpu", "CPU", "%", [["CPU", "#58a6ff", (H.cpu || [[], []])[0]]], (H.cpu || [[], []])[1], 0, 100],
+    ["trendMem", "内存", "GB", [["内存", "#58a6ff", (H.ram || [[], []])[0]]], (H.ram || [[], []])[1], 0, null],
+    ["trendNet", "网络", "MB/s", [["下行", "#7cd7f7", (H.net_rx || [[], []])[0]], ["上行", "#4ade80", (H.net_tx || [[], []])[0]]],
+      (H.net_rx || [[], []])[1], 0, null],
+  ];
+  for (const [id, title, unit, series, stamps, ymin, ymax] of cfgs) {
+    const svg = $(id);
+    if (!svg) continue;
+    const box = svg.closest(".trendBox");
+    const tt = box.querySelector(".tt");
+    // 头部: 标题 + 单位 + 图例(各序列最后一个非 null 值)
+    let legend = "";
+    for (const [name, color, data] of series) {
+      let v = null;
+      for (let i = data.length - 1; i >= 0; i--) { if (data[i] != null) { v = data[i]; break; } }
+      legend += `${name} ${v == null ? "—" : Math.round(v * 10) / 10 + " " + unit}  `;
+    }
+    tt.innerHTML = `<span style="font-weight:700;color:#eef1f3">${mEsc(title)}</span>
+      <span><span class="tlegend">${mEsc(legend.trim())}</span> · ${mEsc(unit)}</span>`;
+    drawTrend(svg, unit, series.map(([name, color, data]) => ({ name, color, data })), stamps, ymin, ymax,
+      tt.querySelector(".tlegend"));
+  }
+}
+
+/* --------------------------- Node 环境面板 --------------------------- */
+async function pollNodeEnv() {
+  try {
+    const st = await api("node/status");
+    const n = st.node24 || {};
+    setTxt("lblNodeStatus", `node: ${n.path ? (n.version || "版本未知") + " (" + n.path + ")" : "未安装"}${st.version_unknown ? " ⚠ 探测失败" : ""}`);
+    const p = st.pnpm || {};
+    setTxt("lblPnpmStatus", `pnpm: ${p.path ? (p.version || "?") + " (" + p.path + ")" : "未安装"}`);
+    setTxt("lblLatestStatus", `最新 v24: ${st.latest_v24 || "—(网络不可达)"}`);
+  } catch (e) { /* ignore */ }
+}
+async function nodeDiagText() {
+  const st = await api("node/status");
+  const env = ["NODE24_PATH", "NODE_EXE", "NODE_HOME", "PATH"].map(k => `${k}=${(os_getenv(k))}`).join("\n");
+  return JSON.stringify(st, null, 2) + "\n" + env;
+}
+function os_getenv(k) { return k === "PATH" ? (navigator.userAgent.includes("Linux") ? "(见服务端)" : "") : "(服务端环境)"; }
+async function pollJobInto(id, logEl, seen) {
+  for (;;) {
+    const j = await api("job", { id });
+    for (const l of j.log || []) {
+      if (!seen.has(l)) { seen.add(l); logEl.value += l + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+    }
+    if (j.status !== "running") {
+      logEl.value += (j.status === "done" ? "✔ 完成: " : "✘ 失败: ") + j.result + "\n";
+      logEl.scrollTop = logEl.scrollHeight;
+      await pollNodeEnv();
+      return j;
+    }
+    await new Promise(r2 => setTimeout(r2, 1500));
+  }
+}
+
+/* --------------------------- 变体面板 --------------------------- */
+async function refreshVariants() {
+  try {
+    const r = await api("toolchains/variants");
+    const sel = $("comboVariant");
+    sel.innerHTML = "";
+    for (const v of r.variants || []) {
+      const o = document.createElement("option");
+      o.value = v.name;
+      o.textContent = `${v.name}${v.installed ? "(b" + (v.local_build ?? "?") + ")" : "(未安装)"}`;
+      sel.appendChild(o);
+    }
+    sel.value = r.active || "";
+    const cb = $("comboBackend");
+    cb.value = (r.backend_choice || "").toLowerCase();
+    $("backendHint").dataset.auto = r.backend_auto || r.backend || "vulkan";
+    $("backendHint").textContent = r.backend_choice
+      ? "生效: " + r.backend + "(手动)"
+      : "生效: " + (r.backend || "?") + "(自动检测)";
+  } catch (e) { /* ignore */ }
+}
+async function installVariantDialog() {
+  const box = document.createElement("div");
+  box.innerHTML = `
+    <div class="tiny" style="margin-bottom:4px">仓库链接(完整 URL,自动解析 owner/repo,兼容 .git 与 /tree//releases 链接):</div>
+    <input type="text" id="vRepo" class="mono" style="width:100%">
+    <div class="tiny" style="margin:6px 0 4px">名称(自动带出可改):</div>
+    <input type="text" id="vName" style="width:100%">
+    <div class="tiny" style="margin:6px 0 4px">目录(自动建议,与现有 llama.cpp 并排):</div>
+    <div style="display:flex;gap:6px">
+      <input type="text" id="vDir" class="mono fill">
+      <button id="vBrowse">浏览…</button>
+    </div>
+    <div class="tiny" id="vHint" style="margin-top:6px"></div>`;
+  const repoIn = box.querySelector("#vRepo"), nameIn = box.querySelector("#vName"),
+        dirIn = box.querySelector("#vDir"), hint = box.querySelector("#vHint");
+  repoIn.addEventListener("change", async () => {
+    if (!repoIn.value.trim()) return;
+    try {
+      const r = await api("toolchains/parse_repo", { url: repoIn.value.trim() });
+      if (r.error) { hint.textContent = r.error; return; }
+      nameIn.value = r.name;
+      dirIn.value = r.dir;
+      hint.textContent = `仓库 ${r.repo} · 后端 ${r.backend}`;
+    } catch (e) { hint.textContent = e.message; }
+  });
+  box.querySelector("#vBrowse").onclick = async () => {
+    const v = await browsePicker("dir");
+    if (v) dirIn.value = v;
+  };
+  const v = await showModal({
+    title: "＋ 安装新变体", body: "", extra: box,
+    buttons: [{ label: "取消", value: null }, { label: "安装", cls: "primary", value: "__ok__" }]
+  });
+  if (v !== "__ok__") return;
+  const job = await api("toolchains/variants/install", {
+    repo: repoIn.value.trim(), name: nameIn.value.trim(), dir: dirIn.value.trim()
+  });
+  const logEl = $("nodeLog");
+  const seen = new Set();
+  const r = await pollJobInto(job.job, logEl, seen);
+  await refreshVariants();
+  if (r.status === "done" && r.result?.ok) showNotice(String(r.result.msg).split("\n")[0]);
+  else if (r.status !== "done") showNotice("变体安装失败", true);
 }
 
 /* ============================ 启动/停止流程 ============================= */
@@ -392,7 +1173,7 @@ async function startLlama() {
   const prof = collectProfile();
   let r;
   try { r = await api("llama/start", { profile: prof }); }
-  catch (e) { alert("启动失败: " + e.message); return; }
+  catch (e) { showNotice("启动失败: " + e.message, true); return; }
   if (r.need_confirm) {
     const k = r.need_confirm.kind;
     if (k === "safetensors") {
@@ -405,19 +1186,24 @@ async function startLlama() {
       await api("llama/start", { profile: prof, confirm: { done: true, convert_dir: r.need_confirm.dir, outtype: v } });
       return;
     }
-    if (k === "build_error") { alert(r.need_confirm.message); return; }
-    if (k === "empty") { alert("Empty"); return; }
-    // confirm:参数剔除 → 显存 → qwen35(一次汇总展示,与原版顺序一致)
+    if (k === "build_error") { showNotice(r.need_confirm.message, true); return; }
+    if (k === "empty") { showNotice("Empty", true); return; }
+    // confirm:参数剔除 → 显存 → qwen35(一次汇总,顺序与 CS 一致;装得下也确认,信息级)
     const nc = r.need_confirm;
     let msg = "";
     if (nc.violations && nc.violations.length) {
       msg += "以下参数未通过依赖/校验检查,将被剔除:\n\n" + nc.violations.map(v => " • " + v).join("\n") + "\n\n";
     }
-    if (nc.vram) msg += "⚠ 预计显存不足,llama-server 很可能因显存耗尽而崩溃(bad allocation / GGML_ASSERT)。\n\n" + nc.vram + "\n\n(建议:减小上下文大小,或将 KV 缓存类型改为 q4_0/q4_1)\n\n";
+    if (nc.vram) {
+      msg += nc.vram + "\n\n判断: " + (nc.vram_fits
+        ? "在可用范围内"
+        : "超出可用范围,llama-server 很可能因显存耗尽而崩溃(bad allocation / GGML_ASSERT)") + "\n\n";
+    }
     if (nc.qwen35) msg += "⚠ " + nc.qwen35 + "\n\n";
     const v = await showModal({
-      title: "启动前确认", body: mEsc(msg.trim()),
-      buttons: [{ label: "否,取消启动", value: "no" }, { label: "是,继续启动", cls: "danger", value: "yes" }]
+      title: nc.vram && !nc.vram_fits ? "显存不足" : "显存预算",
+      body: mEsc(msg.trim()),
+      buttons: [{ label: "否,取消启动", value: "no" }, { label: nc.vram && !nc.vram_fits ? "仍然启动" : "继续启动", cls: nc.vram_fits ? "primary" : "danger", value: "yes" }]
     });
     if (v !== "yes") { logLine("--- 启动已取消 ---"); return; }
     await api("llama/start", { profile: prof, confirm: { done: true } });
@@ -428,7 +1214,7 @@ async function startDsh() {
   const prof = collectProfile();
   let r;
   try { r = await api("dsh/start", { profile: prof }); }
-  catch (e) { alert("DSH 启动失败: " + e.message); return; }
+  catch (e) { showNotice("DSH 启动失败: " + e.message, true); return; }
   if (r.need_rebuild) {
     const v = await showModal({
       title: "DSH 仓库已升级",
@@ -436,10 +1222,10 @@ async function startDsh() {
       buttons: [{ label: "否,跳过重建直接启动", value: "no" }, { label: "是,自动重建后启动", cls: "primary", value: "yes" }]
     });
     const rr = await api(v === "yes" ? "dsh/rebuild_and_start" : "dsh/start_inner", { profile: prof });
-    if (rr.error) alert("DSH: " + rr.error);
+    if (rr.error) showNotice("DSH: " + rr.error, true);
     return;
   }
-  if (r.error) alert("DSH: " + r.error);
+  if (r.error) showNotice("DSH: " + r.error, true);
 }
 
 function logLine(t) { LOG_LINES.push(t); $("logArea").value = LOG_LINES.join("\n"); }
@@ -455,7 +1241,7 @@ function renderProfileCombo() {
   sel.value = CFG.CurrentProfile;
 }
 async function switchProfile(name) {
-  await saveProfileToCfg(false);           // 切换前静默保存 UI 到旧方案
+  await saveProfileToCfg(false);
   CFG.CurrentProfile = name;
   PROF = CFG.Profiles[name];
   await saveConfigFile(false);
@@ -475,25 +1261,28 @@ async function saveConfigFile(notify = true) {
 
 /* ============================== 更新检查 ================================ */
 async function checkUpdateLlama() {
-  const dir = $("inLlamaDir").value.trim();
-  const r = await api("update/check", { target: "llama", dir });
-  if (r.error) { alert(r.error); return; }
-  if (r.up_to_date) { alert(`llama.cpp 已是最新(build ${r.local})`); return; }
+  const r = await api("toolchains/check_update");
+  if (r.error) { showNotice(r.error, true); return; }
+  if (r.up_to_date && !r.mismatch) { showNotice(`llama.cpp 已是最新(build ${r.local} ≥ ${r.latest})`); return; }
+  let extra = "";
+  if (r.mismatch) extra = `\n\n⚠ 本地 build ${r.local} 与上游 ${r.latest} 不一致(可能是分支/CI 构建)。若加载模型报 ggml type 错误,请删除该目录后重新安装。`;
   const v = await showModal({
-    title: "llama.cpp 更新",
-    body: `本地 build: ${r.local ?? "未知"}\n上游最新: ${r.latest}(${r.tag})\n\n下载 ubuntu-x64 压缩包并整目录覆盖(只动二进制,不碰模型)?`,
+    title: "llama.cpp 更新(" + (r.repo || "") + ")",
+    body: `本地 build: ${r.local ?? "未知"}\n上游最新: ${r.latest}(${r.tag})\n后端: ${r.backend}\n资产: ${r.asset_name}(${fmtN((r.size || 0) / GIB, 1)} GB)${extra}\n\n下载并整目录覆盖(只动二进制,不碰模型)?`,
     buttons: [{ label: "取消", value: "no" }, { label: "更新", cls: "primary", value: "yes" }]
   });
   if (v !== "yes") return;
-  const j = await api("update/do", { target: "llama", dir });
-  await pollJob(j.job);
+  const j = await api("toolchains/update");
+  if (j.error) { showNotice(j.error, true); return; }
+  const rr = await pollJobInto(j.job, $("nodeLog"), new Set());
+  if (rr.status === "done" && rr.result?.ok) showNotice(String(rr.result.msg).split("\n")[0]);
 }
 async function checkUpdateDsh() {
   const dir = $("inDshDir").value.trim();
   const r = await api("update/check", { target: "dsh", dir });
-  if (r.error) { alert("git 检查失败: " + r.error); return; }
+  if (r.error) { showNotice("git 检查失败: " + r.error, true); return; }
   if (r.behind === 0) { logLine("[更新] DSH 已是最新(branch " + r.branch + ")"); return; }
-  if (r.ahead > 0) { alert(`本地有 ${r.ahead} 个未推送提交,不自动更新;请先处理本地改动。`); return; }
+  if (r.ahead > 0) { showNotice(`本地有 ${r.ahead} 个未推送提交,不自动更新;请先处理本地改动。`, true); return; }
   const v = await showModal({
     title: "DSH 更新",
     body: `branch ${r.branch}:落后 ${r.behind} 个提交。\n\n执行 git pull --ff-only?(升级后可能需要"🔨 重建 DSH")`,
@@ -503,26 +1292,141 @@ async function checkUpdateDsh() {
   const rr = await api("update/do", { target: "dsh", dir });
   logLine("[更新] DSH pull: " + (rr.msg || rr.ok));
 }
-async function pollJob(id) {
-  for (;;) {
-    const j = await api("job", { id });
-    for (const l of j.log || []) if (!pollJob._seen.has(l)) { pollJob._seen.add(l); logLine("[更新] " + l); }
-    if (j.status !== "running") {
-      logLine("[更新] " + (j.status === "done" ? "完成: " + j.result : "失败: " + j.result));
-      return;
+
+/* ============================== 插件管理 ================================ */
+async function pluginManager() {
+  const prof = collectProfile();
+  const r = await api("dsh/plugins/audit", { profile: prof });
+  if (r.error) { showNotice(r.error, true); return; }
+  const items = r.plugins || [];
+  const box = document.createElement("div");
+  box.innerHTML = `<div class="tiny" style="margin-bottom:6px">${mEsc(r.summary || "")}${r.dsh_running ? " · ⚠ DSH 运行中(升级/卸载/安装被拒)" : ""}</div>
+    <div id="pmlist" style="max-height:320px;overflow:auto"></div>`;
+  const list = box.querySelector("#pmlist");
+  for (const p of items) {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border);flex-wrap:wrap";
+    const peers = (p.peer_issues || []).slice(0, 2)
+      .map(x => `${x.dep} ${x.range}(装 ${x.installed})`).join("; ");
+    const deadPeers = (p.dead_peers || []).length ? ` <span class="mbadge warnBadge">死依赖 ${p.dead_peers.length}</span>` : "";
+    const specLocal = String(p.spec || "").startsWith("file:") ? ` <span class="mbadge">本地</span>` : "";
+    row.innerHTML = `<b>${mEsc(p.name)}</b> <span class="tiny">${mEsc(p.version)}</span>
+      <span class="mbadge">${mEsc(p.state_label)}</span>
+      <span class="tiny mono">${mEsc(p.spec || "(bundle)")}</span>${specLocal}${deadPeers}
+      ${p.compatible ? "" : '<span class="mbadge warnBadge">peer 不兼容</span>'}
+      ${p.exempted ? '<span class="mbadge">已豁免</span>' : ""}
+      ${peers ? `<span class="tiny">${mEsc(peers)}</span>` : ""}
+      ${(p.errors || []).length ? `<span class="tiny evt-error">${mEsc(p.errors.join("; "))}</span>` : ""}`;
+    const btns = document.createElement("div");
+    btns.style.cssText = "margin-left:auto;display:flex;gap:4px;flex-wrap:wrap";
+    const mk = (label, fn, cls, cond = true) => {
+      if (!cond) return;
+      const b = document.createElement("button");
+      b.textContent = label; b.style.padding = "2px 8px"; b.style.fontSize = "11px";
+      if (cls) b.className = cls;
+      b.onclick = async () => {
+        try { await fn(); } catch (e) { showNotice(e.message, true); }
+        pluginManager();
+      };
+      btns.appendChild(b);
+    };
+    mk("激活", async () => {
+      const rr = await api("dsh/plugins/set_active", { profile: prof, name: p.name, active: true });
+      showNotice(rr.msg || "已激活");
+    }, "primary", !p.in_bundles);
+    if (p.locked) {
+      mk("启用并解锁", async () => {
+        const rr = await api("dsh/plugins/set_active", { profile: prof, name: p.name, active: true });
+        showNotice(rr.msg || "已启用");
+      });
+    } else {
+      mk("停用并锁定", async () => {
+        const v2 = await showModal({
+          title: "停用并锁定", body: mEsc(`停用并锁定 "${p.name}"?\n\n将从 dsh.profile.bundles 移除并写入锁定列表:\n· 即使被 DSH 网页端插件管理/市场插件写回,启动器审计也会自动移除\n· 适合 peer 版本错位、client 模块加载失败等需要长期停用的插件`),
+          buttons: [{ label: "取消", value: null }, { label: "确认停用并锁定", cls: "danger", value: 1 }]
+        });
+        if (!v2) return;
+        const rr = await api("dsh/plugins/set_active", { profile: prof, name: p.name, active: false });
+        showNotice(rr.msg || "已停用");
+      });
     }
-    await new Promise(r2 => setTimeout(r2, 1500));
+    mk("升级", async () => {
+      const pv = await api("dsh/plugins/preview_update", { profile: prof, name: p.name });
+      if (pv.error) { showNotice(pv.error, true); return; }
+      if (pv.up_to_date) { showNotice(`已是最新(${pv.installed})`); return; }
+      let confirmMsg = `升级 ${p.name}: ${pv.installed} → ${pv.latest}?`;
+      if (pv.gate_blocked) confirmMsg += `\n\n⚠ ${pv.concern || "可能被 DSH 门禁拒绝"}`;
+      else if (pv.concern) confirmMsg += `\n\n⚠ ${pv.concern}`;
+      const vv = await showModal({ title: "升级插件", body: mEsc(confirmMsg),
+        buttons: [{ label: "取消", value: null }, { label: "升级", cls: "primary", value: 1 }] });
+      if (!vv) return;
+      const rr = await api("dsh/plugins/upgrade", { profile: prof, name: p.name });
+      showNotice(rr.ok ? rr.msg : rr.error, !rr.ok);
+    }, "primary", p.spec && !String(p.spec).startsWith("file:"));
+    mk("豁免本版", async () => {
+      const rr = await api("dsh/plugins/exempt", { profile: prof, name: p.name, version: p.version });
+      showNotice(rr.msg || "已豁免");
+    }, null, p.compatible === false && !p.exempted);
+    mk("卸载", async () => {
+      if (!confirm(`卸载 ${p.name}?(需要 DSH 已停止)`)) return;
+      const rr = await api("dsh/plugins/uninstall", { profile: prof, name: p.name });
+      showNotice(rr.ok ? rr.msg : rr.error, !rr.ok);
+    });
+    mk("打开目录", async () => {
+      const rr = await api("dsh/plugins/open_dir", { dir: p.dir });
+      if (rr.error) showNotice(rr.error, true);
+    });
+    row.appendChild(btns);
+    list.appendChild(row);
   }
+  const box2 = document.createElement("div");
+  box2.innerHTML = `<div class="btnrow" style="margin-top:8px">
+    <button id="pmRefresh">🔄 刷新</button>
+    <button id="pmInstallLocal">📥 安装本地插件(.tgz / 目录,需 DSH 已停止)</button>
+    <button id="pmClose">关闭</button></div>`;
+  box2.querySelector("#pmRefresh").onclick = () => pluginManager();
+  box2.querySelector("#pmInstallLocal").onclick = async () => {
+    try {
+      const v2 = await browsePicker("plugin_src");
+      if (!v2) return;
+      const rr = await api("dsh/plugins/install_local", { profile: prof, source: v2 });
+      showNotice(rr.ok ? (rr.msg || "已安装") : (rr.error || rr.msg || "安装失败"), !(rr.ok));
+      pluginManager();
+    } catch (e) { showNotice("安装失败: " + (e.message || e), true); pluginManager(); }
+  };
+  box.appendChild(box2);
+  await showModal({
+    title: `🗂 插件管理(${items.length} 个)`, body: "", extra: box,
+    buttons: [{ label: "关闭", cls: "primary", value: 1 }]
+  });
 }
-pollJob._seen = new Set();
 
 /* ============================== 事件绑定 ================================ */
 function wire() {
-  // 路径相关输入 → 预览
+  // 浏览器式标签切换
+  document.querySelectorAll(".btab").forEach(b => b.addEventListener("click", () => {
+    document.querySelectorAll(".btab").forEach(x => x.classList.remove("active"));
+    b.classList.add("active");
+    for (const sec of ["path", "param", "cmd"]) {
+      $("sec" + sec.charAt(0).toUpperCase() + sec.slice(1)).style.display = b.dataset.sec === sec ? "" : "none";
+    }
+    if (b.dataset.sec === "cmd") refreshPreview();
+  }));
+  // 主标签(监测/日志)
+  document.querySelectorAll(".mtab").forEach(b => b.addEventListener("click", () => {
+    document.querySelectorAll(".mtab").forEach(x => x.classList.remove("active"));
+    b.classList.add("active");
+    MON_TAB = b.dataset.tab;
+    $("tabMon").style.display = MON_TAB === "mon" ? "" : "none";
+    $("tabLog").style.display = MON_TAB === "log" ? "" : "none";
+    if (MON_TAB === "mon") pollMonitor();
+    else api("monitor", { visible: false }).catch(() => {});
+  }));
+  // 路径输入 → 预览
   for (const id of ["inModel", "inMtp", "inMmproj", "inMmprojUrl", "inLlamaDir", "inDshDir"]) {
-    $(id).addEventListener("input", () => { if (id === "inModel") { /* autofill 无 */ } schedulePreview(); });
+    $(id).addEventListener("input", schedulePreview);
   }
-  for (const id of ["chkNoMmprojOffload", "comboDshMode", "chkDshAdmin", "chkBreaker", "comboBreakerType", "txtBreakerVal"]) {
+  for (const id of ["chkNoMmprojOffload", "comboDshMode", "chkDshAdmin", "chkBreaker", "comboBreakerType", "txtBreakerVal", "chkOomRetry"]) {
     $(id).addEventListener("change", schedulePreview);
   }
   // 浏览按钮
@@ -549,7 +1453,7 @@ function wire() {
       const r = await api("config/save", { config: data });
       await loadAll();
       logLine("[配置] 已导入: " + r.path);
-    } catch (err) { alert("导入失败: " + err.message); }
+    } catch (err) { showNotice("导入失败: " + err.message, true); }
     e.target.value = "";
   };
   $("btnChangePath").onclick = async () => {
@@ -563,7 +1467,7 @@ function wire() {
     const dir = box.querySelector("#cfgDir").value.trim();
     if (!dir) return;
     const r = await api("config/setdir", { dir });
-    if (r.error) alert(r.error);
+    if (r.error) showNotice(r.error, true);
     else { await loadAll(); logLine("[配置] 配置目录: " + r.dir); }
   };
   // 方案操作
@@ -572,7 +1476,7 @@ function wire() {
   $("btnProfNew").onclick = async () => {
     const name = prompt("新方案名称:", "方案 " + (Object.keys(CFG.Profiles).length + 1));
     if (!name) return;
-    if (CFG.Profiles[name]) { alert("同名方案已存在"); return; }
+    if (CFG.Profiles[name]) { showNotice("同名方案已存在", true); return; }
     CFG.Profiles[name] = collectProfile();
     CFG.CurrentProfile = name;
     renderProfileCombo();
@@ -583,7 +1487,7 @@ function wire() {
     const old = CFG.CurrentProfile;
     const name = prompt("重命名方案:", old);
     if (!name || name === old) return;
-    if (CFG.Profiles[name]) { alert("同名方案已存在"); return; }
+    if (CFG.Profiles[name]) { showNotice("同名方案已存在", true); return; }
     CFG.Profiles[name] = CFG.Profiles[old];
     delete CFG.Profiles[old];
     CFG.CurrentProfile = name;
@@ -591,7 +1495,7 @@ function wire() {
     await saveConfigFile();
   };
   $("btnProfDel").onclick = async () => {
-    if (Object.keys(CFG.Profiles).length <= 1) { alert("至少保留一个方案"); return; }
+    if (Object.keys(CFG.Profiles).length <= 1) { showNotice("至少保留一个方案", true); return; }
     if (!confirm(`删除方案 "${CFG.CurrentProfile}"?`)) return;
     delete CFG.Profiles[CFG.CurrentProfile];
     CFG.CurrentProfile = Object.keys(CFG.Profiles)[0];
@@ -605,8 +1509,11 @@ function wire() {
     const prof = collectProfile();
     const r = await api("schema/reload", { profile: prof });
     SCHEMA = r.schema;
-    renderParams();
-    applyProfile(prof);
+    initState();
+    // 保留当前 UI 编辑值(schema 重载不丢改动)
+    const saved = prof;
+    buildNav();
+    applyProfile(Object.assign({}, saved, { BoolParams: collectProfile().BoolParams, ValueParams: collectProfile().ValueParams }));
     refreshPreview();
     logLine("[参数] 配置已重载,来源: " + r.schema.source + ",参数 " + r.schema.params.length + " 项 / 组 " + r.schema.groups.length + " 个");
     if (r.messages && r.messages.length) {
@@ -615,7 +1522,13 @@ function wire() {
   };
   $("btnCopyCmd").onclick = async () => {
     try { await navigator.clipboard.writeText($("cmdPreview").value); logLine("Copied"); }
-    catch (e) { /* fallback */ const t = $("cmdPreview"); t.select(); document.execCommand("copy"); logLine("Copied"); }
+    catch (e) { const t = $("cmdPreview"); t.select(); document.execCommand("copy"); logLine("Copied"); }
+  };
+  $("btnEditCmd").onclick = editCustomArgs;
+  $("btnCancelCmd").onclick = () => {
+    PROF.CustomArgs = [];
+    CFG.Profiles[CFG.CurrentProfile] = PROF;
+    updateCustomPreview(); refreshPreview();
   };
   // 服务按钮
   $("btnLlamaStart").onclick = startLlama;
@@ -631,42 +1544,85 @@ function wire() {
     });
     if (v !== "yes") return;
     const r = await api("dsh/rebuild", { profile: collectProfile() });
-    if (r.error) alert(r.error);
+    if (r.error) showNotice(r.error, true);
   };
   // 维护工具
   $("btnCompat").onclick = async () => {
     const r = await api("dsh/compat", { profile: collectProfile() });
-    const html = r.report.items.map(i => `<div class="${i.level === "error" ? "e" : i.level === "warn" ? "w" : i.level === "ok" ? "o" : "i"}">${mEsc(i.text)}</div>`).join("");
-    await showModal({ title: "🩺 DSH 兼容性检查", body: html || "(无输出)", buttons: [{ label: "关闭", cls: "primary", value: 1 }] });
+    const html = r.report.items.map(i => `<div class="${i.level === "error" ? "evt-error" : i.level === "warn" ? "evt-warn" : i.level === "ok" ? "evt-ok" : ""}">${mEsc(i.text)}</div>`).join("");
+    await showModal({ title: "🔧 DSH 兼容性检查", body: html || "(无输出)", buttons: [{ label: "关闭", cls: "primary", value: 1 }] });
     for (const l of r.log) logLine(l);
   };
   $("btnPlugins").onclick = async () => {
     const r = await api("dsh/plugins", { profile: collectProfile() });
-    const html = r.report.items.map(i => `<div class="i">${mEsc(i.name)} <span class="tiny">${mEsc(i.note || "")}</span></div>`).join("");
-    await showModal({ title: `🧩 插件检测(${r.report.count} 个)`, body: html || "(无插件)", buttons: [{ label: "关闭", cls: "primary", value: 1 }] });
+    const html = r.report.items.map(i => `<div class="${i.level === "error" ? "evt-error" : i.level === "warn" ? "evt-warn" : ""}">${mEsc(i.name)} <span class="tiny">${mEsc(i.note || "")}</span></div>`).join("");
+    await showModal({ title: `🧩 插件智能检测(${r.report.count} 个)`, body: html || "(无插件)", buttons: [{ label: "关闭", cls: "primary", value: 1 }, { label: "🗂 打开插件管理", value: "mgr" }] })
+      .then(v => { if (v === "mgr") pluginManager(); });
     for (const l of r.log) logLine(l);
   };
+  $("btnPluginMgr").onclick = () => pluginManager().catch(e => showNotice(e.message, true));
   // 检索/更新
   $("btnSearchLlama").onclick = async () => {
     logLine("[检索] 正在检索 llama-server(最长 45s)...");
     const r = await api("search", { target: "llama" });
     if (r.result) { $("inLlamaDir").value = r.result; logLine("[检索] 找到: " + r.result); refreshPreview(); }
-    else logLine("[检索] 未找到 llama-server");
+    else showNotice("未找到 llama-server", true);
   };
   $("btnSearchDsh").onclick = async () => {
     logLine("[检索] 正在检索 DSH 项目(最长 45s)...");
     const r = await api("search", { target: "dsh" });
     if (r.result) { $("inDshDir").value = r.result; logLine("[检索] 找到: " + r.result); refreshPreview(); }
-    else logLine("[检索] 未找到 DSH 项目");
+    else showNotice("未找到 DSH 项目", true);
   };
-  $("btnUpdLlama").onclick = () => checkUpdateLlama().catch(e => alert(e.message));
-  $("btnUpdDsh").onclick = () => checkUpdateDsh().catch(e => alert(e.message));
+  $("btnUpdLlama").onclick = () => checkUpdateLlama().catch(e => showNotice(e.message, true));
+  $("btnUpdDsh").onclick = () => checkUpdateDsh().catch(e => showNotice(e.message, true));
+  // 变体
+  $("comboVariant").onchange = async () => {
+    const r = await api("toolchains/variants/switch", { name: $("comboVariant").value });
+    if (r.error) { showNotice(r.error, true); refreshVariants(); return; }
+    if (r.ok) {
+      PROF.LlamaDir = r.new_dir ?? PROF.LlamaDir;
+      $("inLlamaDir").value = PROF.LlamaDir || "";
+      showNotice(r.msg);
+      refreshPreview();
+    }
+  };
+  $("btnAddVariant").onclick = () => installVariantDialog().catch(e => showNotice(e.message, true));
+  $("btnRemoveVariant").onclick = async () => {
+    const name = $("comboVariant").value;
+    if (!confirm(`从列表移除变体 "${name}"?(不删磁盘文件)`)) return;
+    const r = await api("toolchains/variants/remove", { name });
+    if (r.error) showNotice(r.error, true);
+    else { await refreshVariants(); await loadAll(); }
+  };
+  // Node 环境
+  $("btnInstallNodeEnv").onclick = async () => {
+    const job = await api("node/install");
+    await pollJobInto(job.job, $("nodeLog"), NODE_SEEN_LOG);
+  };
+  $("btnRefreshNodeEnv").onclick = pollNodeEnv;
+  $("btnCopyNodeDiag").onclick = async () => {
+    const st = await api("node/status");
+    const txt = JSON.stringify(st, null, 2);
+    try { await navigator.clipboard.writeText(txt); showNotice("诊断已复制"); }
+    catch (e) { $("nodeLog").value += txt + "\n"; }
+  };
+  // 后端选择 → 提示即时更新(生效 = 手动选择或自动检测)
+  $("comboBackend").addEventListener("change", () => {
+    const auto = ($("backendHint").dataset.auto || "vulkan");
+    const v = $("comboBackend").value;
+    $("backendHint").textContent = v ? ("生效: " + v + "(手动)") : ("生效: " + auto + "(自动检测)");
+  });
+  // 参数过滤
+  $("inputParamFilter").addEventListener("input", applyParamFilter);
+  $("btnClearParamFilter").addEventListener("click", () => { $("inputParamFilter").value = ""; applyParamFilter(); });
   // 日志
   $("btnClearLog").onclick = async () => { await api("logs/clear"); LOG_LINES = []; $("logArea").value = ""; };
   $("btnOpenLogDir").onclick = async () => {
     const r = await api("open/logs");
     if (!r.ok) logLine("[日志] 目录: " + (await api("bootstrap")).log_dir);
   };
+  $("noticeClose").onclick = () => $("noticeBar").classList.remove("show");
 }
 
 /* ================================ 启动 ================================== */
@@ -679,11 +1635,12 @@ async function loadAll() {
   renderProfileCombo();
   PROF = CFG.Profiles[CFG.CurrentProfile] || Object.values(CFG.Profiles)[0];
   CFG.Profiles[CFG.CurrentProfile] = PROF;
-  renderParams();
+  initState();
+  buildNav();
   applyProfile(PROF);
-  $("paramFilter").addEventListener("input", applyParamFilter);
-  $("paramFilterClear").addEventListener("click", () => { $("paramFilter").value = ""; applyParamFilter(); });
   await refreshPreview();
+  await refreshVariants();
+  pollNodeEnv();
   if (b.schema.errors && b.schema.errors.length) {
     logLine("[参数] ⚠ schema 错误: " + b.schema.errors.join("; "));
   }
@@ -692,7 +1649,9 @@ async function loadAll() {
 (async function init() {
   wire();
   await loadAll();
-  pollStatus(); pollLogs();
+  pollStatus(); pollLogs(); pollMonitor();
   setInterval(pollStatus, 2000);
   setInterval(pollLogs, 1000);
+  setInterval(pollMonitor, 3000);
+  setInterval(pollNodeEnv, 15000);
 })();

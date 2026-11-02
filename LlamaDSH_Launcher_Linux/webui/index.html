@@ -8,147 +8,345 @@
 </head>
 <body>
 <div id="app">
-  <!-- ==================== 左列 ==================== -->
-  <div class="col">
-    <div class="topbtns">
-      <button id="btnSaveCfg" title="保存到当前配置文件">💾 保存配置</button>
-      <button id="btnExportCfg" title="另存为(浏览器下载)">📤 另存为</button>
-      <button id="btnImportCfg" title="从 JSON 文件导入">📥 加载配置</button>
-      <button id="btnChangePath" title="更改配置文件所在目录">📁 更改路径</button>
-      <input type="file" id="fileImport" accept=".json" style="display:none">
+  <!-- ==================== 左列: 固定块 + 浏览器式三标签 ==================== -->
+  <div class="col left">
+    <div class="card cfgbar">
+      <span class="lbl">配置文件</span>
+      <div class="btnrow">
+        <button id="btnSaveCfg">💾 保存到文件</button>
+        <button id="btnExportCfg">📤 另存为…</button>
+        <button id="btnImportCfg">📥 从文件加载</button>
+        <button id="btnChangePath">📁 配置目录</button>
+        <input type="file" id="fileImport" accept=".json" style="display:none">
+      </div>
     </div>
-    <div class="row">
-      <span class="lbl">方案:</span>
-      <select id="comboProfile" class="fill" style="max-width:220px"></select>
-      <button id="btnProfSave" class="small">💾 保存</button>
-      <button id="btnProfRename" class="small">✏️ 重命名</button>
-      <button id="btnProfNew" class="small">➕ 新建</button>
-      <button id="btnProfDel" class="small">🗑 删除</button>
+    <div class="card profbar">
+      <span class="lbl">方案</span>
+      <select id="comboProfile" class="fill"></select>
+      <div class="btnrow">
+        <button id="btnProfSave">💾 保存方案</button>
+        <button id="btnProfRename">✏️ 重命名</button>
+        <button id="btnProfNew">➕ 新建</button>
+        <button id="btnProfDel">🗑 删除</button>
+      </div>
     </div>
-
-    <fieldset>
-      <legend>📂 路径配置</legend>
-      <div class="row"><span class="lbl">模型文件</span>
-        <input type="text" id="inModel" class="fill mono" placeholder="GGUF 文件 / 分片第一片 / 目录(自动解析)">
-        <button data-br="inModel" data-mode="model" class="small">浏览...</button>
-        <button data-br="inModel" data-mode="dir" class="small">📁 目录</button>
-      </div>
-      <div class="row"><span class="lbl">草稿模型(MTP)</span>
-        <input type="text" id="inMtp" class="fill mono">
-        <button data-br="inMtp" data-mode="file" class="small">浏览...</button>
-      </div>
-      <div class="row"><span class="lbl">mmproj 投影</span>
-        <input type="text" id="inMmproj" class="fill mono">
-        <button data-br="inMmproj" data-mode="file" class="small">浏览...</button>
-      </div>
-      <div class="row"><span class="lbl">mmproj URL</span>
-        <input type="text" id="inMmprojUrl" class="fill mono">
-      </div>
-      <div class="row">
-        <label><input type="checkbox" id="chkNoMmprojOffload"> --no-mmproj-offload(投影留在 CPU)</label>
-      </div>
-      <hr style="border-color:var(--border);border-style:dashed">
-      <div class="row"><span class="lbl">llama.cpp 目录</span>
-        <input type="text" id="inLlamaDir" class="fill mono" placeholder="含 llama-server 的目录(留空回退 D:\llama.cpp 语义 → ~/llama.cpp)">
-        <button data-br="inLlamaDir" data-mode="dir" class="small">浏览...</button>
-        <button id="btnSearchLlama" class="small" title="自动检索 llama-server">🔍 自动检索</button>
-        <button id="btnUpdLlama" class="small" title="从 GitHub Releases 更新(Vulkan-x64 优先)">🔄 检查更新</button>
-      </div>
-      <div class="row"><span class="lbl">DSH 目录</span>
-        <input type="text" id="inDshDir" class="fill mono" placeholder="deepseek-harness 仓库根">
-        <button data-br="inDshDir" data-mode="dir" class="small">浏览...</button>
-        <button id="btnSearchDsh" class="small">🔍 自动检索</button>
-        <button id="btnUpdDsh" class="small" title="git pull --ff-only">🔄 检查更新</button>
-      </div>
-      <hr style="border-color:var(--border);border-style:dashed">
-      <div class="row"><span class="lbl">DSH 选项</span>
-        <select id="comboDshMode">
-          <option value="0">编译版 (node lib/bin.js,优先)</option>
-          <option value="1">一键部署 (npx --yes @deepseek-ai/dsh web)</option>
-        </select>
-        <label title="sudo -n 静默提权运行(原版用于读取 Windows 游戏内存;Linux 上仅在需要 root 网络权限时使用)"><input type="checkbox" id="chkDshAdmin"> 提权启动(sudo)</label>
-      </div>
-      <div class="row"><span class="lbl">维护工具</span>
-        <button id="btnCompat" class="small">🩺 兼容性检查/修复</button>
-        <button id="btnPlugins" class="small">🧩 插件智能检测/修复</button>
-      </div>
-    </fieldset>
-
-    <div style="display:flex;align-items:center;gap:8px;margin:8px 0 2px">
-      <label for="paramFilter" style="color:#8b949e;white-space:nowrap">🔍 过滤参数:</label>
-      <input type="text" id="paramFilter" style="flex:1" placeholder="输入关键词即时过滤参数，匹配名称/说明/分组（如: kv、量化、推测、flash）" />
-      <button id="paramFilterClear" style="display:none" title="清除过滤，显示全部参数">✕</button>
+    <div class="browsertabs">
+      <button id="tabBtnPath" class="btab active" data-sec="path">📂 运行环境</button>
+      <button id="tabBtnParam" class="btab" data-sec="param">⚙️ 参数配置</button>
+      <button id="tabBtnCmd" class="btab" data-sec="cmd">📋 命令预览</button>
     </div>
-    <div id="paramGroups"></div>
-
-    <details open>
-      <summary style="cursor:pointer;font-weight:600">📋 命令预览(点击折叠)</summary>
-      <textarea id="cmdPreview" readonly spellcheck="false"></textarea>
-      <div class="row">
-        <button id="btnRefreshCmd" class="small">🔄 刷新命令</button>
-        <button id="btnReloadSchema" class="small">⟳ 重载参数配置</button>
-        <button id="btnCopyCmd" class="small">📋 复制命令</button>
+    <div class="tabbody">
+      <!-- ───── 运行环境 ───── -->
+      <div id="secPath" class="sec">
+        <div class="secscroll">
+          <div class="grpTitle">📄 模型文件</div>
+          <div class="frow"><span class="flbl">主模型</span>
+            <input type="text" id="inModel" class="fill mono wrap" placeholder="GGUF 文件 / 分片第一片 / 目录(自动解析)">
+            <button data-br="inModel" data-mode="model">浏览…</button>
+            <button data-br="inModel" data-mode="dir">📁 目录</button>
+          </div>
+          <div class="frow"><span class="flbl">草稿模型 MTP</span>
+            <input type="text" id="inMtp" class="fill mono wrap">
+            <button data-br="inMtp" data-mode="file">浏览…</button>
+          </div>
+          <div class="frow"><span class="flbl">mmproj 投影</span>
+            <input type="text" id="inMmproj" class="fill mono wrap">
+            <button data-br="inMmproj" data-mode="file">浏览…</button>
+          </div>
+          <div class="frow"><span class="flbl">mmproj URL</span>
+            <input type="text" id="inMmprojUrl" class="fill mono wrap">
+          </div>
+          <div class="frow"><span class="flbl"></span>
+            <label><input type="checkbox" id="chkNoMmprojOffload"> mmproj 强制CPU (--no-mmproj-offload)</label>
+          </div>
+          <div class="grpTitle">📁 程序目录</div>
+          <div class="frow"><span class="flbl">llama.cpp 目录</span>
+            <input type="text" id="inLlamaDir" class="fill mono wrap" placeholder="含 llama-server 的目录">
+            <button data-br="inLlamaDir" data-mode="dir">浏览…</button>
+            <button id="btnSearchLlama" title="自动检索 llama-server">🔍 自动检索</button>
+          </div>
+          <div class="frow"><span class="flbl">变体</span>
+            <select id="comboVariant" class="fill"></select>
+            <button id="btnAddVariant">＋ 安装新变体</button>
+            <button id="btnRemoveVariant">移除</button>
+            <button id="btnUpdLlama" title="按激活变体仓库+后端查更新">🔄 检查更新</button>
+          </div>
+          <div class="frow"><span class="flbl">llama 后端</span>
+            <select id="comboBackend">
+              <option value="">自动(按显卡挑)</option>
+              <option value="vulkan">Vulkan(RADV,零依赖)</option>
+              <option value="rocm">ROCm(HIP,RDNA3 更快)</option>
+              <option value="cuda">CUDA(NVIDIA)</option>
+              <option value="sycl">SYCL(Intel)</option>
+            </select>
+            <span class="tiny" id="backendHint"></span>
+          </div>
+          <div class="frow"><span class="flbl">DSH 目录</span>
+            <input type="text" id="inDshDir" class="fill mono wrap" placeholder="deepseek-harness 仓库根">
+            <button data-br="inDshDir" data-mode="dir">浏览…</button>
+            <button id="btnSearchDsh">🔍 自动检索</button>
+            <button id="btnUpdDsh" title="git pull --ff-only">🔄 检查更新</button>
+          </div>
+          <div class="grpTitle">⚙️ DSH 选项</div>
+          <div class="frow"><span class="flbl"></span>
+            <select id="comboDshMode" style="min-width:280px">
+              <option value="0">编译版 (node lib/bin.js,优先)</option>
+              <option value="1">一键部署 (npx --yes @deepseek-ai/dsh web)</option>
+            </select>
+            <label style="margin-left:auto" title="sudo -n 静默提权(通常无需勾选)">
+              <input type="checkbox" id="chkDshAdmin"> 以管理员身份启动</label>
+          </div>
+          <div class="frow"><span class="flbl">维护工具</span>
+            <button id="btnCompat">🔧 兼容性检查/修复</button>
+            <button id="btnPlugins">🧩 插件智能检测/修复</button>
+            <button id="btnPluginMgr">🗂 插件管理</button>
+          </div>
+          <div class="grpTitle">🔧 Node 环境</div>
+          <div class="nodecard">
+            <div class="nline" id="lblNodeStatus">node: 检测中…</div>
+            <div class="nline" id="lblPnpmStatus">pnpm: 检测中…</div>
+            <div class="nline" id="lblLatestStatus">最新 v24: —</div>
+            <div class="btnrow">
+              <button id="btnInstallNodeEnv">📦 一键安装/更新 Node + pnpm</button>
+              <button id="btnRefreshNodeEnv">🔄 刷新状态</button>
+              <button id="btnCopyNodeDiag">📋 复制诊断</button>
+            </div>
+            <textarea id="nodeLog" readonly spellcheck="false" placeholder="安装/检测日志"></textarea>
+          </div>
+        </div>
       </div>
-    </details>
+      <!-- ───── 参数配置 ───── -->
+      <div id="secParam" class="sec" style="display:none">
+        <div class="filterRow">
+          <span class="flbl" style="width:86px">🔍 过滤参数:</span>
+          <input type="text" id="inputParamFilter" class="fill wrap" placeholder="跨分类匹配名称 / 说明 / 分组…">
+          <button id="btnClearParamFilter" class="smallClear" style="display:none">✕</button>
+        </div>
+        <div class="paramShell">
+          <div class="paramNav" id="paramNavPanel"></div>
+          <div class="paramMain">
+            <div id="paramBreadcrumb" class="breadcrumb">选择左侧分类</div>
+            <div class="paramScroll" id="paramContent"></div>
+          </div>
+        </div>
+      </div>
+      <!-- ───── 命令预览 ───── -->
+      <div id="secCmd" class="sec" style="display:none">
+        <textarea id="cmdPreview" readonly spellcheck="false"></textarea>
+        <div id="cmdCustomPreview" class="customArgs" style="display:none"></div>
+        <div class="btnrow" style="margin-top:6px">
+          <button id="btnRefreshCmd">🔄 刷新命令</button>
+          <button id="btnReloadSchema">⟳ 重载参数配置</button>
+          <button id="btnCopyCmd">📋 复制命令</button>
+          <button id="btnEditCmd">✏ 编辑命令(仅追加自定义参数)</button>
+          <button id="btnCancelCmd" style="display:none">↩ 取消编辑</button>
+        </div>
+      </div>
+    </div>
   </div>
 
-  <!-- ==================== 右列 ==================== -->
-  <div class="col">
-    <div class="row" style="justify-content:flex-end">
-      <span class="tiny">Web 版常驻后台服务:关闭浏览器标签页不影响已启动的服务</span>
-    </div>
-    <fieldset>
-      <legend>⚡ 服务与性能</legend>
-      <div class="svcgrid">
+  <!-- ==================== 右列: 运行控制 + 监测/日志 ==================== -->
+  <div class="col right">
+    <fieldset class="runctl">
+      <legend>▶ 运行控制</legend>
+      <div class="rungrid">
         <div class="svc">
-          <div class="btns">
-            <button id="btnLlamaStart" class="primary">▶ 启动 Llama</button>
-            <button id="btnLlamaStop" class="danger" disabled>⏹ 停止 Llama</button>
+          <div class="btnrow">
+            <button id="btnLlamaStart" class="primary sz122">▶ 启动 Llama</button>
+            <button id="btnLlamaStop" class="danger sz122" disabled>⏹ 停止 Llama</button>
           </div>
-          <span id="lblLlamaStatus" class="status st-stop">● 已停止</span>
-        </div>
-        <div class="svc">
-          <div class="btns">
-            <button id="btnDshStart" class="primary">▶ 启动 DSH Web</button>
-            <button id="btnDshStop" class="danger" disabled>⏹ 停止 DSH Web</button>
-            <button id="btnOpenDsh" disabled>🌐 打开 DSH Web</button>
+          <div class="statusrow"><span id="lblLlamaStatus" class="status st-stop">● 已停止</span></div>
+          <div class="statusrow">
+            <label class="tiny"><input type="checkbox" id="chkOomRetry" checked> OOM 自动降层重试</label>
           </div>
-          <div class="btns">
-            <button id="btnRebuildDsh" class="small">🔨 重建 DSH</button>
-            <span id="lblDshStatus" class="status st-stop">● 已停止</span>
+          <div class="breakerRow">
+            <label><input type="checkbox" id="chkBreaker"> 🔒 显存熔断</label>
+            <select id="comboBreakerType">
+              <option value="0">百分比 (%)</option>
+              <option value="1">固定值 (GB)</option>
+            </select>
+            <input type="text" id="txtBreakerVal" style="width:48px" value="90">
+            <span id="lblVramBreaker" class="breakerLbl"></span>
           </div>
         </div>
-      </div>
-      <div class="perf">
-        <div class="cell"><div class="k">CPU</div><div class="v" id="pCpu">—</div></div>
-        <div class="cell"><div class="k">内存</div><div class="v" id="pMem">—</div></div>
-        <div class="cell"><div class="k">显卡</div><div class="v" id="pGpu">—</div></div>
-        <div class="cell"><div class="k">显存</div><div class="v" id="pVram">—</div></div>
-        <div class="cell"><div class="k">🌡显卡温度</div><div class="v" id="pTemp">—</div></div>
-        <div class="cell"><div class="k">⚡TPS</div><div class="v" id="pTps">—</div></div>
-        <div class="cell"><div class="k">⏱首Token</div><div class="v" id="pTtft">—</div></div>
-        <div class="cell"><div class="k">📈Prefill</div><div class="v" id="pPf">—</div></div>
-      </div>
-      <div class="breaker">
-        <label><input type="checkbox" id="chkBreaker"> 🔒 显存熔断</label>
-        <select id="comboBreakerType">
-          <option value="0">百分比(%)</option>
-          <option value="1">固定值(GB)</option>
-        </select>
-        <input type="text" id="txtBreakerVal" style="width:64px" value="90">
-        <span id="lblVramBreaker"></span>
+        <div class="vdivider"></div>
+        <div class="svc">
+          <div class="btnrow">
+            <button id="btnDshStart" class="primary sz122">▶ 启动 DSH</button>
+            <button id="btnDshStop" class="danger sz122" disabled>⏹ 停止 DSH</button>
+          </div>
+          <div class="statusrow"><span id="lblDshStatus" class="status st-stop">● 已停止</span></div>
+          <div class="btnrow">
+            <button id="btnRebuildDsh" class="sz122">🔨 重建 DSH</button>
+            <button id="btnOpenDsh" class="sz122" disabled>🌐 打开 Web</button>
+          </div>
+        </div>
       </div>
     </fieldset>
 
-    <fieldset style="flex:1;display:flex;flex-direction:column">
-      <legend>📝 运行日志</legend>
-      <textarea id="logArea" readonly spellcheck="false" style="flex:1"></textarea>
-      <div class="row">
-        <button id="btnClearLog" class="small">🗑 清空日志</button>
-        <button id="btnOpenLogDir" class="small">📂 打开日志目录</button>
-        <label style="margin-left:auto"><input type="checkbox" id="chkAutoScroll" checked> 自动滚动</label>
+    <div class="mainTabs">
+      <div class="tabStrip">
+        <button id="mainTabMon" class="mtab active" data-tab="mon">📊 监测</button>
+        <button id="mainTabLog" class="mtab" data-tab="log">📜 运行日志</button>
       </div>
-    </fieldset>
+      <!-- 监测页 -->
+      <div id="tabMon" class="mtabbody">
+        <div class="monScroll" id="monitorRoot">
+          <div class="mcard stripCard">
+            <div class="strip">
+              <div class="scell"><div class="sdot" style="background:#f0883e"></div><div class="slbl">显卡利用率</div><div class="sval" id="stripGpu">—</div></div>
+              <div class="scell"><div class="sdot" style="background:#58a6ff"></div><div class="slbl">显存占用</div><div class="sval" id="stripMem">—</div></div>
+              <div class="scell"><div class="sdot" style="background:#ff7b72"></div><div class="slbl">最高温度</div><div class="sval" id="stripTemp">—</div></div>
+              <div class="scell"><div class="sdot" style="background:#d2a8ff"></div><div class="slbl">总功耗</div><div class="sval" id="stripPower">—</div></div>
+            </div>
+          </div>
+          <div class="metricRow">
+            <div class="mcard metricCard">
+              <div class="mhead"><span>生成速度</span><span class="mbadge" id="genSub"></span></div>
+              <div class="mval" style="color:#7cd7f7"><span id="genVal">—</span><span class="munit">tok/s</span></div>
+              <div class="mbar"><div class="mbarfill" id="genBar"></div></div>
+              <div class="mscale"><span>0</span><span id="genMax" style="text-align:right">—</span></div>
+              <svg class="spark" id="sparkGen" viewBox="0 0 100 32" preserveAspectRatio="none"></svg>
+              <div class="mfoot" id="genFoot"></div>
+            </div>
+            <div class="mcard metricCard">
+              <div class="mhead"><span>预填充速度</span><span class="mbadge" id="pfSub"></span></div>
+              <div class="mval" style="color:#4ade80"><span id="pfVal">—</span><span class="munit">tok/s</span></div>
+              <div class="mbar"><div class="mbarfill" id="pfBar"></div></div>
+              <div class="mscale"><span>0</span><span id="pfMax" style="text-align:right">—</span></div>
+              <svg class="spark" id="sparkPf" viewBox="0 0 100 32" preserveAspectRatio="none"></svg>
+              <div class="mfoot" id="pfFoot"></div>
+            </div>
+            <div class="mcard metricCard">
+              <div class="mhead"><span>上下文占用</span><span class="mbadge warnBadge" id="ctxBadge" style="display:none">接近上限</span></div>
+              <div class="mval" id="ctxVal"><span>—</span><span class="munit">tok</span></div>
+              <div class="mbar"><div class="mbarfill" id="ctxBar"></div></div>
+              <div class="mscale"><span>0</span><span id="ctxMax" style="text-align:right">—</span></div>
+              <svg class="spark" id="sparkCtx" viewBox="0 0 100 32" preserveAspectRatio="none"></svg>
+              <div class="mfoot" id="ctxFoot"></div>
+            </div>
+            <div class="mcard metricCard">
+              <div class="mhead"><span>MTP 接受率</span><span class="mbadge">spec-decode</span></div>
+              <div class="gaugeWrap">
+                <svg class="gauge" id="mtpGauge" viewBox="0 0 92 92">
+                  <circle cx="46" cy="46" r="36" class="gring-bg"/>
+                  <circle cx="46" cy="46" r="36" class="gring" id="mtpRing"/>
+                </svg>
+                <div class="gaugeCenter"><div class="gval" id="mtpVal">—</div><div class="gsub">acceptance</div></div>
+              </div>
+              <div class="mfoot" id="mtpSub">启用投机解码后显示</div>
+            </div>
+          </div>
+          <div class="secTitle">GPU(按卡聚合)</div>
+          <div id="gpuPanelsHost"></div>
+          <div class="secTitle">实时生成任务</div>
+          <div class="phaseGrid">
+            <div class="mcard phaseCard">
+              <div class="mhead">
+                <span style="font-size:14px;font-weight:700;color:#eef1f3">推理状态</span>
+                <span class="pillBadge" id="monModelName">未加载模型</span>
+              </div>
+              <div class="phasePillRow"><span class="phasePill" id="monPhasePill"><span id="monPhaseText">llama 离线</span></span></div>
+              <div class="stat3" id="phaseStat3">
+                <div class="stat"><div class="slbl2" id="stat1Lbl">—</div><div class="statval c-cyan" id="stat1Val">—</div></div>
+                <div class="stat"><div class="slbl2" id="stat2Lbl">—</div><div class="statval c-cyan" id="stat2Val">—</div></div>
+                <div class="stat"><div class="slbl2" id="stat3Lbl">—</div><div class="statval c-light" id="stat3Val">—</div></div>
+              </div>
+              <div class="mbar big"><div class="mbarfill" id="monBar"></div></div>
+              <div class="phaseFoot"><span id="monPhaseLabel">—</span><span id="monPhaseDetail"></span></div>
+            </div>
+            <div class="mcard eventCard">
+              <div class="mhead"><span style="font-size:14px;font-weight:700;color:#eef1f3">事件流</span><span class="mbadge" id="monEventCount">0 / 200</span></div>
+              <div class="eventFeed" id="monEventFeed"></div>
+            </div>
+          </div>
+          <div class="secTitle">系统资源</div>
+          <div class="sysGrid">
+            <div class="mcard sysCard">
+              <div class="mhead"><span>CPU</span><span class="mbadge" id="cpuHeadSub"></span></div>
+              <div class="sysBody">
+                <div class="bigVal"><span id="cpuBigVal">—</span><span class="munit">利用率</span></div>
+                <div class="coreStrip" id="cpuCoresHost"></div>
+              </div>
+            </div>
+            <div class="mcard sysCard">
+              <div class="mhead"><span>内存</span><span class="mbadge" id="memUsedSub"></span></div>
+              <div class="sysBody">
+                <div class="bigVal"><span id="memBigVal">—</span><span class="munit">已用</span></div>
+                <div>
+                  <div class="memStack"><div class="memUsedPart" id="memStackUsed"></div></div>
+                  <div class="memLegend"><span class="lgdot" style="background:#34d399"></span><span id="memLegendUsed">已用 —</span>
+                    <span class="lgdot" style="background:#1d2226;margin-left:8px"></span><span id="memLegendAvail">可用 —</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="mcard sysCard">
+              <div class="mhead"><span>磁盘</span><span class="mbadge" id="diskHeadSub"></span></div>
+              <div id="diskRowsHost" class="rowsHost"></div>
+            </div>
+            <div class="mcard sysCard">
+              <div class="mhead"><span>网络</span><span class="mbadge" id="netHeadSub"></span></div>
+              <div id="netRowsHost" class="rowsHost"></div>
+            </div>
+          </div>
+          <div class="secTitle">模型与 Slot</div>
+          <div class="msGrid">
+            <div class="mcard modelCard">
+              <div class="mhead"><span>模型</span><span class="mbadge" id="miFtype"></span></div>
+              <div class="miName" id="miName">—</div>
+              <div class="miPath" id="miPath"></div>
+              <div class="miGrid">
+                <div><span class="mlbl">参数量</span><span class="mvalS mono" id="miParams">—</span></div>
+                <div><span class="mlbl">文件体积</span><span class="mvalS mono" id="miSize">—</span></div>
+                <div><span class="mlbl">嵌入维度</span><span class="mvalS mono" id="miEmbd">—</span></div>
+                <div><span class="mlbl">词表大小</span><span class="mvalS mono" id="miVocab">—</span></div>
+                <div><span class="mlbl">n_ctx</span><span class="mvalS mono" id="miCtx">—</span></div>
+                <div><span class="mlbl">n_ctx_train</span><span class="mvalS mono" id="miCtxTrain">—</span></div>
+                <div><span class="mlbl">vocab_type</span><span class="mvalS mono" id="miVocabType">—</span></div>
+                <div><span class="mlbl">模态</span><span class="mvalS mono" id="miModal">—</span></div>
+              </div>
+            </div>
+            <div class="mcard slotCard">
+              <div class="mhead"><span>Slot</span><span class="mbadge" id="monSlotSummary">—</span></div>
+              <div id="slotCardsHost"></div>
+            </div>
+          </div>
+          <div class="secTitle">历史趋势 · 实时</div>
+          <div class="mcard trendsCard">
+            <div class="tGroupLbl">llama</div>
+            <div class="trendGrid">
+              <div class="trendBox"><div class="tt" data-title="Token 生成速度" data-unit="tok/s"></div><svg class="trend" id="trendGen" viewBox="0 0 320 160" preserveAspectRatio="none"></svg></div>
+              <div class="trendBox"><div class="tt" data-title="预填充速度" data-unit="tok/s"></div><svg class="trend" id="trendPf" viewBox="0 0 320 160" preserveAspectRatio="none"></svg></div>
+              <div class="trendBox"><div class="tt" data-title="上下文占用" data-unit="tokens"></div><svg class="trend" id="trendCtx" viewBox="0 0 320 160" preserveAspectRatio="none"></svg></div>
+              <div class="trendBox"><div class="tt" data-title="MTP 接受率" data-unit="%"></div><svg class="trend" id="trendMtp" viewBox="0 0 320 160" preserveAspectRatio="none"></svg></div>
+            </div>
+            <div class="tGroupLbl">GPU</div>
+            <div class="trendGrid">
+              <div class="trendBox"><div class="tt" data-title="GPU 利用率" data-unit="%"></div><svg class="trend" id="trendGpuUtil" viewBox="0 0 320 160" preserveAspectRatio="none"></svg></div>
+              <div class="trendBox"><div class="tt" data-title="GPU 显存" data-unit="GB"></div><svg class="trend" id="trendGpuMem" viewBox="0 0 320 160" preserveAspectRatio="none"></svg></div>
+              <div class="trendBox"><div class="tt" data-title="GPU 温度" data-unit="°C"></div><svg class="trend" id="trendGpuTemp" viewBox="0 0 320 160" preserveAspectRatio="none"></svg></div>
+              <div class="trendBox"><div class="tt" data-title="GPU 功耗" data-unit="W"></div><svg class="trend" id="trendGpuPower" viewBox="0 0 320 160" preserveAspectRatio="none"></svg></div>
+            </div>
+            <div class="tGroupLbl">系统</div>
+            <div class="trendGrid">
+              <div class="trendBox"><div class="tt" data-title="CPU" data-unit="%"></div><svg class="trend" id="trendCpu" viewBox="0 0 320 160" preserveAspectRatio="none"></svg></div>
+              <div class="trendBox"><div class="tt" data-title="内存" data-unit="GB"></div><svg class="trend" id="trendMem" viewBox="0 0 320 160" preserveAspectRatio="none"></svg></div>
+              <div class="trendBox"><div class="tt" data-title="网络" data-unit="MB/s"></div><svg class="trend" id="trendNet" viewBox="0 0 320 160" preserveAspectRatio="none"></svg></div>
+              <div class="trendBox ghost"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- 日志页 -->
+      <div id="tabLog" class="mtabbody" style="display:none">
+        <textarea id="logArea" readonly spellcheck="false"></textarea>
+        <div class="btnrow">
+          <button id="btnClearLog">🗑 清空日志</button>
+          <button id="btnOpenLogDir">📂 打开日志目录</button>
+          <label style="margin-left:auto"><input type="checkbox" id="chkAutoScroll" checked> 自动滚动</label>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -160,6 +358,7 @@
     <div id="modalBtns"></div>
   </div>
 </div>
+<div id="noticeBar"><span id="noticeText"></span><button id="noticeClose">✕</button></div>
 <script src="/app.js"></script>
 </body>
 </html>

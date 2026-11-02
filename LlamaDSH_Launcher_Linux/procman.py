@@ -100,8 +100,10 @@ def kill_process_tree(pid, timeout=3.0):
     return not any(alive(p) for p in pids)
 
 
-def find_process_by_port(*ports, name_filter=("node",)):
-    """netstat -ano 的 Linux 等价:ss -ltnp;进程名需在 name_filter 内。"""
+def find_process_by_port(*ports, name_filter=None):
+    """ss -ltnp 端口属主探测。默认不过滤进程名(C# d227f3c 同语义):
+    Node 24 主线程 comm 已改为 "MainThread", 按 "node" 过滤会永远查不到,
+    导致该接管的没接管、重启撞 EADDRINUSE 误报启动失败。"""
     try:
         out = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=10).stdout
     except Exception:
@@ -112,8 +114,10 @@ def find_process_by_port(*ports, name_filter=("node",)):
             continue
         port, pid = int(m.group(1)), int(m.group(2))
         if port in ports:
+            if not name_filter:
+                return pid
             pname = process_name(pid)
-            if not name_filter or pname in name_filter or pname + ".exe" in name_filter:
+            if pname in name_filter or pname + ".exe" in name_filter:
                 return pid
     if not name_filter:
         # 不限名时退回 lsof

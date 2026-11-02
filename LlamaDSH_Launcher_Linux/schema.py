@@ -6,6 +6,7 @@
 YAML 键为 camelCase(flag/label/role/type/default/group/enabled/...)。
 """
 import os
+import re
 import shutil
 
 import yaml
@@ -87,13 +88,15 @@ def _apply_override(doc, ov, result):
                 "advanced": op.get("advanced") or False, "tooltip": op.get("tooltip") or "",
                 "hidden": op.get("hidden") or False, "deprecated": op.get("deprecated") or False,
             }
-            for k in ("role", "options", "requires", "conflicts", "implies", "suggests", "validate", "aliases"):
+            for k in ("role", "options", "requires", "conflicts", "implies", "suggests",
+                      "validate", "aliases", "subgroup", "offValue", "offFlag", "wide"):
                 if op.get(k) is not None:
                     target[k] = op[k]
             params.append(target)
             continue
         for k in ("label", "role", "type", "default", "group", "options", "requires",
-                  "conflicts", "implies", "suggests", "validate", "aliases"):
+                  "conflicts", "implies", "suggests", "validate", "aliases",
+                  "subgroup", "offValue", "offFlag", "wide"):
             if op.get(k) is not None:
                 target[k] = op[k]
         for k in ("enabled", "advanced", "hidden", "deprecated"):
@@ -145,9 +148,22 @@ def _finalize(doc, result):
                     result["errors"].append("--%s 的 implies 引用了不存在的参数 --%s,该规则已忽略" % (p["flag"], c))
             p["implies"] = keep
         val = p.get("validate")
-        if isinstance(val, dict) and val.get("leq") and val["leq"] not in by_flag:
-            result["errors"].append("--%s 的 validate.leq 引用了不存在的参数 --%s,该规则已忽略" % (p["flag"], val["leq"]))
-            val["leq"] = None
+        if isinstance(val, dict):
+            if val.get("leq") and val["leq"] not in by_flag:
+                result["errors"].append("--%s 的 validate.leq 引用了不存在的参数 --%s,该规则已忽略" % (p["flag"], val["leq"]))
+                val["leq"] = None
+            # 加载期正则预编译: 坏正则置空并告警(CS ValidateSchema 同款),避免运行期逐次抛错
+            if val.get("regex"):
+                try:
+                    re.compile(val["regex"])
+                except re.error as ex:
+                    result["errors"].append("--%s 的 validate.regex 无法编译(%s),该规则已忽略" % (p["flag"], ex))
+                    val["regex"] = None
+        # 算子白名单校验
+        for r in (p.get("requires") or []):
+            if (r.get("op") or "enabled") not in ("enabled", "disabled", "==", "!=", ">", "<", ">=", "<="):
+                result["errors"].append("--%s 的 requires 含未知算子 '%s',该规则已忽略" % (p["flag"], r.get("op")))
+                r["op"] = "enabled"
     doc["groups"].sort(key=lambda g: g.get("order", 0))
 
 

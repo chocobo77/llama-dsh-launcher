@@ -20,9 +20,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import applog
 import compat
 import core
+import procman
 import monitor
+import nodetool
 import schema as schema_mod
 import state
+import toolchain
 import updates
 import cmdline
 
@@ -96,7 +99,8 @@ def run_job(name, fn):
 def takeover_on_boot():
     """LoadState 等价:Llama 按 PID 接管;DSH 按端口→state→孤儿扫描。"""
     st = state.load_state()
-    if st.get("LlamaPid") and procman_alive(st["LlamaPid"]):
+    import procman as _pm
+    if st.get("LlamaPid") and procman_alive(st["LlamaPid"]) and _pm.process_name(st["LlamaPid"]) in ("llama-server", "llama-server.exe"):
         LLAMA.proc = _fake_proc(st["LlamaPid"])
         LLAMA.status = "taken_over"
         HUB.log("[接管] 检测到 Llama 进程(PID %d),已接管" % st["LlamaPid"])
@@ -122,7 +126,17 @@ def takeover_on_boot():
     refresh_schema()
     sync_active_profile()
     name, _ = current_profile()
+    LLAMA.persist_config = persist_config
     HUB.log("[配置] 已加载 %s(方案: %s,参数 %d 项)" % (state.config_file_path(), name, len(SCHEMA["defs"])))
+
+
+def persist_config():
+    """OOM 降层落盘: 把内存中的 CONFIG(含降层后的 gpu-layers)写盘。"""
+    try:
+        state.save_config(CONFIG)
+        HUB.log("[配置] 已保存: %s" % state.config_file_path())
+    except Exception as ex:
+        HUB.log("[配置] 保存失败: %s" % ex)
 
 
 def procman_alive(pid):
@@ -185,22 +199,24 @@ def api_preview(body):
     sync_active_profile()
     defs = SCHEMA["defs"]
     try:
-        lst, violations = cmdline.build_cmd(prof, defs)
+        lst, violations, flag_args = cmdline.build_cmd(prof, defs)
         err = None
     except Exception as ex:
-        lst, violations, err = [], [], str(ex)
-    st = cmdline.ParamState(prof, defs)
+        lst, violations, flag_args, err = [], [], {}, str(ex)
     qw = cmdline.qwen35_partial_offload_warning(prof, defs) if not err else None
     est = cmdline.estimate_vram_needed(prof, defs, monitor.query_gpu) if not err else None
-    fmt = cmdline.fmt_cmd(lst) if not err else ""
+    fmt = cmdline.fmt_cmd(lst, defs) if not err else ""
     if err:
         fmt = "Error:" + err
+    elif not lst:
+        fmt = ("(预览为空——请先在「📂 运行环境」里设置 llama.cpp 目录;"
+               "模型路径可选,设置后命令会在此实时生成)")
     if qw:
         fmt += "\n⚠ " + qw
     return {"fmt_cmd": fmt, "cmd_line": " ".join(cmdline.qa(x) for x in lst),
-            "violations": violations, "qwen35": qw,
-            "vram": {"detail": est["detail"],
-                     "over": est["est_bytes"] > est["avail_bytes"] and est["avail_bytes"] > 0} if est else None}
+            "violations": violations, "qwen35": qw, "flag_args": flag_args,
+            "vram": {"detail": est["detail"], "fits": bool(est.get("fits", True)),
+                     "over": (not est.get("fits", True)) and est["avail_bytes"] > 0} if est else None}
 
 
 def api_llama_start(body):
@@ -306,10 +322,27 @@ def api_compat_repair(body):
 
 
 def api_plugins(body):
+    """插件智能检测(🧩 按钮): 结构化审计 + 可修复项摘要。"""
     prof = body.get("profile") or {}
+    dsh_dir = _dsh_dir_of(prof)
+    plugins = compat.audit_plugins("web", dsh_dir)
     lines = []
-    res = compat.plugin_check((prof.get("DshDir") or "").strip().strip('"'), lines.append)
-    return {"report": res, "log": lines}
+    compat.enforce_pinned("web", lines.append)
+    items = []
+    for p in plugins:
+        notes = []
+        if p["peer_issues"]:
+            notes.append("peer 不兼容: " + "; ".join("%s %s" % (x["dep"], x["range"]) for x in p["peer_issues"]))
+        if p["dead_peers"]:
+            notes.append("死依赖: " + ", ".join(p["dead_peers"]))
+        if p["missing_specs"]:
+            notes.append("缺依赖: " + ", ".join(p["missing_specs"]))
+        if p["errors"]:
+            notes.append("; ".join(p["errors"]))
+        items.append({"name": p["name"], "note": "; ".join(notes) or p["state_label"],
+                      "level": "error" if (p["errors"] or p["dead_peers"]) else
+                               ("warn" if notes else "ok")})
+    return {"report": {"items": items, "count": len(plugins)}, "log": lines}
 
 
 def api_search(body):
@@ -415,6 +448,7 @@ def api_status(_):
                 "converting": CONVERTER.running},
         "monitor": MON.snapshot,
         "profile": name,
+        "lightweight": MON.lightweight,
         "dsh_stale_lock": DSH.stale_lock_present(),
     }
 
@@ -462,8 +496,6 @@ def api_browse(body):
     dirs, files = [], []
     try:
         for e in sorted(os.scandir(p), key=lambda x: (not x.is_dir(), x.name.lower())):
-            if e.name.startswith("."):
-                continue
             if e.is_dir():
                 dirs.append(e.name)
             elif e.is_file():
@@ -487,6 +519,251 @@ def _mounts():
                     yield parts[1]
     except OSError:
         return
+
+
+def api_lightweight(body):
+    """轻量化模式开关(客户端最小化到托盘时调用)。"""
+    MON.lightweight = bool(body.get("on"))
+    HUB.log("[轻量化] %s(采样间隔: %s)" % (
+        "开——后台低频保活" if MON.lightweight else "关——恢复正常监控",
+        "无服务 60s / 有服务 30s" if MON.lightweight else "3s"))
+    return {"lightweight": MON.lightweight,
+            "llama_status": LLAMA.status, "dsh_status": DSH.status}
+
+
+def api_monitor(body):
+    """监测页快照(3s 轮询)。打点 monitor_visible 以启用 3s 快速采样。"""
+    MON.monitor_visible = bool(body.get("visible", True))
+    return MON.snapshot
+
+
+def api_args_map(body):
+    """逐参数真实启动参数回显(48a9a2f)。"""
+    prof = body.get("profile") or {}
+    name = CONFIG.get("CurrentProfile")
+    if name in (CONFIG.get("Profiles") or {}):
+        CONFIG["Profiles"][name] = prof
+    sync_active_profile()
+    return {"flag_args": LLAMA.args_map(prof)}
+
+
+# ------------------------------------------------ Toolchain / Node API ----
+
+def _active_variant_profile():
+    name, prof = current_profile()
+    return prof
+
+
+def api_toolchain_variants(_):
+    prof = _active_variant_profile()
+    toolchain.ensure_default_variant(prof)
+    out = []
+    for v in prof.get("LlamaVariants") or []:
+        lb = toolchain.local_build(v.get("Dir") or "") if v.get("Dir") else None
+        out.append({"name": v.get("Name", ""), "repo": v.get("Repo", ""),
+                    "dir": v.get("Dir", ""), "installed": bool(toolchain.find_llama_server_exe(v.get("Dir") or "")),
+                    "local_build": lb})
+    active = prof.get("ActiveLlamaVariant")
+    if not active and out:
+        active = out[0]["name"]
+    _, prof0 = current_profile()
+    return {"variants": out, "active": active,
+            "backend": toolchain.resolve_backend(prof0),
+            "backend_auto": toolchain.backend_preference(),
+            "backend_choice": (prof0.get("LlamaBackend") or "").lower(),
+            "gpu_name": monitor.gpu_friendly_name()}
+
+
+def api_toolchain_switch(body):
+    name = body.get("name") or ""
+    _, prof = current_profile()
+    if LLAMA.running:
+        return {"error": "Llama 服务运行中,请先停止再切换变体"}
+    ok, msg, _d = toolchain.switch_variant(prof, name)
+    if ok:
+        persist_config()
+        HUB.log("[变体] " + msg)
+    return {"ok": ok, "msg": msg, "error": None if ok else msg}
+
+
+def api_toolchain_remove(body):
+    name = body.get("name") or ""
+    _, prof = current_profile()
+    vs = prof.get("LlamaVariants") or []
+    if len(vs) <= 1:
+        return {"error": "至少保留一个变体(只移除列表项,不删磁盘文件)"}
+    victim = next((x for x in vs if x.get("Name") == name), None)
+    if victim is None:
+        return {"error": "变体不存在: %s" % name}
+    prof["LlamaVariants"] = [x for x in vs if x.get("Name") != name]
+    if prof.get("ActiveLlamaVariant") == name:
+        rest = prof["LlamaVariants"][0]
+        prof["ActiveLlamaVariant"] = rest.get("Name")
+        prof["LlamaDir"] = rest.get("Dir") or ""
+    persist_config()
+    HUB.log("[变体] 已移除列表项: %s(目录文件保留)" % name)
+    return {"ok": True}
+
+
+def api_toolchain_parse_repo(body):
+    r = toolchain.parse_repo_input(body.get("url") or "")
+    if not r:
+        return {"error": "无法识别仓库链接(支持 主页/.git/tree/releases 深链/裸 owner/repo)"}
+    owner, name = r.split("/", 1)
+    _, prof = current_profile()
+    return {"repo": r, "name": name,
+            "dir": toolchain.suggest_variant_dir(prof.get("LlamaDir"), owner),
+            "backend": toolchain.backend_preference()}
+
+
+def api_toolchain_install(body):
+    _, prof = current_profile()
+    if LLAMA.running:
+        return {"error": "Llama 服务运行中,请先停止再安装变体"}
+    repo_input = body.get("repo") or body.get("url") or ""
+    name = (body.get("name") or "").strip()
+    dir_ = (body.get("dir") or "").strip()
+    def job(jl):
+        ok, msg = toolchain.install_variant(prof, repo_input, name, dir_, jl)
+        if ok:
+            persist_config()
+            HUB.log("[变体] " + msg.splitlines()[0])
+        return {"ok": ok, "msg": msg}
+    return {"job": run_job("variant-install", job)}
+
+
+def api_toolchain_check_update(body):
+    """按激活变体的仓库 + 显卡后端查更新。"""
+    _, prof = current_profile()
+    toolchain.ensure_default_variant(prof)
+    active = prof.get("ActiveLlamaVariant") or ""
+    v = next((x for x in prof.get("LlamaVariants") or [] if x.get("Name") == active), None) \
+        or (prof.get("LlamaVariants") or [{}])[0]
+    repo = v.get("Repo") or toolchain.DEFAULT_REPO
+    dir_ = v.get("Dir") or prof.get("LlamaDir") or ""
+    backend = toolchain.resolve_backend(prof)
+    try:
+        release = toolchain.fetch_latest_llama_release(repo, backend, None)
+    except Exception as ex:
+        return {"error": "查询失败(%s): %s" % (repo, ex)}
+    local = toolchain.local_build(dir_)
+    latest = release.get("build", 0)
+    mismatch = bool(local is not None and latest > 0 and local != latest and local > latest)
+    return {"local": local, "latest": latest, "tag": release.get("tag"),
+            "repo": repo, "backend": backend, "asset_name": release.get("asset_name"),
+            "size": release.get("size"),
+            "up_to_date": local is not None and latest > 0 and local >= latest,
+            "mismatch": mismatch}
+
+
+def api_toolchain_update(body):
+    _, prof = current_profile()
+    if LLAMA.running:
+        return {"error": "Llama 服务运行中,请先停止再更新"}
+    toolchain.ensure_default_variant(prof)
+    active = prof.get("ActiveLlamaVariant") or ""
+    v = next((x for x in prof.get("LlamaVariants") or [] if x.get("Name") == active), None) \
+        or (prof.get("LlamaVariants") or [{}])[0]
+    repo = v.get("Repo") or toolchain.DEFAULT_REPO
+    dir_ = v.get("Dir") or prof.get("LlamaDir") or ""
+    if not dir_:
+        return {"error": "未设置 llama.cpp 目录"}
+    backend = toolchain.resolve_backend(prof)
+    def job(jl):
+        ok, msg = updates.llama_update(dir_, HUB.log, jl, repo=repo, backend=backend)
+        return {"ok": ok, "msg": msg}
+    return {"job": run_job("llama-update", job)}
+
+
+def api_node_status(_):
+    st = nodetool.detect()
+    base, v = nodetool.latest_v24()
+    st["latest_v24"] = v
+    return st
+
+
+def api_node_install(_):
+    return {"job": run_job("node-install", lambda jl: nodetool.install_node_env(jl))}
+
+
+def _dsh_dir_of(prof):
+    return (prof.get("DshDir") or "").strip().strip('"')
+
+
+def _dsh_running_guard():
+    """pnpm 会写 node_modules, 运行中拒绝(C# RequireDshStopped)。"""
+    if procman.find_process_by_port(DSH_PORT) or procman.node_host_running():
+        return False
+    return True
+
+
+def api_plugins_audit(body):
+    """插件管理器: 结构化逐插件审计(含锁定回写强制)。"""
+    prof = body.get("profile") or {}
+    dsh_dir = _dsh_dir_of(prof)
+    writebacks = compat.enforce_pinned("web", HUB.log)
+    plugins = compat.audit_plugins("web", dsh_dir)
+    errs = sum(1 for p in plugins if p["errors"])
+    warns = sum(1 for p in plugins if p["peer_issues"] or p["missing_specs"] or p["dead_peers"])
+    locked = sum(1 for p in plugins if p["locked"])
+    ver = compat.get_dsh_version(dsh_dir)
+    return {"plugins": plugins, "writebacks": writebacks,
+            "summary": "DSH %s · 插件 %d 个 · 错误 %d · 警告 %d · 锁定停用 %d" % (
+                ver or "?", len(plugins), errs, warns, locked),
+            "dsh_running": not _dsh_running_guard()}
+
+
+def api_plugins_set_active(body):
+    ok, msg = compat.set_bundle_active(body.get("profile") or "web",
+                                       body.get("name") or "", bool(body.get("active")))
+    return {"ok": ok, "msg": msg}
+
+
+def api_plugins_exempt(body):
+    ok, msg = compat.exempt_plugin(body.get("profile") or "web",
+                                   body.get("name") or "", body.get("version") or "")
+    return {"ok": ok, "msg": msg}
+
+
+def api_plugins_preview_update(body):
+    prof = body.get("profile") or {}
+    return compat.preview_plugin_update("web", body.get("name") or "", _dsh_dir_of(prof))
+
+
+def api_plugins_upgrade(body):
+    prof = body.get("profile") or {}
+    if not _dsh_running_guard():
+        return {"error": "该操作需要先停止 DSH(会运行 pnpm 修改插件目录)。"}
+    ok, msg = compat.upgrade_plugin("web", body.get("name") or "", _dsh_dir_of(prof))
+    return {"ok": ok, "msg": msg}
+
+
+def api_plugins_uninstall(body):
+    if not _dsh_running_guard():
+        return {"error": "该操作需要先停止 DSH(会运行 pnpm 修改插件目录)。"}
+    ok, msg = compat.uninstall_plugin("web", body.get("name") or "")
+    return {"ok": ok, "msg": msg}
+
+
+def api_plugins_install_local(body):
+    if not _dsh_running_guard():
+        return {"error": "该操作需要先停止 DSH(会运行 pnpm 修改插件目录)。"}
+    ok, msg = compat.install_local_plugin("web", body.get("source") or "", HUB.log)
+    return {"ok": ok, "msg": msg}
+
+
+def api_plugins_open_dir(body):
+    """打开插件目录(C# 打开目录按钮;失败仅记日志不打断)。"""
+    path = body.get("dir") or ""
+    if not path or not os.path.isdir(path):
+        return {"error": "目录不存在: %s" % path}
+    try:
+        subprocess.Popen(["xdg-open", path],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"ok": True}
+    except Exception as ex:
+        applog.error("打开插件目录失败: %s -> %s" % (path, ex))
+        return {"error": str(ex)}
 
 
 def api_health(_):
@@ -524,6 +801,26 @@ ROUTES = {
     ("open/dsh",): api_open_dsh,
     ("convert/start",): api_convert_start,
     ("browse",): api_browse,
+    ("monitor",): api_monitor,
+    ("lightweight",): api_lightweight,
+    ("args_map",): api_args_map,
+    ("toolchains/variants",): api_toolchain_variants,
+    ("toolchains/variants/switch",): api_toolchain_switch,
+    ("toolchains/variants/remove",): api_toolchain_remove,
+    ("toolchains/parse_repo",): api_toolchain_parse_repo,
+    ("toolchains/variants/install",): api_toolchain_install,
+    ("toolchains/check_update",): api_toolchain_check_update,
+    ("toolchains/update",): api_toolchain_update,
+    ("node/status",): api_node_status,
+    ("node/install",): api_node_install,
+    ("dsh/plugins/audit",): api_plugins_audit,
+    ("dsh/plugins/open_dir",): api_plugins_open_dir,
+    ("dsh/plugins/set_active",): api_plugins_set_active,
+    ("dsh/plugins/exempt",): api_plugins_exempt,
+    ("dsh/plugins/preview_update",): api_plugins_preview_update,
+    ("dsh/plugins/upgrade",): api_plugins_upgrade,
+    ("dsh/plugins/uninstall",): api_plugins_uninstall,
+    ("dsh/plugins/install_local",): api_plugins_install_local,
     ("health",): api_health,
 }
 
@@ -553,6 +850,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._static("index.html")
         if path == "/favicon.ico":
             return self._send(204, b"", "image/x-icon")
+        # GET /api/status: 供客户端自举探测与轻量轮询使用(客户端 _probe 走 GET)
+        if path == "/api/status":
+            try:
+                return self._send(200, api_status({}))
+            except Exception as ex:
+                return self._send(500, {"error": str(ex)})
         safe = os.path.normpath(path.lstrip("/"))
         full = os.path.join(WEBUI_DIR, safe)
         if full.startswith(WEBUI_DIR) and os.path.isfile(full):
@@ -592,6 +895,22 @@ def main():
     ap = argparse.ArgumentParser(description="LlamaDSH Launcher (Linux 复刻版)")
     ap.add_argument("-p", "--port", type=int, default=DEFAULT_PORT)
     args = ap.parse_args()
+
+    # sudo 血统切断(对齐 C# App.OnStartup 的安装器血统检测): 以 root 运行时
+    # HOME=/root, 配置/检索/DSH_HOME/日志全部错位。检测到经 sudo 发起时,
+    # 自动以发起 sudo 的桌面用户身份重启自己, 不再以 root 继续。
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        user = os.environ["SUDO_USER"]
+        home = "/home/" + user
+        if os.path.isdir(home):
+            argv = [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:]
+            print("检测到以 sudo(root)启动——所有 ~ 路径会错位,自动切换为用户 %s 重新启动…" % user)
+            os.execvp("sudo", ["sudo", "-u", user,
+                               "env", "HOME=" + home, "USER=" + user,
+                               "LANG=" + os.environ.get("LANG", "C.UTF-8")] + argv)
+            # execvp 成功则不再返回
+    elif os.geteuid() == 0:
+        print("⚠ 正在以 root 运行:配置/检索/日志都会指向 /root,建议改用桌面用户启动")
 
     # 单实例
     try:

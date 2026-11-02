@@ -97,9 +97,11 @@ def find_llama_server():
 def find_dsh_project():
     """返回包含 pnpm-workspace.yaml 的 DSH 项目目录或 None。"""
     home = os.path.expanduser("~")
-    known = [os.path.join(home, "deepseek-harness"),
+    known = [os.path.join(home, ".local", "share", "deepseek-harness"),
+             os.path.join(home, "deepseek-harness"),
              os.path.join(home, "code", "deepseek-harness"),
              os.path.join(home, "Projects", "deepseek-harness"),
+             os.path.join(home, ".local", "share", "pnpm", "global"),
              "/opt/deepseek-harness"]
     for k in known:
         if os.path.isfile(os.path.join(k, "pnpm-workspace.yaml")) or \
@@ -129,7 +131,8 @@ def llama_local_version(llama_dir):
     if not exe or not os.path.isfile(exe):
         return None
     try:
-        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=15).stdout
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=15)
+        out = (r.stdout or "") + (r.stderr or "")  # 新版版本横幅在 stderr
         m = re.search(r"build\s+(\d+)", out)
         return int(m.group(1)) if m else None
     except Exception:
@@ -172,47 +175,23 @@ def llama_download_url(build):
     return names[0]["browser_download_url"] if names else None
 
 
-def llama_update(llama_dir, log, job_log):
-    """下载并整目录覆盖(只动二进制,不碰模型)。返回 (ok, msg)。"""
+def llama_update(llama_dir, log, job_log, repo=None, backend=None):
+    """标准版更新: 委托 toolchain 完整链(后端挑选/.part/对账/磁盘预检/build 硬校验)。"""
+    import toolchain as _tc
+    repo = repo or _tc.DEFAULT_REPO
     local = llama_local_version(llama_dir)
-    latest, tag = llama_latest_version()
-    if latest is None:
-        return False, "无法获取上游版本(网络?)"
-    if local is not None and local >= latest:
+    backend = backend or _tc.backend_preference()
+    log("[更新] 按显卡挑选后端: %s" % backend)
+    try:
+        release = _tc.fetch_latest_llama_release(repo, backend, job_log)
+    except Exception as ex:
+        return False, "无法获取上游版本: %s" % ex
+    latest = release.get("build", 0)
+    if local is not None and latest > 0 and local >= latest:
         return True, "已是最新(build %d ≥ %d)" % (local, latest)
-    log("[更新] llama.cpp: build %s → %d(%s)" % (local or "?", latest, tag))
-    url = llama_download_url(latest)
-    if not url:
-        return False, "未找到 ubuntu-x64 资产"
-    ok = False
-    for base in ("",) + _MIRRORS:
-        dl = url if not base else base + url
-        try:
-            job_log("下载: %s" % dl)
-            blob = _http_get(dl, timeout=1800)
-            if len(blob) < 1024 * 1024:
-                raise IOError("文件过小")
-            zf = zipfile.ZipFile(io.BytesIO(blob))
-            os.makedirs(llama_dir, exist_ok=True)
-            for info in zf.infolist():
-                if info.is_dir():
-                    continue
-                base_name = os.path.basename(info.filename)
-                if not base_name:
-                    continue
-                target = os.path.join(llama_dir, base_name)
-                with zf.open(info) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                os.chmod(target, 0o755)
-            job_log("解压完成 → %s" % llama_dir)
-            ok = True
-            break
-        except Exception as ex:
-            job_log("下载/解压失败(%s): %s" % (base or "直连", ex))
-    if not ok:
-        return False, "全部镜像下载失败"
-    new_local = llama_local_version(llama_dir)
-    return True, "更新完成:build %s → %s" % (local or "?", new_local or "?")
+    log("[更新] llama.cpp: build %s → %s(%s)" % (local or "?", latest or release["tag"], release["tag"]))
+    ok, msg = _tc.apply_llama_update(llama_dir, release, job_log)
+    return ok, msg
 
 
 # ================================================================== DSH 更新
@@ -227,6 +206,8 @@ def dsh_check_update(dsh_dir):
     try:
         branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=dsh_dir,
                                 capture_output=True, text=True, timeout=15).stdout.strip()
+        if branch == "HEAD":
+            return {"error": "仓库处于 detached HEAD 状态,无法比对更新"}
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=dsh_dir,
                               capture_output=True, text=True, timeout=15).stdout.strip()
         cnt = subprocess.run(["git", "rev-list", "--left-right", "--count", "HEAD...origin/%s" % branch],
@@ -237,10 +218,32 @@ def dsh_check_update(dsh_dir):
         return {"error": str(ex)}
 
 
+def _cleanup_git_lock(repo_dir):
+    """超时强杀会留下 .git/index.lock;确认无存活 git 进程时自动清理(81cdb3b)。"""
+    lock = os.path.join(repo_dir, ".git", "index.lock")
+    if not os.path.exists(lock):
+        return False
+    try:
+        r = subprocess.run(["pgrep", "-x", "git"], capture_output=True, text=True, timeout=10)
+        if (r.stdout or "").strip():
+            return False
+    except Exception:
+        pass
+    try:
+        os.remove(lock)
+        return True
+    except OSError:
+        return False
+
+
 def dsh_pull(dsh_dir):
     try:
         r = subprocess.run(["git", "pull", "--ff-only"], cwd=dsh_dir,
-                           capture_output=True, text=True, timeout=180)
+                           capture_output=True, text=True, timeout=240)
         return r.returncode == 0, (r.stdout or r.stderr).strip()[-500:]
+    except subprocess.TimeoutExpired:
+        if _cleanup_git_lock(dsh_dir):
+            return False, "git 执行超时(240 秒); 已自动清理残留的 .git/index.lock, 可直接重试"
+        return False, "git 执行超时(240 秒); .git/index.lock 仍在(可能有 git 进程运行中)"
     except Exception as ex:
         return False, str(ex)
