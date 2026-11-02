@@ -176,13 +176,17 @@ def install_node_env(job_log, timeout_secs=600):
                             break
                         f.write(chunk)
                 os.replace(part, dest)
-                shas_url = "%s/%s/SHASUMS256.txt" % (attempt_base, latest_v)
                 try:
-                    shas = _http_get(shas_url, timeout=30).decode()
+                    # SHASUMS 固定从 nodejs.org 官方源取: 与 tarball 同镜像取时,
+                    # 镜像被控 = tarball+校验表一起换, 校验形同虚设
+                    shas = _http_get("https://nodejs.org/dist/%s/SHASUMS256.txt" % latest_v,
+                                     timeout=30).decode()
                     want = None
                     for ln in shas.splitlines():
-                        if ln.strip().endswith(fname):
-                            want = ln.split()[0]
+                        toks = ln.strip().split()
+                        # 精确匹配 "<hash>  <fname>": endswith 可被前缀伪造
+                        if len(toks) == 2 and toks[1] == fname:
+                            want = toks[0]
                             break
                     if want:
                         got = _sha256(dest)
@@ -192,7 +196,12 @@ def install_node_env(job_log, timeout_secs=600):
                     else:
                         raise IOError("SHASUMS 中未找到 %s" % fname)
                 except Exception as sha_ex:
-                    job_log("校验失败(%s),换源重试" % sha_ex)
+                    # 坏文件已 replace 进 dest, 不删会永久残留未校验 tarball
+                    job_log("校验失败(%s),删除坏文件并换源重试" % sha_ex)
+                    try:
+                        os.remove(dest)
+                    except OSError:
+                        pass
                     continue
                 ok_dl = True
                 break
@@ -224,13 +233,17 @@ def install_node_env(job_log, timeout_secs=600):
         for exe in ("node", "npm", "npx", "corepack"):
             src = os.path.join(target, "bin", exe)
             dst = os.path.join(LOCAL_BIN, exe)
+            if not os.path.isfile(src):
+                continue
             try:
-                if os.path.islink(dst) or os.path.exists(dst):
-                    os.remove(dst)
-                if os.path.isfile(src):
-                    os.symlink(src, dst)
-            except OSError:
-                pass
+                # 原子换链: 先 remove 再 symlink 的窗口里失败会摧毁用户原有 node 链接
+                new_link = dst + ".new"
+                if os.path.islink(new_link) or os.path.exists(new_link):
+                    os.remove(new_link)
+                os.symlink(src, new_link)
+                os.replace(new_link, dst)
+            except OSError as link_ex:
+                job_log("软链 %s 失败: %s" % (dst, link_ex))
         job_log("Node %s 安装到 %s" % (latest_v, target))
         cur_v = latest_v
     else:
@@ -241,16 +254,24 @@ def install_node_env(job_log, timeout_secs=600):
         node = detect(force=True)["node24"]["path"]
         if node:
             job_log("安装 pnpm(corepack enable)...")
-            r = subprocess.run([node, os.path.join(os.path.dirname(node), "corepack"), "enable"],
-                               capture_output=True, text=True, timeout=120)
+            try:
+                r = subprocess.run([node, os.path.join(os.path.dirname(node), "corepack"), "enable"],
+                                   capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                r = None
+                job_log("corepack enable 超时(120s)")
             pnpm = procman.which("pnpm")
             if not pnpm:
                 job_log("corepack 失败(%s),回退 npm --prefix ~/.local install -g pnpm" % (r.stderr or "").strip()[:120])
                 npm = os.path.join(os.path.dirname(node), "npm")
-                subprocess.run([npm, "config", "set", "prefix", os.path.expanduser("~/.local")],
-                               capture_output=True, text=True, timeout=60)
-                r = subprocess.run([npm, "install", "-g", "pnpm"], capture_output=True,
-                                   text=True, timeout=600)
+                # 一次性 --prefix: `npm config set prefix` 会持久改写 ~/.npmrc,
+                # 影响该用户所有 node 的全局安装路径
+                try:
+                    subprocess.run([npm, "install", "-g", "--prefix",
+                                    os.path.expanduser("~/.local"), "pnpm"],
+                                   capture_output=True, text=True, timeout=600)
+                except subprocess.TimeoutExpired:
+                    job_log("npm install -g pnpm 超时(600s)")
                 pnpm = procman.which("pnpm")
     st2 = detect(force=True)
     if not st2["pnpm"]["path"]:

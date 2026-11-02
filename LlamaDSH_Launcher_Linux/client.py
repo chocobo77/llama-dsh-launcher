@@ -99,25 +99,15 @@ def run_gtk(base_url):
     gi.require_version("WebKit2", "4.1")
     from gi.repository import Gtk, GLib, Gdk, WebKit2
 
-    dbus_loop_ok = False
-    tray = None
-    try:
-        import dbus
-        from dbus.mainloop.glib import DBusGMainLoop
-        DBusGMainLoop(set_as_default=True)
-        dbus_loop_ok = True
-    except Exception:
-        pass
-
-    state = {"win": None, "lightweight": False, "quit": False}
+    state = {"win": None, "quit": False}
 
     # ---------------------------------------------------------- 轻量化切换 --
     def apply_lightweight(on):
-        state["lightweight"] = on
-        threading.Thread(target=set_lightweight, args=(base_url, on), daemon=True).start()
-        if tray is not None:
-            tray.set_lightweight(on)
-        print("[client] 轻量化模式: %s" % ("开(后台低频保活)" if on else "关"))
+        # T1: 关窗路径在 main_quit 前同步调用(带 3s 超时), daemon 线程会在
+        # 进程退出时被硬杀 —— 异步发送会让轻量化永远到不了服务端
+        ok = set_lightweight(base_url, on)
+        print("[client] 轻量化模式: %s%s" % ("开(后台低频保活)" if on else "关",
+              "" if ok else "(通知服务失败)"))
 
     # -------------------------------------------------------------- 主窗口 --
     def build_window():
@@ -141,6 +131,7 @@ def run_gtk(base_url):
         sw.add(web)
         win.add(sw)
         win.show_all()
+        apply_lightweight(False)  # 窗口打开 = 恢复 3s 正常监控(轻量化只属于托盘驻留态)
 
         def on_delete(_w, _e):
             # QQ/微信式收进托盘: 窗口进程整体退出(WebKit 子进程随之退出),
@@ -149,15 +140,29 @@ def run_gtk(base_url):
             state["quit"] = True
             GLib.idle_add(Gtk.main_quit)
             return True  # 阻止默认销毁
+        # SIGTERM/SIGINT 走同一路径(CPython 的 signal handler 在 Gtk.main() 阻塞于 C 时
+        # 不会被调度; unix_signal_add 挂进 GLib 主循环才能及时处理注销会话/kill 场景)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig,
+                                 lambda s=sig: (apply_lightweight(True),
+                                                state.__setitem__("quit", True),
+                                                Gtk.main_quit()) and False or False)
         win.connect("delete-event", on_delete)
         state["win"] = win
         web.load_uri(base_url)
         return win
 
-    def _on_policy(_web, decision, _type):
+    def _on_policy(_web, decision, dtype):
         try:
             uri = decision.get_request().get_uri()
-            if uri.startswith(base_url):
+            internal = uri == base_url or uri.startswith(base_url + "/")
+            if dtype == WebKit2.PolicyDecisionType.RESPONSE and not internal:
+                # 外部主资源响应交系统浏览器
+                decision.ignore()
+                subprocess.Popen(["xdg-open", uri], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                return
+            if internal:
                 decision.use()
                 return
         except Exception:
@@ -181,195 +186,27 @@ def run_gtk(base_url):
 
     build_window()
 
-    signal.signal(signal.SIGINT, lambda *_: GLib.idle_add(quit_client))
     Gtk.main()
 
 
-# ------------------------------------------------------ SNI 托盘(纯 Python) --
-
-class TrayIcon:
-    """org.kde.StatusNotifierItem + com.canonical.dbusmenu 最小实现。
-
-    GNOME(ubuntu-appindicator 扩展)即认这套协议; 左键 Activate 显示主窗口,
-    右键弹出菜单: 显示主窗口 / 轻量化模式(复选) / 退出客户端。
-    """
-
-    MENU_SHOW, MENU_LIGHT, MENU_QUIT, MENU_MIN = 1, 2, 3, 4
-
-    def __init__(self, base_url, on_show, on_light, on_quit, on_minimize):
-        import dbus
-        self._dbus = dbus
-        self.base_url = base_url
-        self.on_show = on_show
-        self.on_light = on_light
-        self.on_quit = on_quit
-        self.on_minimize = on_minimize
-        self.lightweight = False
-        self.revision = 1
-        self.bus = dbus.SessionBus()
-        # 规范: org.kde.StatusNotifierItem-<pid>(不能把带 . : 的 URL 拼进总线名)
-        self.name = "org.kde.StatusNotifierItem-%d" % os.getpid()
-        self.item = _SniObject(self.bus, "/StatusNotifierItem", self)
-        self.menu = _DBusMenuObject(self.bus, "/MenuBar", self)
-        # 申请 well-known 名; 结果不校验——真正的注册是 RegisterStatusNotifierItem
-        self.bus.request_name(self.name)
-
-    def start(self):
-        from gi.repository import GLib
-        self._register()
-        # watcher 重启后自动重注册(每 10s 兜底)
-        GLib.timeout_add_seconds(10, self._register)
-
-    def _register(self):
-        try:
-            watcher = self.bus.get_object("org.kde.StatusNotifierWatcher",
-                                          "/StatusNotifierWatcher")
-            watcher.RegisterStatusNotifierItem(self.name,
-                dbus_interface="org.kde.StatusNotifierWatcher")
-        except Exception:
-            pass
-        return True  # 保持 timer
-
-    def set_lightweight(self, on):
-        self.lightweight = bool(on)
-        self.revision += 1
-
-    def icon_path(self):
-        for s in (64, 48, 32):
-            p = os.path.join(ICON_DIR, "icon%d.png" % s)
-            if os.path.isfile(p):
-                return p
-        return ""
-
-    # dbusmenu 布局: (id, props, children)
-    def _layout(self):
-        return (0, {"children-display": "submenu"}, [
-            (self.MENU_SHOW, {"label": "显示主窗口", "icon-name": "view-restored"}, []),
-            (self.MENU_LIGHT, {"label": "轻量化模式(后台低频保活)",
-                               "toggle-type": "checkmark",
-                               "toggle-state": 1 if self.lightweight else 0}, []),
-            (0, {}, []),  # 分隔线
-            (self.MENU_MIN, {"label": "收进托盘(轻量化)"}, []),
-            (self.MENU_QUIT, {"label": "退出客户端(服务与 llama/DSH 继续运行)"}, []),
-        ])
-
-    def _fire(self, item_id):
-        from gi.repository import GLib
-        if item_id == self.MENU_SHOW:
-            GLib.idle_add(self.on_show)
-        elif item_id == self.MENU_LIGHT:
-            self.set_lightweight(not self.lightweight)
-            GLib.idle_add(self.on_light, self.lightweight)
-        elif item_id == self.MENU_MIN:
-            GLib.idle_add(self.on_minimize)
-        elif item_id == self.MENU_QUIT:
-            GLib.idle_add(self.on_quit)
+def _acquire_window_lock():
+    """窗口进程单例: 已有窗口时再点托盘直接退出(fcntl + sys.exit)。"""
+    import fcntl
+    path = os.path.join(os.path.expanduser("~"), ".llamadsh_launcher_window.lock")
+    fh = open(path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fh.write(str(os.getpid()))
+        fh.flush()
+        # fd 需要持有到进程结束: 挂到模块全局防止 GC 关闭释放锁
+        global _win_lock_fh
+        _win_lock_fh = fh
+        return True
+    except OSError:
+        return False
 
 
-if _DBUS_OK:
-
-    class _SniObject(dbus.service.Object):
-        """org.kde.StatusNotifierItem + 手动实现的 Properties 接口。"""
-
-        def __init__(self, bus, path, tray):
-            self.tray = tray
-            super().__init__(bus, path)
-
-        @dbus.service.method("org.kde.StatusNotifierItem", in_signature="", out_signature="")
-        def Activate(self):
-            self.tray.on_show()
-
-        @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii", out_signature="")
-        def SecondaryActivate(self, x, y):
-            self.tray.on_show()
-
-        @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii", out_signature="")
-        def ContextMenu(self, x, y):
-            pass  # 菜单由 ItemIsMenu + /MenuBar 承载
-
-        @dbus.service.method("org.kde.StatusNotifierItem", in_signature="", out_signature="s")
-        def Title(self):
-            return "LlamaDSH 启动器"
-
-        @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ss", out_signature="v")
-        def Get(self, iface, prop):
-            return self.GetAll(iface).get(prop)
-
-        @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="s", out_signature="a{sv}")
-        def GetAll(self, iface):
-            return {
-                "Category": "ApplicationStatus",
-                "Id": "llamadsh-launcher",
-                "Title": "LlamaDSH 启动器",
-                "Status": "Active",
-                "IconName": "llamadsh-launcher",
-                "IconThemePath": ICON_DIR,
-                "IconPixmap": dbus.Array([], signature="(iiay)"),
-                "OverlayIconName": "",
-                "AttentionIconName": "",
-                "ItemIsMenu": True,
-                "Menu": "/MenuBar",
-                "ToolTip": dbus.Struct(
-                    (dbus.String("llamadsh-launcher"),
-                     dbus.Array([], signature="(iiay)"),
-                     dbus.String("LlamaDSH 启动器"),
-                     dbus.String("左键: 显示主窗口 | 右键: 菜单")),
-                    signature=None),
-            }
-
-        @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ssv", out_signature="")
-        def Set(self, iface, prop, value):
-            pass
-
-        @dbus.service.signal("org.freedesktop.DBus.Properties", signature="sa{sv}as")
-        def PropertiesChanged(self, iface, changed, invalidated):
-            pass
-
-    class _DBusMenuObject(dbus.service.Object):
-        """com.canonical.dbusmenu 最小实现(静态三项目录)。"""
-
-        def __init__(self, bus, path, tray):
-            self.tray = tray
-            super().__init__(bus, path)
-
-        @dbus.service.method("com.canonical.dbusmenu", in_signature="iia{ss}",
-                             out_signature="u(ia{sv}av)")
-        def GetLayout(self, parent, depth, props):
-            return (self.tray.revision, _layout_node(self.tray._layout(), depth))
-
-        @dbus.service.method("com.canonical.dbusmenu", in_signature="i", out_signature="b")
-        def AboutToShow(self, _id):
-            return False  # 菜单常开, 靠 revision 推送更新
-
-        @dbus.service.method("com.canonical.dbusmenu", in_signature="ias", out_signature="a{ia{sv}}")
-        def GetGroupProperties(self, ids, props):
-            return dbus.Dictionary({}, signature="ia{sv}")
-
-        @dbus.service.method("com.canonical.dbusmenu", in_signature="isvu", out_signature="")
-        def Event(self, _id, event, _data, _ts):
-            if event == "clicked":
-                try:
-                    self.tray._fire(int(_id))
-                except Exception:
-                    pass
-
-
-
-
-def _layout_node(node, depth, variant=False):
-    import dbus
-    rid, props, children = node
-    d = dbus.Dictionary(((dbus.String(k), v) for k, v in props.items()),
-                        signature="sv")
-    if depth == 0:
-        kids = dbus.Array([], signature="v")
-    else:
-        # dbusmenu 规范: children 是 av —— 每个结构体包一层 Variant
-        # (python-dbus 的类型构造器都支持 variant_level 参数)
-        kids = dbus.Array([_layout_node(c, depth - 1, variant=True)
-                           for c in children], signature="v")
-    s = dbus.Struct((rid, d, kids), signature=None)
-    return dbus.Struct((rid, d, kids), variant_level=1) if variant else s
+_win_lock_fh = None
 
 
 def main():
@@ -379,6 +216,9 @@ def main():
     ap.add_argument("--show", action="store_true", help="仅显示窗口(托盘助手调用)")
     args = ap.parse_args()
 
+    if not _acquire_window_lock():
+        print("[client] 主窗口已打开(另一进程持有窗口锁), 忽略本次请求")
+        return
     base = args.url or ensure_server(args.port)
     if base is None:
         print("无法启动/连接本地服务(端口 %d 起)" % args.port)

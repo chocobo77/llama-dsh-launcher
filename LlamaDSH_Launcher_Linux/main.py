@@ -90,11 +90,19 @@ def run_job(name, fn):
             JOBS[jid]["result"] = str(ex)
             JOBS[jid]["status"] = "error"
             HUB.error_ex(ex, "后台任务 %s" % name)
+        # 长驻进程慢性泄漏: 只保留最近 20 个 job
+        try:
+            done = [k for k, v in JOBS.items() if v["status"] in ("done", "error")]
+            done.sort(key=lambda k: JOBS[k]["started"])
+            for k in done[:-20]:
+                JOBS.pop(k, None)
+        except Exception:
+            pass
     threading.Thread(target=wrap, daemon=True).start()
     return jid
 
 
-# ------------------------------------------------------------- 启动接管 ----
+
 
 def takeover_on_boot():
     """LoadState 等价:Llama 按 PID 接管;DSH 按端口→state→孤儿扫描。"""
@@ -229,15 +237,14 @@ def api_llama_start(body):
     # 确认链:safetensors → 依赖剔除 → 显存 → qwen35(与原版同序)
     if not confirm.get("done") and not confirm.get("skip_checks"):
         need = LLAMA.precheck(prof)
-        if need.get("kind") in ("safetensors", "empty", "build_error"):
-            return {"need_confirm": need}
-        if need.get("kind") == "confirm":
+        if need.get("kind") in ("safetensors", "empty", "build_error", "confirm"):
             return {"need_confirm": need}
         cmd_list = need["cmd"]
     else:
+        # 用户已在前端确认(剔除/显存/qwen35): 跳过二次硬拒,
+        # 否则"确认后启动"被 build 时的 violations 检查静默拒绝
         cmd_list = None
     if confirm.get("convert_dir"):
-        # 走 safetensors 转换流程
         outtype = confirm.get("outtype") or "f16"
         convert_dir = confirm["convert_dir"]
 
@@ -246,11 +253,17 @@ def api_llama_start(body):
                 _, saved = current_profile()
                 saved["ModelPath"] = path
                 state.save_config(CONFIG)
-                LLAMA.start(saved)
+                ok, msg = LLAMA.start(saved, skip_vram_confirm=True)
+                if not ok:
+                    HUB.log("[转换] 转换完成但启动失败: %s" % msg)
         CONVERTER.start(convert_dir, outtype, after)
         return {"started": True, "converting": True}
-    ok, msg = LLAMA.start(prof, cmd_list)
-    return {"started": ok, "error": msg}
+    ok, msg = LLAMA.start(prof, cmd_list, skip_vram_confirm=True)
+    if not ok:
+        return {"started": False, "error": msg}
+    return {"started": True}
+
+
 
 
 def api_llama_stop(_):
@@ -440,32 +453,25 @@ def api_status(_):
         dsh_pid = DSH.tracker.pid
     elif DSH.proc is not None:
         dsh_pid = DSH.proc.pid
-    if MON.lightweight:
-        return {
-            "llama": {"status": LLAMA.status, "pid": LLAMA.proc.pid if LLAMA.proc else None},
-            "dsh": {"status": DSH.status, "pid": DSH.tracker.pid if DSH.tracker else None,
-                    "url": "http://127.0.0.1:%d" % DSH_PORT,
-                    "rebuilding": DSH.rebuild_running(),
-                    "converting": CONVERTER.running},
-            "monitor": {"lightweight": True, "llama_status": LLAMA.status,
-                        "dsh_status": DSH.status,
-                        "vram": MON.snapshot.get("vram", {"used": 0, "total": 0, "pct": 0}),
-                        "breaker_triggered": MON.breaker_triggered},
-            "profile": name,
-            "lightweight": True,
-            "dsh_stale_lock": DSH.stale_lock_present(),
-        }
+    # status 与 monitor 双路轮询: status 只回状态摘要(前端 pollStatus 只用这几个
+    # 字段), 完整快照(12 条历史/事件流/slots)只走 /api/monitor
     return {
         "llama": {"status": LLAMA.status, "pid": LLAMA.proc.pid if LLAMA.proc else None},
         "dsh": {"status": DSH.status, "pid": dsh_pid,
                 "url": "http://127.0.0.1:%d" % DSH_PORT,
                 "rebuilding": DSH.rebuild_running(),
                 "converting": CONVERTER.running},
-        "monitor": MON.snapshot,
+        "monitor": {"lightweight": MON.lightweight,
+                    "llama_status": LLAMA.status, "dsh_status": DSH.status,
+                    "breaker_triggered": MON.breaker_triggered,
+                    "breaker_pct": MON.snapshot.get("vram", {}).get("pct", 0),
+                    "vram": MON.snapshot.get("vram", {"used": 0, "total": 0, "pct": 0})},
         "profile": name,
         "lightweight": MON.lightweight,
         "dsh_stale_lock": DSH.stale_lock_present(),
     }
+
+
 
 
 def api_logs(body):
@@ -506,7 +512,6 @@ def api_convert_start(body):
 
 def api_browse(body):
     """服务端目录浏览(替代 WPF OpenFileDialog/FolderBrowserDialog)。"""
-    import glob as _glob
     p = (body.get("path") or os.path.expanduser("~")).strip()
     if not os.path.isdir(p):
         p = os.path.dirname(p) or os.path.expanduser("~")
@@ -525,7 +530,10 @@ def api_browse(body):
     except OSError as ex:
         return {"error": str(ex), "path": p}
     drives = ["/"] + sorted(set(mountpoint for mountpoint in _mounts()))
-    return {"path": p, "dirs": dirs, "files": files[:500], "roots": drives}
+    return {"path": p, "dirs": dirs[:400], "files": files[:500],
+            "files_truncated": len(files) > 500, "roots": drives}
+
+
 
 
 def _mounts():
@@ -533,10 +541,13 @@ def _mounts():
         with open("/proc/mounts") as f:
             for ln in f:
                 parts = ln.split()
-                if len(parts) > 1 and parts[1].startswith("/media") or parts[1] == "/" or parts[1].startswith("/home"):
+                # and 优先级高于 or: 长度守卫必须括住全部分支
+                if len(parts) > 1 and (parts[1].startswith("/media") or parts[1] == "/" or parts[1].startswith("/home")):
                     yield parts[1]
     except OSError:
         return
+
+
 
 
 def api_lightweight(body):
@@ -876,7 +887,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, {"error": str(ex)})
         safe = os.path.normpath(path.lstrip("/"))
         full = os.path.join(WEBUI_DIR, safe)
-        if full.startswith(WEBUI_DIR) and os.path.isfile(full):
+        if ((full == WEBUI_DIR or full.startswith(WEBUI_DIR + os.sep)) and os.path.isfile(full)):
             return self._static(safe)
         self._send(404, {"error": "not found"})
 
@@ -895,10 +906,17 @@ class Handler(BaseHTTPRequestHandler):
             path = path[4:]
         try:
             n = int(self.headers.get("Content-Length") or 0)
+            if n > 10_000_000:
+                return self._send(413, {"error": "payload too large"})
             raw = self.rfile.read(n) if n else b""
             body = json.loads(raw.decode("utf-8")) if raw else {}
         except Exception:
             return self._send(400, {"error": "bad request"})
+        # CSRF: 浏览器可跨站提交 text/plain 表单拼合法 JSON 驱动全部 POST API;
+        # 校验 Host 白名单(DNS rebinding 同时被挡)
+        host = (self.headers.get("Host") or "").split(":")[0]
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return self._send(403, {"error": "forbidden host"})
         fn = ROUTES.get((path,))
         if fn is None:
             return self._send(404, {"error": "unknown api: " + path})
@@ -906,7 +924,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, fn(body))
         except Exception as ex:
             HUB.error_ex(ex, "API %s" % path)
-            self._send(500, {"error": str(ex), "trace": traceback.format_exc()[-1500:]})
+            self._send(500, {"error": str(ex)})
 
 
 def main():
@@ -932,7 +950,8 @@ def main():
 
     # 单实例
     try:
-        _lockfh = open(LOCK_FILE, "w")
+        # "a" 模式: 第二实例 flock 失败即退出, 但 open("w") 已截断运行实例写的 pid
+        _lockfh = open(LOCK_FILE, "a")
         fcntl.flock(_lockfh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         _lockfh.write(str(os.getpid()))
         _lockfh.flush()

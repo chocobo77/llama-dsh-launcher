@@ -178,6 +178,7 @@ def pick_assets(assets, backend):
     """
     names = [a["name"] for a in assets]
     sizes = {a["name"]: a.get("size") or 0 for a in assets}
+    digests = {a["name"]: a.get("digest") or "" for a in assets}
     cands = [n for n in names
              if PLATFORM_TOKEN in n and n.endswith(ARCHIVE_SUFFIX)
              and "cudart" not in n.lower()
@@ -226,8 +227,10 @@ def pick_assets(assets, backend):
                 want = "cudart-%s-bin-ubuntu-cuda-%s-x64%s" % (tag_m.group(1), cv.group(1), ARCHIVE_SUFFIX)
                 cudart_name = want if want in cudarts else None
     return {"main": chosen, "main_size": sizes.get(chosen, 0) if chosen else 0,
+            "main_digest": digests.get(chosen, "") if chosen else "",
             "cudart": cudart_name,
-            "cudart_size": sizes.get(cudart_name, 0) if cudart_name else 0}
+            "cudart_size": sizes.get(cudart_name, 0) if cudart_name else 0,
+            "cudart_digest": digests.get(cudart_name, "") if cudart_name else ""}
 
 
 def _pick_cpu(cands):
@@ -298,7 +301,9 @@ def _release_info(repo, rel, pick, stable_version):
         "asset_url": next((a["browser_download_url"] for a in rel.get("assets", [])
                            if a["name"] == pick["main"]), ""),
         "size": pick["main_size"],
+        "digest": pick.get("main_digest", ""),
         "cudart_name": pick["cudart"],
+        "cudart_digest": pick.get("cudart_digest", ""),
         "cudart_url": next((a["browser_download_url"] for a in rel.get("assets", [])
                             if a["name"] == pick["cudart"]), "") if pick["cudart"] else "",
         "cudart_size": pick["cudart_size"],
@@ -308,7 +313,16 @@ def _release_info(repo, rel, pick, stable_version):
 
 # ------------------------------------------------------------- 下载/安装 --
 
-def download_asset(url, dest, expected_size=0, job_log=None, timeout_secs=1200):
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def download_asset(url, dest, expected_size=0, job_log=None, timeout_secs=1200, expected_digest=""):
     """直连 → 三镜像;.part 临时文件 + 原子改名;长度 <1MB 拒收;±1% 对账。"""
     urls = [url] + [m + url for m in MIRRORS]
     part = dest + ".part"
@@ -329,6 +343,12 @@ def download_asset(url, dest, expected_size=0, job_log=None, timeout_secs=1200):
                 raise IOError("文件过小(%d B)" % got)
             if expected_size > 0 and abs(got - expected_size) > expected_size * 0.01:
                 raise IOError("大小对账失败(得 %d, 期望 %d, 疑似镜像错误页/截断)" % (got, expected_size))
+            if expected_digest:
+                # GitHub asset digest(sha256:...)强校验: 镜像链任一环被篡改时体积对账挡不住等长内容
+                want = expected_digest[7:] if expected_digest.lower().startswith("sha256:") else expected_digest
+                got_hash = _sha256_file(part)
+                if got_hash != want.lower():
+                    raise IOError("SHA-256 不匹配(得 %s… 期望 %s…, 镜像内容被替换?)" % (got_hash[:16], want[:16]))
             os.replace(part, dest)
             return dest
         except Exception as ex:
@@ -357,8 +377,10 @@ def _disk_precheck(target_dir, need_bytes):
 
 
 def _extract_tar(archive, dest_dir):
+    # filter="data": 拒绝绝对路径成员/.. 穿越/指向解压目录外的软硬链, 剥离特权位
+    # (3.12 不传 filter = fully_trusted 语义 + DeprecationWarning)
     with tarfile.open(archive, "r:gz") as tf:
-        tf.extractall(dest_dir)
+        tf.extractall(dest_dir, filter="data")
     # zipfile/tar 不保证可执行位: 统一给 llama-* 补 755
     for root, _dirs, files in os.walk(dest_dir):
         for fn in files:
@@ -399,14 +421,20 @@ def _copy_dir_overwrite(src, dst):
 
 
 def llama_running(dir_hint=None):
-    """覆盖前运行态预检(Linux 无文件锁,以进程/端口为准)。"""
+    """覆盖前运行态预检。dir_hint 给定时只判定该目录的实例
+    (变体 A 运行不应阻断变体 B 更新); 不给时保持全机判定。"""
     import glob as _glob
-    pids = [int(os.path.basename(p)) for p in _glob.glob("/proc/[0-9]*")]
-    for pid in pids:
+    hint = os.path.realpath(os.path.abspath(dir_hint)) if dir_hint else None
+    for pdir in _glob.glob("/proc/[0-9]*"):
         try:
-            with open("/proc/%d/comm" % pid) as f:
-                if f.read().strip() in ("llama-server", "llama-server.exe"):
-                    return True
+            with open(os.path.join(pdir, "comm")) as f:
+                if f.read().strip() not in ("llama-server", "llama-server.exe"):
+                    continue
+            if hint is None:
+                return True
+            exe = os.path.realpath(os.path.join(pdir, "exe"))
+            if exe.startswith(hint + os.sep) or exe.startswith(hint + "/"):
+                return True
         except OSError:
             continue
     return False
@@ -416,16 +444,22 @@ def apply_llama_update(dir_, release, job_log=None):
     """下载 → 解压 → 覆盖 → build 硬校验。返回 (ok, msg)。"""
     dir_ = os.path.abspath(dir_)
     os.makedirs(dir_, exist_ok=True)
-    if llama_running():
-        return False, "llama-server 正在运行,请先停止再更新(防半套混合二进制)"
+    if llama_running(dir_):
+        return False, "该目录的 llama-server 正在运行,请先停止再更新(防半套混合二进制)"
     os.makedirs(UPDATE_TMP_ROOT, exist_ok=True)  # 先建缓存目录再做磁盘预检
     need = max(release.get("size", 0) * 3, 512 * 1048576)
+    need += release.get("cudart_size", 0)  # cudart 包大小原漏计
     ok, free, need = _disk_precheck(UPDATE_TMP_ROOT, need)
     if not ok:
         return False, "磁盘空间不足(需要约 %.1f GB,可用 %.1f GB)" % (need / GIB, free / GIB)
+    # 目标盘与缓存盘可能不同分区: 解压结果最终要落到 dir_, 该盘空间也必须预检
+    ok2, free2, _ = _disk_precheck(dir_, need)
+    if not ok2:
+        return False, "目标磁盘空间不足(需要约 %.1f GB,可用 %.1f GB)" % (need / GIB, free2 / GIB)
     main_path = os.path.join(UPDATE_TMP_ROOT, release["asset_name"])
     try:
-        download_asset(release["asset_url"], main_path, release.get("size", 0), job_log)
+        download_asset(release["asset_url"], main_path, release.get("size", 0), job_log,
+                       expected_digest=release.get("digest", ""))
         ex_dir = os.path.join(UPDATE_TMP_ROOT, "extract_%d" % release.get("build", 0))
         shutil.rmtree(ex_dir, ignore_errors=True)
         os.makedirs(ex_dir)
@@ -437,7 +471,8 @@ def apply_llama_update(dir_, release, job_log=None):
         if release.get("cudart_url"):
             cudart_path = os.path.join(UPDATE_TMP_ROOT, release["cudart_name"])
             try:
-                download_asset(release["cudart_url"], cudart_path, release.get("cudart_size", 0), job_log)
+                download_asset(release["cudart_url"], cudart_path, release.get("cudart_size", 0), job_log,
+                               expected_digest=release.get("cudart_digest", ""))
                 cdir = os.path.join(UPDATE_TMP_ROOT, "extract_cudart_%d" % release.get("build", 0))
                 shutil.rmtree(cdir, ignore_errors=True)
                 os.makedirs(cdir)
@@ -446,32 +481,51 @@ def apply_llama_update(dir_, release, job_log=None):
                 cudart_note = " + cudart 运行库已并入"
             except Exception as ex:
                 cudart_note = "(cudart 下载失败: %s — 启动 CUDA 版可能报缺库, 可改选 Vulkan 资产)" % ex
-        # 覆盖安装(只动二进制不碰模型;先清目标旧二进制防混杂)
+        # 覆盖安装原子化: 先整体装到 dir_ 同分区的暂存目录, 校验通过后再交换;
+        # 失败/断电不留混合二进制(Windows 版"exe 占用预检"的 Linux 等价防护)
+        stage = dir_ + ".stage-%d" % os.getpid()
+        shutil.rmtree(stage, ignore_errors=True)
+        os.makedirs(stage)
         for fn in os.listdir(src_dir):
             s = os.path.join(src_dir, fn)
             if os.path.isfile(s):
-                shutil.copy2(s, os.path.join(dir_, fn))
+                shutil.copy2(s, os.path.join(stage, fn))
                 try:
-                    os.chmod(os.path.join(dir_, fn), 0o755)
+                    os.chmod(os.path.join(stage, fn), 0o755)
                 except OSError:
                     pass
             elif os.path.isdir(s):
-                _copy_dir_overwrite(s, os.path.join(dir_, fn))
-        # 落盘自检(d227f3c 硬校验): 本地 build 必须存在且与 release 一致
-        lb = local_build(dir_)
+                _copy_dir_overwrite(s, os.path.join(stage, fn))
+        # 落盘自检(d227f3c 硬校验): 暂存目录的 build 必须存在且与 release 一致,
+        # 通过后才交换进正式目录(失败只丢暂存, 正式目录完好)
+        lb = local_build(stage)
         if lb is None:
+            shutil.rmtree(stage, ignore_errors=True)
             return False, "安装后 llama-server 未报告 build 号,安装可能不完整。建议删除该目录后重新安装。"
         rb = release.get("build", 0)
         if rb > 0 and lb != rb:
+            shutil.rmtree(stage, ignore_errors=True)
             return False, ("本地 build %d 与上游 %d 不一致(目录里可能是分支/CI 构建)。"
                            "若加载模型报 ggml type 错误,请删除该目录后重新安装。" % (lb, rb))
+        # 原子交换: 旧目录改名 .old → 暂存转正 → 删旧; rename 同分区原子
+        old_dir = dir_ + ".old-%d" % os.getpid()
+        if os.path.exists(dir_):
+            os.rename(dir_, old_dir)
+        try:
+            os.rename(stage, dir_)
+        except OSError:
+            if os.path.exists(old_dir) and not os.path.exists(dir_):
+                os.rename(old_dir, dir_)  # 回滚
+            raise
+        shutil.rmtree(old_dir, ignore_errors=True)
         msg = "llama.cpp 已更新到 %s(build %d)[%s]%s, 本地验证 build %d" % (
             release["tag"], rb, release["asset_name"], cudart_note, lb)
         if "prismml" in (release.get("repo") or "").lower():
             msg += "\n⚠ PrismML 低比特内核仅覆盖 CUDA/Metal/CPU——AMD/Intel 显卡将走 CPU 回退(较慢)。"
-        if "libcudart" in cudart_note:
-            pass
         return True, msg
+    except Exception as ex:
+        # 契约是 (ok, msg): 下载/解压异常直接 raise 会穿透 run_job 之外的调用方
+        return False, "安装失败: %s" % ex
     finally:
         shutil.rmtree(UPDATE_TMP_ROOT, ignore_errors=True)
 

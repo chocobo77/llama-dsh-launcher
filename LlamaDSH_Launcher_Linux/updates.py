@@ -22,7 +22,8 @@ import applog
 
 SEARCH_DEADLINE = 45
 _DIR_BLACKLIST = {"$recycle.bin", "windows", "node_modules", ".git", "__pycache__",
-                  "proc", "sys", "dev", "run", "snap", "boot", "cdrom", "tmp", "var/lib/docker"}
+                  "proc", "sys", "dev", "run", "snap", "boot", "cdrom", "tmp",
+                  "var", "docker", "lost+found"}
 _HITS = ("llama", "llamacpp", "llama.cpp", "ggml")
 
 
@@ -37,7 +38,6 @@ def _score_dir(name):
 def _bfs(roots, predicate, deadline, max_depth=5):
     """按代价(深度+得分)排序的 BFS。"""
     import queue as _q
-    found = []
     pq = _q.PriorityQueue()
     for r in roots:
         if os.path.isdir(r):
@@ -57,14 +57,15 @@ def _bfs(roots, predicate, deadline, max_depth=5):
                     continue
                 p = e.path
                 if e.is_file(follow_symlinks=False) and predicate(e.name):
-                    return p
+                    # 可执行位统一在此校验(谓词只拿得到文件名)
+                    if os.access(p, os.X_OK):
+                        return p
+                    continue
                 if e.is_dir(follow_symlinks=False):
                     c = (depth + 2) * 1.5 + _score_dir(e.name)
                     counter += 1
                     pq.put((c, depth + 1, p))
-        if found:
-            break
-    return found[0] if found else None
+    return None
 
 
 def find_llama_server():
@@ -80,7 +81,7 @@ def find_llama_server():
     deadline = time.time() + SEARCH_DEADLINE
 
     def pred(name):
-        return name == "llama-server" and os.access(os.path.join("", name), os.X_OK)
+        return name == "llama-server"
 
     # 先浅扫常见根的一级子目录
     for r in list(roots):
@@ -219,16 +220,30 @@ def dsh_check_update(dsh_dir):
 
 
 def _cleanup_git_lock(repo_dir):
-    """超时强杀会留下 .git/index.lock;确认无存活 git 进程时自动清理(81cdb3b)。"""
+    """git 失败/超时后清理本仓库的 index.lock。
+
+    保守条件: 仅当"本仓库路径"没有存活 git 进程在工作时才删
+    (pgrep -x git 是全系统匹配, 用户在别的仓库跑 git 会误阻止 —— 改为按
+    /proc/<pid>/cwd 比对仓库路径;pgrep 缺失时保守拒绝而非放行)。"""
     lock = os.path.join(repo_dir, ".git", "index.lock")
     if not os.path.exists(lock):
         return False
+    repo_real = os.path.realpath(repo_dir)
     try:
         r = subprocess.run(["pgrep", "-x", "git"], capture_output=True, text=True, timeout=10)
-        if (r.stdout or "").strip():
-            return False
+        if r.returncode != 0:
+            return False  # pgrep 缺失/异常: 保守拒绝删锁
+        for pid in (r.stdout or "").split():
+            try:
+                cwd = os.path.realpath(os.path.join("/proc", pid, "cwd"))
+                if cwd == repo_real or repo_real.startswith(cwd + os.sep):
+                    return False  # 该仓库确有 git 进程在工作
+            except OSError:
+                continue
+    except FileNotFoundError:
+        return False  # 无 procps: 保守拒绝
     except Exception:
-        pass
+        return False
     try:
         os.remove(lock)
         return True
@@ -246,4 +261,7 @@ def dsh_pull(dsh_dir):
             return False, "git 执行超时(240 秒); 已自动清理残留的 .git/index.lock, 可直接重试"
         return False, "git 执行超时(240 秒); .git/index.lock 仍在(可能有 git 进程运行中)"
     except Exception as ex:
+        # 普通失败且报锁: 同样尝试自动清理(常见于上次异常退出)
+        if "index.lock" in str(ex) and _cleanup_git_lock(dsh_dir):
+            return False, "git 报锁冲突; 已自动清理残留的 .git/index.lock, 可直接重试"
         return False, str(ex)

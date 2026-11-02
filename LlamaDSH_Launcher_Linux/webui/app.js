@@ -12,6 +12,13 @@ let CFG_DIR = "";
 let FLAG_ARGS = {};          // 逐参数发射片段(preview 下发)
 let LAST_TOTAL_EVENTS = -1;  // 事件流增量指纹(4bf9416: 单调序号)
 let MON_TAB = "mon";
+// 轮询 in-flight 保护: 上一轮未返回则跳过本轮(服务卡顿时请求/线程不堆积)
+const POLL_INFLIGHT = {};
+function pollGuard(name, fn) {
+  if (POLL_INFLIGHT[name]) return;
+  POLL_INFLIGHT[name] = true;
+  Promise.resolve().then(fn).catch(() => {}).finally(() => { POLL_INFLIGHT[name] = false; });
+}
 let NAV_SEL = null;          // {grp, sub}
 /* 参数 UI 状态表(等价 CS _pbw/_pw 控件字典): 导航式渲染下只有当前子组挂载 DOM,
  * collect/apply/依赖评估一律读写状态表, DOM 仅作展示层 */
@@ -28,13 +35,13 @@ function initState() {
     }
   }
 }
-let NODE_SEEN_LOG = new Set();
 const GIB = 1073741824;
 
-async function api(path, body) {
+async function api(path, body, timeoutMs = 12000) {
   const r = await fetch("/api/" + path, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body || {})
+    body: JSON.stringify(body || {}),
+    signal: AbortSignal.timeout(timeoutMs)   // 服务卡顿时请求不无限挂起
   });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || r.status);
@@ -61,7 +68,8 @@ function showModal({ title, body = "", buttons = [], extra = null }) {
     $("overlay").classList.add("show");
   });
 }
-const mEsc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const mEsc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
+  .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 
 /* ================================ 通知条 ================================= */
 let noticeTimer = null;
@@ -92,6 +100,11 @@ async function browsePicker(mode) {
     cur = r.path; sel = null; selInfo.textContent = "";
     pathIn.value = cur;
     list.innerHTML = "";
+    if (r.files_truncated) {
+      const t = document.createElement("div");
+      t.className = "tiny"; t.textContent = "⚠ 文件过多,仅显示前 500 个(可用上方路径框直接输入)";
+      list.appendChild(t);
+    }
     for (const root of r.roots || []) {
       const d = document.createElement("div");
       d.className = "item dir"; d.textContent = "⌂ " + root;
@@ -443,19 +456,21 @@ function updateArgEcho() {
 }
 
 /* ============================== 命令预览 ================================ */
-let previewTimer = null;
+let previewTimer = null, previewSeq = 0;
 function schedulePreview() {
   clearTimeout(previewTimer);
   previewTimer = setTimeout(refreshPreview, 300);
 }
 async function refreshPreview() {
+  const seq = ++previewSeq;   // 乱序保护: 旧响应不得覆盖新结果(estimate 走子进程, 延迟真实存在)
   try {
-    const r = await api("preview", { profile: collectProfile() });
+    const r = await api("preview", { profile: collectProfile() }, 20000);
+    if (seq !== previewSeq) return;
     $("cmdPreview").value = r.fmt_cmd || "";
     FLAG_ARGS = r.flag_args || {};
     updateArgEcho();
   } catch (e) {
-    $("cmdPreview").value = "Error:" + e.message;
+    if (seq === previewSeq) $("cmdPreview").value = "Error:" + e.message;
   }
 }
 
@@ -1034,11 +1049,6 @@ function drawTrend(svg, unit, series, stamps, yMin, yMax, legendHost) {
   };
 }
 
-function histPair(m, key) {
-  const h = (m.hists || {})[key];
-  return h ? [h[0] || [], h[1] || []] : [[], []];
-}
-
 function renderTrends(m) {
   const H = m.hists || {};
   const pair = (k) => H[k] || [[], []];
@@ -1086,12 +1096,6 @@ async function pollNodeEnv() {
     setTxt("lblLatestStatus", `最新 v24: ${st.latest_v24 || "—(网络不可达)"}`);
   } catch (e) { /* ignore */ }
 }
-async function nodeDiagText() {
-  const st = await api("node/status");
-  const env = ["NODE24_PATH", "NODE_EXE", "NODE_HOME", "PATH"].map(k => `${k}=${(os_getenv(k))}`).join("\n");
-  return JSON.stringify(st, null, 2) + "\n" + env;
-}
-function os_getenv(k) { return k === "PATH" ? (navigator.userAgent.includes("Linux") ? "(见服务端)" : "") : "(服务端环境)"; }
 async function pollJobInto(id, logEl, seen) {
   for (;;) {
     const j = await api("job", { id });
@@ -1175,7 +1179,15 @@ async function installVariantDialog() {
 }
 
 /* ============================ 启动/停止流程 ============================= */
+let START_BUSY = false;
 async function startLlama() {
+  if (START_BUSY) return;
+  START_BUSY = true;
+  try { await _startLlamaInner(); }
+  catch (e) { showNotice("启动失败: " + (e.message || e), true); }
+  finally { START_BUSY = false; }
+}
+async function _startLlamaInner() {
   const prof = collectProfile();
   let r;
   try { r = await api("llama/start", { profile: prof }); }
@@ -1189,7 +1201,8 @@ async function startLlama() {
         buttons: [{ label: "取消", value: "cancel" }, { label: "Q8_0(省一半)", value: "q8_0" }, { label: "F16(精度优先)", cls: "primary", value: "f16" }]
       });
       if (v === "cancel") { logLine("--- 已取消:模型为 safetensors,未转换 ---"); return; }
-      await api("llama/start", { profile: prof, confirm: { done: true, convert_dir: r.need_confirm.dir, outtype: v } });
+      const rr = await api("llama/start", { profile: prof, confirm: { done: true, convert_dir: r.need_confirm.dir, outtype: v } });
+      if (rr.error) showNotice("启动失败: " + rr.error, true);
       return;
     }
     if (k === "build_error") { showNotice(r.need_confirm.message, true); return; }
@@ -1212,11 +1225,19 @@ async function startLlama() {
       buttons: [{ label: "否,取消启动", value: "no" }, { label: nc.vram && !nc.vram_fits ? "仍然启动" : "继续启动", cls: nc.vram_fits ? "primary" : "danger", value: "yes" }]
     });
     if (v !== "yes") { logLine("--- 启动已取消 ---"); return; }
-    await api("llama/start", { profile: prof, confirm: { done: true } });
+    const rr = await api("llama/start", { profile: prof, confirm: { done: true } });
+    if (rr.error) showNotice("启动失败: " + rr.error, true);
   }
 }
 
 async function startDsh() {
+  if (START_BUSY) return;
+  START_BUSY = true;
+  try { await _startDshInner(); }
+  catch (e) { showNotice("DSH 启动失败: " + (e.message || e), true); }
+  finally { START_BUSY = false; }
+}
+async function _startDshInner() {
   const prof = collectProfile();
   let r;
   try { r = await api("dsh/start", { profile: prof }); }
@@ -1274,7 +1295,7 @@ async function checkUpdateLlama() {
   if (r.mismatch) extra = `\n\n⚠ 本地 build ${r.local} 与上游 ${r.latest} 不一致(可能是分支/CI 构建)。若加载模型报 ggml type 错误,请删除该目录后重新安装。`;
   const v = await showModal({
     title: "llama.cpp 更新(" + (r.repo || "") + ")",
-    body: `本地 build: ${r.local ?? "未知"}\n上游最新: ${r.latest}(${r.tag})\n后端: ${r.backend}\n资产: ${r.asset_name}(${fmtN((r.size || 0) / GIB, 1)} GB)${extra}\n\n下载并整目录覆盖(只动二进制,不碰模型)?`,
+    body: mEsc(`本地 build: ${r.local ?? "未知"}\n上游最新: ${r.latest}(${r.tag})\n后端: ${r.backend}\n资产: ${r.asset_name}(${fmtN((r.size || 0) / GIB, 1)} GB)${extra}\n\n下载并整目录覆盖(只动二进制,不碰模型)?`),
     buttons: [{ label: "取消", value: "no" }, { label: "更新", cls: "primary", value: "yes" }]
   });
   if (v !== "yes") return;
@@ -1291,7 +1312,7 @@ async function checkUpdateDsh() {
   if (r.ahead > 0) { showNotice(`本地有 ${r.ahead} 个未推送提交,不自动更新;请先处理本地改动。`, true); return; }
   const v = await showModal({
     title: "DSH 更新",
-    body: `branch ${r.branch}:落后 ${r.behind} 个提交。\n\n执行 git pull --ff-only?(升级后可能需要"🔨 重建 DSH")`,
+    body: mEsc(`branch ${r.branch}:落后 ${r.behind} 个提交。\n\n执行 git pull --ff-only?(升级后可能需要"🔨 重建 DSH")`),
     buttons: [{ label: "取消", value: "no" }, { label: "拉取", cls: "primary", value: "yes" }]
   });
   if (v !== "yes") return;
@@ -1604,7 +1625,7 @@ function wire() {
   // Node 环境
   $("btnInstallNodeEnv").onclick = async () => {
     const job = await api("node/install");
-    await pollJobInto(job.job, $("nodeLog"), NODE_SEEN_LOG);
+    await pollJobInto(job.job, $("nodeLog"), new Set());  // seen 随 job 新建(全局 Set 会吞合法重复行)
   };
   $("btnRefreshNodeEnv").onclick = pollNodeEnv;
   $("btnCopyNodeDiag").onclick = async () => {
@@ -1656,8 +1677,8 @@ async function loadAll() {
   wire();
   await loadAll();
   pollStatus(); pollLogs(); pollMonitor();
-  setInterval(pollStatus, 2000);
-  setInterval(pollLogs, 1000);
-  setInterval(pollMonitor, 3000);
-  setInterval(pollNodeEnv, 15000);
+  setInterval(() => pollGuard("status", pollStatus), 2000);
+  setInterval(() => pollGuard("logs", pollLogs), 1000);
+  setInterval(() => pollGuard("mon", pollMonitor), 3000);
+  setInterval(() => pollGuard("node", pollNodeEnv), 15000);
 })();

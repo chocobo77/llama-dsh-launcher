@@ -97,6 +97,8 @@ class LogHub:
 # ================================================================ Llama ====
 
 class LlamaRunner:
+    _start_lock = threading.Lock()  # start 的 Already-running 检查与 Popen 之间是 TOCTOU 窄窗
+
     def __init__(self, hub, schema_holder):
         self.hub = hub
         self.schema = schema_holder
@@ -210,6 +212,10 @@ class LlamaRunner:
 
     # ------------------------------------------------------------ 启动 ------
     def start(self, profile, cmd_list=None, skip_vram_confirm=False):
+        with LlamaRunner._start_lock:
+            return self._start_locked(profile, cmd_list, skip_vram_confirm)
+
+    def _start_locked(self, profile, cmd_list=None, skip_vram_confirm=False):
         defs = self.schema["defs"]
         if self.running:
             return False, "Already running"

@@ -36,7 +36,7 @@ class TrayIcon:
     右键弹出菜单: 显示主窗口 / 轻量化模式(复选) / 退出客户端。
     """
 
-    MENU_SHOW, MENU_LIGHT, MENU_QUIT = 1, 2, 3
+    MENU_SHOW, MENU_LIGHT, MENU_QUIT, MENU_SEP = 1, 2, 3, 4
 
     def __init__(self, base_url, on_show, on_quit):
         self.base_url = base_url
@@ -62,8 +62,12 @@ class TrayIcon:
         try:
             watcher = self.bus.get_object("org.kde.StatusNotifierWatcher",
                                           "/StatusNotifierWatcher")
-            watcher.RegisterStatusNotifierItem(self.name,
-                dbus_interface="org.kde.StatusNotifierWatcher")
+            items = watcher.Get("org.kde.StatusNotifierWatcher",
+                                "RegisteredStatusNotifierItems",
+                                dbus_interface="org.freedesktop.DBus.Properties")
+            if self.name not in items:  # 无条件重注册会让图标周期性重建/闪烁
+                watcher.RegisterStatusNotifierItem(self.name,
+                    dbus_interface="org.kde.StatusNotifierWatcher")
         except Exception:
             pass
         return True  # 保持 timer
@@ -71,6 +75,11 @@ class TrayIcon:
     def set_lightweight(self, on):
         self.lightweight = bool(on)
         self.revision += 1
+        # 推送布局更新, 否则客户端复选框永远停在首帧值
+        try:
+            self.menu.LayoutUpdated(self.revision, 0)
+        except Exception:
+            pass
 
     def icon_dir(self):
         for base in (os.path.dirname(os.path.abspath(__file__)),
@@ -95,7 +104,7 @@ class TrayIcon:
             (self.MENU_LIGHT, {"label": "轻量化模式(后台低频保活)",
                                "toggle-type": "checkmark",
                                "toggle-state": 1 if self.lightweight else 0}, []),
-            (0, {}, []),  # 分隔线
+            (self.MENU_SEP, {"type": "separator"}, []),  # id 0 保留给根, 分隔线需独立 id
             (self.MENU_QUIT, {"label": "退出托盘助手(窗口/服务/llama/DSH 不受影响)"}, []),
         ])
 
@@ -109,15 +118,19 @@ class TrayIcon:
 
     def toggle_light(self):
         on = not self.lightweight
-        try:
-            req = urllib.request.Request(self.base_url + "/api/lightweight",
-                data=json.dumps({"on": on}).encode(),
-                headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=5)
-            self.set_lightweight(on)
-            print("[tray] 轻量化模式: %s" % ("开" if on else "关"))
-        except Exception as ex:
-            print("[tray] 轻量化切换失败: %s" % ex)
+        def post():
+            try:
+                req = urllib.request.Request(self.base_url + "/api/lightweight",
+                    data=json.dumps({"on": on}).encode(),
+                    headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=5)
+                # 回主线程更新菜单复选态并推送 LayoutUpdated
+                from gi.repository import GLib
+                GLib.idle_add(self.set_lightweight, on)
+                print("[tray] 轻量化模式: %s" % ("开" if on else "关"))
+            except Exception as ex:
+                print("[tray] 轻量化切换失败: %s" % ex)
+        threading.Thread(target=post, daemon=True).start()
 
 
 if _DBUS_OK:
@@ -193,7 +206,11 @@ if _DBUS_OK:
 
         @dbus.service.method("com.canonical.dbusmenu", in_signature="i", out_signature="b")
         def AboutToShow(self, _id):
-            return False  # 菜单常开, 靠 revision 推送更新
+            return True  # 让客户端每次弹出前重取布局(轻量化复选状态会变)
+
+        @dbus.service.signal("com.canonical.dbusmenu", signature="uu")
+        def LayoutUpdated(self, revision, parent):
+            pass
 
         @dbus.service.method("com.canonical.dbusmenu", in_signature="ias", out_signature="a{ia{sv}}")
         def GetGroupProperties(self, ids, props):
@@ -255,7 +272,9 @@ def ensure_server(port):
                      cwd=APP_DIR, env=env, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
-    for _ in range(40):
+    # 120 次的预算是"连接拒绝近乎零耗时 + 0.5s sleep"——实际 ~60s,
+    # 冷启动(fuseblk 盘 + 大 yml)import 也可能超 20s, 预算必须宽裕
+    for _ in range(120):
         if probe(port):
             return base
         time.sleep(0.5)
@@ -265,10 +284,25 @@ def ensure_server(port):
     return None
 
 
+def _session_bus_ready():
+    """SSH 会话无 DBUS_SESSION_BUS_ADDRESS、或 GNOME 未装 appindicator 扩展
+    (无 StatusNotifierWatcher)时, 托盘不可用 —— 返回 False 让 start.sh 降级浏览器。"""
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return False
+    try:
+        bus = dbus.SessionBus()
+        return bool(bus.name_has_owner("org.kde.StatusNotifierWatcher"))
+    except Exception:
+        return False
+
+
 def main():
     if not _DBUS_OK:
         print("python3-dbus 不可用, 托盘助手无法运行(apt install python3-dbus)")
         sys.exit(1)
+    if not _session_bus_ready():
+        print("会话总线/StatusNotifierWatcher 不可达(SSH 会话或未装托盘扩展), 托盘不可用")
+        sys.exit(2)  # 约定: start.sh 捕获 2 → 降级浏览器模式
     ap = argparse.ArgumentParser(description="LlamaDSH 托盘助手(微型常驻)")
     ap.add_argument("-p", "--port", type=int, default=8788)
     ap.add_argument("--minimized", action="store_true", help="自启模式(默认即无窗口, 参数仅为兼容)")
@@ -283,8 +317,10 @@ def main():
     from gi.repository import GLib
     GLib.threads_init()
 
-    tray = TrayIcon(base, on_show=lambda: _spawn_window(base),
-                    on_quit=lambda: GLib.MainLoop.default_main_loop_quit() if False else os._exit(0))
+    loop = GLib.MainLoop()
+    tray = TrayIcon(base,
+                    on_show=lambda: _spawn_window(base),
+                    on_quit=loop.quit)
     tray.start()
     tray.set_lightweight(True)
     try:
@@ -296,8 +332,7 @@ def main():
         print("[tray] 轻量化模式: 开(后台低频保活)")
     except Exception:
         pass
-    print("[tray] 托盘就绪: 左键显示主窗口, 右键菜单 | 进程常驻 ~25MB")
-    loop = GLib.MainLoop()
+    print("[tray] 托盘就绪: 左键显示主窗口, 右键菜单 | 进程常驻 ~25MB", flush=True)
     loop.run()
 
 
