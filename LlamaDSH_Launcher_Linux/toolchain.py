@@ -507,7 +507,8 @@ def apply_llama_update(dir_, release, job_log=None):
             shutil.rmtree(stage, ignore_errors=True)
             return False, ("本地 build %d 与上游 %d 不一致(目录里可能是分支/CI 构建)。"
                            "若加载模型报 ggml type 错误,请删除该目录后重新安装。" % (lb, rb))
-        # 原子交换: 旧目录改名 .old → 暂存转正 → 删旧; rename 同分区原子
+        # 原子交换: 旧目录改名 .old → 暂存转正 → 用户额外文件(模型等)迁回 → 删旧。
+        # 语义对齐 Windows 版"只动二进制不碰模型": swap 不丢 dir_ 里的非构建文件
         old_dir = dir_ + ".old-%d" % os.getpid()
         if os.path.exists(dir_):
             os.rename(dir_, old_dir)
@@ -517,9 +518,21 @@ def apply_llama_update(dir_, release, job_log=None):
             if os.path.exists(old_dir) and not os.path.exists(dir_):
                 os.rename(old_dir, dir_)  # 回滚
             raise
+        # 迁回用户额外文件(新构建里没有的条目 = 用户放的模型/配置等)
+        extras_warn = ""
+        try:
+            for entry in os.listdir(old_dir):
+                dst = os.path.join(dir_, entry)
+                if not os.path.exists(dst):
+                    shutil.move(os.path.join(old_dir, entry), dst)
+        except OSError as mv_ex:
+            # 迁回失败不回滚安装(二进制已就绪), 但 .old 保留供用户手动找回
+            extras_warn = "\n⚠ 部分旧目录文件未能迁回(%s), 原目录保留在: %s" % (mv_ex, old_dir)
         shutil.rmtree(old_dir, ignore_errors=True)
         msg = "llama.cpp 已更新到 %s(build %d)[%s]%s, 本地验证 build %d" % (
             release["tag"], rb, release["asset_name"], cudart_note, lb)
+        if extras_warn:
+            msg += extras_warn
         if "prismml" in (release.get("repo") or "").lower():
             msg += "\n⚠ PrismML 低比特内核仅覆盖 CUDA/Metal/CPU——AMD/Intel 显卡将走 CPU 回退(较慢)。"
         return True, msg
