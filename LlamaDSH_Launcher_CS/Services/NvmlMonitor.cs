@@ -332,7 +332,7 @@ public sealed class GpuDevInfo
 	public string Driver = "";
 }
 
-partial class NvmlMonitor
+public static partial class NvmlMonitor
 {
 	private static string? _driver;
 
@@ -449,6 +449,7 @@ partial class NvmlMonitor
 			}
 			return list;
 		}
+		}
 
 		/// <summary>进程退出时调用: 释放 NVML 资源(与 nvmlInit_v2 配对)。</summary>
 		public static void ShutdownNvml()
@@ -468,9 +469,8 @@ partial class NvmlMonitor
 			}
 		}
 	}
-}
 
-partial class NvmlMonitor
+public static partial class NvmlMonitor
 {
 	private static double _smiNextTry;
 

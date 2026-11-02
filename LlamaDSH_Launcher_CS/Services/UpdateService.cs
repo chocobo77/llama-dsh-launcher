@@ -266,7 +266,7 @@ public static class UpdateService
 			}
 		}
 		// 按显卡挑后端: NVIDIA=CUDA(取最高版本), Intel=SYCL(原生低比特内核), AMD/默认=Vulkan; 依次回退
-		(string name, string url)? chosen = backend switch
+		(string name, string url, string digest)? chosen = backend switch
 		{
 			"sycl" => PickAsset(cands, "sycl-x64") ?? PickAsset(cands, "vulkan-x64") ?? PickAsset(cands, "avx2-x64"),
 			"cuda" => PickCudaAsset(cands) ?? PickAsset(cands, "vulkan-x64") ?? PickAsset(cands, "avx2-x64"),
@@ -306,7 +306,7 @@ public static class UpdateService
 		return new LlamaReleaseInfo { Tag = tag, Build = build, AssetName = chosen.Value.name, AssetUrl = chosen.Value.url, Size = chosenSz, CudartName = cudartName, CudartUrl = cudartUrl, CudartSize = cudartSz, Digest = chosenDigest, CudartDigest = cudartDigest };
 	}
 
-	private static (string name, string url)? PickAsset(List<(string name, string url)> cands, string token)
+	private static (string name, string url, string digest)? PickAsset(List<(string name, string url, string digest)> cands, string token)
 	{
 		foreach (var c in cands)
 		{
@@ -318,9 +318,9 @@ public static class UpdateService
 		return null;
 	}
 
-	private static (string name, string url)? PickCudaAsset(List<(string name, string url)> cands)
+	private static (string name, string url, string digest)? PickCudaAsset(List<(string name, string url, string digest)> cands)
 	{
-		(string name, string url)? best = null;
+		(string name, string url, string digest)? best = null;
 		Version bestV = new Version(0, 0);
 		foreach (var c in cands)
 		{
