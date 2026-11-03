@@ -77,7 +77,6 @@ public sealed partial class LlamaApiMonitor
 	private int _failCount;
 	private double _lastSlowPoll;
 	private bool _slowPollBusy;
-	private int _llamaPortCache = -1;
 
 	public bool Online { get; private set; }
 	public List<SlotInfo> Slots { get; } = new();

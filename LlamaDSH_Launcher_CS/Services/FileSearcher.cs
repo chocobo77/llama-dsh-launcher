@@ -187,7 +187,6 @@ public static class FileSearcher
 
 	public static string? FindDshProject(Action<string>? cb = null, int timeoutSec = 45)
 	{
-		string value = "deepseek-harness";
 		Emit("Searching DSH project...");
 		Emit("  [S0] Known locations...");
 		string? knownDsh = ProbeKnownDshRoots();

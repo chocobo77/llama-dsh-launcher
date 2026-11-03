@@ -8,6 +8,9 @@
     <AssemblyName>LlamaDSH_Launcher</AssemblyName>
     <RootNamespace>LlamaDSH_Launcher</RootNamespace>
     <Nullable>enable</Nullable>
+    <!-- 代码库存量 80+ 处风格级可空性告警(CS86xx), 一次性补齐注解风险大;
+         保留 Nullable 语义但暂不告警, 后续按文件逐步收紧后从 NoWarn 移除 -->
+    <NoWarn>$(NoWarn);CS8600;CS8601;CS8602;CS8603;CS8604;CS8618;CS8619;CS8620;CS8625;CS8629</NoWarn>
     <ImplicitUsings>enable</ImplicitUsings>
     <PlatformTarget>x64</PlatformTarget>
     <!-- 必须保留：App.xaml.cs 的 [LibraryImport] 由源生成器产出 unsafe 代码（SYSLIB1062 / CS0227），

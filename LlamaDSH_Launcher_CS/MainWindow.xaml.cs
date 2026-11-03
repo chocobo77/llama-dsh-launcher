@@ -3125,11 +3125,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			// 显式关闭 FA 时 llama 会把 V 回退到 f16（llama.cpp cache 类型回退规则）
 			string ck = RoleText("cache_type_k", out string ckv) && !string.IsNullOrEmpty(ckv) ? ckv : "f16";
 			string cv = RoleText("cache_type_v", out string cvv) && !string.IsNullOrEmpty(cvv) ? cvv : "f16";
-			string kvNote = "";
 			if (TryGetParamValue("flash-attn", out string faStr) && faStr.Trim() == "off" && cv != "f16")
 			{
 				cv = "f16";
-				kvNote = "（FA 关闭，V 量化回退 f16）";
 			}
 			long ctx = 0L;
 			if (RoleText("ctx_size", out string ctxStr))
@@ -4306,7 +4304,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			_oomRetryLeft = 3; // 用户手动启动时重置重试额度
 		}
-		double result;
 		_llamaApi?.ResetLogMachine();
 		string? stDir = DetectSafetensorsDir();
 		if (stDir != null)
@@ -6647,8 +6644,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private static readonly System.Windows.Media.Color ToneWarn = System.Windows.Media.Color.FromRgb(0xf5, 0xb5, 0x3d);
 
 	// 副行信息: GPU 数量/名称, CPU 型号拓扑(性能线程初始化时采集)
-	private int _gpuCount;
-	private string _gpuName = "GPU";
 	private string _cpuName = "处理器";
 
 	// llama-server HTTP 采集(llama-lens 移植): /slots 差分 + /props 模型信息 + 事件流
