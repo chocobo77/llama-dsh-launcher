@@ -104,6 +104,15 @@ def run_job(name, fn):
 
 
 
+def _pid_is_dsh(pid):
+    """PID 复用防护(4bf9416 同语义): 只认 cmdline 带 DSH 强特征的 node 进程,
+    否则"停止"会误杀复用了该 PID 的无关进程。"""
+    import procman as _pm
+    cl = _pm.read_cmdline(int(pid)).lower()
+    return bool(cl) and any(h.lower() in cl
+                            for h in (_pm._DSH_NAME_HINTS + ("@deepseek-ai",)))
+
+
 def takeover_on_boot():
     """LoadState 等价:Llama 按 PID 接管;DSH 按端口→state→孤儿扫描。"""
     st = state.load_state()
@@ -113,12 +122,17 @@ def takeover_on_boot():
         LLAMA.status = "taken_over"
         HUB.log("[接管] 检测到 Llama 进程(PID %d),已接管" % st["LlamaPid"])
     else:
+        if st.get("LlamaPid"):
+            HUB.log("[接管] 状态文件中的 Llama PID %s 已失效(进程退出或 PID 被复用),跳过接管" % st["LlamaPid"])
         state.clear_state_for("LlamaPid")
     pid = procman_find_port()
     if pid:
         DSH.attach(pid, "[接管] 端口 %d 已有 DSH 在运行,直接接管" % DSH_PORT)
-    elif st.get("DshPid") and procman_alive(st["DshPid"]):
+    elif st.get("DshPid") and procman_alive(st["DshPid"]) and _pid_is_dsh(st["DshPid"]):
         DSH.attach(st["DshPid"], "[接管] 恢复 DSH 进程", save_state=True)
+    elif st.get("DshPid"):
+        HUB.log("[接管] 状态文件中的 DSH PID %s 已失效(进程退出或 PID 被复用),跳过接管" % st["DshPid"])
+        state.clear_state_for("DshPid")
     else:
         dsh_dir = st.get("DshDir", "")
         orphans = procman_find_orphans(dsh_dir)
@@ -385,7 +399,7 @@ def api_do_update(body):
         d = (body.get("dir") or "").strip().strip('"')
         return {"job": run_job("llama-update", lambda jl: updates.llama_update(d, HUB.log, jl))}
     d = (body.get("dir") or "").strip().strip('"')
-    ok, msg = updates.dsh_pull(d)
+    ok, msg = updates.dsh_pull(d, HUB.log)
     return {"ok": ok, "msg": msg}
 
 

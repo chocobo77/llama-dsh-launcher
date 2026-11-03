@@ -184,7 +184,9 @@ def find_orphaned_dsh_processes(dsh_dir, cache_secs=15):
             continue
         low = cl.lower()
         score = 0
-        if re.search(r"tsx|cli/src|/bin\b|apps/cli", low):
+        # 强特征(C# 4bf9416 同语义): 裸 "tsx" 不命中——任何 tsx dev server
+        # 都会被误认成孤儿 DSH 而误杀
+        if re.search(r"cli/src/bin|apps/cli|@deepseek-ai", low):
             score = max(score, 5)
         if "deepseek-harness" in low:
             score = max(score, 4)

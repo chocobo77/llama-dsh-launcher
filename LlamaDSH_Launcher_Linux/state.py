@@ -117,14 +117,10 @@ def load_config():
 
 
 def save_config(cfg):
-    """原子写: 先写 .tmp 再 os.replace,进程被杀/断电不留截断文件(be42658 同款)。"""
+    """原子写: tmp + os.replace(be42658 同款),复用 _atomic_write_json。"""
     path = config_file_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with _lock:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
+    _atomic_write_json(path, cfg)
     return path
 
 
@@ -138,11 +134,18 @@ def load_state():
     return {}
 
 
+def _atomic_write_json(path, obj):
+    """tmp + os.replace 原子写(与 save_config 同语义):进程被杀/断电不留截断文件。"""
+    tmp = path + ".tmp"
+    with _lock:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+
+
 def save_state(state):
     try:
-        with _lock:
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(STATE_FILE, state)
     except Exception:
         pass
 
@@ -176,11 +179,8 @@ def load_build_state():
 
 def save_build_state(head):
     try:
-        with _lock:
-            with open(BUILD_STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump({"head": head or "",
-                           "builtAt": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
-                          f, indent=2, ensure_ascii=False)
+        _atomic_write_json(BUILD_STATE_FILE, {"head": head or "",
+                            "builtAt": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
     except Exception:
         pass
 

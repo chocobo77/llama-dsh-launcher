@@ -3,7 +3,8 @@
 
 - 检索:PATH → 常见目录 → 受限 BFS(启发式打分,超时停止)。
 - llama.cpp 更新:GitHub Releases,优先 vulkan-x64 的 ubuntu 包,三镜像回退。
-- DSH 更新:git fetch + ahead/behind,--ff-only 拉取。
+- DSH 更新:git fetch + ahead/behind,--ff-only 拉取;本地未提交改动自动
+  stash→合并→pop 恢复;直连失败时镜像 fetch 回退(42e897c 同语义)。
 """
 import os
 import re
@@ -200,10 +201,29 @@ def llama_update(llama_dir, log, job_log, repo=None, backend=None):
 def dsh_check_update(dsh_dir):
     """返回 dict:branch/ahead/behind/head。"""
     try:
-        subprocess.run(["git", "fetch", "origin", "--prune"], cwd=dsh_dir,
-                       capture_output=True, text=True, timeout=120)
+        fr = subprocess.run(["git", "fetch", "origin", "--prune"], cwd=dsh_dir,
+                            capture_output=True, text=True, timeout=120)
     except Exception as ex:
         return {"error": str(ex)}
+    remote_ref = "origin/%s"
+    if fr.returncode != 0:
+        # 直连失败: 镜像 fetch 回退(比对对象改为 FETCH_HEAD)
+        try:
+            origin = subprocess.run(["git", "remote", "get-url", "origin"], cwd=dsh_dir,
+                                    capture_output=True, text=True, timeout=15).stdout.strip()
+        except Exception:
+            origin = ""
+        fetched = False
+        for candidate in _mirror_urls(origin):
+            mf = subprocess.run(["git", "-c", "http.version=HTTP/1.1", "fetch", "--no-tags",
+                                 candidate, "+refs/heads/*:refs/mirrors/*"],
+                                cwd=dsh_dir, capture_output=True, text=True, timeout=120)
+            if mf.returncode == 0:
+                fetched = True
+                remote_ref = "refs/mirrors/%s"
+                break
+        if not fetched:
+            return {"error": "fetch 失败(直连与镜像均不可达): " + (fr.stderr or "").strip()[-400:]}
     try:
         branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=dsh_dir,
                                 capture_output=True, text=True, timeout=15).stdout.strip()
@@ -211,7 +231,7 @@ def dsh_check_update(dsh_dir):
             return {"error": "仓库处于 detached HEAD 状态,无法比对更新"}
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=dsh_dir,
                               capture_output=True, text=True, timeout=15).stdout.strip()
-        cnt = subprocess.run(["git", "rev-list", "--left-right", "--count", "HEAD...origin/%s" % branch],
+        cnt = subprocess.run(["git", "rev-list", "--left-right", "--count", "HEAD...%s" % (remote_ref % branch)],
                              cwd=dsh_dir, capture_output=True, text=True, timeout=30).stdout.strip()
         ahead, behind = (cnt.split() + ["0", "0"])[:2]
         return {"branch": branch, "head": head[:8], "ahead": int(ahead), "behind": int(behind)}
@@ -251,17 +271,128 @@ def _cleanup_git_lock(repo_dir):
         return False
 
 
-def dsh_pull(dsh_dir):
+def _run_git(repo_dir, args, timeout):
     try:
-        r = subprocess.run(["git", "pull", "--ff-only"], cwd=dsh_dir,
-                           capture_output=True, text=True, timeout=240)
-        return r.returncode == 0, (r.stdout or r.stderr).strip()[-500:]
+        r = subprocess.run(["git"] + args, cwd=repo_dir,
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
     except subprocess.TimeoutExpired:
-        if _cleanup_git_lock(dsh_dir):
-            return False, "git 执行超时(240 秒); 已自动清理残留的 .git/index.lock, 可直接重试"
-        return False, "git 执行超时(240 秒); .git/index.lock 仍在(可能有 git 进程运行中)"
+        if _cleanup_git_lock(repo_dir):
+            return -1, "git 执行超时(%d 秒); 已自动清理残留的 .git/index.lock" % timeout
+        return -1, "git 执行超时(%d 秒); .git/index.lock 仍在(可能有 git 进程运行中)" % timeout
+    except FileNotFoundError:
+        return -1, "未找到 git,请安装 git 并加入 PATH"
     except Exception as ex:
-        # 普通失败且报锁: 同样尝试自动清理(常见于上次异常退出)
-        if "index.lock" in str(ex) and _cleanup_git_lock(dsh_dir):
-            return False, "git 报锁冲突; 已自动清理残留的 .git/index.lock, 可直接重试"
-        return False, str(ex)
+        if "index.lock" in str(ex) and _cleanup_git_lock(repo_dir):
+            return -1, "git 报锁冲突; 已自动清理残留的 .git/index.lock"
+        return -1, str(ex)
+
+
+def _mirror_urls(origin):
+    """从 origin URL 推导 GitHub 镜像候选(UpdateService.MirrorUrls 同语义):
+    支持 LLAMADSH_GIT_MIRROR 环境变量(分号分隔,{url} 占位可选)+ 三个固定前缀。"""
+    u = (origin or "").strip()
+    if not u:
+        return []
+    if u.startswith("git@github.com:"):
+        u = "https://github.com/" + u[len("git@github.com:"):]
+    elif u.startswith("ssh://git@github.com/"):
+        u = "https://github.com/" + u[len("ssh://git@github.com/"):]
+    if "github.com" not in u.lower():
+        return []
+    u = u.split("?", 1)[0].rstrip("/")
+    if u.lower().endswith(".git"):
+        u = u[:-4]
+    out, seen = [], set()
+
+    def add(url):
+        if url.lower() not in seen:
+            seen.add(url.lower())
+            out.append(url)
+
+    custom = os.environ.get("LLAMADSH_GIT_MIRROR") or ""
+    for item in custom.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        if "{url}" in item.lower():
+            # 大小写不敏感替换占位符
+            idx = item.lower().index("{url}")
+            add(item[:idx] + u + item[idx + 5:])
+        else:
+            add(item.rstrip("/") + "/" + u)
+    for prefix in ("https://gh-proxy.com/", "https://ghfast.top/", "https://ghproxy.net/"):
+        if u.startswith(prefix):
+            continue
+        add(prefix + u)
+    return out
+
+
+def _local_changes_blocked(git_output):
+    """git 输出表明合并被本地未提交改动挡住。"""
+    t = (git_output or "").lower()
+    return ("would be overwritten" in t or "please commit your changes" in t
+            or "local changes" in t)
+
+
+def _stash_pop_safe(repo_dir, log):
+    """恢复 stash;pop 冲突时 git 本就不丢弃条目,提示手动处理。"""
+    rc, out = _run_git(repo_dir, ["stash", "pop"], 60)
+    if rc == 0:
+        log("[更新] 本地未提交改动已恢复(stash pop)")
+    else:
+        log("[更新] ⚠ 更新完成,但本地改动恢复时有冲突——改动仍保留在 stash 中。"
+            "请在 DSH 目录手动执行 git stash pop 处理:\n" + out[-500:])
+
+
+def dsh_pull(dsh_dir, log=None):
+    """git pull --ff-only;本地未提交改动挡合并时 stash→合并→pop 恢复;
+    直连失败时镜像 fetch + merge --ff-only 回退(不产生 merge 提交)。
+    所有失败路径先 pop 还原工作区再报错,不留半套状态(42e897c 同语义)。"""
+    log = log or (lambda t: None)
+    rc, out = _run_git(dsh_dir, ["pull", "--ff-only"], 240)
+    stashed = False
+    if rc == 0:
+        return True, out[-500:]
+    if rc > 0 and _local_changes_blocked(out):
+        # 本地补丁挡住快进: stash 带标记,更新完自动恢复,绝不丢弃。
+        # -u 连未跟踪文件一起收进 stash(untracked 挡 merge 是常见形态);
+        # "No local changes to save" 视为无可 stash,不置 stashed 标记
+        rc2, out2 = _run_git(dsh_dir, ["stash", "push", "-u", "-m", "LlamaDSH auto-stash before update"], 60)
+        if rc2 != 0:
+            return False, "本地有未提交改动且自动 stash 失败:\n" + out2[-400:]
+        if "no local changes to save" not in out2.lower():
+            stashed = True
+            log("[更新] 检测到本地未提交改动,已自动 stash(更新完成后自动恢复)")
+        rc, out = _run_git(dsh_dir, ["pull", "--ff-only"], 240)
+        if rc == 0:
+            _stash_pop_safe(dsh_dir, log)
+            return True, out[-500:]
+    # 直连拉取失败: 镜像 fetch 当前分支 + 本地快进合并
+    brc, branch = _run_git(dsh_dir, ["rev-parse", "--abbrev-ref", "HEAD"], 15)
+    if brc == 0 and branch and branch != "HEAD":
+        orc, origin = _run_git(dsh_dir, ["remote", "get-url", "origin"], 15)
+        last_mirror_err = ""
+        for candidate in _mirror_urls(origin if orc == 0 else ""):
+            mrc, mout = _run_git(dsh_dir,
+                                 ["-c", "http.version=HTTP/1.1", "fetch", "--no-tags", candidate, branch], 120)
+            if mrc == 0:
+                mrc2, head = _run_git(dsh_dir, ["rev-parse", "FETCH_HEAD"], 15)
+                if mrc2 == 0 and re.fullmatch(r"[0-9a-f]{40}", head):
+                    mmrc, mmerge = _run_git(dsh_dir, ["merge", "--ff-only", head], 120)
+                    if mmrc == 0:
+                        if stashed:
+                            _stash_pop_safe(dsh_dir, log)
+                        log("[更新] 已通过镜像完成更新: %s" % candidate)
+                        return True, "镜像更新成功(%s): %s" % (candidate, head[:8])
+                    if stashed:
+                        _stash_pop_safe(dsh_dir, log)  # 合并仍失败: 先还原工作区
+                    return False, "镜像已获取上游,但本地无法快进合并(可能有本地提交/历史分叉):\n" + mmerge[-800:]
+                break
+            last_mirror_err = mout
+        if stashed:
+            _stash_pop_safe(dsh_dir, log)  # 镜像全失败: 先还原工作区再报错
+        return False, "直连与镜像拉取均失败:\n" + (out + "\n" + last_mirror_err)[-800:]
+    if stashed:
+        _stash_pop_safe(dsh_dir, log)
+    return False, out[-500:]

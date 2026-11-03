@@ -34,16 +34,30 @@ GIB = 1073741824.0
 
 
 def is_dsh_noise(content):
+    """DSH 日志噪音判定(4f2ccf5 同语义)。
+
+    错误/诊断相关行一律保留(堆栈、模块解析错误等);其余按强特征白名单放行。
+    旧表含 started/ready/server/web/plugin/error 等宽子串——node 启动横幅几乎
+    全部命中,隐藏功能形同虚设(环形缓冲很快滚掉关键报错),故收敛为强特征。
+    """
     if not content or not content.strip():
         return False
-    low = content.strip().lower()
+    trimmed = content.strip()
+    low = trimmed.lower()
+    # 强保留: 错误/诊断信息,绝不隐藏
     force_keep = ("at ", "^", "node:internal", "file:///", "imported from",
                   "cannot find", "module", "require", "resolve", "throw")
-    keep_if = ("dsh web", "http", "127.0.0.1", "localhost", "listen", "port",
-               "eaddrinuse", "error", "fail", "exception", "warn", "started",
-               "ready", "loaded", "plugin", "exit", "browser", "open", "server",
-               "version", "status", "web")
-    if any(k in low for k in force_keep) or any(k in low for k in keep_if):
+    if any(k in low for k in force_keep):
+        return False
+    # 白名单收敛为强特征(listening on/ready in/eaddrinuse/127.0.0.1/localhost/dsh web/http(s)://)
+    if (low.startswith("ready in")
+            or "listening on" in low
+            or "dsh web" in low
+            or "eaddrinuse" in low
+            or "127.0.0.1" in low
+            or "localhost" in low
+            or "http://" in low
+            or "https://" in low):
         return False
     return True
 
@@ -173,7 +187,8 @@ class LlamaRunner:
         mp, m_err = cmdline.resolve_model_path(profile.get("ModelPath"))
         if m_err:
             return {"kind": "build_error", "message": "Build failed:" + m_err}
-        if mp and not os.path.isfile(mp):
+        # http(s) 远程模型 URL 不做本地存在性检查(4f2ccf5 同语义)
+        if mp and not mp.lower().startswith(("http://", "https://")) and not os.path.isfile(mp):
             return {"kind": "build_error", "message": "Build failed:模型文件不存在: %s" % mp}
         try:
             lst, violations, flag_args = cmdline.build_cmd(profile, defs)
