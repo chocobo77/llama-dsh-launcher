@@ -789,10 +789,29 @@ public static class UpdateService
 				return (false, "未找到 git.exe：请安装 Git for Windows 或把 git 加入 PATH。");
 			}
 			(int ExitCode, string Output) pull = RunGit(dir, "pull --ff-only", 240);
-			if (pull.ExitCode == 0)
+			bool stashed = false;
+			if (pull.ExitCode != 0 && LocalChangesBlocked(pull.Output))
 			{
-				string head = RunGit(dir, "rev-parse HEAD", 15).Output.Trim();
-				return (head.Length == 40, head.Length == 40 ? head : "pull 成功但无法读取新 HEAD");
+				// 本地未提交改动挡住合并: stash → 合并 → pop 恢复(改动是用户/其它
+				// 会话的真实补丁, 绝不丢弃; pop 冲突时保留在 stash 供手动处理)
+				(bool ok, string err) = TryStash(dir, log);
+				if (!ok)
+				{
+					return (false, "本地有未提交改动且自动 stash 失败：\n" + err);
+				}
+				stashed = true;
+				pull = RunGit(dir, "pull --ff-only", 240);
+				if (pull.ExitCode == 0)
+				{
+					string head = RunGit(dir, "rev-parse HEAD", 15).Output.Trim();
+					if (head.Length != 40)
+					{
+						StashPopSafe(dir, log);
+						return (false, "pull 成功但无法读取新 HEAD");
+					}
+					StashPopSafe(dir, log);
+					return (true, head);
+				}
 			}
 			// 直连拉取失败：尝试镜像 fetch + merge --ff-only
 			string branch = RunGit(dir, "rev-parse --abbrev-ref HEAD", 15).Output.Trim();
@@ -812,16 +831,70 @@ public static class UpdateService
 					if (merge.ExitCode == 0)
 					{
 						string head = RunGit(dir, "rev-parse HEAD", 15).Output.Trim();
-						return (head.Length == 40, head.Length == 40 ? head : "镜像拉取成功但无法读取新 HEAD");
+						if (head.Length == 40)
+						{
+							if (stashed)
+							{
+								StashPopSafe(dir, log);
+							}
+							return (true, head);
+						}
+						if (stashed)
+						{
+							StashPopSafe(dir, log);
+						}
+						return (false, "镜像拉取成功但无法读取新 HEAD");
 					}
-					return (false, "镜像已获取上游，但本地无法快进合并（可能有未提交改动/本地提交）：\n" + Tail(merge.Output, 800));
+					if (stashed)
+					{
+						StashPopSafe(dir, log); // 合并仍失败: 先把工作区还原再说
+					}
+					return (false, "镜像已获取上游，但本地无法快进合并（可能有本地提交/历史分叉）：\n" + Tail(merge.Output, 800));
 				}
+			}
+			if (stashed)
+			{
+				StashPopSafe(dir, log);
 			}
 			return (false, ExplainGitFailure(pull.Output, "pull"));
 		}
 		catch (Exception ex)
 		{
 			return (false, ex.Message);
+		}
+	}
+
+	/// <summary>git 输出表明合并被本地未提交改动挡住（would be overwritten / local changes）。</summary>
+	private static bool LocalChangesBlocked(string gitOutput)
+	{
+		string t = gitOutput ?? "";
+		return t.Contains("would be overwritten", StringComparison.OrdinalIgnoreCase)
+			|| t.Contains("Please commit your changes", StringComparison.OrdinalIgnoreCase)
+			|| t.Contains("local changes", StringComparison.OrdinalIgnoreCase);
+	}
+
+	private static (bool ok, string err) TryStash(string dir, Action<string>? log)
+	{
+		(int ExitCode, string Output) st = RunGit(dir, "stash push -m \"LlamaDSH auto-stash before update\"", 60);
+		if (st.ExitCode != 0)
+		{
+			return (false, Tail(st.Output, 400));
+		}
+		log?.Invoke("[更新] 检测到本地未提交改动，已自动 stash（更新完成后自动恢复）");
+		return (true, "");
+	}
+
+	/// <summary>恢复 stash；pop 冲突时保留 stash 条目并提示手动处理（git pop 冲突时本就不丢弃）。</summary>
+	private static void StashPopSafe(string dir, Action<string>? log)
+	{
+		(int ExitCode, string Output) pop = RunGit(dir, "stash pop", 60);
+		if (pop.ExitCode == 0)
+		{
+			log?.Invoke("[更新] 本地未提交改动已恢复（stash pop）");
+		}
+		else
+		{
+			log?.Invoke("[更新] ⚠ 更新完成，但本地改动恢复时有冲突——改动仍保留在 stash 中。请在 DSH 目录手动执行 git stash pop 处理：\n" + Tail(pop.Output, 500));
 		}
 	}
 
