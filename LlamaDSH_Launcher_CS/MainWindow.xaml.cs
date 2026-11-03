@@ -6202,6 +6202,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void Log(string text)
 	{
+		// 后台线程一律转发 UI 线程: LogArea 是 WPF 依赖对象, 跨线程直摸会抛
+		// "调用线程无法访问此对象"——PullDsh 等后台回调传进来的 Log 曾因此
+		// 把成功的 git fetch 判成失败
+		if (!Dispatcher.CheckAccess())
+		{
+			Dispatcher.BeginInvoke((Action)(() => Log(text)));
+			return;
+		}
 		if (!string.IsNullOrWhiteSpace(text) && (!(text == _lastLogLine) || text.StartsWith("[Perf] Error")))
 		{
 			_lastLogLine = text;
