@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(192 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(199 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -1973,6 +1973,107 @@ check("健康对账抛异常要进 error.log(旧写法吞掉 → 面板永远显
       len(_calls6) >= 1 and "健康对账" in _calls6[0][1], str(_calls6))
 check("信号处理器注册失败也必须留痕(挂不上等于整条收尾链不存在, 服务被杀就是孤儿)",
       "信号处理器注册失败" in main_src, "")
+
+
+# --- 15) 第七轮: 假绿与假报告(读不到却报"一切正常"、未核就称"已回滚") ---------
+# 15.1 兼容审计: cordis.patch.yml 读不动时以前返回空清单, 于是打印"0 条补丁"并在结尾
+#      给出"0 错误 / 0 可修复项" —— 坏文件被报成一切正常, patch_orphan/rename 整段跳过。
+_dsh7 = os.path.join(_tmp, "dsh_tree7")
+os.makedirs(os.path.join(_dsh7, ".git"), exist_ok=True)
+os.makedirs(os.path.join(_dsh7, "apps", "cli", "lib"), exist_ok=True)
+open(os.path.join(_dsh7, "apps", "cli", "lib", "bin.js"), "w").write("//x\n")
+_rep7 = _compat.audit(_dsh7, lambda _t: None, include_dump=False)
+_lv7 = [x["level"] for x in _rep7["items"]]
+with open(os.path.join(_prof, "cordis.patch.yml"), "w", encoding="utf-8") as _fh7:
+    _fh7.write("patch:\n  - id: a\n   bad_indent: [unclosed\n")
+_rep7b = _compat.audit(_dsh7, lambda _t: None, include_dump=False)
+_txt7b = "\n".join(x["text"] for x in _rep7b["items"])
+_lv7b = [x["level"] for x in _rep7b["items"]]
+with open(os.path.join(_prof, "cordis.patch.yml"), "w", encoding="utf-8") as _fh7:
+    _fh7.write("patch:\n  - id: aaa\n  - id: bbb\n")
+_rep7c = _compat.audit(_dsh7, lambda _t: None, include_dump=False)
+_txt7c = "\n".join(x["text"] for x in _rep7c["items"])
+_lv7c = [x["level"] for x in _rep7c["items"]]
+os.remove(os.path.join(_prof, "cordis.patch.yml"))
+check("审计: patch.yml 读不动必须报 error(旧版报\"0 条补丁\"并给出\"0 错误\", 是假绿)",
+      "error" in _lv7b and "读不动" in _txt7b and "0 错误 / 0 可修复项" not in _txt7b,
+      _txt7b[:200])
+check("审计: 有项未能核对时结尾不能是\"0 错误 / 0 可修复项\", 要写明几项未能核对",
+      any("未能核对" in x["text"] for x in _rep7b["items"]), _txt7b[-160:])
+check("对照: patch.yml 正常时照旧报条数且不产生 error(修法没把正常路径变红)",
+      "error" not in _lv7c and "cordis.patch.yml: 2 条补丁" in _txt7c
+      and "复检结果:0 错误 / 0 可修复项" in _txt7c, _txt7c[:260])
+
+# 15.2 repair 入口的重审失败要说出来: 否则修的是弹窗时的陈旧快照, 日志上却只剩"已修复 N 项"
+_stale_lock7 = os.path.join(_tmp, "dsh_tree7", "ledger-v2.lock")
+open(_stale_lock7, "w").close()
+_real_audit7 = _compat.audit
+_logs7 = []
+
+
+def _audit_boom7(*a, **k):
+    raise RuntimeError("审计自己炸了")
+
+
+_compat.audit = _audit_boom7
+_fixed7 = _compat.repair(_dsh7, {"fixables": [{"kind": "stale_lock", "path": _stale_lock7}]},
+                         lambda t: _logs7.append(t))
+_compat.audit = _real_audit7
+check("修复前重审失败必须留痕并说明本次按旧清单修(否则修的是陈旧快照还报已修复)",
+      _fixed7 == 1 and not os.path.exists(_stale_lock7)
+      and any("重审失败" in t for t in _logs7), str(_logs7[:3]))
+
+# 15.3 回滚文案要反映"写回是否真成功": 以前只看备份存不存在, copy2 失败也说"已回滚"
+_real_copy2 = _compat.shutil.copy2
+_real_run7 = _compat.subprocess.run
+
+
+def _copy_boom7(src, dst, *a, **k):
+    if str(dst) == os.path.join(_prof, "package.json"):
+        raise OSError("只读文件系统")
+    return _real_copy2(src, dst, *a, **k)
+
+
+_compat.shutil.copy2 = _copy_boom7
+_compat.subprocess.run = _boom_run
+ok_rb7, msg_rb7 = _compat.install_local_plugin("web", _tgz)
+_compat.subprocess.run = _real_run7
+_compat.shutil.copy2 = _real_copy2
+check("备份存在但写回失败时不得说\"已回滚\", 要说明可能停在半安装状态",
+      (not ok_rb7) and "写回失败" in msg_rb7 and "已回滚 package.json/lock" not in msg_rb7,
+      msg_rb7[:180])
+
+# 15.4 状态写盘失败要有出口: LlamaPid/DshPid 落不了盘 → 重启后接管不到进程 → 面板假
+#      "未运行", 用户点启动就变"端口已被占用/启动失败"。
+_real_state = core.state.STATE_FILE
+_msgs7 = []
+core.state.set_error_sink(lambda t: _msgs7.append(t))
+core.state.STATE_FILE = os.path.join(_tmp, "a_file7", "state.json")
+with open(os.path.join(_tmp, "a_file7"), "w", encoding="utf-8") as _fh7b:
+    _fh7b.write("x")          # 同名是个文件 → 写 state.json 必失败
+core.state.update_state(LlamaPid=12345)
+core.state.save_state({"DshPid": 1})
+core.state.STATE_FILE = _real_state
+core.state.set_error_sink(None)
+check("状态写盘失败必须能看见(以前整族静默吞, 真因只能靠猜)",
+      len(_msgs7) == 2 and "state.json" in _msgs7[0] and "接管" in _msgs7[0], str(_msgs7[:2]))
+
+# 15.5 端口探针不可用时不得当成"端口空闲": find_process_by_port 只会返回 None, 那是查不到。
+_real_which7, _real_pcache7 = procman.which, dict(procman._probe_cache)
+_real_nh7, _real_fp7 = main.procman.node_host_running, main.procman.find_process_by_port
+main.procman.node_host_running = lambda: False
+main.procman.find_process_by_port = lambda *a, **k: None
+procman._probe_cache = {"at": 0.0, "ok": False}
+procman.which = lambda name: None              # 冒充 ss 与 lsof 都没有
+procman._probe_cache = {"at": 0.0, "ok": False}
+_guard_nossp = main._dsh_running_guard()
+procman.which = _real_which7
+procman._probe_cache = {"at": 0.0, "ok": False}
+_guard_ok = main._dsh_running_guard()
+main.procman.node_host_running, main.procman.find_process_by_port = _real_nh7, _real_fp7
+procman._probe_cache = _real_pcache7
+check("探针(ss/lsof)缺失时插件操作要被拒, 不能把\"查不到\"当成\"没在跑\"就写 node_modules",
+      _guard_nossp is False and _guard_ok is True, str((_guard_nossp, _guard_ok)))
 
 
 shutil.rmtree(_tmp, ignore_errors=True)

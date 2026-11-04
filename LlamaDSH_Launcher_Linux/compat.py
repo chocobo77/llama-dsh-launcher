@@ -101,15 +101,25 @@ def write_json_atomic(path, doc, backup=False):
 
 
 def _parse_patch_entries(path):
-    """粗解析 cordis.patch.yml:返回 [{index, id, raw_block}]。"""
+    """粗解析 cordis.patch.yml:返回 ([{index, id, raw_block}], 失败原因)。
+
+    原因非空表示**读不动**(编码错/YAML 语法错/顶层不是映射)。以前这种情况返回空列表,
+    审计于是打印"cordis.patch.yml: 0 条补丁"并在结尾给出"0 错误 / 0 可修复项"——
+    一个坏掉的文件被报成"一切正常", patch_orphan/rename 检查也整段跳过(假绿)。
+    """
     entries = []
     try:
         with open(path, encoding="utf-8") as f:
             doc = yaml.safe_load(f)
-    except Exception:
-        return entries
+    except Exception as ex:
+        return entries, "%s: %s" % (type(ex).__name__, ex)
     if not isinstance(doc, dict):
-        return entries
+        return entries, "顶层不是映射(实际是 %s)" % type(doc).__name__
+    return _walk_patch_entries(doc), ""
+
+
+def _walk_patch_entries(doc):
+    entries = []
     def walk(node, in_patch=False):
         if isinstance(node, dict):
             this_id = node.get("id") or node.get("path")
@@ -184,6 +194,8 @@ def _broken_symlinks(profile="web"):
 def audit(dsh_dir, log, include_dump=True):
     """返回报告 dict:items=[{level,text}], fixables=[{kind,detail,...}], version。"""
     items, fixables = [], []
+    # 检查项本身没跑成(文件读不动)与"检查过且没问题"是两回事, 分开计数免得假绿
+    unreadable = []
     dsh_dir = (dsh_dir or "").strip().strip('"')
 
     def it(level, text):
@@ -221,8 +233,12 @@ def audit(dsh_dir, log, include_dump=True):
     patch_path = os.path.join(profile_dir(), "cordis.patch.yml")
     patch_ids = []
     if os.path.isfile(patch_path):
-        patch_ids = _parse_patch_entries(patch_path)
-        it("info", "cordis.patch.yml: %d 条补丁" % len(patch_ids))
+        patch_ids, why = _parse_patch_entries(patch_path)
+        if why:
+            it("error", "cordis.patch.yml 读不动(%s) —— 本次无法核对补丁条目" % why)
+            unreadable.append("cordis.patch.yml")
+        else:
+            it("info", "cordis.patch.yml: %d 条补丁" % len(patch_ids))
 
     # dump-config 探针
     if include_dump and os.path.isfile(binjs):
@@ -272,11 +288,23 @@ def audit(dsh_dir, log, include_dump=True):
             if dis:
                 fixables.append({"kind": "market_disabled", "path": state_p, "count": len(dis)})
                 it("warn", "dsh-market 写入了 %d 条 disabled 状态(可修复:清空)" % len(dis))
-        except Exception:
-            pass
+        except Exception as ex:
+            it("error", "dsh-market/state.json 读不动(%s: %s) —— 无法核对 disabled 状态"
+               % (type(ex).__name__, ex))
+            unreadable.append(".dsh-market/state.json")
 
     if not fixables:
-        it("ok", "复检结果:0 错误 / 0 可修复项")
+        # "没有可修复项"不等于"一切正常": 有些项是**没能跑成**(文件读不动), 还有些是
+        # 查出来但无法自动修的错误。旧写法一律报"0 错误 / 0 可修复项", 用户据此认为环境
+        # 干净就去做下一步(装插件), 这是典型的假绿。
+        _errs = sum(1 for x in items if x["level"] == "error")
+        if unreadable:
+            it("warn", "复检结果:0 可修复项, 但有 %d 项未能核对(%s), 不要据此认为一切正常"
+               % (len(unreadable), ", ".join(unreadable)))
+        elif _errs:
+            it("warn", "复检结果:0 可修复项, 但有 %d 项错误(见上面 ✗), 需要手工处理" % _errs)
+        else:
+            it("ok", "复检结果:0 错误 / 0 可修复项")
     return {"items": items, "fixables": fixables, "version": ver}
 
 
@@ -288,8 +316,11 @@ def repair(dsh_dir, report, log):
     dsh_dir = (dsh_dir or "").strip().strip('"')
     try:
         report = audit(dsh_dir, lambda _t: None)
-    except Exception:
-        pass
+    except Exception as ex:
+        # 重审失败必须说出来: 否则整轮修的是弹窗时的**陈旧快照**(新出现的问题没修、
+        # 已经消失的项被再改写), 而日志上只剩"已修复 N 项", 看不出这次修的不是现状。
+        log("[兼容] ⚠ 修复前重审失败(%s: %s), 本次按弹窗时的旧清单修复; "
+            "结束后请重新审计一次" % (type(ex).__name__, ex))
     for f in report.get("fixables", []):
         kind = f["kind"]
         try:
@@ -1444,13 +1475,27 @@ def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
     removed_spec = ""
 
     def _rollback():
-        """把 manifest/lock 恢复原状(失败与异常两条路都要走, 不留半安装状态)。"""
+        """把 manifest/lock 恢复原状(失败与异常两条路都要走, 不留半安装状态)。
+
+        返回**是否真的写回成功**: 文案以前只看"备份存不存在", 于是 copy2 失败(只读挂载、
+        磁盘满、权限)时也报"已回滚 package.json/lock" —— 用户以为 profile 完好, 实际停在
+        半安装(声明在、依赖没装), 下次 DSH 启动才表现为 ENOENT/模块加载失败。
+        """
+        restored = True
         for path, bak in ((manifest, manifest_bak), (lockfile, lock_bak)):
             if bak:
                 try:
                     shutil.copy2(bak, path)
                 except OSError:
-                    pass
+                    restored = False
+        return restored
+
+    def _rollback_note(ok_restored):
+        if not manifest_bak and not lock_bak:
+            return "⚠ 备份失败未能回滚; "
+        if ok_restored:
+            return "已回滚 package.json/lock; "
+        return "⚠ 备份在但写回失败, 未能回滚 package.json/lock(profile 可能停在半安装状态); "
         if not lock_existed and lock_bak is None and os.path.isfile(lockfile):
             try:  # 原本没有 lock 文件: 回滚后也不该留下 pnpm 新建的那一份
                 os.remove(lockfile)
@@ -1539,9 +1584,7 @@ def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
             job_log("[插件安装] pnpm add %s …" % spec)
         ok, out = _pnpm_add_spec(base, spec)
         if not ok:
-            _rollback()
-            rolled = "已回滚 package.json/lock" if manifest_bak else \
-                     "⚠ 备份失败, 无法回滚 package.json/lock"
+            rolled = _rollback_note(_rollback()).rstrip("; ")
             note = "(%s)" % rolled
             if removed_spec:
                 # 旧依赖已被 pnpm remove 掉而新装又失败: manifest 回滚了但 node_modules
@@ -1603,10 +1646,8 @@ def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
                            % (installed or name or "(包名未识别)",
                               ("@" + got) if got else (("@" + version) if version else ""),
                               tail))
-        _rollback()
         return False, ("本地插件安装异常(%s), %s请重试并查看日志"
-                       % (tail, "已回滚 package.json/lock; " if manifest_bak else
-                          "⚠ 备份失败未能回滚; "))
+                       % (tail, _rollback_note(_rollback())))
     finally:
         if pack_temp:
             shutil.rmtree(pack_temp, ignore_errors=True)

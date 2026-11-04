@@ -125,6 +125,22 @@ def kill_process_tree(pid, timeout=3.0):
     return (not any(alive(p) for p in pids)) and tree_certain
 
 
+_probe_cache = {"at": 0.0, "ok": False}
+
+
+def port_probe_ok():
+    """端口探针(ss / lsof)是否可用。不可用时 find_process_by_port 一律返回 None,
+    那是**查不到**, 不是"端口空闲" —— 拿它做决策的地方要把方向取保守的一侧。
+    (实测本机两者都在; 这里防的是精简系统/PATH 被改窄时把"运行中"看成"没在跑"。)
+    """
+    now = time.time()
+    if now - _probe_cache["at"] < 10.0:
+        return _probe_cache["ok"]
+    ok = bool(which("ss") or which("lsof"))
+    _probe_cache["at"], _probe_cache["ok"] = now, ok
+    return ok
+
+
 def find_process_by_port(*ports, name_filter=None):
     """ss -ltnp 端口属主探测。默认不过滤进程名(C# d227f3c 同语义):
     Node 24 主线程 comm 已改为 "MainThread", 按 "node" 过滤会永远查不到,

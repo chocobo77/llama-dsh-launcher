@@ -21,6 +21,28 @@ DEFAULT_CONFIG_FILENAME = "LlamaDSH_Launcher_config.json"
 
 _lock = threading.RLock()
 
+# 状态/基线写盘失败此前一律静默吞掉。这一族的后果不是"少写一个文件"而是接管失效:
+# LlamaPid/DshPid 没落盘 → 重启后面板显示"未运行", 用户点"启动"就变成"端口已被占用/
+# 启动失败"; save_build_state 失败则升级后 need_rebuild 判定永不触发, 直接跑旧产物。
+# 故把失败交给一个可注入的日志出口(main 启动时接 HUB.log), 调用点不必各自处理。
+_err_sink = None
+
+
+def set_error_sink(fn):
+    """接入日志出口(测试里传 None 即静默)。"""
+    global _err_sink
+    _err_sink = fn
+
+
+def _fail(what, ex):
+    if _err_sink is None:
+        return
+    try:
+        _err_sink("[状态] ⚠ %s 写入失败(%s: %s) —— 重启后可能无法接管进程, 面板会显示未运行"
+                  % (what, type(ex).__name__, ex))
+    except Exception:
+        pass
+
 
 def default_profile():
     return {
@@ -145,8 +167,8 @@ def save_state(state):
     """全量替换 —— 调用方必须持有完整状态字典;只想更新个别键请用 update_state。"""
     try:
         _atomic_write_json(STATE_FILE, state)
-    except Exception:
-        pass
+    except Exception as ex:
+        _fail("state.json(全量)", ex)
 
 
 def update_state(**updates):
@@ -158,16 +180,16 @@ def update_state(**updates):
             st = load_state()
             st.update(updates)
             _atomic_write_json(STATE_FILE, st)
-    except Exception:
-        pass
+    except Exception as ex:
+            _fail("state.json(合并写)", ex)
 
 
 def clear_state():
     try:
         if os.path.exists(STATE_FILE):
             os.remove(STATE_FILE)
-    except Exception:
-        pass
+    except Exception as ex:
+        _fail("state.json(清除)", ex)
 
 
 def clear_state_for(which, state=None):
@@ -193,8 +215,15 @@ def save_build_state(head):
     try:
         _atomic_write_json(BUILD_STATE_FILE, {"head": head or "",
                             "builtAt": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
-    except Exception:
-        pass
+    except Exception as ex:
+        # 这一条失败的另一半后果: 升级基线没记下, 下次 DSH 启动不会提示"仓库已升级需要
+        # 全量重建", 于是直接跑旧编译产物然后崩。
+        if _err_sink is not None:
+            try:
+                _err_sink("[状态] ⚠ DSH 重建基线写入失败(%s: %s) —— 升级后可能不再提示需要重建"
+                          % (type(ex).__name__, ex))
+            except Exception:
+                pass
 
 
 def migrate_profile_flags_in_config(cfg, defs):

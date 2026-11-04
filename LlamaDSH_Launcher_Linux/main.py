@@ -905,6 +905,11 @@ def _dsh_running_guard():
         return False
     if procman.find_process_by_port(DSH_PORT) or procman.node_host_running():
         return False
+    if not procman.port_probe_ok():
+        # 探针本身不可用(ss 与 lsof 都没有)时, find_process_by_port 只会返回 None ——
+        # 那是"查不到", 不是"端口空闲"。这里取保守方向: 拒绝 pnpm 去写一个可能正在
+        # 运行的 DSH 的 node_modules(与"宁可说不确定, 也不谎报空闲"一致)。
+        return False
     return True
 
 
@@ -1210,6 +1215,9 @@ def main():
         sys.exit(1)
 
     _write_token_file()
+    # 状态写盘失败要有日志出口: LlamaPid/DshPid 落不了盘时, 下次启动就接管不到进程,
+    # 面板显示"未运行", 用户点启动变成"端口已被占用/启动失败" —— 真因必须看得见。
+    state.set_error_sink(HUB.log)
     toolchain.cleanup_update_tmp()   # 上次崩溃留下的 .part/解压目录, 启动时清掉
     takeover_on_boot()
     threading.Thread(target=MON.loop, daemon=True).start()
