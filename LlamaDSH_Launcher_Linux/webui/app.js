@@ -525,6 +525,8 @@ function setStatus(el, st) {
     taken_over: ["● 接管运行中", "st-run"], starting: ["● 启动中...", "st-start"],
     rebuilding: ["🔨 Rebuilding...", "st-start"], stopped: ["● 已停止", "st-stop"],
     failed: ["● 启动失败", "st-fail"], crashed: ["● 启动失败/崩溃", "st-fail"],
+    // 进程还在(杀不掉, 常见于以 root 启动): 不能显示成"已停止", 也不能点亮 Start
+    stop_failed: ["⚠ 停止失败(进程仍在)", "st-fail"],
   };
   const [t, c] = map[st] || map.stopped;
   el.textContent = t; el.className = "status " + c;
@@ -534,9 +536,11 @@ async function pollStatus() {
   try { s = await api("status"); } catch (e) { return; }
   setStatus($("lblLlamaStatus"), s.llama.status);
   setStatus($("lblDshStatus"), s.dsh.rebuilding ? "rebuilding" : s.dsh.status);
-  $("btnLlamaStart").disabled = ["running", "starting", "taken_over"].includes(s.llama.status);
-  $("btnLlamaStop").disabled = !["running", "starting", "taken_over"].includes(s.llama.status);
-  const dshBusy = ["running", "running_admin", "starting", "taken_over", "rebuilding"].includes(s.dsh.status);
+  const llamaBusy = ["running", "starting", "taken_over", "stop_failed"].includes(s.llama.status);
+  $("btnLlamaStart").disabled = llamaBusy;
+  $("btnLlamaStop").disabled = !llamaBusy;
+  const dshBusy = ["running", "running_admin", "starting", "taken_over", "rebuilding",
+                   "stop_failed"].includes(s.dsh.status);
   $("btnDshStart").disabled = dshBusy;
   $("btnDshStop").disabled = !dshBusy;
   $("btnOpenDsh").disabled = !["running", "running_admin", "taken_over"].includes(s.dsh.status);

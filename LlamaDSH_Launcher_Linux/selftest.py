@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(156 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(161 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -1465,6 +1465,61 @@ check("pnpm 取包超时要放宽且用 rc-option 写法(pnpm 12 实测 --fetch-
       "--config.fetch-timeout=600000" in adds[0] and adds[0][2].startswith("file:")
       and "--config.fetch-timeout=600000" in _rm_now[0],
       "%s | %s" % (adds[0], _rm_now[0]))
+
+
+
+# --- 13) 停止失败必须露出来(不能报"已停止"还把 Start 点亮) --------------
+_kill_keep, _alive_keep, _which_keep = (core.procman.kill_process_tree,
+                                        core.procman.alive, core.procman.which)
+core.procman.kill_process_tree = lambda pid, timeout=3.0: False
+core.procman.alive = lambda pid: True
+core.procman.which = lambda name: None      # 不去真跑 sudo
+
+
+class _StubProc:
+    pid = 999999999
+
+    def poll(self):
+        return None
+
+
+class _StubTracker:
+    pid = 999999999
+
+    def poll(self):
+        return None                         # 还活着
+
+
+_clear_real3 = core.state.clear_state_for
+core.state.clear_state_for = lambda which, state=None: None
+try:
+    _lr = core.LlamaRunner(_Silent(), {"defs": []})
+    _lr.proc = _StubProc()
+    _lr.status = "running"
+    _lr.stop()
+    check("杀不掉进程时 llama 状态必须是 stop_failed, 不能落成 stopped",
+          _lr.status == "stop_failed", _lr.status)
+    _ok2, _msg2 = _lr._start_locked({}, cmd_list=["true"], skip_vram_confirm=True)
+    check("stop_failed 下不得放行启动(否则只是换个方式的端口撞车)",
+          not _ok2 and "上一次停止未成功" in _msg2, _msg2)
+    _ds = core.DshRunner(_Silent(), {"defs": []})
+    _ds.tracker = _StubTracker()
+    _ds.status = "running"
+    _ds.stop()
+    check("DSH 停止未成功同样落 stop_failed(复核过还在的进程不能说已停止)",
+          _ds.status == "stop_failed", _ds.status)
+finally:
+    core.state.clear_state_for = _clear_real3
+    core.procman.kill_process_tree = _kill_keep
+    core.procman.alive = _alive_keep
+    core.procman.which = _which_keep
+
+_js = open(os.path.join(APP, "webui", "app.js"), encoding="utf-8").read()
+check("前端把 stop_failed 当在跑(Start 禁用 / Stop 可点)并给出可见标签",
+      'stop_failed: ["' in _js and '"stop_failed"].includes(s.llama.status)' in _js
+      and '"stop_failed"].includes(s.dsh.status)' in _js, _js[:120])
+check("_dsh_running_guard 也把 stop_failed 视为在跑(pnpm 不能碰还没停掉的 DSH)",
+      '"stop_failed"' in _guard_src, "")
 
 
 shutil.rmtree(_tmp, ignore_errors=True)

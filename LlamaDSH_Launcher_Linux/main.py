@@ -894,7 +894,7 @@ def _dsh_running_guard():
     """
     if DSH.running:
         return False
-    if DSH.status in ("starting", "running", "running_admin", "rebuilding"):
+    if DSH.status in ("starting", "running", "running_admin", "rebuilding", "stop_failed"):
         return False
     if procman.find_process_by_port(DSH_PORT) or procman.node_host_running():
         return False

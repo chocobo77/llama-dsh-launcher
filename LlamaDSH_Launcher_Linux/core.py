@@ -239,6 +239,12 @@ class LlamaRunner:
         defs = self.schema["defs"]
         if self.running:
             return False, "Already running"
+        if self.status == "stop_failed":
+            # 上一次"停止"没能真的杀掉进程(root 属主/杀不掉): 这时候放行启动只会在同一
+            # 个端口上撞 EADDRINUSE, 用户看到的是一个没头没尾的"启动失败"。C# 也是把
+            # Start 保持禁用直到 Stop 成功为止。
+            return False, ("上一次停止未成功(进程仍在, 可能以 root 启动): 请先手动结束它,"
+                           " 或再点一次「停止」重试")
         self.last_profile = profile
         self.user_stopped = False     # 新会话开始, 清掉上一次的"用户已停"
         self.cache_port_from_profile(profile)
@@ -418,15 +424,18 @@ class LlamaRunner:
             self._finish_stop(quiet=True)
             return
         self.hub.log("--- 正在停止 Llama ---")
-        if not procman.kill_process_tree(pid):
+        killed = procman.kill_process_tree(pid)
+        if not killed:
             # kill_process_tree 的返回值以前被丢掉, 于是 root 属主/杀不掉的进程
-            # 也照样打印"已停止"
+            # 也照样打印"已停止", 面板还把 Start 重新点亮(再点就是撞端口)
             self.hub.log("[Llama] ⚠ 进程 PID %s 未能停止(可能以 root 启动), 请手动结束" % pid)
-        self._finish_stop()
+        self._finish_stop(ok=killed)
 
-    def _finish_stop(self, quiet=False):
+    def _finish_stop(self, quiet=False, ok=True):
         self.proc = None
-        self.status = "stopped"
+        # stop_failed 不是 stopped: 进程还在。前端据此保持 Stop 可点、Start 禁用,
+        # 日志与状态标签都要能看出"没停掉"(C# FinishStopLlama 的"仍在运行"同语义)。
+        self.status = "stopped" if ok else "stop_failed"
         self.api.reset_log_machine()
         self.mem_state = {"oom_seen": False, "offloaded": 0, "total_layers": 0, "buffers": {}}
         self.oom_retry_active = False
@@ -775,9 +784,13 @@ class DshRunner:
                     self.hub.log("[DSH] 进程 PID %d 仍存活,请手动结束" % pid)
         self.tracker = None
         self.proc = None
+        # 同上: 复核过还在的进程不能落成"已停止"(面板会把 Start 点亮, 再点就是撞端口)
         self.status = "stopped"
+        if pid and procman.alive(pid):
+            self.status = "stop_failed"
         if pid:                         # 从没运行过就别报告"已停止"
-            self.hub.log("--- 已停止 DSH ---")
+            self.hub.log("--- 已停止 DSH ---" if self.status == "stopped"
+                         else "[DSH] ⚠ 停止未成功, 进程仍在(PID %d), 状态记为停止失败" % pid)
         state.clear_state_for("DshPid")
 
     def rebuild(self, profile, on_done=None):
