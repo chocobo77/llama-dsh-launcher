@@ -308,6 +308,11 @@ def main():
         print("[client] 主窗口已打开(另一进程持有窗口锁), 忽略本次请求")
         return
     base = args.url or ensure_server(args.port)
+    if args.url and base and _probe(base) is None:
+        # 托盘助手传的是它**上次记住**的地址: 服务可能已经退出、换了顺延端口, 或重启后
+        # 换了 token。直接用它 ⇒ 窗口打开一片空白, 用户看不出服务其实不在。
+        print("[client] --url %s 无响应, 回退到按端口 %d 自举/拉起" % (base, args.port))
+        base = ensure_server(args.port)
     if base is None:
         print("无法启动/连接本地服务(端口 %d 起)" % args.port)
         sys.exit(1)

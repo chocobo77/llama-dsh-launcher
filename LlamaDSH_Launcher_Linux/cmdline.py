@@ -601,6 +601,26 @@ def gguf_shard_paths(model_path):
     return out or [p]
 
 
+def gguf_shard_missing(model_path):
+    """分片家族缺了几片(0 = 齐全, -1 = 不是分片模型)。
+
+    gguf_shard_paths 只列出**存在**的分片, 所以缺片时它看起来完全正常: 权重按已有分片
+    算(少算一整片 = 预算偏乐观), 张量表 shards_ok == shards_total 也照样"ok"。
+    缺失数必须按文件名里声明的 -of-NNNNN 单独算出来。
+    """
+    m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", os.path.basename(model_path or ""), re.I)
+    if not m:
+        return -1
+    stem = os.path.basename(model_path)[:m.start()]
+    d = os.path.dirname(model_path) or "."
+    total = int(m.group(2))
+    have = 0
+    for i in range(1, total + 1):
+        if os.path.isfile(os.path.join(d, "%s-%05d-of-%05d.gguf" % (stem, i, total))):
+            have += 1
+    return total - have
+
+
 def gguf_shard_bytes(model_path):
     return float(sum(os.path.getsize(s) for s in gguf_shard_paths(model_path) if os.path.isfile(s)))
 
@@ -664,6 +684,11 @@ def read_gguf_tensor_stats(model_path, layer_count):
     # 估算基于残缺数据(Windows 版同型修复: Ok 仅全部分片成功才置位)
     r["ok"] = shards_ok > 0 and shards_ok == shards_total
     r["partial"] = 0 < shards_ok < shards_total
+    # 缺片是另一种"残缺": 枚举只给存在的分片, 于是每片都解析成功也照样"完整"。
+    _miss = gguf_shard_missing(model_path)
+    r["missing_shards"] = _miss if _miss > 0 else 0
+    if _miss > 0:
+        r["ok"], r["partial"] = False, shards_ok > 0
     return r
 
 
@@ -778,7 +803,13 @@ def estimate_vram_needed(profile, defs, query_gpu_fn):
         rec_state_bytes = 0.0
         swa_note = ""
         meta_warn = []
-        if ts.get("partial"):
+        # 缺片必须单独说: 枚举只列出存在的分片, 所以"每片都读通了"也可能是残缺模型 ——
+        # 权重按已有分片算(少一整片), 而 llama-server 加载时会直接报缺片。
+        if ts.get("missing_shards"):
+            meta_warn.append("⚠ 分片不完整: 声明的分片里有 %d 片不在位(按已存在的分片估算, 权重偏小), "
+                             "llama-server 加载时会报缺片 —— 请补全分片或改用单文件模型"
+                             % ts["missing_shards"])
+        elif ts.get("partial"):
             meta_warn.append("⚠ 张量表仅解析到部分分片, 显存预估可能偏乐观(请核对分片文件是否齐全)")
         swa_full = st.bools.get("swa-full", False)
         if swa_layers > 0:

@@ -102,12 +102,19 @@ def detect(force=False):
     now = time.time()
     if not force and _cache["v"] and now - _cache["t"] < 15:
         return _cache["v"]
-    nodes = []
+    nodes, broken = [], []
     for c in _node_candidates():
         if os.path.isfile(c) and os.access(c, os.X_OK):
             v = _exe_version(c)
             if v and re.match(r"^v\d+", v):
                 nodes.append((c, v))
+            elif c not in broken:
+                # 文件在、能执行, 但 `node -v` 没输出(损坏/被换成的空壳/依赖库缺失):
+                # 81cdb3b 要把它算"已安装但版本未知"。以前这里直接丢弃, 于是
+                # version_unknown 恒为 False(下游那段跳过重装的守卫是死码), 面板上
+                # 与"根本没装 node"同形, 一键安装每次都重下一遍 node。
+                broken.append(c)
+
     def major(v):
         try:
             return int(v.lstrip("v").split(".")[0])
@@ -116,13 +123,16 @@ def detect(force=False):
     n24 = next(((p, v) for p, v in nodes if major(v) >= 24), None)
     if n24 is None and nodes:
         n24 = max(nodes, key=lambda x: major(x[1]))
+    unknown = bool(n24 is None and broken)
     pnpm = _pnpm_path()
     pnpm_v = _exe_version(pnpm) if pnpm else None
     st = {
-        "node24": {"path": n24[0], "version": n24[1]} if n24 else {"path": None, "version": None},
-        "any_node": {"path": nodes[0][0], "version": nodes[0][1]} if nodes else {"path": None, "version": None},
+        "node24": ({"path": n24[0], "version": n24[1]} if n24 else
+                   ({"path": broken[0], "version": None} if unknown else {"path": None, "version": None})),
+        "any_node": {"path": nodes[0][0], "version": nodes[0][1]} if nodes else
+                    ({"path": broken[0], "version": None} if unknown else {"path": None, "version": None}),
         "pnpm": {"path": pnpm, "version": pnpm_v} if pnpm else {"path": None, "version": None},
-        "version_unknown": bool(n24 and not n24[1]),
+        "version_unknown": unknown,
         "meets": bool(n24 and major(n24[1]) >= 24 and pnpm),
     }
     _cache.update(t=now, v=st)

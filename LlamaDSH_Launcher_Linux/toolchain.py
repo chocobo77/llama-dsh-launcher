@@ -560,6 +560,25 @@ def llama_running(dir_hint=None):
     return False
 
 
+def _migrate_extras(old_dir, new_dir):
+    """把新构建里没有的条目(用户放的模型/配置等)从旧目录迁回。返回 (警告文本, 是否保留旧目录)。
+
+    迁回失败时**不能**删 old_dir: 警告让用户去那儿找回文件, 紧接着的 rmtree 就把刚说
+    要保留的东西删了(以前正是这个顺序)。
+    """
+    try:
+        for entry in os.listdir(old_dir):
+            dst = os.path.join(new_dir, entry)
+            if not os.path.exists(dst):
+                shutil.move(os.path.join(old_dir, entry), dst)
+    except OSError as mv_ex:
+        keep = os.path.isdir(old_dir)
+        return ("\n⚠ 部分旧目录文件未能迁回(%s), %s" % (
+            mv_ex, ("原目录已保留: %s(确认无误后可手动删除)" % old_dir)
+            if keep else "旧目录本身也已不可读: %s" % old_dir)), keep
+    return "", False
+
+
 def apply_llama_update(dir_, release, job_log=None):
     """下载 → 解压 → 覆盖 → build 硬校验。返回 (ok, msg)。"""
     global _active_downloads
@@ -650,16 +669,9 @@ def apply_llama_update(dir_, release, job_log=None):
                 os.rename(old_dir, dir_)  # 回滚
             raise
         # 迁回用户额外文件(新构建里没有的条目 = 用户放的模型/配置等)
-        extras_warn = ""
-        try:
-            for entry in os.listdir(old_dir):
-                dst = os.path.join(dir_, entry)
-                if not os.path.exists(dst):
-                    shutil.move(os.path.join(old_dir, entry), dst)
-        except OSError as mv_ex:
-            # 迁回失败不回滚安装(二进制已就绪), 但 .old 保留供用户手动找回
-            extras_warn = "\n⚠ 部分旧目录文件未能迁回(%s), 原目录保留在: %s" % (mv_ex, old_dir)
-        shutil.rmtree(old_dir, ignore_errors=True)
+        extras_warn, keep_old = _migrate_extras(old_dir, dir_)
+        if not keep_old:
+            shutil.rmtree(old_dir, ignore_errors=True)
         msg = "llama.cpp 已更新到 %s(build %d)[%s]%s, 本地验证 build %d" % (
             release["tag"], rb, release["asset_name"], cudart_note, lb)
         if extras_warn:
@@ -743,8 +755,16 @@ def install_variant(profile, repo_input, name, dir_, job_log=None, backend=None)
         return False, msg
     if job_log:
         job_log(msg)
+    # 注册要按**写入时**的变体列表改: 下载安装可能持续几分钟, 期间用户完全可能增删改
+    # 其他变体。用下载前抓的 vs 回写会把那些改动静默抹掉(且看不出被抹)。
+    vs_now = profile.get("LlamaVariants") or []
+    dup2 = next((x for x in vs_now
+                 if x.get("Name") == name and (x.get("Dir") or "") != (dir_ or "")), None)
+    if dup2:
+        return False, ("下载与安装已完成(目录 %s), 但下载期间出现了同名不同目录的变体, "
+                       "为避免覆盖未做注册: 请改个名字或先删除同名变体" % dir_)
     entry = {"Name": name, "Repo": repo, "Dir": dir_}
-    profile["LlamaVariants"] = [x for x in vs if x.get("Name") != name] + [entry]
+    profile["LlamaVariants"] = [x for x in vs_now if x.get("Name") != name] + [entry]
     profile["ActiveLlamaVariant"] = name
     profile["LlamaDir"] = dir_
     return True, msg

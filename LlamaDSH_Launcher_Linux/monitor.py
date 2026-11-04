@@ -118,13 +118,20 @@ def _disk_statvfs():
     for dev, mp in rows:
         try:
             st = os.statvfs(mp)
-            total = st.f_blocks * st.f_frsize
-            free = st.f_bavail * st.f_frsize
+            fr = st.f_frsize
+            total = st.f_blocks * fr
+            # used 不能写成 total - f_bavail: 那样 root 保留块(ext4 默认 5%)被算成"已用",
+            # 2T 盘白多约 100G、进度条提前进红区, 且与 df/文件管理器的数字对不上
+            # (f_bfree 才是"空闲块", f_bavail 是"非 root 可用块")。
+            avail = st.f_bavail * fr
+            used = (st.f_blocks - st.f_bfree) * fr
             if total <= 0 or mp in seen:
                 continue
             seen.add(mp)
+            pct_base = used + avail
             out.append({"dev": dev.rsplit("/", 1)[-1][:12], "mount": mp, "total": total,
-                        "used": total - free, "pct": round(100.0 * (total - free) / total, 1)})
+                        "used": used, "avail": avail,
+                        "pct": round(100.0 * used / pct_base, 1) if pct_base > 0 else 0.0})
         except OSError:
             continue
     return out[:6]
@@ -155,6 +162,18 @@ def _disk_rows_cached():
                 c["busy"] = False
         threading.Thread(target=refresh, daemon=True).start()
     return [dict(d) for d in c["rows"]]
+
+
+def _parent_disk(name):
+    """分区名 → 整盘名: nvme0n1p2→nvme0n1、mmcblk0p1→mmcblk0、sda2→sda、xvda1→xvda。
+    整盘名(sda/nvme0n1)原样返回。规则不对会导致整盘 I/O 被算到每个分区上(表头翻倍)。"""
+    m = re.match(r"^(nvme\d+n\d+)p\d+$", name) or re.match(r"^(mmcblk\d+)p\d+$", name)
+    if m:
+        return m.group(1)
+    m = re.match(r"^([a-z]+)(\d+)$", name)
+    if m and m.group(1)[-1].isalpha() and m.group(1) not in ("md", "loop", "fd", "dm"):
+        return m.group(1)     # md0/loop0 本身就是整设备, 不是 sda2 那种分区
+    return name
 
 
 def _disk_io_rates():
@@ -404,12 +423,23 @@ def sample_system():
     cm = cpu_mem_usage()
     disks = _disk_rows_cached()
     io = _disk_io_rates()
+    # I/O 归属要按**分区名精确**匹配。旧写法是双向 startswith + next(): 同一块盘上挂两个
+    # 分区(/ 与 /home)时, 两行都先匹配到 diskstats 里排在前面的整盘名 ⇒ 两行显示同一份
+    # 整盘速率, 而表头是逐行相加的, 于是读写速率被数两遍(实测翻倍)。
+    by_parent = {}
     for d in disks:
-        key = next((k for k in io if d["dev"].startswith(k) or k.startswith(d["dev"])), None)
-        if key:
-            d["read_mb"], d["write_mb"] = round(io[key][0], 1), round(io[key][1], 1)
+        by_parent.setdefault(_parent_disk(d["dev"]), []).append(d)
+    for d in disks:
+        rate, scope = io.get(d["dev"]), "part"
+        if rate is None:
+            par = _parent_disk(d["dev"])
+            # 没有该分区的独立计数时才退到整盘, 且同一块盘只允许一行这么退(否则表头重复计数)
+            if par in io and by_parent[par][0] is d:
+                rate, scope = io[par], "disk"
+        if rate:
+            d["read_mb"], d["write_mb"], d["io_scope"] = round(rate[0], 1), round(rate[1], 1), scope
         else:
-            d["read_mb"] = d["write_mb"] = 0.0
+            d["read_mb"], d["write_mb"], d["io_scope"] = 0.0, 0.0, ""
     snap = {"cpu": cm["cpu"], "cpu_cores": cm["cpu_cores"], "cpu_model": cpu_model(),
             "mem_used": cm["mem_used"], "mem_total": cm["mem_total"], "mem_pct": cm["mem_pct"],
             "disks": disks, "net": {k: [round(v[0], 2), round(v[1], 2)] for k, v in net_rates().items()}}

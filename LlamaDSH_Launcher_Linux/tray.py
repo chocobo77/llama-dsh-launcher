@@ -95,7 +95,37 @@ class TrayIcon:
                     dbus_interface="org.kde.StatusNotifierWatcher")
         except Exception:
             pass
+        self._sync_lightweight()
         return True  # 保持 timer
+
+    def _sync_lightweight(self):
+        """复选态要从服务读回。
+
+        轻量化会被别处改: 网页端开关、主窗口关闭时自动置位、服务重启后回到 False。
+        以前只有托盘自己点过时才改 self.lightweight ⇒ 菜单勾与真实监控状态相反
+        (看着像"低频保活", 实际每 3s 全量采样, 或反之)。读不到时保持现状, 不猜。
+        """
+        if time.time() < getattr(self, "_light_busy_until", 0.0):
+            return                      # 自己刚点过, 别用旧回包把新勾抹掉
+
+        def worker():
+            try:
+                with urllib.request.urlopen(self.base_url + "/api/status", timeout=1.5) as r:
+                    on = bool((json.loads(r.read().decode("utf-8", "replace")) or {})
+                              .get("lightweight"))
+            except Exception:
+                return
+            if on != self.lightweight:
+                self._post_ui(self.set_lightweight, on)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _post_ui(self, fn, *a):
+        """回 D-Bus/GLib 主线程执行(gi 不可用时直接调, 不让后台线程的更新整个丢掉)。"""
+        try:
+            from gi.repository import GLib
+            GLib.idle_add(fn, *a)
+        except Exception:
+            fn(*a)
 
     def set_lightweight(self, on):
         self.lightweight = bool(on)
@@ -149,6 +179,7 @@ class TrayIcon:
 
     def toggle_light(self):
         on = not self.lightweight
+        self._light_busy_until = time.time() + 3.0   # 期间不做回读, 防旧回包盖掉刚点的勾
         def post():
             try:
                 req = urllib.request.Request(self.base_url + "/api/lightweight",

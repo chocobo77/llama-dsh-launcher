@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(245 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(265 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -2721,6 +2721,287 @@ check("DSH 目录没填且已知位置扫不到时, 必须直接说明缺什么(
       and "Errno 2" not in (_msg21c or ""), str((_d21, _ok21c, _msg21c)))
 check("对照: 指明有效目录时不得被这道新守卫拦住",
       "未指定有效" not in (_msg21d or ""), str((_ok21d, _msg21d)))
+
+
+# --- 22) 第十三轮: 数字算错 / 缺证据却下结论 --------------------------------------
+# 22.1 磁盘 used 把 root 保留块算成"已用"(f_bavail 是"非 root 可用", f_bfree 才是"空闲"):
+#      ext4 默认保留 5%, 2T 盘白多约 100G, 进度条提前进红区, 且与 df/文件管理器对不上。
+_real_statvfs22 = monitor.os.statvfs
+_blk22 = 1024
+_fake_st22 = types.SimpleNamespace(f_blocks=1000, f_bfree=300, f_bavail=250, f_frsize=_blk22)
+monitor.os.statvfs = lambda _p: _fake_st22
+_rows22 = monitor._disk_statvfs()
+monitor.os.statvfs = _real_statvfs22
+check("磁盘 used 必须是 blocks-bfree、pct 必须是 used/(used+avail)(与 df 同口径)",
+      _rows22 and _rows22[0]["used"] == 700 * _blk22 and _rows22[0]["avail"] == 250 * _blk22
+      and abs(_rows22[0]["pct"] - 73.7) < 0.05,
+      str(_rows22[:1]) if _rows22 else "无可用挂载点")
+check("对照: 真实文件系统上 total 仍是文件系统总大小(不得改成 used+avail 之和)",
+      monitor._disk_statvfs()[0]["total"] > monitor._disk_statvfs()[0]["used"],
+      str(monitor._disk_statvfs()[0]))
+
+# 22.2 每挂载点的 I/O 用双向 startswith 匹配 diskstats: 同一块盘挂两个分区(/ 与 /data)时,
+#      两行都匹配到排在前面的整盘名 ⇒ 表头(逐行相加)把同一块盘的读写数两遍。
+check("分区名→整盘名的规则: nvme/mmcblk 的 pN 与 sd 系的尾数都要对",
+      [monitor._parent_disk(n) for n in ("nvme0n1p2", "mmcblk0p1", "sda2", "xvda1")]
+      == ["nvme0n1", "mmcblk0", "sda", "xvda"]
+      and [monitor._parent_disk(n) for n in ("sda", "nvme0n1", "md0", "loop0")]
+      == ["sda", "nvme0n1", "md0", "loop0"],
+      str({n: monitor._parent_disk(n) for n in ("nvme0n1p2", "sda2", "md0", "loop0")}))
+_real_rows22, _real_io22 = monitor._disk_rows_cached, monitor._disk_io_rates
+_two = [{"dev": "nvme0n1p1", "mount": "/", "total": 1, "used": 1, "avail": 1, "pct": 50.0},
+        {"dev": "nvme0n1p2", "mount": "/data", "total": 1, "used": 1, "avail": 1, "pct": 50.0}]
+monitor._disk_rows_cached = lambda: [dict(d) for d in _two]
+monitor._disk_io_rates = lambda: {"nvme0n1": (100.0, 50.0), "nvme0n1p1": (30.0, 10.0)}
+monitor._sys_cache.update(t=0.0, v=None)
+_s22 = monitor.sample_system()
+_sum22 = round(sum(d["read_mb"] for d in _s22["disks"]), 1)
+monitor._disk_rows_cached = lambda: [{"dev": "sdb1", "mount": "/x", "total": 1, "used": 1,
+                                      "avail": 1, "pct": 50.0}]
+monitor._disk_io_rates = lambda: {"sdb": (12.0, 3.0)}
+monitor._sys_cache.update(t=0.0, v=None)
+_s22b = monitor.sample_system()
+monitor._disk_rows_cached, monitor._disk_io_rates = _real_rows22, _real_io22
+monitor._sys_cache.update(t=0.0, v=None)
+check("同盘两个挂载点不得各自显示整盘速率(表头逐行相加会翻倍)",
+      _s22["disks"][0]["read_mb"] == 30.0 and _s22["disks"][0]["io_scope"] == "part"
+      and _s22["disks"][1]["read_mb"] == 0.0 and _sum22 == 30.0,
+      "表头读=%.1f 行=%s" % (_sum22, [(d["dev"], d["read_mb"], d["io_scope"]) for d in _s22["disks"]]))
+check("对照: 只有一个挂载点且没有分区级计数时, 仍要退回整盘速率(不得变成一律 0)",
+      _s22b["disks"][0]["read_mb"] == 12.0 and _s22b["disks"][0]["io_scope"] == "disk",
+      str([(d["dev"], d["read_mb"], d["io_scope"]) for d in _s22b["disks"]]))
+
+# 22.3 分片模型缺片: gguf_shard_paths 只列**存在**的分片, 于是"每片都读通"也可能是残缺模型
+#      —— 权重按已有分片算(偏小), 而 llama-server 加载时会直接报缺片。
+def _stub_gguf(path):
+    with open(path, "wb") as fh:
+        fh.write(b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0) + struct.pack("<Q", 0))
+
+
+_gdir22 = os.path.join(_tmp, "shards22")
+os.makedirs(_gdir22)
+_g122 = os.path.join(_gdir22, "m-00001-of-00003.gguf")
+_g322 = os.path.join(_gdir22, "m-00003-of-00003.gguf")
+_stub_gguf(_g122)
+_stub_gguf(_g322)
+check("缺片必须按文件名声明的 -of-NNNNN 单独算出来(枚举只给存在的分片)",
+      cmdline.gguf_shard_missing(_g122) == 1 and len(cmdline.gguf_shard_paths(_g122)) == 2,
+      str((cmdline.gguf_shard_missing(_g122), len(cmdline.gguf_shard_paths(_g122)))))
+_ts22 = cmdline.read_gguf_tensor_stats(_g122, 0)
+check("缺片时张量表不得报\"完整\"(旧版 shards_ok==shards_total 于是 ok=True)",
+      _ts22["missing_shards"] == 1 and _ts22["ok"] is False,
+      str({k: _ts22.get(k) for k in ("ok", "partial", "missing_shards")}))
+_stub_gguf(os.path.join(_gdir22, "m-00002-of-00003.gguf"))
+_ts22c = cmdline.read_gguf_tensor_stats(_g122, 0)
+check("对照: 分片齐全时照旧判 ok 且不产生缺失告警",
+      _ts22c["missing_shards"] == 0 and _ts22c["ok"] is True,
+      str({k: _ts22c.get(k) for k in ("ok", "partial", "missing_shards")}))
+_arch22 = cmdline.read_gguf_arch
+cmdline.read_gguf_arch = lambda _p: {
+    "ok": True, "layers": 8, "kv_heads": 4, "head_dim": 64, "head_count": 32,
+    "embed": 2048, "context_len": 4096, "architecture": "qwen35", "sliding_window": 0,
+    "full_attention_interval": 1, "nextn_predict_layers": 0, "expert_count": 0,
+    "ssm_inner_size": 0, "ssm_state_size": 0, "ssm_conv_kernel": 0, "vocab_size": 1000}
+os.remove(os.path.join(_gdir22, "m-00002-of-00003.gguf"))
+_e22 = cmdline.estimate_vram_needed(dict(_prof20, ModelPath=_g122), _defs20,
+                                    lambda: {"vram_total": 64 * _GIB20, "vram_used": 0})
+_stub_gguf(os.path.join(_gdir22, "m-00002-of-00003.gguf"))   # 补齐缺片再跑对照
+_e22c = cmdline.estimate_vram_needed(dict(_prof20, ModelPath=_g122), _defs20,
+                                     lambda: {"vram_total": 64 * _GIB20, "vram_used": 0})
+cmdline.read_gguf_arch = _arch22
+check("预算必须把缺片写成显眼警告(而不是按已有分片安静地少算)",
+      _e22 and "分片不完整" in _e22["detail"] and "分片不完整" not in _e22c["detail"],
+      str([ln for ln in (_e22 or {}).get("detail", "").splitlines()[:2]]))
+
+# 22.4 node 在但 `node -v` 无输出: 81cdb3b 要判"已安装但版本未知", 以前候选里只收有版本的
+#      节点 ⇒ version_unknown 恒为 False, 那段跳过重装的守卫是死码, 面板与"没装"同形。
+_node_silent22 = os.path.join(_tmp, "node-silent22")
+with open(_node_silent22, "w", encoding="utf-8") as fh:
+    fh.write("#!/bin/sh\nexit 0\n")
+os.chmod(_node_silent22, 0o755)
+_node_ok22 = os.path.join(_tmp, "node-ok22")
+with open(_node_ok22, "w", encoding="utf-8") as fh:
+    fh.write("#!/bin/sh\necho v24.9.9\n")
+os.chmod(_node_ok22, 0o755)
+_real_cands22 = nodetool._node_candidates
+nodetool._node_candidates = lambda: [_node_silent22]
+_st22a = nodetool.detect(force=True)
+nodetool._node_candidates = lambda: [_node_ok22]
+_st22b = nodetool.detect(force=True)
+nodetool._node_candidates = _real_cands22
+check("exe 在但版本探测不到时必须判\"已安装、版本未知\"(并把这个 exe 报出来)",
+      _st22a["version_unknown"] is True and _st22a["node24"]["path"] == _node_silent22
+      and _st22a["meets"] is False,
+      str({k: _st22a.get(k) for k in ("version_unknown", "meets", "node24")}))
+check("对照: node 正常时不得判未知版本",
+      _st22b["version_unknown"] is False and _st22b["node24"]["version"] == "v24.9.9",
+      str({k: _st22b.get(k) for k in ("version_unknown", "node24")}))
+#      守卫必须是活的: 版本未知时一键安装不得再去下载 node(每次重下几十 MB 也修不好它)
+_real_v24_22, _real_up22 = nodetool.latest_v24, nodetool.urllib.request.urlopen
+_opened22 = []
+
+
+def _no_net22(*a, **k):
+    _opened22.append(a[0] if a else "")
+    raise IOError("不该下载")
+
+
+_real_detect22 = nodetool.detect
+nodetool.detect = lambda force=False: dict(_st22a, pnpm={"path": None, "version": None})
+nodetool.latest_v24 = lambda: ("https://nodejs.org/dist", "v24.9.9")
+nodetool.urllib.request.urlopen = _no_net22
+_log22 = []
+_ok22, _msg22 = nodetool.install_node_env(_log22.append)
+nodetool.urllib.request.urlopen = _real_up22
+nodetool.detect, nodetool.latest_v24 = _real_detect22, _real_v24_22
+check("版本未知时不得发起下载(81cdb3b 的守卫必须真的生效), 且日志要说明跳过重装",
+      not _opened22 and any("跳过重装" in t for t in _log22),
+      str((["%s" % u for u in _opened22], [t[:40] for t in _log22[:3]])))
+
+# 22.5 迁回旧目录的额外文件失败时, 消息让用户去 old_dir 找回, 紧接着却 rmtree 删掉它
+_old22, _new22 = os.path.join(_tmp, "old22"), os.path.join(_tmp, "new22")
+os.makedirs(_old22)
+os.makedirs(_new22)
+open(os.path.join(_old22, "my-model.gguf"), "w", encoding="utf-8").write("x")
+_w22, _keep22 = toolchain._migrate_extras(_old22, _new22)
+check("迁回成功时不保留旧目录(不留垃圾)",
+      _w22 == "" and _keep22 is False
+      and os.path.isfile(os.path.join(_new22, "my-model.gguf")), str((_w22, _keep22)))
+_real_move22 = toolchain.shutil.move
+shutil.rmtree(_old22, ignore_errors=True)
+shutil.rmtree(_new22, ignore_errors=True)
+os.makedirs(_old22)
+open(os.path.join(_old22, "my-model.gguf"), "w", encoding="utf-8").write("x")
+os.makedirs(_new22)
+toolchain.shutil.move = lambda s, d: (_ for _ in ()).throw(OSError(28, "No space left on device"))
+_w22b, _keep22b = toolchain._migrate_extras(_old22, _new22)
+toolchain.shutil.move = _real_move22
+check("迁回失败时必须保留旧目录并说清位置(旧版接着 rmtree, 把说要保留的删了)",
+      _keep22b is True and "原目录已保留" in _w22b and _old22 in _w22b
+      and os.path.isfile(os.path.join(_old22, "my-model.gguf")),
+      str((_w22b, _keep22b)))
+
+# 22.6 变体注册要按写入时的列表改: 下载安装要几分钟, 期间用户改的其他变体不能被快照抹掉
+_real_pr22, _real_fetch22 = toolchain.parse_repo_input, toolchain.fetch_latest_llama_release
+_real_upd22, _real_be22 = toolchain.apply_llama_update, toolchain.resolve_backend
+_real_fexe22 = toolchain.find_llama_server_exe
+toolchain.parse_repo_input = lambda t: "owner/repo"
+toolchain.resolve_backend = lambda p: "vulkan"
+toolchain.find_llama_server_exe = lambda d: None
+toolchain.fetch_latest_llama_release = lambda repo, backend=None, log=None: {
+    "tag": "b9", "build": 9, "asset_name": "a.tar.gz", "repo": "owner/repo"}
+
+
+def _upd_with_race(dir_, release, job_log=None):
+    cur = _prof22.get("LlamaVariants") or []
+    _prof22["LlamaVariants"] = cur + [{"Name": "用户期间新增", "Repo": "a/b", "Dir": "/tmp/other"}]
+    return True, "装好了"
+
+
+toolchain.apply_llama_update = _upd_with_race
+_prof22 = {"LlamaVariants": [{"Name": "旧变体", "Repo": "o/r", "Dir": "/tmp/old-var"}]}
+_ok22d, _msg22d = toolchain.install_variant(_prof22, "https://github.com/owner/repo", "新变体", "/tmp/new-var")
+_names22 = sorted(x["Name"] for x in _prof22["LlamaVariants"])
+check("安装期间用户新增的变体必须还在(不得用下载前的快照回写)",
+      _ok22d is True and _names22 == ["新变体", "旧变体", "用户期间新增"],
+      str(_names22))
+
+
+def _upd_same_name(dir_, release, job_log=None):
+    cur = _prof22.get("LlamaVariants") or []
+    _prof22["LlamaVariants"] = [x for x in cur if x["Name"] != "新变体"] + \
+        [{"Name": "新变体", "Repo": "z/z", "Dir": "/tmp/elsewhere"}]
+    return True, "装好了"
+
+
+toolchain.apply_llama_update = _upd_same_name
+_prof22 = {"LlamaVariants": [{"Name": "旧变体", "Repo": "o/r", "Dir": "/tmp/old-var"}]}
+_ok22e, _msg22e = toolchain.install_variant(_prof22, "https://github.com/owner/repo",
+                                            "新变体", "/tmp/new-var")
+toolchain.parse_repo_input, toolchain.fetch_latest_llama_release = _real_pr22, _real_fetch22
+toolchain.apply_llama_update, toolchain.resolve_backend = _real_upd22, _real_be22
+toolchain.find_llama_server_exe = _real_fexe22
+check("下载期间出现同名不同目录的变体时不得覆盖注册, 要说清目录已装好",
+      _ok22e is False and "未做注册" in (_msg22e or "")
+      and next((x for x in _prof22["LlamaVariants"] if x["Name"] == "新变体"), {})["Dir"] == "/tmp/elsewhere",
+      str((_ok22e, _msg22e, _prof22["LlamaVariants"])))
+
+import client
+# 22.7 托盘助手传的 --url 是它上次记住的地址: 服务可能已退出/换了顺延端口/重启换了 token,
+#      以前直接用它 ⇒ 窗口打开一片空白, 看不出服务不在。
+_real_argv, _real_lock, _real_probe = sys.argv, client._acquire_window_lock, client._probe
+_real_ens, _real_gtk, _real_pop22 = client.ensure_server, client.run_gtk, client.subprocess.Popen
+_seen_gtk = []
+sys.argv = ["client.py", "--url", "http://127.0.0.1:9"]
+client._acquire_window_lock = lambda: True
+client.run_gtk = lambda base: _seen_gtk.append(base)
+client.subprocess.Popen = lambda *a, **k: None
+client.ensure_server = lambda port: "http://127.0.0.1:8799"
+client._probe = lambda base: None                      # --url 那个地址没人应
+client.main()
+sys.argv = ["client.py", "--url", "http://127.0.0.1:8788"]
+client._probe = lambda base: {"ok": True}
+client.main()
+sys.argv = _real_argv
+client._acquire_window_lock, client._probe = _real_lock, _real_probe
+client.ensure_server, client.run_gtk = _real_ens, _real_gtk
+client.subprocess.Popen = _real_pop22
+check("--url 无响应时必须回退到按端口自举/拉起(不是打开空白窗口)",
+      _seen_gtk[0] == "http://127.0.0.1:8799", str(_seen_gtk))
+check("对照: --url 确实活着时照旧直接用它(不得每次都去拉一个新服务)",
+      len(_seen_gtk) == 2 and _seen_gtk[1] == "http://127.0.0.1:8788", str(_seen_gtk))
+
+# 22.8 托盘的"轻量化"复选只在托盘自己点过时改: 网页端开关、窗口关闭置位、服务重启归零
+#      都不会回填 ⇒ 菜单勾与真实监控状态相反。
+_real_url22 = _tray.urllib.request.urlopen
+
+
+class _FakeTray22:
+    base_url = "http://127.0.0.1:1"
+    lightweight = False
+    _light_busy_until = 0.0
+
+    def set_lightweight(self, on):
+        self.lightweight = bool(on)
+
+    def _post_ui(self, fn, *a):
+        fn(*a)
+
+
+def _mk_st(status):
+    class _R:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"lightweight": status}).encode()
+    return lambda *a, **k: _R()
+
+
+_ft22 = _FakeTray22()
+_tray.urllib.request.urlopen = _mk_st(True)
+_tray.TrayIcon._sync_lightweight(_ft22)
+for _ in range(40):
+    if _ft22.lightweight:
+        break
+    time.sleep(0.05)
+_tray.urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(IOError("服务没起"))
+_still22 = _ft22.lightweight
+_tray.urllib.request.urlopen = _real_url22
+check("托盘必须从 /api/status 回填轻量化复选态(网页端/窗口关闭改的也能看见)",
+      _still22 is True, str(_ft22.lightweight))
+_ft22b = _FakeTray22()
+_ft22b.lightweight = True
+_tray.urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(IOError("服务没起"))
+_tray.TrayIcon._sync_lightweight(_ft22b)
+for _ in range(20):
+    time.sleep(0.05)
+_tray.urllib.request.urlopen = _real_url22
+check("对照: 读不到服务时保持现状, 不得当成\"没开\"(勾会自己跳掉)",
+      _ft22b.lightweight is True, str(_ft22b.lightweight))
 
 # --- 17) 自检自身的边界: 不得污染用户真实的日志目录 ---------------------------
 # 17.1 以前 selftest 直接往 ~/.dsh_launcher_logs 写: 每跑一次就多出几条测试噪声
