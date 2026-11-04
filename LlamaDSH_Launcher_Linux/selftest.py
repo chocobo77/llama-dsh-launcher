@@ -9,6 +9,7 @@
 import io
 import json
 import os
+import shutil
 import struct
 import sys
 import threading
@@ -662,6 +663,108 @@ r = subprocess.run([sys.executable, td, "T", "B", _Fake.BTN_CLIENT],
                    env={"HOME": os.path.expanduser("~"), "PATH": os.environ.get("PATH", "")})
 check("无显示环境 → 退出码 2(调用方据此提示, 而不是'点了没反应')",
       r.returncode == 2 and "无显示" in r.stderr, "rc=%s %s" % (r.returncode, r.stderr[:80]))
+
+# --- 8) 本地插件安装(装 dsh-infinite-context-0.8.8.tgz 报"非法包名"那一族) ---
+import compat as _compat
+import tempfile
+
+_tmp = tempfile.mkdtemp(prefix="llamadsh_selftest_plugin_")
+_home = os.path.join(_tmp, "dshhome")
+_prof = os.path.join(_home, "profiles", "web")
+os.makedirs(os.path.join(_prof, "node_modules", "demo-plugin"))
+_compat.dsh_home = lambda: _home
+_compat.profile_dir = lambda p="web": _prof
+
+# 造一个 tgz: 根 package.json 是本体, examples/ 里再放一个假的干扰
+import tarfile
+_pkg = os.path.join(_tmp, "src")
+os.makedirs(os.path.join(_pkg, "examples"))
+with open(os.path.join(_pkg, "package.json"), "w", encoding="utf-8") as fh:
+    json.dump({"name": "demo-plugin", "version": "9.9.9", "main": "index.js",
+               "dsh": {"bundle": "index.js"}}, fh)
+with open(os.path.join(_pkg, "examples", "package.json"), "w", encoding="utf-8") as fh:
+    json.dump({"name": "not-the-plugin", "version": "0.0.1"}, fh)
+with open(os.path.join(_pkg, "index.js"), "w", encoding="utf-8") as fh:
+    fh.write("// stub\n")
+_tgz = os.path.join(_tmp, "demo-plugin-9.9.9.tgz")
+with tarfile.open(_tgz, "w:gz") as tf:
+    tf.add(_pkg, arcname="package")
+ident = _compat._tarball_identity(_tgz)
+check("_tarball_identity 取包根 package.json 的 name/version(忽略 examples/ 里的)",
+      ident == ("demo-plugin", "9.9.9"), str(ident))
+
+# profile manifest + 同名旧声明(指向已删除的旧 tgz)
+_manifest = {"dependencies": {"demo-plugin": "file:/gone/old/demo-plugin-1.0.0.tgz"},
+             "dsh": {"profile": {"bundles": []}}}
+with open(os.path.join(_prof, "package.json"), "w", encoding="utf-8") as fh:
+    json.dump(_manifest, fh)
+with open(os.path.join(_prof, "node_modules", "demo-plugin", "package.json"),
+          "w", encoding="utf-8") as fh:
+    json.dump({"name": "demo-plugin", "version": "9.9.9", "dsh": {"bundle": "index.js"}}, fh)
+
+pnpm_calls = []
+_compat.procman_which_pnpm = lambda: True
+orig_compat_run = _compat.subprocess.run
+
+
+def _fake_pnpm(cmd, cwd=None, **kw):
+    pnpm_calls.append(list(cmd))
+    if cmd[:2] == ["pnpm", "add"]:
+        # 模拟 pnpm 写依赖
+        m = json.load(open(os.path.join(_prof, "package.json")))
+        m["dependencies"][ident[0]] = cmd[2][len("file:"):] if cmd[2].startswith("file:") else cmd[2]
+        json.dump(m, open(os.path.join(_prof, "package.json"), "w"))
+
+    class _R:
+        returncode, stdout, stderr = 0, "", ""
+    return _R()
+
+
+_compat.subprocess.run = _fake_pnpm
+ok, msg = _compat.install_local_plugin("web", _tgz)
+_compat.subprocess.run = orig_compat_run
+adds = [c for c in pnpm_calls if c[:2] == ["pnpm", "add"]]
+rms = [c for c in pnpm_calls if c[:2] == ["pnpm", "remove"]]
+check("安装 tgz 不再报“非法包名”(旧代码把路径当包名送进白名单)",
+      ok and "非法包名" not in msg, msg)
+check("pnpm add 收到的是 file:<<dshHome>/packages 快照路径>",
+      len(adds) == 1 and adds[0][2] == "file:" + os.path.join(_home, "packages",
+                                                              "demo-plugin-9.9.9.tgz"),
+      str(adds))
+check("tgz 已复制进 <dshHome>/packages(profile 不依赖 U 盘/临时目录)",
+      os.path.isfile(os.path.join(_home, "packages", "demo-plugin-9.9.9.tgz")), "")
+check("同名旧 spec 指向失效路径时先 pnpm remove 再 add",
+      len(rms) == 1 and rms[0][2] == "demo-plugin" and pnpm_calls.index(rms[0]) < pnpm_calls.index(adds[-1]),
+      str(pnpm_calls))
+check("包声明了 dsh.bundle → 自动加入 profile bundles",
+      "demo-plugin" in (((json.load(open(os.path.join(_prof, "package.json")))
+                          .get("dsh") or {}).get("profile") or {}).get("bundles") or []), msg)
+
+# 失败必须回滚, 不留半安装状态
+before_manifest = open(os.path.join(_prof, "package.json"), encoding="utf-8").read()
+_compat.procman_which_pnpm = lambda: True
+
+
+def _fail_add(cmd, cwd=None, **kw):
+    class _R:
+        returncode, stdout, stderr = (1, "", "ERR_PNPM_ENOENT old tarball missing") if cmd[:2] == ["pnpm", "add"] else (0, "", "")
+    return _R()
+
+
+_compat.subprocess.run = _fail_add
+ok2, msg2 = _compat.install_local_plugin("web", _tgz)
+_compat.subprocess.run = orig_compat_run
+check("pnpm add 失败 → 回滚 package.json 并说明原因",
+      (not ok2) and open(os.path.join(_prof, "package.json"), encoding="utf-8").read() == before_manifest
+      and "已回滚" in msg2, msg2[:160])
+
+src_ilp = inspect.getsource(_compat.install_local_plugin)
+check("install_local_plugin 不再调用按包名校验的 _pnpm_add(",
+      "_pnpm_add(" not in src_ilp and "_pnpm_add_spec(" in src_ilp, src_ilp[:80])
+ok3, msg3 = _compat._pnpm_add_spec(_prof, "-force")
+check("以 '-' 开头的 spec 被挡掉(否则会被 pnpm 当命令行参数)",
+      not ok3 and "非法安装参数" in msg3, msg3)
+shutil.rmtree(_tmp, ignore_errors=True)
 
 print()
 if FAILS:
