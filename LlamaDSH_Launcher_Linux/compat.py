@@ -611,6 +611,20 @@ def _profile_dep_spec(profile, name):
 
 
 def set_bundle_active(profile, name, active):
+    """激活/停用插件(改 manifest); 与装/卸/升级共用同一把 profile 锁串行。
+
+    审计里的 pinned 回写、pnpm 安装回滚都会读改写同一份 package.json —— 并发的两条
+    写会互相覆盖(表现为"激活没生效"或"依赖又回来了")。
+    """
+    if not begin_profile_op(profile, ("激活" if active else "停用") + "插件 %s" % name):
+        return False, _BUSY_MSG
+    try:
+        return _set_bundle_active_locked(profile, name, active)
+    finally:
+        end_profile_op(profile)
+
+
+def _set_bundle_active_locked(profile, name, active):
     """激活 = 加回 dsh.profile.bundles + UnpinInactive;停用 = 移出 + PinInactive。
     只改 package.json 不跑 pnpm(b63884c/aec1e9b);写前备份 + 原子写。"""
     p = os.path.join(profile_dir(profile), "package.json")
@@ -919,6 +933,13 @@ def _pnpm_env():
     return env
 
 
+# 取包超时放宽(C# InstallLocalPlugin/UpgradePlugin 传 --fetch-timeout=600000)。
+# pnpm 的 CLI **不认** `--fetch-timeout`(实测 12.16.1: "unexpected argument"), 但认
+# rc-option 形式 `--config.fetch-timeout=...`; 写在参数**末尾**(不影响调用方按下标取
+# spec)。镜像/网络差时这条决定"卡 60 秒失败"还是"等到取到为止"。
+_NET_FLAGS = ["--config.fetch-timeout=600000"]
+
+
 _PKG_RE = re.compile(r"^(?:@[A-Za-z0-9._~-]+/)?[A-Za-z0-9_~][A-Za-z0-9._~-]*$")
 
 
@@ -928,13 +949,12 @@ def _safe_pkg(name):
 
 
 def _pnpm_add(cwd, name, spec):
-    # 注意: pnpm 的 CLI 不认 --fetch-timeout(那是 npm 参数), 传了会直接
-    # "unexpected argument" 拒绝执行——超时放宽走 .npmrc/PNPM_HOME 配置, 不走这里
     if not _safe_pkg(name):
         return False, "非法包名: %r" % (name,)
     if not procman_which_pnpm():
         return False, "pnpm 不在 PATH(可先在 Node 环境面板一键安装)"
-    r = subprocess.run(["pnpm", "add", name + spec], cwd=cwd, capture_output=True,
+    r = subprocess.run(["pnpm", "add", name + spec] + _NET_FLAGS, cwd=cwd,
+                       capture_output=True,
                        text=True, encoding="utf-8", errors="replace",
                        timeout=900, env=_pnpm_env())
     return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
@@ -948,13 +968,24 @@ def procman_which_pnpm():
 def _pnpm_remove(cwd, name):
     if not _safe_pkg(name):
         return False, "非法包名: %r" % (name,)
-    r = subprocess.run(["pnpm", "remove", name], cwd=cwd, capture_output=True,
+    r = subprocess.run(["pnpm", "remove", name] + _NET_FLAGS, cwd=cwd,
+                       capture_output=True,
                        text=True, encoding="utf-8", errors="replace",
                        timeout=600, env=_pnpm_env())
     return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
 
 
 def upgrade_plugin(profile, name, dsh_dir="", job_log=None):
+    """升级插件; 与装/卸/激活共用 profile 锁(升级 = pnpm remove+add 的变体)。"""
+    if not begin_profile_op(profile, "升级插件 %s" % name):
+        return False, _BUSY_MSG
+    try:
+        return _upgrade_plugin_locked(profile, name, dsh_dir, job_log)
+    finally:
+        end_profile_op(profile)
+
+
+def _upgrade_plugin_locked(profile, name, dsh_dir="", job_log=None):
     """升级插件: 预检(gate/死 peer)→ pnpm add @latest(registry 失败换 npmmirror)
     → 读回实际版本 → 死 peer 依赖声明清理。"""
     prev = preview_plugin_update(profile, name, dsh_dir)
@@ -991,10 +1022,23 @@ def upgrade_plugin(profile, name, dsh_dir="", job_log=None):
 
 
 def uninstall_plugin(profile, name):
-    ok, out = _pnpm_remove(profile_dir(profile), name)
-    if not ok:
-        return False, "pnpm remove 失败: %s" % out[-300:]
-    return True, "已卸载 %s" % name
+    """卸载 = 先停用并锁定(移出 dsh.profile.bundles + pin), 再 pnpm remove。
+
+    C# UninstallPlugin(735-751) 的第一步就是 SetBundleActive(false)。Linux 以前只跑
+    pnpm remove, 于是 bundles 里仍指向已删掉的包 —— DSH 启动/入口补丁全报 entry not
+    found, 下一次审计还会把它当"已启用的插件"来审。
+    """
+    if not begin_profile_op(profile, "卸载插件 %s" % name):
+        return False, _BUSY_MSG
+    try:
+        ok_off, msg_off = set_bundle_active(profile, name, False)
+        ok, out = _pnpm_remove(profile_dir(profile), name)
+        if not ok:
+            return False, ("pnpm remove 失败: %s; bundle 已先停用(%s), 依赖声明未变"
+                           % (out[-300:], msg_off if ok_off else "停用也失败"))
+        return True, "已卸载 %s(%s)" % (name, msg_off)
+    finally:
+        end_profile_op(profile)
 
 
 # ---------------------------------------------------- 本地插件安装(C# InstallLocalPlugin) --
@@ -1282,39 +1326,68 @@ def _pnpm_add_spec(cwd, spec):
     ok, why = _spec_ok(s)
     if not ok:
         return False, why
-    r = subprocess.run(["pnpm", "add", s], cwd=cwd, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", timeout=900, env=_pnpm_env())
+    r = subprocess.run(["pnpm", "add", s] + _NET_FLAGS, cwd=cwd, capture_output=True,
+                       text=True, encoding="utf-8", errors="replace",
+                       timeout=900, env=_pnpm_env())
     return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
 
 
-_INSTALL_LOCKS = {}
-_INSTALL_LOCKS_GUARD = threading.Lock()
-# 正在进行的 profile 级 pnpm 写操作。它们**同步跑在 HTTP 线程里**, 不在 main 的 JOBS
-# 里 —— 而"把 package.json 写到一半服务就退出了"恰是这一族最坏的收尾事故, 所以退出
-# 前必须点名(main._stop_all_and_exit 调 inflight_ops())。
+_PROFILE_LOCKS = {}
+_PROFILE_LOCKS_GUARD = threading.Lock()
+# 正在进行的 profile 级写操作: [描述, 重入深度]。它们**同步跑在 HTTP 线程里**, 不在
+# main 的 JOBS 里 —— 而"把 package.json 写到一半服务就退出了"恰是这一族最坏的收尾事故,
+# 所以退出前必须点名(main._stop_all_and_exit 调 inflight_ops())。
 _INFLIGHT = {}
 
 
-def _install_lock(profile):
-    """同一 profile 的本地安装必须串行(见 install_local_plugin 里的拒绝分支)。"""
-    with _INSTALL_LOCKS_GUARD:
-        return _INSTALL_LOCKS.setdefault(str(profile or ""), threading.Lock())
+def _profile_lock(profile):
+    """同一 profile 的依赖写操作必须串行。
+
+    main.py 是 ThreadingHTTPServer(每请求一线程): 装/卸/升级/激活都会读改写同一份
+    package.json 并对同一个 pnpm project 跑 pnpm, 各自的备份与回滚会互相覆盖(等于丢掉
+    对方刚写好的依赖)。用 **RLock** 是因为 install 内部还会调 set_bundle_active —— 同
+    一线程重入必须放行。C# 不需要锁: 那边靠模态窗口 + 窗口级 _busy + manifest 写回全在
+    UI 线程, 结构上就是串行的。
+    """
+    with _PROFILE_LOCKS_GUARD:
+        return _PROFILE_LOCKS.setdefault(str(profile or ""), threading.RLock())
 
 
-def _mark_inflight(profile, what):
-    with _INSTALL_LOCKS_GUARD:
-        _INFLIGHT[str(profile or "")] = what
+def begin_profile_op(profile, what):
+    """非阻塞拿锁 + 登记在途; 拿不到说明别的插件操作正在跑, 调用方直接回忙。
+
+    宁可明确拒绝也不排队: 一条 HTTP 请求挂 900s 等锁, 用户只会以为界面卡死。
+    """
+    key = str(profile or "")
+    if not _profile_lock(key).acquire(blocking=False):
+        return False
+    with _PROFILE_LOCKS_GUARD:
+        rec = _INFLIGHT.setdefault(key, ["", 0])
+        rec[0] = what
+        rec[1] += 1
+    return True
 
 
-def _clear_inflight(profile):
-    with _INSTALL_LOCKS_GUARD:
-        _INFLIGHT.pop(str(profile or ""), None)
+def end_profile_op(profile):
+    """与 begin_profile_op 成对; 重入时只减深度, 回到 0 才真正放锁。"""
+    key = str(profile or "")
+    with _PROFILE_LOCKS_GUARD:
+        rec = _INFLIGHT.get(key)
+        if rec is None:
+            return
+        rec[1] -= 1
+        if rec[1] <= 0:
+            _INFLIGHT.pop(key, None)
+    _profile_lock(key).release()
 
 
 def inflight_ops():
     """当前在跑的、会改 profile 依赖的动作(退出收尾用)。"""
-    with _INSTALL_LOCKS_GUARD:
-        return ["%s(profile %s)" % (what, key or "?") for key, what in _INFLIGHT.items()]
+    with _PROFILE_LOCKS_GUARD:
+        return ["%s(profile %s)" % (rec[0], key or "?") for key, rec in _INFLIGHT.items()]
+
+
+_BUSY_MSG = "已有插件操作正在进行中, 请等它结束后再试"
 
 
 def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
@@ -1383,13 +1456,11 @@ def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
             shutil.copy2(tgz_src, dest)
         return dest
 
-    if not _install_lock(profile).acquire(blocking=False):
-        # main.py 是 ThreadingHTTPServer, 两个安装请求会并发跑到这里: 各自的备份/回滚会用
-        # "自己进入时"的快照覆盖对方刚写好的依赖(等于丢掉对方装好的包), pnpm 也会同时改
-        # 同一个 project。宁可明确拒绝, 不排队让用户以为卡死。
-        return False, "已有本地插件安装正在进行中, 请等它结束后再试"
+    if not begin_profile_op(profile, "本地插件安装"):
+        # 两个安装并发跑到这里时, 各自的备份/回滚会用"自己进入时"的快照覆盖对方刚写好
+        # 的依赖(等于丢掉对方装好的包), pnpm 也会同时改同一个 project。
+        return False, _BUSY_MSG
     try:
-        _mark_inflight(profile, "本地插件安装")   # 收尾退出时要点名
         if is_dir:
             name, version = _package_identity(src)
             if not name:
@@ -1522,11 +1593,20 @@ def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
     finally:
         if pack_temp:
             shutil.rmtree(pack_temp, ignore_errors=True)
-        _clear_inflight(profile)
-        _install_lock(profile).release()
+        end_profile_op(profile)
 
 
 def exempt_plugin(profile, name, version):
+    """写版本豁免(compatibility.json); 也走 profile 锁, 免得和 pnpm 写回交错。"""
+    if not begin_profile_op(profile, "写插件豁免 %s" % name):
+        return False, _BUSY_MSG
+    try:
+        return _exempt_plugin_locked(profile, name, version)
+    finally:
+        end_profile_op(profile)
+
+
+def _exempt_plugin_locked(profile, name, version):
     """版本豁免写入 compatibility.json(备份失败即中止;29be3c6)。"""
     p = os.path.join(profile_dir(profile), COMPAT_JSON)
     doc = read_json(p, {})

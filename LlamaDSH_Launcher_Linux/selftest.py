@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(150 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(156 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -1106,12 +1106,22 @@ check("装成功后有 dsh.bundle 也要先过激活守卫(审计不兼容就不
 # --- 9) 本轮 review 补: 并发/回滚方向/打包忽略/空值守卫 --------------
 # 9.1 两个安装请求并发(main.py 是 ThreadingHTTPServer, 每请求一线程): 各自的备份与
 #     回滚会把对方刚写好的依赖覆盖掉 —— 等于悄悄丢掉别人装好的包。必须明确拒绝。
-_lk = _compat._install_lock("web")
-_lk.acquire()
+def _hold_lock(lk, secs):
+    """在**另一个线程**里持锁: RLock 可重入, 同线程 acquire 后自己调用是测不出
+    并发拒绝的(第一版断言就是这么假绿的)。"""
+    lk.acquire()
+    time.sleep(secs)
+    lk.release()
+
+
+_lk = _compat._profile_lock("web")
+_h1 = threading.Thread(target=_hold_lock, args=(_lk, 1.5), daemon=True)
+_h1.start()
+time.sleep(0.4)
 ok_conc, msg_conc = _compat.install_local_plugin("web", _tgz)
-_lk.release()
+_h1.join()
 check("并发本地安装被明确拒绝(两个安装不能互相覆盖 package.json)",
-      (not ok_conc) and "已有本地插件安装正在进行中" in msg_conc, msg_conc)
+      (not ok_conc) and "已有插件操作正在进行中" in msg_conc, msg_conc)
 
 # 9.2 pnpm add **成功之后**再出错(典型: 激活写 manifest 时备份失败抛 IOError):
 #     回滚方向是反的, 会把已经装好的包删掉还谎报"安装失败"。只报告, 不回滚。
@@ -1382,13 +1392,13 @@ check("已豁免版本检查但 peer 仍不匹配的包不得自动激活(激活
       _k_ex == [] and _d_ex and "豁免" in _d_ex[0]["reason"], str((_k_ex, _d_ex)))
 
 # 11.6 pnpm 写依赖不在 JOBS 里, 收尾退出时必须能点名
-_compat._mark_inflight("web", "本地插件安装")
+_compat.begin_profile_op("web", "本地插件安装")
 check("正在写依赖的动作要能被收尾点名(同步跑在 HTTP 线程, 不在 JOBS 里)",
       any("本地插件安装" in x for x in _compat.inflight_ops()), str(_compat.inflight_ops()))
-check("在途集合必须成对清理(install 的 finally 里 clear)",
-      "_mark_inflight(profile" in src_ilp and "_clear_inflight(profile)" in src_ilp
-      and '_clear_inflight(profile)' in src_ilp, src_ilp[-120:])
-_compat._clear_inflight("web")
+check("在途登记必须成对清理(install 的 finally 里 end)",
+      "begin_profile_op(profile" in src_ilp and "end_profile_op(profile)" in src_ilp,
+      src_ilp[-120:])
+_compat.end_profile_op("web")
 check("clear 后在途集合必须为空(否则会一直误报有任务在跑)",
       _compat.inflight_ops() == [], str(_compat.inflight_ops()))
 
@@ -1398,6 +1408,63 @@ check("兜底 SIGTERM 后的等待窗要盖住服务端收尾预算(否则把正
       "for _ in range(50)" in _tsrc and "45s" in _tsrc, _tsrc[:100])
 check("杀不掉的(root 属主)服务要点名并给出动作(在所属账号下 sudo kill)",
       "sudo kill" in _tsrc and "属主不是本人" in _tsrc, "")
+
+
+
+# --- 12) 第三轮补: profile 锁覆盖全部写操作 + 卸载必须摘 bundle --------------
+# 12.1 并发保护不能只盖 install: 激活/升级/豁免都会读改写同一份 package.json,
+#      与 pnpm 的写回交错就表现为"激活没生效"或"依赖又回来了"。
+_lk2 = _compat._profile_lock("web")
+_h2 = threading.Thread(target=_hold_lock, args=(_lk2, 1.5), daemon=True)
+_h2.start()
+time.sleep(0.4)
+_busy = []
+for _call in ((lambda: _compat.set_bundle_active("web", "demo-plugin", True), "激活"),
+              (lambda: _compat.upgrade_plugin("web", "demo-plugin"), "升级"),
+              (lambda: _compat.exempt_plugin("web", "demo-plugin", "9.9.9"), "豁免"),
+              (lambda: _compat.uninstall_plugin("web", "demo-plugin"), "卸载")):
+    _ok_b, _msg_b = _call[0]()
+    _busy.append((_call[1], _ok_b, _msg_b))
+_h2.join()
+check("激活/升级/豁免/卸载都要过同一把 profile 锁(与 pnpm 写回不能并发)",
+      all((not _ok) and "已有插件操作正在进行中" in _m for (_n, _ok, _m) in _busy),
+      str(_busy))
+check("锁必须可重入(install 内部会再调 set_bundle_active, 自锁就是安装失败)",
+      "threading.RLock()" in inspect.getsource(_compat._profile_lock), "")
+_op_a = _compat.begin_profile_op("web", "外层动作")
+_op_b = _compat.begin_profile_op("web", "内层动作")
+_ops1 = _compat.inflight_ops()
+_compat.end_profile_op("web")
+_ops2 = _compat.inflight_ops()
+_compat.end_profile_op("web")
+_ops3 = _compat.inflight_ops()
+check("在途登记按重入深度配对: 内层结束不能把外层的点名清掉",
+      _op_a and _op_b and len(_ops1) == 1 and len(_ops2) == 1 and _ops3 == [],
+      str((_ops1, _ops2, _ops3)))
+
+# 12.2 卸载: C# 的第一步是 SetBundleActive(false)。只跑 pnpm remove 会把 bundles 留在
+#      指向已删包上 —— DSH 启动/入口补丁全报 entry not found。
+_before = json.load(open(os.path.join(_prof, "package.json")))
+assert "demo-plugin" in ((_before.get("dsh") or {}).get("profile") or {}).get("bundles"), _before
+_n_rm = len(pnpm_calls)
+_compat.subprocess.run = _fake_pnpm
+ok_un, msg_un = _compat.uninstall_plugin("web", "demo-plugin")
+_compat.subprocess.run = orig_compat_run
+_after = json.load(open(os.path.join(_prof, "package.json")))
+_bundles = ((_after.get("dsh") or {}).get("profile") or {}).get("bundles") or []
+_pinned = _compat.read_pinned_inactive("web")
+_rm_now = [c for c in pnpm_calls[_n_rm:] if c[:2] == ["pnpm", "remove"]]
+check("卸载先停用并锁定: dsh.profile.bundles 里不能留下已卸载的包",
+      ok_un and "demo-plugin" not in _bundles and "demo-plugin" in _pinned,
+      "%s | bundles=%s pinned=%s" % (msg_un, _bundles, _pinned))
+check("停用之后照样要跑 pnpm remove(停用不等于卸载)",
+      len(_rm_now) == 1 and _rm_now[0][2] == "demo-plugin", str(_rm_now))
+
+
+check("pnpm 取包超时要放宽且用 rc-option 写法(pnpm 12 实测 --fetch-timeout 被拒; 参数不能插在 spec 前)",
+      "--config.fetch-timeout=600000" in adds[0] and adds[0][2].startswith("file:")
+      and "--config.fetch-timeout=600000" in _rm_now[0],
+      "%s | %s" % (adds[0], _rm_now[0]))
 
 
 shutil.rmtree(_tmp, ignore_errors=True)
