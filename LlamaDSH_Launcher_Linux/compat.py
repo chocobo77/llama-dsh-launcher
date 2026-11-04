@@ -85,11 +85,26 @@ def write_file_atomic(path, content):
 def read_json(path, default=None):
     try:
         # utf-8-sig: Windows/node 写的 package.json 可能带 BOM, 用 utf-8 读会
-        # 在首字符塞一个 \ufeff → json 解析失败, 于是整个插件被当成"没有 package.json"
+        # 在首字符塞一个 ‌ → json 解析失败, 于是整个插件被当成"没有 package.json"
         with open(path, encoding="utf-8-sig") as f:
             return json.load(f)
     except Exception:
+        # 注意: 传 None **不会**拿到 None —— 兜底是 `default if default is not None else {}`,
+        # 而签名默认就是 None。要区分"文件是空的"与"文件读不动"必须用 read_json_or_none。
         return default if default is not None else {}
+
+
+def read_json_or_none(path):
+    """读 JSON, 失败(不存在/无权限/截断/坏编码)返回 None。
+
+    与 read_json 的区别就是那个 None: 凡是据此判断"这个文件到底能不能核对"的地方
+    (插件启停状态、市场停用记录)都必须用本函数, 用 read_json 会把读不动当成空内容。
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def write_json_atomic(path, doc, backup=False):
@@ -445,13 +460,20 @@ def plugin_check(dsh_dir, log):
     bundles = set(_manifest_bundles())
     disabled = set()
     state_p = os.path.join(profile_dir(), ".dsh-market", "state.json")
+    state_why = ""
     if os.path.isfile(state_p):
         try:
             with open(state_p, encoding="utf-8") as f:
                 disabled = set((json.load(f) or {}).get("disabled") or [])
-        except Exception:
-            pass
+        except Exception as ex:
+            # 读不动不等于"没有被停用的插件": 静默当成空集合, 被市场停用的插件会全部
+            # 显示成正常状态, 用户据此以为插件都在跑。
+            state_why = "%s: %s" % (type(ex).__name__, str(ex)[:80])
+            items.append({"name": "dsh-market",
+                          "note": "⚠ state.json 读不动(%s), 本次无法核对哪些插件被市场停用"
+                                  % state_why})
     count = 0
+    unreadable = []
     for pat in (os.path.join(base, "*"), os.path.join(base, "@*", "*")):
         for pdir in glob.glob(pat):
             pj = os.path.join(pdir, "package.json")
@@ -460,7 +482,11 @@ def plugin_check(dsh_dir, log):
             try:
                 with open(pj, encoding="utf-8") as f:
                     doc = json.load(f)
-            except Exception:
+            except Exception as ex:
+                # 以前这里 continue: 一个被截断/带 BOM/权限不对的 package.json 会让该插件
+                # **从列表里消失**, 结尾还照报"共扫描 N 个插件" —— 坏插件被扫成不存在。
+                unreadable.append((os.path.relpath(pdir, base),
+                                   "%s: %s" % (type(ex).__name__, str(ex)[:80])))
                 continue
             name = doc.get("name") or ""
             if not name or name.startswith("@types"):
@@ -479,8 +505,16 @@ def plugin_check(dsh_dir, log):
             if os.path.islink(pdir) and not os.path.exists(pdir):
                 status.append("✗ 失效链接")
             items.append({"name": name, "note": "; ".join(status) or "已安装(%s)" % link})
-    log("[插件] 共扫描 %d 个插件" % count)
-    return {"items": items, "count": count}
+    for rel, why in unreadable:
+        items.append({"name": rel,
+                      "note": "⚠ package.json 读不动(%s), 无法判定该插件状态" % why})
+    if unreadable:
+        log("[插件] ⚠ %d 个插件目录的 package.json 读不动(不计入上面的计数): %s"
+            % (len(unreadable), ", ".join("%s(%s)" % r for r in unreadable[:5])))
+    log("[插件] 共扫描 %d 个插件%s" % (count, "、另有 %d 个未能核对" % len(unreadable)
+                                       if unreadable else ""))
+    return {"items": items, "count": count, "unreadable": [r[0] for r in unreadable],
+            "market_state_unreadable": bool(state_why)}
 
 
 # ============================================================ Semver 判定 ==
@@ -824,8 +858,11 @@ def audit_plugins(profile="web", dsh_dir=""):
     deps = manifest.get("dependencies") or {}
     exempt_doc = read_json(os.path.join(pdir, COMPAT_JSON), {})
     pinned = set(read_pinned_inactive(profile))
-    market_doc = read_json(os.path.join(pdir, ".dsh-market", "state.json"), {})
-    market_disabled = set(market_doc.get("disabled") or [])
+    # None 与 {} 必须分开: {} 是"没有被停用的插件", None 是"读不动"。读不动时每个插件的
+    # 启用/停用判定都没有依据, 静默当成 {} 会把被市场停用的插件一律显示成"已启用"。
+    _mp = os.path.join(pdir, ".dsh-market", "state.json")
+    market_doc = read_json_or_none(_mp) if os.path.isfile(_mp) else {}
+    market_disabled = set((market_doc or {}).get("disabled") or [])
     ver = get_dsh_version(dsh_dir)
     out = []
     # 只列直接依赖(用户/市场安装的插件);pnpm 传递依赖(argparse/undici 等)
@@ -839,7 +876,23 @@ def audit_plugins(profile="web", dsh_dir=""):
             try:
                 with open(pj, encoding="utf-8") as f:
                     doc = json.load(f)
-            except Exception:
+            except Exception as ex:
+                # 依赖里声明了它, 但 package.json 读不动(截断/带 BOM/权限/磁盘满): 以前
+                # 直接 continue ⇒ 插件列表里**整个插件消失**, 面板显示"没有这个插件",
+                # 用户只会看到 DSH 启动时它加载失败。必须作为 error 条目列出来。
+                rel = os.path.relpath(pdir_, base)
+                if rel in direct_deps:
+                    out.append({
+                        "name": rel, "version": "?", "dir": pdir_,
+                        "state_label": "无法核对", "spec": deps.get(rel, "") or "(bundle)",
+                        "in_bundles": rel in in_bundles, "installed": True,
+                        "compatible": False, "exempted": False, "peer_issues": [],
+                        "dead_peers": [], "missing_specs": [],
+                        "errors": ["package.json 读不动(%s: %s)"
+                                   % (type(ex).__name__, str(ex)[:100])],
+                        "locked": rel in pinned,
+                        "disabled_by_market": rel in market_disabled,
+                    })
                 continue
             name = doc.get("name") or ""
             if not name or name.startswith("@types"):
@@ -894,6 +947,15 @@ def audit_plugins(profile="web", dsh_dir=""):
                 "locked": name in pinned,
                 "disabled_by_market": name in market_disabled,
             })
+    if market_doc is None:
+        out.append({
+            "name": ".dsh-market/state.json", "version": "?", "dir": _mp,
+            "state_label": "无法核对", "spec": "", "in_bundles": False,
+            "installed": False, "compatible": False, "exempted": False,
+            "peer_issues": [], "dead_peers": [], "missing_specs": [],
+            "errors": ["市场停用记录读不动 → 各插件的启用/停用状态本次未能核对"],
+            "locked": False, "disabled_by_market": False,
+        })
     out.sort(key=lambda x: (0 if x["in_bundles"] else 1, x["name"]))
     return out
 

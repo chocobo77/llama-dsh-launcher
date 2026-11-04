@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(215 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(222 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -2295,6 +2295,90 @@ if _old_home_env9 is None:
     os.environ.pop("DSH_HOME", None)
 else:
     os.environ["DSH_HOME"] = _old_home_env9
+
+
+# --- 19) 第十轮: 插件扫描里的静默跳过(package.json 读不动 ⇒ 插件"不存在") -------
+# 19.1 面板的 🧩 按钮走 audit_plugins: 一个被截断/带 BOM/权限不对的 package.json 以前
+#      直接 continue ⇒ 该插件从列表里**消失**, 用户只会看到 DSH 启动时它加载失败。
+_p19 = _prof
+_dsh19 = _dsh9
+os.makedirs(os.path.join(_p19, "node_modules", "good-plugin"), exist_ok=True)
+os.makedirs(os.path.join(_p19, "node_modules", "broken-plugin"), exist_ok=True)
+with open(os.path.join(_p19, "package.json"), "w", encoding="utf-8") as fh:
+    json.dump({"name": "profile-web", "version": "1.0.0",
+               "dependencies": {"good-plugin": "^1.0.0", "broken-plugin": "^1.0.0"}}, fh)
+with open(os.path.join(_p19, "node_modules", "good-plugin", "package.json"), "w",
+          encoding="utf-8") as fh:
+    json.dump({"name": "good-plugin", "version": "1.0.0"}, fh)
+_broken_pj19 = os.path.join(_p19, "node_modules", "broken-plugin", "package.json")
+with open(_broken_pj19, "w", encoding="utf-8") as fh:
+    fh.write('{"name": "broken-plugin", "version": "1.0.0"')      # 截断(写盘被中断)
+_rows19 = {r["name"]: r for r in _compat.audit_plugins("web", _dsh19)}
+check("审计必须把 package.json 读不动的已声明插件列成 error 行(旧版整个插件从列表消失)",
+      "broken-plugin" in _rows19
+      and any("package.json 读不动" in e for e in _rows19.get("broken-plugin", {}).get("errors", [])),
+      str(sorted(_rows19)))
+check("对照: 正常插件不得被牵连(good-plugin 仍无 error)",
+      "good-plugin" in _rows19 and not _rows19["good-plugin"]["errors"],
+      str(_rows19.get("good-plugin")))
+
+# 19.2 .dsh-market/state.json 读不动时, 哪些插件被停用整项失去依据: 以前 read_json
+#      返回 {}, 与没有被停用的情况同形 ⇒ 被市场停用的插件一律显示成已启用。
+os.makedirs(os.path.join(_p19, ".dsh-market"), exist_ok=True)
+with open(os.path.join(_p19, ".dsh-market", "state.json"), "w", encoding="utf-8") as fh:
+    fh.write("not json at all\n")
+_bad19 = {r["name"]: r for r in _compat.audit_plugins("web", _dsh19)}
+with open(os.path.join(_p19, ".dsh-market", "state.json"), "w", encoding="utf-8") as fh:
+    json.dump({"disabled": ["good-plugin"]}, fh)
+_ok19 = {r["name"]: r for r in _compat.audit_plugins("web", _dsh19)}
+check("市场停用记录读不动必须单独成行说明(不能当成没有被停用)",
+      ".dsh-market/state.json" in _bad19
+      and any("未能核对" in e for e in _bad19.get(".dsh-market/state.json", {}).get("errors", [])),
+      str(sorted(_bad19)))
+check("对照: state.json 正常时停用状态照旧反映, 且不产生未能核对行",
+      ".dsh-market/state.json" not in _ok19
+      and _ok19.get("good-plugin", {}).get("disabled_by_market") is True, str(sorted(_ok19)))
+
+# 19.3 plugin_check(C# 智能检测的同名实现, 目前未接线但语义必须一致): 计数与列表都要
+#      反映没扫成, 而不是把坏插件当成不存在。
+_log19 = []
+_res_bad19 = _compat.plugin_check(_dsh19, _log19.append)
+with open(_broken_pj19, "w", encoding="utf-8") as fh:
+    json.dump({"name": "broken-plugin", "version": "1.0.0"}, fh)
+_res_ok19 = _compat.plugin_check(_dsh19, _log19.append)
+with open(_broken_pj19, "w", encoding="utf-8") as fh:
+    fh.write('{"name": "broken-plugin", "version": "1.0.0"')
+with open(os.path.join(_p19, ".dsh-market", "state.json"), "w", encoding="utf-8") as fh:
+    fh.write("{oops\n")
+_res_ms19 = _compat.plugin_check(_dsh19, _log19.append)
+with open(os.path.join(_p19, ".dsh-market", "state.json"), "w", encoding="utf-8") as fh:
+    json.dump({"disabled": []}, fh)
+check("检测: 读不动的插件目录要列出来并从计数里排除(修好后计数应 +1)",
+      "broken-plugin" in _res_bad19.get("unreadable", [])
+      and _res_ok19["count"] == _res_bad19["count"] + 1
+      and any("未能核对" in t for t in _log19),
+      "bad=%s ok=%s" % (_res_bad19["count"], _res_ok19["count"]))
+check("检测: state.json 读不动必须报出来(market_state_unreadable + 列表里说明)",
+      _res_ms19.get("market_state_unreadable") is True
+      and any("state.json" in str(x["note"]) for x in _res_ms19["items"]),
+      str(_res_ms19["items"][:3]))
+
+# 19.4 本轮自己踩到的坑, 钉成断言: read_json(path, None) 的兜底是
+#      `default if default is not None else {}`, 传 None 等于传默认 ⇒ 失败也给 {}。
+#      想区分"文件是空的"与"文件读不动"必须用 read_json_or_none, 否则又是假绿。
+_trap19 = os.path.join(_tmp, "trap19.json")
+with open(_trap19, "w", encoding="utf-8") as fh:
+    fh.write("{broken")
+_empty19 = os.path.join(_tmp, "empty19.json")
+with open(_empty19, "w", encoding="utf-8") as fh:
+    fh.write("{}")
+check("read_json(p, None) 读不动时仍返回 {}(传 None 不等于要 None), 必须用 read_json_or_none",
+      _compat.read_json(_trap19, None) == {}
+      and _compat.read_json_or_none(_trap19) is None
+      and _compat.read_json_or_none(_empty19) == {}
+      and _compat.read_json_or_none(os.path.join(_tmp, "nope19.json")) is None,
+      str((_compat.read_json(_trap19, None), _compat.read_json_or_none(_trap19),
+          _compat.read_json_or_none(_empty19))))
 
 # --- 17) 自检自身的边界: 不得污染用户真实的日志目录 ---------------------------
 # 17.1 以前 selftest 直接往 ~/.dsh_launcher_logs 写: 每跑一次就多出几条测试噪声
