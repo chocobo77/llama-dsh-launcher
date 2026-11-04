@@ -3,6 +3,8 @@
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
+注意: 本机没有 Xvfb/输入注入工具, traydialog 的退出码契约只能真弹一次窗
+      (约 0.2s 一闪), 否则那 4 项只能空转。
 每项断言都对应一个真实踩过的坑, 修 bug 前先跑它, 修完再跑它。"""
 import io
 import json
@@ -505,6 +507,161 @@ else:
     line = [l for l in sig.splitlines() if "LayoutUpdated" in l]
     check("LayoutUpdated 信号签名符合规范(uu→ui)",
           bool(line) and "ui" in line[0], str(line))
+
+# --- 7) "打开 Web" 与 托盘退出的二次确认 ---
+import inspect
+import tray as _tray
+
+
+class _Fake:
+    """只带被测方法所需属性的替身(不建总线对象、不跑主循环)。"""
+    MENU_SHOW, MENU_LIGHT, MENU_QUIT, MENU_SEP = 1, 2, 3, 4
+    BTN_SERVICES = _tray.TrayIcon.BTN_SERVICES
+    BTN_CLIENT = _tray.TrayIcon.BTN_CLIENT
+    BTN_CANCEL = _tray.TrayIcon.BTN_CANCEL
+    lightweight = True
+
+    def __init__(self):
+        self.calls = []
+        self._exiting = False
+
+    def on_show(self):
+        self.calls.append("show")
+
+    def on_quit(self):
+        self.calls.append("quit")
+
+    def _close_window(self):
+        self.calls.append("close_window")
+
+    def _stop_all_then_quit(self):
+        self.calls.append("stop_all")
+
+    def _server_alive(self):
+        return False
+
+
+lay = _tray.TrayIcon._layout(_Fake())
+check("托盘菜单最后一行是“退出”(退出方式挪到二次确认)",
+      lay[2][-1][1].get("label") == "退出", str(lay[2][-1]))
+src_fire = inspect.getsource(_tray.TrayIcon._fire)
+check("点“退出”走 ask_exit 而不是直接退出",
+      "self.MENU_QUIT: self.ask_exit" in src_fire and "MENU_QUIT: self.on_quit" not in src_fire,
+      src_fire.strip()[:120])
+
+# ask_exit 必须把三选按约定顺序交给一次性确认框子进程
+captured = {}
+orig_run = _tray.subprocess.run
+
+
+def _fake_run(argv, **kw):
+    captured["argv"] = list(argv)
+
+    class _R:
+        returncode, stdout, stderr = 1, "", ""
+    return _R()
+
+
+_tray.subprocess.run = _fake_run
+_f = _Fake()
+_tray.TrayIcon.ask_exit(_f)
+for _ in range(40):
+    if captured.get("argv"):
+        break
+    time.sleep(0.05)
+_tray.subprocess.run = orig_run
+argv = captured.get("argv") or []
+check("确认框由一次性子进程弹(不在 D-Bus 主线程里等 GTK)",
+      len(argv) > 1 and os.path.basename(argv[1]) == "traydialog.py", str(argv[:3]))
+check("二次确认三选顺序 = 关闭服务并退出 / 退出 / 取消",
+      argv[-3:] == [_Fake.BTN_SERVICES, _Fake.BTN_CLIENT, _Fake.BTN_CANCEL], str(argv[-3:]))
+
+for choice, expect in ((_Fake.BTN_CANCEL, []),
+                       (_Fake.BTN_CLIENT, ["close_window", "quit"]),
+                       (_Fake.BTN_SERVICES, ["stop_all"])):
+    g = _Fake()
+    _tray.TrayIcon._do_exit(g, choice, 0, "")
+    time.sleep(0.3)
+    check("选择“%s” → %s" % (choice, expect or "无动作"), g.calls == expect, str(g.calls))
+g = _Fake()
+_buf = io.StringIO()
+_stdout = sys.stdout
+sys.stdout = _buf
+try:
+    _tray.TrayIcon._do_exit(g, "", 2, "GTK3 不可用")
+finally:
+    sys.stdout = _stdout
+check("确认框弹不出来(rc=2)时既不退出也要把原因留在日志",
+      g.calls == [] and "无法显示" in _buf.getvalue(),
+      "%s | %s" % (g.calls, _buf.getvalue()[:80]))
+
+# "关闭服务并退出"必须先让服务端停 llama+DSH
+opened_urls = []
+orig_urlopen = _tray.urllib.request.urlopen
+
+
+class _Resp:
+    def read(self):
+        return b"{}"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _fake_urlopen(req, timeout=None):
+    opened_urls.append(getattr(req, "full_url", str(req)))
+    return _Resp()
+
+
+_tray.urllib.request.urlopen = _fake_urlopen
+g = _Fake()
+g.base_url = "http://127.0.0.1:1"
+threading.Thread(target=lambda: _tray.TrayIcon._stop_all_then_quit(g)).start()
+time.sleep(1.0)
+_tray.urllib.request.urlopen = orig_urlopen
+check("“关闭服务并退出”先 POST /api/shutdown",
+      any(u.endswith("/api/shutdown") for u in opened_urls), str(opened_urls))
+
+main_src = open(os.path.join(APP, "main.py"), encoding="utf-8").read()
+check("服务端有 /api/shutdown 路由", '("shutdown",): api_shutdown' in main_src)
+i0 = main_src.index("def api_shutdown")
+shut_src = main_src[i0:i0 + 1200]
+check("/api/shutdown 停完 llama.cpp 与 DSH 才自尽(顺序不能反)",
+      shut_src.index("os._exit") > shut_src.index("LLAMA") and "DSH" in shut_src,
+      shut_src[:60])
+check("open/dsh 由服务端交系统浏览器(WebKit 客户端里 window.open 会被静默吞掉)",
+      "def _open_external" in main_src and '"opened": opened' in main_src)
+check("_open_external 只接 http/https(不把任意串交给 xdg-open)",
+      'url.startswith(("http://", "https://"))' in main_src)
+appjs = open(os.path.join(APP, "webui", "app.js"), encoding="utf-8").read()
+j0 = appjs.index('$("btnOpenDsh").onclick')   # 第一处是 disabled 赋值, 要的是点击处理
+seg = appjs[j0:j0 + 420]
+check("前端不再把 window.open 当唯一出路(服务端开不成才回落, 失败要可见)",
+      "r.opened" in seg and "showNotice" in seg, seg[:120])
+cli = open(os.path.join(APP, "client.py"), encoding="utf-8").read()
+check("客户端接了 WebKit create 信号(window.open/_blank 交系统浏览器)",
+      'web.connect("create", _on_create)' in cli)
+
+# traydialog 的退出码契约: 0=选中并把标签写 stdout / 2=无显示环境
+td = os.path.join(APP, "traydialog.py")
+r = subprocess.run([sys.executable, td, "--check"], capture_output=True, text=True, timeout=30)
+check("traydialog --check: 本机 GTK3 与显示可用", r.returncode == 0, r.stderr[:120])
+r = subprocess.run([sys.executable, td, "--respond", _Fake.BTN_CLIENT, "--delay", "0.2",
+                    "T", "B", _Fake.BTN_SERVICES, _Fake.BTN_CLIENT, _Fake.BTN_CANCEL],
+                   capture_output=True, text=True, timeout=30)
+check("traydialog 回传选中标签原文且退出码 0",
+      r.returncode == 0 and r.stdout.strip() == _Fake.BTN_CLIENT,
+      "rc=%s out=%r" % (r.returncode, r.stdout[:60]))
+check("traydialog 弹窗成功在 stderr 留痕(没有输入注入工具时唯一取证)",
+      "已弹出" in r.stderr, r.stderr[:120])
+r = subprocess.run([sys.executable, td, "T", "B", _Fake.BTN_CLIENT],
+                   capture_output=True, text=True, timeout=30,
+                   env={"HOME": os.path.expanduser("~"), "PATH": os.environ.get("PATH", "")})
+check("无显示环境 → 退出码 2(调用方据此提示, 而不是'点了没反应')",
+      r.returncode == 2 and "无显示" in r.stderr, "rc=%s %s" % (r.returncode, r.stderr[:80]))
 
 print()
 if FAILS:

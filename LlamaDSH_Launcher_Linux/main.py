@@ -528,8 +528,56 @@ def api_open_logs(_):
         return {"error": str(ex)}
 
 
+def _open_external(url):
+    """交系统默认浏览器打开(仅 http/https), 返回是否成功交出去。
+
+    "打开 Web" 这类动作必须由**服务端**做, 不能只靠前端 window.open ——
+    主窗口是 WebKit2 客户端, 未处理 create 信号时 window.open 会被静默吞掉,
+    表现就是"按钮点了没反应"(而在浏览器里打开同一页面时它又能用, 所以只改一边不够)。
+    """
+    if not url.startswith(("http://", "https://")):
+        return False
+    try:
+        if webbrowser.open(url):
+            return True
+    except Exception:
+        pass
+    try:  # 无 $BROWSER/部分桌面下 webbrowser 会失败, xdg-open 兜底
+        p = subprocess.Popen(["xdg-open", url], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.6)
+        return p.poll() is None or p.returncode == 0
+    except Exception:
+        return False
+
+
 def api_open_dsh(_):
-    return {"url": "http://127.0.0.1:%d" % DSH_PORT}
+    """与 Windows 版 OpenDsh_Click 同语义: 由程序把 DSH 首页交系统默认浏览器。"""
+    url = "http://127.0.0.1:%d" % DSH_PORT
+    opened = _open_external(url)
+    HUB.log("[DSH] %s Web: %s" % ("已交系统浏览器打开" if opened else "打开失败", url))
+    return {"url": url, "opened": opened}
+
+
+def api_shutdown(body):
+    """托盘"关闭服务并退出": 停 llama.cpp 与 DSH, 然后服务进程自身退出。
+
+    先把响应送达再动手(0.8s): 否则调用方只看到连接断开,
+    分不清是"退出成功"还是"请求失败"。
+    """
+    HUB.log("[退出] 关闭服务并退出: 停止 llama.cpp 与 DSH…")
+
+    def later():
+        for name, runner in (("llama.cpp", LLAMA), ("DSH", DSH)):
+            try:
+                runner.stop()
+            except Exception as ex:
+                HUB.log("[退出] 停止 %s 失败: %s" % (name, ex))
+        HUB.log("[退出] 服务进程退出")
+        os._exit(0)
+
+    threading.Timer(0.8, later).start()
+    return {"ok": True}
 
 
 def api_convert_start(body):
@@ -858,6 +906,7 @@ ROUTES = {
     ("logs/clear",): api_logs_clear,
     ("open/logs",): api_open_logs,
     ("open/dsh",): api_open_dsh,
+    ("shutdown",): api_shutdown,
     ("convert/start",): api_convert_start,
     ("browse",): api_browse,
     ("monitor",): api_monitor,

@@ -1562,7 +1562,16 @@ function wire() {
   $("btnLlamaStop").onclick = () => api("llama/stop");
   $("btnDshStart").onclick = startDsh;
   $("btnDshStop").onclick = () => api("dsh/stop");
-  $("btnOpenDsh").onclick = async () => { const r = await api("open/dsh"); window.open(r.url, "_blank"); };
+  $("btnOpenDsh").onclick = async () => {
+    // 主窗口是 WebKit2 客户端, 弹窗会被吞掉 → 优先让服务端交系统默认浏览器;
+    // 服务端交不出去(无桌面/无浏览器)时才回落到前端 window.open(浏览器模式下可用)。
+    try {
+      const r = await api("open/dsh");
+      if (!r.opened && r.url && !window.open(r.url, "_blank")) {
+        showNotice("打不开浏览器, 请手动访问 " + r.url, true);
+      }
+    } catch (e) { showNotice("打开 DSH 失败: " + e.message, true); }
+  };
   $("btnRebuildDsh").onclick = async () => {
     const v = await showModal({
       title: "重建 DSH(全量三步)",

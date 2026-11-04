@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import json
+import signal
 import argparse
 import threading
 import subprocess
@@ -26,6 +27,13 @@ try:
 except Exception:
     dbus = None
     _DBUS_OK = False
+
+try:
+    # 托盘的 stdout 平时被重定向进日志文件 → CPython 默认块缓冲,
+    # 诊断信息会长时间看不见(本轮排查就被它骗过一次"什么都没打印")
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_DIR)
@@ -49,6 +57,8 @@ class TrayIcon:
     """
 
     MENU_SHOW, MENU_LIGHT, MENU_QUIT, MENU_SEP = 1, 2, 3, 4
+    # "退出"的二次确认三选(确认框按标签回传, 所以标签即协议值, 见 traydialog.py)
+    BTN_SERVICES, BTN_CLIENT, BTN_CANCEL = "关闭服务并退出", "退出", "取消"
 
     def __init__(self, base_url, on_show, on_quit):
         self.base_url = base_url
@@ -57,6 +67,7 @@ class TrayIcon:
         self.lightweight = False
         self.revision = 1
         self.xdg_token = ""
+        self._exiting = False   # 确认框在弹/退出流程进行中(防重复弹)
         self.bus = dbus.SessionBus()
         # 规范: org.kde.StatusNotifierItem-<pid>(不能把带 . : 的 URL 拼进总线名)
         self.name = "org.kde.StatusNotifierItem-%d" % os.getpid()
@@ -112,14 +123,17 @@ class TrayIcon:
                                "toggle-type": "checkmark",
                                "toggle-state": 1 if self.lightweight else 0}, []),
             (self.MENU_SEP, {"type": "separator"}, []),  # id 0 保留给根, 分隔线需独立 id
-            (self.MENU_QUIT, {"label": "退出托盘助手(窗口/服务/llama/DSH 不受影响)"}, []),
+            # 真正的退出方式在二次确认里选(关闭服务并退出 / 退出 / 取消),
+            # 菜单这一行本身不再隐含"只退托盘"的语义
+            (self.MENU_QUIT, {"label": "退出"}, []),
         ])
 
     def _fire(self, item_id):
         from gi.repository import GLib
         fn = {self.MENU_SHOW: self.on_show,
               self.MENU_LIGHT: self.toggle_light,
-              self.MENU_QUIT: self.on_quit}.get(item_id)
+              # 不是直接退出: 先二次确认(见 ask_exit), 否则一键就灭掉托盘没有反悔机会
+              self.MENU_QUIT: self.ask_exit}.get(item_id)
         if fn:
             GLib.idle_add(fn)
 
@@ -148,6 +162,95 @@ class TrayIcon:
             except Exception as ex:
                 print("[tray] 轻量化切换失败: %s" % ex)
         threading.Thread(target=post, daemon=True).start()
+
+    # ---- 退出(菜单"退出" → 二次确认三选) ----
+    def ask_exit(self):
+        """点"退出"先弹确认框(traydialog.py 一次性子进程), 选完才动手。
+
+        确认框不能在 D-Bus 主线程里等: 那会卡死主循环, 托盘图标当场失联,
+        宿主还会以为我们死了。所以子进程放后台线程, 结果用 idle_add 回主线程。
+        """
+        if self._exiting:
+            return
+        self._exiting = True
+
+        def worker():
+            rc, out, err = 2, "", ""
+            try:
+                p = subprocess.run(
+                    [sys.executable, os.path.join(APP_DIR, "traydialog.py"),
+                     "退出 LlamaDSH 启动器",
+                     "“退出”只关掉本客户端(托盘助手与主窗口),"
+                     " llama.cpp 与 DSH 继续运行;\n"
+                     "“关闭服务并退出”先停止 llama.cpp 与 DSH, 再退出客户端与本地服务。",
+                     self.BTN_SERVICES, self.BTN_CLIENT, self.BTN_CANCEL],
+                    capture_output=True, text=True, timeout=300)
+                rc, out, err = p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+            except Exception as ex:
+                err = str(ex)
+            from gi.repository import GLib
+            GLib.idle_add(self._do_exit, out, rc, err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _do_exit(self, choice, rc, err):
+        self._exiting = False
+        if choice in (self.BTN_CANCEL, ""):
+            if choice or rc != 2:
+                return                      # 用户取消(或关窗) —— 什么都不做
+            # 确认框弹不出来(无桌面/GTK 缺失)必须讲清楚, 否则又像"点了没反应"
+            print("[tray] 退出确认框无法显示: %s" % (err or "未知原因"))
+            return
+        if choice == self.BTN_SERVICES:
+            print("[tray] %s: 停止 llama.cpp 与 DSH…" % choice)
+            threading.Thread(target=self._stop_all_then_quit, daemon=True).start()
+        else:
+            print("[tray] %s: 仅退出客户端(llama.cpp/DSH/服务不动)" % choice)
+            self._close_window()
+            self.on_quit()
+        return False                        # idle_add 只跑一次
+
+    def _stop_all_then_quit(self):
+        """"关闭服务并退出": POST /api/shutdown(服务端停 llama+DSH 后自尽),
+        确认服务真的没了再收托盘 —— 否则用户会看到"托盘没了但 llama 还在跑"。"""
+        try:
+            req = urllib.request.Request(
+                self.base_url + "/api/shutdown", data=b"{}",
+                headers={"Content-Type": "application/json", "X-Auth": _api_token()})
+            urllib.request.urlopen(req, timeout=15)
+        except Exception as ex:
+            print("[tray] 关闭服务请求未送达: %s" % ex)
+        deadline = time.time() + 45         # 停止 llama/DSH 本身可能要几秒
+        while time.time() < deadline and self._server_alive():
+            time.sleep(0.5)
+        if self._server_alive():
+            # 兜底: 服务没自尽(老服务无 /api/shutdown 等), 按 /proc 找出来终止
+            pids = _find_py_pids("main.py")
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            print("[tray] 服务未自行退出, 已发 SIGTERM: %s" % (pids or "未找到进程"))
+        self._close_window()
+        from gi.repository import GLib
+        GLib.idle_add(self.on_quit)
+
+    def _server_alive(self):
+        try:
+            with urllib.request.urlopen(self.base_url + "/api/status", timeout=1.5) as r:
+                json.loads(r.read().decode("utf-8", "replace"))
+            return True
+        except Exception:
+            return False
+
+    def _close_window(self):
+        """关掉主窗口进程(若开着): 走它自己的 SIGTERM 收尾路径。"""
+        for pid in _find_py_pids("client.py"):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
 
 
 if _DBUS_OK:
@@ -383,6 +486,30 @@ def _layout_node(node, depth, variant=False):
 
 
 
+
+
+def _find_py_pids(script):
+    """按 /proc 找在跑的 <script> 进程(用于收主窗口进程 / 兜底终止服务)。
+
+    不用 pgrep -f: 它的正则会被包裹 shell 自己的命令行命中(本轮踩过一次,
+    结果把自己杀掉且没有任何输出); 这里再校验 comm 是 python, bash 壳必然排除。
+    """
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/comm" % entry, encoding="utf-8", errors="replace") as fh:
+                comm = fh.read().strip()
+            if not comm.startswith("python"):
+                continue
+            with open("/proc/%s/cmdline" % entry, "rb") as fh:
+                args = fh.read().split(b"\0")
+            if any(os.path.basename(a.decode("utf-8", "ignore")) == script for a in args):
+                pids.append(int(entry))
+        except OSError:
+            continue
+    return pids
 
 
 def _spawn_window(base_url):

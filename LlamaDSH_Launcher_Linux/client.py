@@ -22,6 +22,13 @@ import threading
 import subprocess
 import urllib.request
 
+try:
+    # 窗口进程常由托盘以 stdout→日志文件 的方式拉起, 默认块缓冲会让
+    # "[client] …" 这类诊断迟迟不落盘(排查时像"什么都没发生")
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_DIR)
 import appicon   # noqa: E402  图标自举(hicolor 主题 + 窗口/托盘图标统一)
@@ -157,8 +164,10 @@ def run_gtk(base_url):
         except Exception:
             pass
         web = WebKit2.WebView()
-        # 外部链接(http://127.0.0.1:3080 等)交给系统浏览器打开
+        # 外部链接(http://127.0.0.1:3080 等)交给系统浏览器打开;
+        # 弹窗(window.open/_blank)走 create 信号, 不接就会被静默吞掉
         web.connect("decide-policy", _on_policy)
+        web.connect("create", _on_create)
         sw = Gtk.ScrolledWindow()
         sw.add(web)
         win.add(sw)
@@ -210,6 +219,29 @@ def run_gtk(base_url):
         except Exception:
             pass
         decision.ignore()
+
+    def _on_create(_web, action):
+        """window.open / target=_blank 触发的是 **create** 信号(不是 decide-policy)。
+
+        不接这个信号时 WebKit 取不到新 WebView, 于是把弹窗**静默丢弃** ——
+        前端按钮"点了没反应"正是这个原因(decide-policy 只管导航, 管不到弹窗)。
+        统一交系统浏览器, 且返回 None 表示不新建窗口。
+        """
+        uri = ""
+        try:
+            uri = action.get_uri()          # 新版 WebKitGTK
+        except Exception:
+            try:
+                uri = action.get_request().get_uri()
+            except Exception:
+                pass
+        if uri:
+            try:
+                subprocess.Popen(["xdg-open", uri], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        return None
 
     def show_window():
         build_window()
