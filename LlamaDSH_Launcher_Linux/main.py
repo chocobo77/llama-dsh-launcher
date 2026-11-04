@@ -506,6 +506,11 @@ def api_status(_):
                     "llama_status": LLAMA.status, "dsh_status": DSH.status,
                     "breaker_triggered": MON.breaker_triggered,
                     "breaker_pct": MON.snapshot.get("vram", {}).get("pct", 0),
+                    # 这帧显存/熔断数字的年龄: 轻量化休眠分支不重新采样, 不给出年龄就等于
+                    # 把几小时前的显存当成"现在" (与"查不到 ≠ 知道"同一族)
+                    "sampled_at": MON.snapshot.get("sampled_at"),
+                    "snapshot_age": (round(time.time() - MON.snapshot["sampled_at"], 1)
+                                     if MON.snapshot.get("sampled_at") else None),
                     "vram": MON.snapshot.get("vram", {"used": 0, "total": 0, "pct": 0})},
         "profile": name,
         "lightweight": MON.lightweight,
@@ -734,8 +739,13 @@ def api_lightweight(body):
 
 
 def api_monitor(body):
-    """监测页快照(3s 轮询)。打点 monitor_visible 以启用 3s 快速采样。"""
+    """监测页快照(3s 轮询)。打点 monitor_visible 以启用 3s 快速采样。
+
+    打点同时记下时刻: 页面关掉时那句 visible:false 不一定发得出(卸载时的 fetch 不可靠),
+    粘滞的 True 会让 30s 空转档与轻量化都进不去 —— 采样端按 8s 时效判定(见 Monitor._watched)。
+    """
     MON.monitor_visible = bool(body.get("visible", True))
+    MON.monitor_seen_at = time.time() if MON.monitor_visible else 0.0
     return MON.snapshot
 
 

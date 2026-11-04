@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(265 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(280 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -3003,6 +3003,234 @@ _tray.urllib.request.urlopen = _real_url22
 check("对照: 读不到服务时保持现状, 不得当成\"没开\"(勾会自己跳掉)",
       _ft22b.lightweight is True, str(_ft22b.lightweight))
 
+
+# --- 23) 第十四轮: 监控线程会死 / 轻量化吞掉"有人在看" / 磁盘数字口径 -------------
+# 23.1 loop 末尾的 time.sleep(interval): 首拍在赋值**之前**抛异常(读 /proc、端口探测抖动),
+#      interval 就未绑定 ⇒ UnboundLocalError 把整条监控线程杀掉(HEAD 实测线程存活=False)。
+#      后果: 监控页永远停在最后一帧, 而显存熔断的判定就跑在这个循环里 —— 熔断从此失效且
+#      毫无提示。同时同类错误 3s 刷一条会刷爆 error.log。
+class _BoomLlama23:
+    def __init__(self, kind=RuntimeError):
+        self.kind, self.calls = kind, 0
+
+    @property
+    def running(self):
+        self.calls += 1
+        raise self.kind("探进程时炸了")
+
+
+class _IdleDsh23:
+    running = False
+    status = "未启动"
+
+
+class _LogHub23:
+    def __init__(self):
+        self.lines = []
+
+    def log(self, text):
+        self.lines.append(text)
+
+
+_mon23 = core.Monitor(_LogHub23(), _BoomLlama23(), _IdleDsh23())
+_orig_sleep23 = core.time.sleep
+core.time.sleep = lambda s: _orig_sleep23(0.02)
+_th23 = threading.Thread(target=_mon23.loop, daemon=True)
+_th23.start()
+_orig_sleep23(0.6)
+_alive23 = _th23.is_alive()
+_calls23 = _mon23.llama.calls
+_lines23 = list(_mon23.hub.lines)
+# 换一种异常时, 新行必须补上"上一条同类重复了多少次"
+_mon23.llama = _BoomLlama23(ValueError)
+_orig_sleep23(0.3)
+core.time.sleep = _orig_sleep23
+_th23.join(0.3)
+check("监控循环首拍抛异常后线程必须活着(interval 要有兜底值; HEAD 会 UnboundLocalError 退出)",
+      _alive23 and _calls23 >= 5 and len(_lines23) == 1,
+      str((_alive23, _calls23, _lines23)))
+check("监控错误日志必须带异常类型名(很多异常 str 是空的)",
+      any("RuntimeError:" in t for t in _lines23), str(_lines23))
+check("同一错误不得逐拍刷屏; 换错时新行要说明上一条重复了多少次",
+      len(_mon23.hub.lines) == 2 and "已重复" in _mon23.hub.lines[1]
+      and "ValueError:" in _mon23.hub.lines[1], str(_mon23.hub.lines))
+
+# 23.2 轻量化不能把 monitor_visible 也省掉: 那是监控页每 3s 打点的"有人正看着"。
+#      以前 lightweight 一开就走低频分支并完全忽略 visible, 实测 sample_system 一次都不跑
+#      ⇒ 浏览器直开面板, 或窗口那次"关轻量化"被 401 拒掉时, 整片图表停在旧帧。
+_m23 = core.Monitor(_LogHub23(), None, None)
+_cad = {}
+for _lw in (True, False):
+    for _vis in (True, False):
+        _m23.lightweight, _m23.monitor_visible = _lw, _vis
+        _m23.monitor_seen_at = time.time() if _vis else 0.0     # "有人在看"是有时效的打点
+        _cad[(_lw, _vis, False)] = _m23._cadence(False, False, False)
+        _cad[(_lw, _vis, True)] = _m23._cadence(True, False, False)
+check("监控页可见时不得走轻量化休眠分支(间隔也要回到 3s)",
+      _cad[(True, True, False)] == ("full", 3.0) and _cad[(True, True, True)] == ("full", 3.0),
+      str({k: v for k, v in _cad.items() if k[1]}))
+check("对照: 没人看页时才降频(无服务 60s / 有服务 30s)",
+      _cad[(True, False, False)] == ("light", 60.0) and _cad[(True, False, True)] == ("light", 30.0),
+      str({k: v for k, v in _cad.items() if k[1] is False}))
+check("对照: 非轻量化时 30s 空转/3s 活跃照旧(不得改成一律 3s)",
+      _cad[(False, False, False)] == ("full", 30.0) and _cad[(False, False, True)] == ("full", 3.0),
+      str({k: v for k, v in _cad.items() if k[0] is False}))
+#      而且这个标志必须有时效: 窗口关掉时那句 visible:false 常常发不出去(页面卸载时的
+#      fetch 不可靠), 粘滞的 True 会让 30s 空转档与轻量化永远进不去(HEAD 实测: 标志一旦
+#      True 就永久 3s 全速采样)。
+_m23.monitor_visible, _m23.monitor_seen_at = True, time.time() - 9.0
+_stale23 = [_m23._cadence(False, False, False)]
+_m23.lightweight = True
+_stale23.append(_m23._cadence(False, False, False))
+check("页面打点过期(8s)后不得再算\"有人在看\"(粘滞标志会废掉轻量化与 30s 空转)",
+      _stale23 == [("full", 30.0), ("light", 60.0)], str(_stale23))
+_m23.monitor_seen_at = time.time()
+check("对照: 打点新鲜时仍算\"有人在看\"(3s 全速)",
+      _m23._cadence(False, False, False) == ("full", 3.0), str(_m23._cadence(False, False, False)))
+_m23.lightweight = False
+
+
+# 23.3 visible=True 时必须真的采样(整条链路), 且快照要带上帧龄与轻量化标记
+class _IdleApi23:
+    online = False
+    phase = ""
+    _active_port = None
+    slots = []
+    boot = {}
+    tg_tps = tg3s_tps = log_prompt_speed = log_n_decoded = last_prefill_speed = None
+    prompt_progress = prompt_total_tokens = prompt_elapsed_s = None
+    last_task = task_started_at = None
+    mtp_acceptance = mtp_accepted = mtp_generated = mtp_mean_len = graphs_reused = None
+
+    @staticmethod
+    def events_snapshot():
+        return [], 0
+
+    @staticmethod
+    def model_info():
+        return {}
+
+    @staticmethod
+    def speeds():
+        return 0, 0, "api"
+
+    @staticmethod
+    def ctx_view():
+        return -1, 0
+
+    @staticmethod
+    def poll_fast():
+        pass
+
+    @staticmethod
+    def poll_slow_if_needed():
+        pass
+
+
+class _IdleLlama23:
+    running = False
+    status = "未启动"
+    api = _IdleApi23()
+
+    @staticmethod
+    def get_port():
+        return None
+
+    @staticmethod
+    def oom_recredit():
+        pass
+
+
+_seen23 = {"sys": 0, "gpu": 0}
+_real_ss23, _real_qg23 = core.monitor.sample_system, core.monitor.query_gpus
+core.monitor.sample_system = lambda: (_seen23.__setitem__("sys", _seen23["sys"] + 1),
+                                      {"cpu": 1.0, "disks": [], "net": {}})[1]
+core.monitor.query_gpus = lambda: (_seen23.__setitem__("gpu", _seen23["gpu"] + 1), [])[1]
+core.time.sleep = lambda s: _orig_sleep23(0.02)
+_m23b = core.Monitor(_LogHub23(), _IdleLlama23(), _IdleDsh23())
+_m23b.lightweight, _m23b.monitor_visible = True, True
+_m23b.monitor_seen_at = time.time()
+_th23b = threading.Thread(target=_m23b.loop, daemon=True)
+_th23b.start()
+_orig_sleep23(0.5)
+_th23b_alive = _th23b.is_alive()
+core.time.sleep = _orig_sleep23
+_th23b.join(0.3)
+core.monitor.sample_system, core.monitor.query_gpus = _real_ss23, _real_qg23
+_snap23 = dict(_m23b.snapshot)
+check("轻量化开着但页面可见时, 必须真的执行采样(HEAD 实测 0 次)",
+      _th23b_alive and _seen23["sys"] >= 1 and _seen23["gpu"] >= 1,
+      str((_th23b_alive, _seen23, _m23b.hub.lines[:1])))
+check("快照必须带 sampled_at 与 lightweight(旧帧要能自报年龄)",
+      isinstance(_snap23.get("sampled_at"), float) and _snap23.get("lightweight") is True
+      and _snap23["sampled_at"] <= time.time(),
+      str({k: _snap23.get(k) for k in ("sampled_at", "lightweight")}))
+
+# 23.4 磁盘 I/O 的设备名过滤必须与磁盘列表、_parent_disk 同口径:
+#      以前只认 (sd|vd|nvme|hd) ⇒ eMMC/云盘/RAID 的盘在列表里有行, 速率却永远 0。
+_ds23 = os.path.join(_tmp, "diskstats23")
+
+
+def _write_ds23(reads):
+    with open(_ds23, "w", encoding="utf-8") as fh:
+        for name, (rs, ws) in reads.items():
+            fh.write("259 0 %s 1 2 %d 4 5 6 %d 10 0 0 0\n" % (name, rs, ws))
+
+
+_base23 = {"nvme0n1p1": (100, 40), "nvme0n1": (100, 40), "mmcblk0p1": (300, 90),
+           "mmcblk0": (300, 90), "xvda1": (400, 120), "md0": (500, 150),
+           "loop0": (99999, 99999), "mmcblk0boot0": (88888, 88888)}
+_real_ds23, _real_prev23 = monitor.DISKSTATS_PATH, dict(monitor._disk_prev)
+monitor.DISKSTATS_PATH = _ds23
+_write_ds23(_base23)
+monitor._disk_prev.update(t=0.0, io={})
+monitor._disk_io_rates()                                    # 第一遍只建基线
+_write_ds23({k: (v[0] + 2048, v[1] + 1024) for k, v in _base23.items()})
+_orig_sleep23(1.05)
+_rates23 = monitor._disk_io_rates()
+monitor.DISKSTATS_PATH = _real_ds23
+monitor._disk_prev.update(**_real_prev23)
+check("eMMC/virtio/RAID 的分区必须能取到读写速率(以前只认 sd|vd|nvme|hd, 这些盘恒显示 0)",
+      all(k in _rates23 and _rates23[k][0] > 0 for k in ("nvme0n1p1", "mmcblk0p1", "xvda1", "md0")),
+      str({k: round(v[0], 1) for k, v in _rates23.items()}))
+check("对照: loop*(snap 镜像)与 mmcblk0boot0 这类硬件分区仍不参与采样",
+      "loop0" not in _rates23 and "mmcblk0boot0" not in _rates23
+      and "mmcblk0" in _rates23, str(sorted(_rates23.keys())))
+
+# 23.5 磁盘行截断: 以前 out[:6] 按 /proc/mounts 的出现顺序砍, 既不排序也不告知;
+#      表头速率还是逐显示行相加 ⇒ 被砍掉的盘连读写都不计入。
+_mt23 = os.path.join(_tmp, "mounts23")
+with open(_mt23, "w", encoding="utf-8") as _fh23:
+    for i in range(8):
+        _fh23.write("/dev/sd%c1 /m%d ext4 defaults 0 0\n" % (ord("a") + i, i))
+    _fh23.write("/dev/sdz1 / ext4 defaults 0 0\n")
+_real_mt23, _real_st23 = monitor.MOUNTS_PATH, monitor.os.statvfs
+monitor.MOUNTS_PATH = _mt23
+monitor.os.statvfs = lambda p: types.SimpleNamespace(
+    f_blocks=(5000 if p == "/" else 1000 * (1 + int(p[2]))), f_bfree=500, f_bavail=400,
+    f_frsize=1024)
+_rows23 = monitor._disk_statvfs()
+monitor.MOUNTS_PATH, monitor.os.statvfs = _real_mt23, _real_st23
+check("挂载行不得在采集处截断, 且必须确定性排序(根挂载优先、其余按容量降序)",
+      len(_rows23) == 9 and _rows23[0]["mount"] == "/"
+      and [d["mount"] for d in _rows23[1:4]] == ["/m7", "/m6", "/m5"],
+      str([d["mount"] for d in _rows23[:5]] + ["共 %d 行" % len(_rows23)]))
+_real_rows23, _real_io23 = monitor._disk_rows_cached, monitor._disk_io_rates
+monitor._disk_rows_cached = lambda: [{"dev": "sd%d1" % i, "mount": "/m%d" % i, "total": 1,
+                                      "used": 1, "avail": 1, "pct": 10.0} for i in range(8)]
+monitor._disk_io_rates = lambda: {"sd%d1" % i: (1.0 * i, 2.0 * i) for i in range(8)}
+monitor._sys_cache.update(t=0.0, v=None)
+_sys23 = monitor.sample_system()
+monitor._sys_cache.update(t=0.0, v=None)
+monitor._disk_rows_cached, monitor._disk_io_rates = _real_rows23, _real_io23
+monitor._sys_cache.update(t=0.0, v=None)
+check("面板只留 6 行时必须告知被截掉的条数(截断与\"只有这么多盘\"不得同形)",
+      len(_sys23["disks"]) == 6 and _sys23["disks_dropped"] == 2,
+      str((len(_sys23["disks"]), _sys23["disks_dropped"])))
+check("表头读写速率必须按全部盘求和(截的是显示行, 不是这些盘的读写)",
+      _sys23["io_total"] == [28.0, 56.0]
+      and round(sum(d["read_mb"] for d in _sys23["disks"]), 1) == 15.0,
+      str((_sys23["io_total"], [d["read_mb"] for d in _sys23["disks"]])))
 # --- 17) 自检自身的边界: 不得污染用户真实的日志目录 ---------------------------
 # 17.1 以前 selftest 直接往 ~/.dsh_launcher_logs 写: 每跑一次就多出几条测试噪声
 #      ("资产名形态非法: ../evil.tar.gz"、"摘要与直连不一致"), 用户排障时会把它们当成

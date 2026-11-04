@@ -573,6 +573,11 @@ async function pollMonitor() {
 }
 
 function renderMonitor(m) {
+  /* ---- 帧龄: 轻量化驻留时服务端故意不重新采样, 旧帧必须自己说明自己多旧,
+     否则几小时前的显存/CPU 会被读成"现在"。阈值取正常 3s 采样的若干倍。 ---- */
+  const age = (typeof m.sampled_at === "number") ? (Date.now() / 1000 - m.sampled_at) : null;
+  setTxt("monStale", (age != null && age > 15)
+    ? `本帧已 ${fmtEta(age)}未刷新${m.lightweight ? "(轻量化驻留)" : "(采样可能已停)"}` : "");
   /* ---- 摘要条 ---- */
   const gpus = m.gpus || [];
   const utils = gpus.map(g => g.util).filter(v => v != null);
@@ -839,10 +844,13 @@ function renderSystem(sys) {
   setTxt("memLegendAvail", `可用 ${fmtN(((mt || 0) - (mu || 0)) / GIB)} GB`);
   // 磁盘
   const disks = sys.disks || [];
-  setTxt("diskHeadSub", disks.length ? `读 ${fmtN(disks.reduce((a, d) => a + (d.read_mb || 0), 0))} MB/s · 写 ${fmtN(disks.reduce((a, d) => a + (d.write_mb || 0), 0))} MB/s` : "—");
+  // 表头速率用服务端按全部盘算的 io_total(服务端只截显示行, 不截这些盘的读写)
+  const ioAll = sys.io_total || [disks.reduce((a, d) => a + (d.read_mb || 0), 0),
+                                 disks.reduce((a, d) => a + (d.write_mb || 0), 0)];
+  setTxt("diskHeadSub", disks.length ? `读 ${fmtN(ioAll[0])} MB/s · 写 ${fmtN(ioAll[1])} MB/s` : "—");
   const dh = $("diskRowsHost");
   dh.innerHTML = "";
-  for (const d of disks.slice(0, 6)) {
+  for (const d of disks) {
     const row = document.createElement("div");
     row.className = "drow";
     const color = d.pct >= 90 ? "var(--err)" : d.pct >= 70 ? "var(--warn)" : "var(--ok)";
@@ -852,6 +860,12 @@ function renderSystem(sys) {
     dh.appendChild(row);
   }
   if (!disks.length) dh.innerHTML = `<div class="tiny">—</div>`;
+  else if (sys.disks_dropped > 0) {
+    const more = document.createElement("div");
+    more.className = "tiny";
+    more.textContent = `另有 ${sys.disks_dropped} 块挂载未列出(按根挂载与容量排序后截断)`;
+    dh.appendChild(more);
+  }
   // 网络
   const net = sys.net || {};
   const keys = Object.keys(net);

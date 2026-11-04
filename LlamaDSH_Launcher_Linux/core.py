@@ -1004,10 +1004,12 @@ class Monitor:
         self.active_profile = {}
         self.breaker_triggered = False
         self.monitor_visible = False
+        self.monitor_seen_at = 0.0      # 最近一次"页面可见"打点的时刻(见 _watched)
         # 轻量化模式(QQ/微信式最小化到托盘): 大幅降低采样频率, 无服务存活时不做任何
         # 子进程采样——llama/dsh 都没跑时后台几乎零占用
         self.lightweight = False
         self.snapshot = {}
+        self._perf_last, self._perf_reps = "", 0
         self.h = {k: llapimon.Hist() for k in
                   ("tps", "pf", "ctx", "mtp", "gpu_util", "gpu_mem", "gpu_temp", "gpu_power",
                    "cpu", "ram", "net_rx", "net_tx")}
@@ -1022,8 +1024,30 @@ class Monitor:
                 return s
         return None
 
+    def _watched(self):
+        """"有人正在看监控页"必须有时效: 页面每 3s 打一次 visible 点, 只有最近的点在 8s 内
+        才算。这个标志以前是粘滞的 —— 窗口直接关掉(卸载时的 fetch 不可靠)、页签崩掉, 它
+        就永远停在 True, 于是 30s 的空转档永远进不去, 轻量化也形同被废掉。"""
+        return bool(self.monitor_visible) and (time.time() - self.monitor_seen_at <= 8.0)
+
+    def _cadence(self, llama_alive, api_online, dsh_alive):
+        """本拍走哪条采样路("light"=轻量化驻留 / "full"=正常), 以及下一拍间隔。
+
+        有人在看页时既不降频也不跳过采样: 以前 lightweight 一开就无条件走低频分支、把
+        visible 完全忽略, 实测 sample_system 一次都不跑 ⇒ 浏览器直接打开面板, 或窗口那次
+        "关轻量化"没成功(服务重启换 token 被 401)时, 图表和 CPU/磁盘/网络整片永远停在旧帧,
+        却没有任何过期标记。
+        """
+        if self.lightweight and not self._watched():
+            return "light", (30.0 if (llama_alive or api_online or dsh_alive) else 60.0)
+        return "full", (3.0 if (llama_alive or api_online or self._watched()) else 30.0)
+
     def loop(self):
         while True:
+            # interval 必须先给兜底值: 首拍在赋值**之前**抛异常(读 /proc、端口探测抖动),
+            # 末尾的 time.sleep(interval) 就会抛 UnboundLocalError, 整条监控线程从此退出 ——
+            # 监控页停在最后一帧、显存熔断(判定就跑在本循环里)静默失效, 且看不出来。
+            interval = 3.0
             try:
                 # 存活判定(CS IsLlamaRunning 语义): 进程对象 或 端口属主 或 API 在线
                 llama_alive = self.llama.running
@@ -1035,11 +1059,11 @@ class Monitor:
                         llama_alive = True
                 if not llama_alive:
                     self.breaker_triggered = False
-                if self.lightweight:
-                    # 轻量化: 有服务存活 → 30s(保熔断/接管安全); 无服务 → 60s 纯休眠,
+                mode, interval = self._cadence(llama_alive, api_online, dsh_alive)
+                if mode == "light":
+                    # 轻量化驻留: 有服务存活 → 30s(保熔断/接管安全); 无服务 → 60s 纯休眠,
                     # 不做任何子进程采样(nvidia-smi/ss/statvfs 全部跳过)
                     busy = llama_alive or api_online or dsh_alive
-                    interval = 30.0 if busy else 60.0
                     if busy:
                         if llama_alive or api_online:
                             self.llama.api.poll_fast()
@@ -1067,8 +1091,7 @@ class Monitor:
                                               "dsh_status": self.dsh.status})
                     time.sleep(interval)
                     continue
-                interval = 3.0 if (llama_alive or api_online or self.monitor_visible) else 30.0
-                if llama_alive or api_online or self.monitor_visible:
+                if llama_alive or api_online or self._watched():
                     self.llama.api.poll_fast()
                     self.llama.api.poll_slow_if_needed()
                     self.llama.oom_recredit()
@@ -1111,7 +1134,15 @@ class Monitor:
                 self.snapshot = self._build_snapshot(gpus, sysi, gen, prompt, src,
                                                      ctx_used, ctx_total, vt_sum, vu_sum)
             except Exception as ex:
-                self.hub.log("[Perf] Error: %s" % ex)
+                # 带上类型名(很多异常 str 是空的, 只剩"Error: "), 且同一错误不逐拍刷屏:
+                # 本循环 3s 一轮, 持续故障一小时能写 1200 条同样的行。换错时补一句重复次数。
+                msg = "%s: %s" % (type(ex).__name__, ex)
+                if msg == self._perf_last:
+                    self._perf_reps += 1
+                else:
+                    self.hub.log("[Perf] Error: %s%s" % (
+                        msg, "" if not self._perf_reps else "(上一条同类已重复 %d 次)" % self._perf_reps))
+                    self._perf_last, self._perf_reps = msg, 0
             time.sleep(interval)
 
     def _collect_speeds(self):
@@ -1177,8 +1208,12 @@ class Monitor:
             "gpus": gpus,
             "sys": sysi,
             "hists": hists,
-            "monitor_visible": self.monitor_visible,
+            "monitor_visible": self._watched(),   # 时效后的"有人在看", 不是粘滞的原始标志
             "breaker_triggered": self.breaker_triggered,
+            # 这一帧是什么时候采的、当时是否处于轻量化: 休眠分支只 update 状态字段而不动
+            # 这两项 ⇒ 消费方能算出"这帧已经 X 秒没更新", 不会把旧帧当成当前值
+            "lightweight": self.lightweight,
+            "sampled_at": time.time(),
             "vram": {"used": vu_sum, "total": vt_sum,
                      "pct": round(100.0 * vu_sum / vt_sum, 1) if vt_sum > 0 else 0.0},
         }

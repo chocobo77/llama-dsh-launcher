@@ -94,11 +94,13 @@ def cpu_model():
 _disk_prev = {"t": 0.0, "io": {}}
 
 
+MOUNTS_PATH = "/proc/mounts"
+
+
 def _disk_statvfs():
-    import string
     rows = []
     try:
-        with open("/proc/mounts") as f:
+        with open(MOUNTS_PATH) as f:
             for ln in f:
                 parts = ln.split()
                 if len(parts) < 3:
@@ -134,7 +136,13 @@ def _disk_statvfs():
                         "pct": round(100.0 * used / pct_base, 1) if pct_base > 0 else 0.0})
         except OSError:
             continue
-    return out[:6]
+    # 不在这一步截断(调用方截并告知条数)。排序必须确定性: 根挂载优先、其余按容量降序,
+    # 否则挂载一多就按 /proc/mounts 的出现顺序砍掉最要紧的盘, 面板上像"盘凭空少了"。
+    out.sort(key=lambda d: (d["mount"] != "/", -d["total"]))
+    return out
+
+
+DISK_ROWS_LIMIT = 6
 
 
 # 磁盘容量行后台快照: statvfs 打到失联的 fuse/网络设备会卡进内核 D 态,
@@ -176,10 +184,18 @@ def _parent_disk(name):
     return name
 
 
+DISKSTATS_PATH = "/proc/diskstats"
+# 参与 I/O 速率的设备名: sd*/vd*/xvd*(virtio)/hd*/nvme*n*/mmcblk*/md*(RAID)/dm-*(LVM)。
+# 与磁盘列表、_parent_disk 必须同口径: 以前只认 (sd|vd|nvme|hd), 于是 eMMC/云盘/RAID 的盘
+# 在磁盘列表里有行(它们走 /dev/ 前缀), 读写速率却永远显示 0 —— "读不到"被显示成"没在读"。
+# loop*(snap 只读镜像)故意不采。
+_DISKDEV_RE = re.compile(r"^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme\d+n\d+|mmcblk\d+|md\d+|dm-\d+)(p?\d+)?$")
+
+
 def _disk_io_rates():
     rates = {}
     try:
-        with open("/proc/diskstats") as f:
+        with open(DISKSTATS_PATH) as f:
             now = time.time()
             cur = {}
             for ln in f:
@@ -187,7 +203,7 @@ def _disk_io_rates():
                 if len(parts) < 14:
                     continue
                 name = parts[2]
-                if not re.match(r"(sd|vd|nvme|hd)[a-z0-9]*$", name):
+                if not _DISKDEV_RE.match(name):
                     continue
                 cur[name] = (int(parts[5]), int(parts[9]))  # 读扇区/写扇区
             prev = _disk_prev
@@ -421,15 +437,15 @@ def sample_system():
     if now - _sys_cache["t"] < _CACHE_SECS and _sys_cache["v"]:
         return _sys_cache["v"]
     cm = cpu_mem_usage()
-    disks = _disk_rows_cached()
+    all_disks = _disk_rows_cached()
     io = _disk_io_rates()
     # I/O 归属要按**分区名精确**匹配。旧写法是双向 startswith + next(): 同一块盘上挂两个
     # 分区(/ 与 /home)时, 两行都先匹配到 diskstats 里排在前面的整盘名 ⇒ 两行显示同一份
     # 整盘速率, 而表头是逐行相加的, 于是读写速率被数两遍(实测翻倍)。
     by_parent = {}
-    for d in disks:
+    for d in all_disks:
         by_parent.setdefault(_parent_disk(d["dev"]), []).append(d)
-    for d in disks:
+    for d in all_disks:
         rate, scope = io.get(d["dev"]), "part"
         if rate is None:
             par = _parent_disk(d["dev"])
@@ -442,7 +458,13 @@ def sample_system():
             d["read_mb"], d["write_mb"], d["io_scope"] = 0.0, 0.0, ""
     snap = {"cpu": cm["cpu"], "cpu_cores": cm["cpu_cores"], "cpu_model": cpu_model(),
             "mem_used": cm["mem_used"], "mem_total": cm["mem_total"], "mem_pct": cm["mem_pct"],
-            "disks": disks, "net": {k: [round(v[0], 2), round(v[1], 2)] for k, v in net_rates().items()}}
+            "disks": all_disks[:DISK_ROWS_LIMIT],
+            # 面板最多 6 行, 多出来的必须说有几块, 否则"截断"与"只有这么多盘"同形
+            "disks_dropped": max(0, len(all_disks) - DISK_ROWS_LIMIT),
+            # 表头读写速率按**全部**盘求和: 截断只是不再显示那些行, 不是那些盘不存在
+            "io_total": [round(sum(d["read_mb"] for d in all_disks), 1),
+                         round(sum(d["write_mb"] for d in all_disks), 1)],
+            "net": {k: [round(v[0], 2), round(v[1], 2)] for k, v in net_rates().items()}}
     _sys_cache.update(t=now, v=snap)
     return snap
 
