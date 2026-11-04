@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(161 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(170 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
 注意: 本机没有 Xvfb/输入注入工具, traydialog 的退出码契约只能真弹一次窗
       (约 0.2s 一闪), 否则那 4 项只能空转。
-每项断言都对应一个真实踩过的坑, 修 bug 前先跑它, 修完再跑它。"""
+每项断言都对应一个真实踩过的坑, 修 bug 前先跑它, 修完再跑它。
+注意: 源码级断言(比对字符串)挡不住运行时错误 —— 收尾/退出这一族另有行为级
+      测试(第 13 节): 进程内真调收尾函数 + 隔离 HOME 起真实例打 /api/shutdown。"""
 import io
 import json
 import os
@@ -1521,6 +1523,131 @@ check("前端把 stop_failed 当在跑(Start 禁用 / Stop 可点)并给出可�
 check("_dsh_running_guard 也把 stop_failed 视为在跑(pnpm 不能碰还没停掉的 DSH)",
       '"stop_failed"' in _guard_src, "")
 
+
+# --- 13) 第五轮: 收尾路径必须能**真的执行**(源码级断言挡不住 TypeError) -----
+# 95ba776 把 `with _SHUTDOWN_LATCH:` 打成 `with _SHUTTING_DOWN:`(bool 不能当上下文管理
+# 器), /api/shutdown 从那次起每次都抛 TypeError 然后静默不退出 —— 而第 8 节那批断言全
+# 绿, 因为它们只比对字符串。教训: 收尾/退出这一族必须有行为级测试, 而且两条都要:
+# 进程内直接调用(快, 覆盖幂等闩与"真的调了 stop") + 隔离实例端到端(覆盖路由、延迟、
+# 真实进程退出与 run.log 落地)。
+check("收尾的闩必须是 Lock: 必须是 with _SHUTDOWN_LATCH(bool 当上下文管理器就是 TypeError)",
+      "with _SHUTDOWN_LATCH:" in shut_src and "with _SHUTTING_DOWN:" not in shut_src, "")
+
+import subprocess as _sub5
+import socket as _sock5
+import urllib.request as _url5
+import main as _m5
+
+# 13.1 进程内: 只把 os._exit 与两个 stop() 换掉, 其余原样跑
+_exit5 = []
+_stop5 = []
+_log5 = []
+_real5 = (os._exit, _m5.LLAMA.stop, _m5.DSH.stop)
+_m5.LLAMA.stop = lambda: _stop5.append("llama")
+_m5.DSH.stop = lambda: _stop5.append("dsh")
+_m5.HUB.log = lambda text: _log5.append(text)
+_err5 = None
+try:
+    os._exit = lambda code=0: _exit5.append(code)
+    _m5._SHUTTING_DOWN = False
+    try:
+        _m5._stop_all_and_exit("自检")
+        _m5._stop_all_and_exit("自检-重复")
+    except Exception as _ex5:
+        _err5 = "%s: %s" % (type(_ex5).__name__, _ex5)
+finally:
+    os._exit, _m5.LLAMA.stop, _m5.DSH.stop = _real5
+    try:
+        del _m5.HUB.log                     # 去掉实例属性, 恢复类方法(别把日志吞进本进程)
+    except Exception:
+        pass
+check("收尾函数真调一次能走到底(旧代码: 闩是 bool, 每次 /api/shutdown 都抛 TypeError)",
+      _err5 is None and _exit5 == [0], str((_err5, _exit5)))
+check("收尾真的停了 llama.cpp 与 DSH 并留了日志(不是只 os._exit 走人)",
+      _stop5 == ["llama", "dsh"] and any("服务进程退出" in t for t in _log5),
+      str((_stop5, _log5[-2:])))
+check("重复收尾只退出一次(两个收尾线程并发就是互相掐断 kill, 恰好又造孤儿)",
+      _exit5 == [0] and _stop5 == ["llama", "dsh"], str((_exit5, _stop5)))
+
+# 13.2 端到端: 隔离 HOME 起一个真服务实例, 真打一次 /api/shutdown, 它必须真的退出。
+# 三处必须中和, 否则测试会去动用户的真环境: takeover_on_boot(可能接管真 DSH)、
+# LLAMA.get_port(stop 有"按 1234 找 llama-server"的回退)、webbrowser.open(会弹浏览器)。
+_h5 = os.path.join(_tmp, "e2e_home")
+os.makedirs(_h5, exist_ok=True)
+_free5 = []
+for _ in range(2):
+    _s5 = _sock5.socket()
+    _s5.bind(("127.0.0.1", 0))
+    _free5.append(_s5.getsockname()[1])
+    _s5.close()
+_api5, _dshp5 = _free5
+_code5 = ("import sys; sys.argv = ['main.py', '-p', '%d']; import main; "
+          "main.DSH_PORT = %d; main.takeover_on_boot = lambda: None; "
+          "main.LLAMA.get_port = lambda: 0; main.webbrowser.open = lambda *a, **k: False; "
+          "main.main()") % (_api5, _dshp5)
+_errf5 = open(os.path.join(_tmp, "e2e_stderr.txt"), "wb")
+_proc5 = _sub5.Popen([sys.executable, "-c", _code5], cwd=APP,
+                     env=dict(os.environ, HOME=_h5,
+                              XDG_CACHE_HOME=os.path.join(_h5, ".cache")),
+                     stdout=_errf5, stderr=_errf5)
+_ok5 = None
+_rc5 = None
+_wait5 = -1.0
+_port5 = 0
+try:
+    for _ in range(120):
+        if _proc5.poll() is not None:
+            break
+        for _c5 in range(_api5, _api5 + 6):      # 端口被占时 main() 会往后挪
+            try:
+                _q5 = _sock5.create_connection(("127.0.0.1", _c5), 0.2)
+                _q5.close()
+                _port5 = _c5
+                break
+            except OSError:
+                continue
+        if _port5:
+            break
+        time.sleep(0.1)
+    _tok5 = ""
+    if _port5:
+        try:
+            _tok5 = open(os.path.join(_h5, ".dsh_launcher_token"), encoding="utf-8").read().strip()
+        except OSError:
+            _tok5 = ""
+        if _tok5:
+            _rq5 = _url5.Request("http://127.0.0.1:%d/api/shutdown" % _port5, data=b"{}",
+                                 headers={"X-Auth": _tok5,
+                                          "Content-Type": "application/json"})
+            try:
+                _ok5 = json.loads(_url5.urlopen(_rq5, timeout=5).read().decode("utf-8")).get("ok")
+            except Exception as _e5:
+                _ok5 = "err:%s" % _e5
+    _t5 = time.time()
+    try:
+        _rc5 = _proc5.wait(timeout=20)
+    except Exception:
+        _rc5 = None
+    _wait5 = time.time() - _t5
+    check("端到端: 实例能起来且 POST /api/shutdown 先拿到 {ok:true}(调用方不该只看到断连)",
+          bool(_port5) and _ok5 is True, "port=%s ok=%r" % (_port5, _ok5))
+    check("端到端: /api/shutdown 之后服务进程真的退出且退出码 0(旧代码抛异常后一直活着)",
+          _rc5 == 0, "rc=%r 等待=%.1fs" % (_rc5, _wait5))
+    check("收尾要留出响应送达的时间(0.8s 延迟, 不是当场就把连接掐了)",
+          _rc5 == 0 and _wait5 >= 0.6, "等位=%.2fs" % _wait5)
+    _etxt5 = open(os.path.join(_tmp, "e2e_stderr.txt"), encoding="utf-8",
+                  errors="replace").read()
+    check("收尾全程 stderr 不得出现 traceback(出现就是收尾路径又断了)",
+          "Traceback" not in _etxt5, _etxt5[-300:])
+    _rlf5 = os.path.join(_h5, ".dsh_launcher_logs", "run.log")
+    _rl5 = open(_rlf5, encoding="utf-8", errors="replace").read() if os.path.isfile(_rlf5) else ""
+    check("收尾两行都要落到 run.log(只打到 stdout 时排障看不见发生了什么)",
+          "关闭服务并退出" in _rl5 and "服务进程退出" in _rl5, _rl5[-200:])
+finally:
+    if _proc5.poll() is None:
+        _proc5.kill()
+        _proc5.wait()
+    _errf5.close()
 
 shutil.rmtree(_tmp, ignore_errors=True)
 

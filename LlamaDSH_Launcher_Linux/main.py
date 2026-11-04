@@ -581,7 +581,7 @@ def _stop_all_and_exit(tag):
       干等。故挂一个看门狗兜底(托盘那侧会按 PID 复核并把残留点名)。
     """
     global _SHUTTING_DOWN
-    with _SHUTTING_DOWN:
+    with _SHUTDOWN_LATCH:
         if _SHUTTING_DOWN:
             return
         _SHUTTING_DOWN = True
