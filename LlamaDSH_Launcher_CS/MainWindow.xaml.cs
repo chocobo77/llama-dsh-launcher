@@ -252,6 +252,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		};
 		_logTimer.Start();
 		base.IsVisibleChanged += new DependencyPropertyChangedEventHandler(OnVisibilityChanged);
+		// 最小化到任务栏同样进轻量模式(托盘路径在 Window_Closing 的 Hide 分支)
+		StateChanged += (_, _) =>
+		{
+			if (base.WindowState == WindowState.Minimized)
+			{
+				EnterTrayLightMode();
+			}
+			else
+			{
+				ExitTrayLightMode();
+			}
+		};
 	}
 
 	private void BuildParamGroups()
@@ -875,9 +887,44 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void ShowFromTray()
 	{
+		ExitTrayLightMode();
 		Show();
 		base.WindowState = WindowState.Normal;
 		Activate();
+	}
+
+	/// <summary>进入托盘轻量模式: 一次性 GC 清理 + 提示条隐藏 + 采样降频(_trayMode)。</summary>
+	private void EnterTrayLightMode()
+	{
+		if (_trayMode)
+		{
+			return;
+		}
+		_trayMode = true;
+		try
+		{
+			// 软件渲染 + 长时间运行积累的托管对象, 隐藏后无 UI 压力, 一次性回收
+			GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+			GC.WaitForPendingFinalizers();
+			GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+		}
+		catch
+		{
+		}
+	}
+
+	private void ExitTrayLightMode()
+	{
+		if (!_trayMode)
+		{
+			return;
+		}
+		_trayMode = false;
+		// 立即用最近一拍全量刷新(轻量模式期间跳过了视觉重建)
+		if (_lastPerfDict != null)
+		{
+			OnPerf(_lastPerfDict, _lastPerfGpus ?? new List<GpuDevInfo>());
+		}
 	}
 
 	private void UpdateTray()
@@ -6472,11 +6519,29 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					LogError(ex5, "性能监控异常");
 				}
-				// 采样节奏(Strata #4066): 监测页可见 3s, 不可见 30s; llama 运行中保底 3s(熔断时效)
+				// 采样节奏(Strata #4066): 监测页可见 3s, 不可见 30s; llama 运行中保底 3s(熔断时效);
+				// 托盘/最小化轻量模式: llama 运行中仍 3s(熔断不断), 空闲 60s
 				bool llamaRunning = IsAlive(_llamaProc);
-				bool fast = llamaRunning || _monitorTabVisible;
-				_gpuMonitor.CacheTtlSeconds = fast ? 2.5 : 24.0;
-				Thread.Sleep(fast ? 3000 : 30000);
+				int sleepMs;
+				double cacheTtl;
+				if (llamaRunning)
+				{
+					sleepMs = 3000;
+					cacheTtl = 2.5;
+				}
+				else if (_trayMode)
+				{
+					sleepMs = 60000;
+					cacheTtl = 55.0;
+				}
+				else
+				{
+					bool fast = _monitorTabVisible;
+					sleepMs = fast ? 3000 : 30000;
+					cacheTtl = fast ? 2.5 : 24.0;
+				}
+				_gpuMonitor.CacheTtlSeconds = cacheTtl;
+				Thread.Sleep(sleepMs);
 			}
 		})
 		{
@@ -6561,6 +6626,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	// ── 监测标签页(Strata Monitor 复刻): 60 秒历史 + 图表/状态卡/Gauge/请求表 ──
 	// 监测页是否可见(Strata #4066: 可见 3s / 不可见 30s 采样)
 	private bool _monitorTabVisible = true;
+
+	// 托盘轻量模式: 最小化到托盘时置位(最小化到任务栏同样生效), 恢复窗口清除。
+	// perf 线程读(volatile): 采样降频 + OnPerf 走轻量路径(只推历史与熔断)
+	private volatile bool _trayMode;
 
 	private void MainTabs_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
 	{
@@ -7126,8 +7195,116 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private Dictionary<string, string>? _lastPerfDict;
 	private List<GpuDevInfo>? _lastPerfGpus;
 
+	/// <summary>
+	/// 托盘轻量模式性能路径: 只做历史序列入库与显存熔断判定, 不碰任何视觉元素。
+	/// llama 运行中保持 3s 采样(熔断时效), 空闲时 perf 线程拉长到 60s。
+	/// </summary>
+	private void TrayLightPerf(Dictionary<string, string> d, List<GpuDevInfo> gpusPre)
+	{
+		var api = _llamaApi;
+		if (api != null)
+		{
+			var (gSpd, pSpd, _) = api.Speeds();
+			_hTps.Push(gSpd > 0.0 ? gSpd : null);
+			_hPf.Push(pSpd > 0.0 ? pSpd : null);
+			long ctxUsed = api.CtxUsed >= 0 ? api.CtxUsed : (api.LogCtxUsed ?? -1);
+			_hCtx.Push(ctxUsed >= 0 ? ctxUsed : null);
+			_hMtp.Push(api.MtpAcceptance is double acc ? acc * 100.0 : null);
+		}
+		else
+		{
+			_hTps.Push(null);
+			_hPf.Push(null);
+			_hCtx.Push(null);
+			_hMtp.Push(null);
+		}
+		if (gpusPre.Count > 0)
+		{
+			var temps = gpusPre.Where(x => x.Temp > 0).ToArray();
+			double pw = gpusPre.Sum(x => x.Power);
+			_hGpuUtil.Push(gpusPre.Average(x => x.Util));
+			_hGpuMem.Push(gpusPre.Sum(x => x.MemUsedMb) / 1024.0);
+			_hTemp.Push(temps.Length > 0 ? temps.Max(x => x.Temp) : null);
+			_hPower.Push(pw > 0 ? pw : null);
+		}
+		else
+		{
+			_hGpuUtil.Push(null);
+			_hGpuMem.Push(null);
+			_hTemp.Push(null);
+			_hPower.Push(null);
+		}
+		if (d.TryGetValue("ram_used", out string vRu) && d.TryGetValue("ram_total", out string vRt)
+			&& double.TryParse(vRu, NumberStyles.Float, CultureInfo.InvariantCulture, out var vRu2)
+			&& double.TryParse(vRt, NumberStyles.Float, CultureInfo.InvariantCulture, out var vRt2)
+			&& vRt2 > 0.0)
+		{
+			_hRam.Push(vRu2 / 1073741824.0);
+		}
+		else
+		{
+			_hRam.Push(null);
+		}
+		CheckVramBreaker(gpusPre);
+	}
+
+	/// <summary>
+	/// 显存熔断: llama 运行中显存越过阈值立即停止服务(整机 OOM 保护, 无防抖、绝不容许突破)。
+	/// 百分比模式=各卡已用/总量; GB 模式=各卡已用合计。
+	/// </summary>
+	private void CheckVramBreaker(List<GpuDevInfo> gpus)
+	{
+		if (_vramBreakerTriggered || ChkVramBreaker?.IsChecked != true || gpus.Count == 0)
+		{
+			return;
+		}
+		if (_llamaProc == null || _llamaProc.HasExited)
+		{
+			return;
+		}
+		double usedMb = gpus.Sum(x => x.MemUsedMb);
+		bool hit = false;
+		string desc = "";
+		if (double.TryParse(TxtVramBreakerVal.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double thr))
+		{
+			if (ComboVramBreakerType.SelectedIndex == 1)
+			{
+				double usedGb = usedMb / 1024.0;
+				hit = usedGb >= thr;
+				desc = $"{usedGb:F1}GB ≥ 阈值 {thr:F1}GB";
+			}
+			else
+			{
+				double totalMb = gpus.Sum(x => x.MemTotalMb);
+				if (totalMb > 0)
+				{
+					double pct = usedMb / totalMb * 100.0;
+					hit = pct >= thr;
+					desc = $"{pct:F0}% ≥ 阈值 {thr:F0}%";
+				}
+			}
+		}
+		if (!hit)
+		{
+			return;
+		}
+		_vramBreakerTriggered = true;
+		Log($"[熔断] 显存越过阈值({desc}), 自动停止 Llama 服务");
+		LblVramBreaker.Text = "已触发";
+		LblVramBreaker.Foreground = new SolidColorBrush(Color.FromRgb(0xff, 0x8a, 0x98));
+		ShowNotice("⚠ 显存熔断已触发（" + desc + "），Llama 服务已自动停止。", isError: true);
+		StopLlama();
+	}
+
 	private void OnPerf(Dictionary<string, string> d, List<GpuDevInfo> gpusPre)
 	{
+		// 托盘轻量模式: 只推历史 + 熔断判定, 全部视觉树重建跳过(恢复窗口时用
+		// _lastPerfDict 立即全量刷新, 曲线无缺口)
+		if (_trayMode)
+		{
+			TrayLightPerf(d, gpusPre);
+			return;
+		}
 		// 速度历史: 日志 tg_3s / prompt 行 > /slots 差分 (llama-lens speeds())
 		var api = _llamaApi;
 		if (api != null)
@@ -7366,54 +7543,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				LogError(exPer, "OOM 降层配置持久化失败");
 			}
 		}
-
-	/// <summary>
-	/// 显存熔断: llama 运行中显存越过阈值立即停止服务(整机 OOM 保护, 无防抖、绝不容许突破)。
-	/// 百分比模式=各卡已用/总量; GB 模式=各卡已用合计。
-	/// </summary>
-	void CheckVramBreaker(List<GpuDevInfo> gpus)
-	{
-		if (_vramBreakerTriggered || ChkVramBreaker?.IsChecked != true || gpus.Count == 0)
-		{
-			return;
-		}
-		if (_llamaProc == null || _llamaProc.HasExited)
-		{
-			return;
-		}
-		double usedMb = gpus.Sum(x => x.MemUsedMb);
-		bool hit = false;
-		string desc = "";
-		if (double.TryParse(TxtVramBreakerVal.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double thr))
-		{
-			if (ComboVramBreakerType.SelectedIndex == 1)
-			{
-				double usedGb = usedMb / 1024.0;
-				hit = usedGb >= thr;
-				desc = $"{usedGb:F1}GB ≥ 阈值 {thr:F1}GB";
-			}
-			else
-			{
-				double totalMb = gpus.Sum(x => x.MemTotalMb);
-				if (totalMb > 0)
-				{
-					double pct = usedMb / totalMb * 100.0;
-					hit = pct >= thr;
-					desc = $"{pct:F0}% ≥ 阈值 {thr:F0}%";
-				}
-			}
-		}
-		if (!hit)
-		{
-			return;
-		}
-		_vramBreakerTriggered = true;
-		Log($"[熔断] 显存越过阈值({desc}), 自动停止 Llama 服务");
-		LblVramBreaker.Text = "已触发";
-		LblVramBreaker.Foreground = new SolidColorBrush(Color.FromRgb(0xff, 0x8a, 0x98));
-		ShowNotice("⚠ 显存熔断已触发（" + desc + "），Llama 服务已自动停止。", isError: true);
-		StopLlama();
-	}
 
 	// ============ 构建器: GPU 每卡面板(llama-lens GpuPanel) ============
 		void BuildGpuPanels(List<GpuDevInfo> gpus)
@@ -8909,6 +9038,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		if (ChkMinimizeToTray.IsChecked == true && _trayIcon != null)
 		{
+			EnterTrayLightMode();
 			Hide();
 			_trayIcon.ShowBalloonTip(2000, "Llama 启动器", "程序已最小化到系统托盘", ToolTipIcon.Info);
 			e.Cancel = true;
