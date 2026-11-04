@@ -484,6 +484,43 @@ def _find_dir_containing(root, filename):
     return None
 
 
+def _sole_top_level_dir(root):
+    """解压目录里**只有一个目录、没有文件**时返回它, 否则 None。
+
+    上游 tar 都带一层归档根目录(llama-bNNNN-…/、cudart-llama-bNNNN-…/)。主包靠
+    _find_dir_containing("llama-server") 找到它, 而没有可寻文件名的包(cudart)需要这个
+    通用剥壳: 不剥就会把整棵根目录搬进去, 库文件与可执行文件不同目录。
+    """
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    if len(names) != 1:
+        return None
+    full = os.path.join(root, names[0])
+    return full if os.path.isdir(full) else None
+
+
+def merge_cudart_tree(cdir, src_dir):
+    """把解压好的 cudart 包并入 llama-* 目录, 返回 (.so 数, 说明文本)。
+
+    两个坑叠在一起:
+      1) cudart 包与主包一样带一层归档根目录(cudart-llama-bNNNN-bin-…-x64/)。以前直接
+         copytree(cdir) ⇒ .so 落到 src_dir/cudart-…/ 里, 而 llama-server 的 rpath 是
+         $ORIGIN ⇒ 运行时照样找不到 libcublas(安装流程还会把整棵目录当"用户额外文件"
+         在下次更新时迁回来, 越攒越多)。
+      2) 说明文本以前无条件写"已并入"。现在按**同目录里真的有 .so** 才这么说, 否则明说
+         结构不对, 让用户知道 CUDA 版仍会缺库。
+    """
+    root = _sole_top_level_dir(cdir) or cdir
+    _copy_dir_overwrite(root, src_dir)
+    so = [fn for fn in os.listdir(src_dir) if ".so" in fn]
+    if so:
+        return len(so), " + cudart 运行库已并入(%d 个 .so 与 llama-server 同目录)" % len(so)
+    return 0, (" ⚠ cudart 已解压并入, 但 llama-server 同目录里没有 .so(解压结构变化?)"
+               " —— CUDA 版很可能仍报缺库")
+
+
 def _copy_dir_overwrite(src, dst):
     os.makedirs(dst, exist_ok=True)
     for item in os.listdir(src):
@@ -570,8 +607,9 @@ def apply_llama_update(dir_, release, job_log=None):
                 shutil.rmtree(cdir, ignore_errors=True)
                 os.makedirs(cdir)
                 _extract_tar(cudart_path, cdir)
-                _copy_dir_overwrite(cdir, src_dir)  # cudart 包含 *.so*,并入同一目录
-                cudart_note = " + cudart 运行库已并入"
+                _so_n, cudart_note = merge_cudart_tree(cdir, src_dir)
+                if _so_n == 0 and job_log:
+                    job_log("[更新] ⚠ cudart 并入后 %s 里没有找到 .so" % src_dir)
             except Exception as ex:
                 cudart_note = "(cudart 下载失败: %s — 启动 CUDA 版可能报缺库, 可改选 Vulkan 资产)" % ex
         # 覆盖安装原子化: 先整体装到 dir_ 同分区的暂存目录, 校验通过后再交换;

@@ -78,6 +78,24 @@ def _exe_version(path, args=("--version",), timeout=8):
         return None
 
 
+def _pnpm_path():
+    """pnpm 的实际可执行文件: PATH 之外必须认 LOCAL_BIN(~/.local/bin)。
+
+    node 一侧的候选里就有 LOCAL_BIN(_node_candidates), pnpm 一侧以前只走
+    procman.which(PATH)。而两条安装路线(corepack 的 shim、npm install -g --prefix ~/.local)
+    都把 pnpm 放进 ~/.local/bin, 项目里没有任何地方把它加进 PATH。GNOME 自启、systemd-user、
+    sudo 的 PATH 常常不含它 ⇒ 明明装好了却被判"未安装": 面板显示 pnpm 未安装, 一键安装每次都
+    重下一遍 node 并在结尾报"pnpm 安装失败", 用户反复点也不会收敛。
+    """
+    p = procman.which("pnpm")
+    if p:
+        return p
+    for cand in (os.path.join(LOCAL_BIN, "pnpm"), "/usr/local/bin/pnpm", "/usr/bin/pnpm"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
 def detect(force=False):
     """返回 dict: node24 {path,version} / any_node {path,version} / pnpm {path,version} /
     meets(bool) / version_unknown(bool)。"""
@@ -98,7 +116,7 @@ def detect(force=False):
     n24 = next(((p, v) for p, v in nodes if major(v) >= 24), None)
     if n24 is None and nodes:
         n24 = max(nodes, key=lambda x: major(x[1]))
-    pnpm = procman.which("pnpm")
+    pnpm = _pnpm_path()
     pnpm_v = _exe_version(pnpm) if pnpm else None
     st = {
         "node24": {"path": n24[0], "version": n24[1]} if n24 else {"path": None, "version": None},
@@ -253,7 +271,7 @@ def install_node_env(job_log, timeout_secs=600):
     else:
         job_log("Node 已是最新(%s)" % cur_v)
     # pnpm: corepack 优先
-    pnpm = procman.which("pnpm")
+    pnpm = _pnpm_path()
     if not pnpm:
         node = detect(force=True)["node24"]["path"]
         if node:
@@ -264,9 +282,13 @@ def install_node_env(job_log, timeout_secs=600):
             except subprocess.TimeoutExpired:
                 r = None
                 job_log("corepack enable 超时(120s)")
-            pnpm = procman.which("pnpm")
+            pnpm = _pnpm_path()
             if not pnpm:
-                job_log("corepack 失败(%s),回退 npm --prefix ~/.local install -g pnpm" % (r.stderr or "").strip()[:120])
+                # 超时分支里 r 是 None: 直接取 r.stderr 会抛 AttributeError, 整个任务以
+                # "'NoneType' object has no attribute 'stderr'" 收场, 看不出 node 其实已装好
+                _why = ("corepack enable 超时(120s)" if r is None
+                        else ((r.stderr or "") + (r.stdout or "")).strip()[:120])
+                job_log("corepack 失败(%s),回退 npm --prefix ~/.local install -g pnpm" % _why)
                 npm = os.path.join(os.path.dirname(node), "npm")
                 # 一次性 --prefix: `npm config set prefix` 会持久改写 ~/.npmrc,
                 # 影响该用户所有 node 的全局安装路径
@@ -276,9 +298,16 @@ def install_node_env(job_log, timeout_secs=600):
                                    capture_output=True, text=True, timeout=600)
                 except subprocess.TimeoutExpired:
                     job_log("npm install -g pnpm 超时(600s)")
-                pnpm = procman.which("pnpm")
+                pnpm = _pnpm_path()
     st2 = detect(force=True)
     if not st2["pnpm"]["path"]:
         return False, "pnpm 安装失败(可手动: corepack enable 或 npm install -g pnpm)"
-    job_log("pnpm %s 就绪(%s)" % (st2["pnpm"]["version"], st2["pnpm"]["path"]))
-    return True, "Node %s + pnpm %s 就绪" % (st2["node24"]["version"], st2["pnpm"]["version"])
+    # "文件在"不等于"能用": corepack 的 shim 首次运行要联网取 pnpm, 离线/被代理拦住时
+    # `pnpm --version` 没有任何输出。以前只看 path 就报"pnpm None 就绪", 失败被推到后面的
+    # DSH 安装/重建里, 那时没人会想到根因是 pnpm 还没跑起来。
+    pv = st2["pnpm"]["version"] or _exe_version(st2["pnpm"]["path"], timeout=60)
+    if not pv:
+        return False, ("pnpm 已就位(%s)但 `pnpm --version` 无输出 —— corepack 首次运行需要联网取包, "
+                       "请手动执行一次 pnpm --version 看具体报错" % st2["pnpm"]["path"])
+    job_log("pnpm %s 就绪(%s)" % (pv, st2["pnpm"]["path"]))
+    return True, "Node %s + pnpm %s 就绪" % (st2["node24"]["version"], pv)

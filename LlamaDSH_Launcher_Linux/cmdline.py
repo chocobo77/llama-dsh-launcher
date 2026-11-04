@@ -53,6 +53,18 @@ class ParamState:
         en, v = self.values.get(flag, (False, ""))
         return v if en else ""
 
+    def eff_value(self, flag):
+        """按 flag 取"**实际会生效的值**": 未勾选时回退 offValue(与 build_cmd 一致)。
+
+        raw_value 只给用户填的值, 未勾选就是 ""。但 build_cmd 对带 offValue 的 Combo/Bool
+        会**显式写出关闭值**(--flash-attn off、--spec-type none…)。用 raw_value 做判断的地方
+        会把"关掉的开关"当成"没填": 实测取消勾选 Flash Attention 后, 命令行是
+        --flash-attn off, 而显存预算仍按 cache-type-v 的量化计价 —— V 缓存实际回退 f16,
+        预算少算约 1.8 倍, 提示也一起消失。
+        """
+        d = next((x for x in self.defs if x["flag"] == flag), None)
+        return self.effective_value(d) if d else self.raw_value(flag)
+
     def role_def(self, role):
         for d in self.defs:
             if d.get("role") == role:
@@ -746,7 +758,7 @@ def estimate_vram_needed(profile, defs, query_gpu_fn):
         ck = st.role_text("cache_type_k") or "f16"
         cv = st.role_text("cache_type_v") or "f16"
         kv_note = ""
-        fa_str = (st.raw_value("flash-attn") or "").strip()
+        fa_str = (st.eff_value("flash-attn") or "").strip()
         if fa_str == "off" and cv != "f16":
             cv = "f16"
             kv_note = "(FA 关闭,V 量化回退 f16)"
@@ -824,10 +836,15 @@ def estimate_vram_needed(profile, defs, query_gpu_fn):
         total_vram = _try_float(g.get("vram_total")) or 0.0
         used_vram = _try_float(g.get("vram_used")) or 0.0
         avail = max(0.0, total_vram - used_vram)
+        # 探针读不到显存时 total_vram=0, 与"显存 0 的显卡"同形。这种机器(CPU-only、
+        # i915 无 mem_info_vram_*、nvidia-smi 挂了)以前会得出 fits=True ⇒ 面板写"在可用
+        # 范围内", 用户据此启动然后 bad allocation。C# 侧有第三态("未取到显卡显存信息,
+        # 无法判断"), Linux 移植时丢了 —— 这里补回三态: fits=None 表示无法判断。
+        vram_known = total_vram > 0.0
 
         if layers <= 0 or gi["kv_heads"] <= 0 or ctx <= 0:
             meta_warn.append("⚠ KV 元数据不完整(层数=%d KV头=%d ctx=%d),KV 可能算成 0,预算仅供参考" % (layers, gi["kv_heads"], ctx))
-        fa_auto = (st.raw_value("flash-attn") or "").strip()
+        fa_auto = (st.eff_value("flash-attn") or "").strip()
         if fa_auto == "auto" and cv != "f16":
             meta_warn.append("⚠ FA=auto:若后端不支持 FA,V 缓存会回退 f16,实际占用更高")
         lora_str = st.raw_value("lora")
@@ -842,14 +859,18 @@ def estimate_vram_needed(profile, defs, query_gpu_fn):
                   + "运行时基线: %.0f MiB\n" % (runtime_bytes / 1048576.0)
                   + (("视觉编码器: %.0f MiB\n" % (mmproj_bytes / 1048576.0)) if mmproj_bytes > 0 else "")
                   + "预计总占用: %.2f GiB\n" % (total / GIB)
-                  + "可用显存: %.2f GiB" % (avail / GIB))
+                  + ("可用显存: %.2f GiB" % (avail / GIB) if vram_known
+                     else "可用显存: 未取到(显卡探针无数据, 无法判断能否装下)"))
         if meta_warn:
             detail = "\n".join(meta_warn) + "\n" + detail
         if kv_note:
             detail = detail.replace("KV(%s/%s" % (ck, cv), "KV(%s/%s%s" % (ck, cv, kv_note.replace("(FA 关闭", "(FA 关闭")))
         return {"est_bytes": total, "model_bytes": file_bytes, "kv_bytes": kv_bytes,
                 "avail_bytes": avail, "detail": detail, "ok": True,
-                "warnings": meta_warn, "fits": avail <= 0.0 or total <= avail,
+                "warnings": meta_warn,
+                # None = 探针没有显存数据, 无法判断(调用方不得当成"装得下")
+                "fits": (total <= avail) if vram_known else None,
+                "vram_known": vram_known,
                 "breakdown": {"weights": gpu_weights * 0.95, "kv": kv_bytes,
                               "compute": compute_bytes, "runtime": runtime_bytes,
                               "mmproj": mmproj_bytes, "draft": draft_bytes}}

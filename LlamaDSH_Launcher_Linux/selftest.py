@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(222 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(237 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -2379,6 +2379,247 @@ check("read_json(p, None) 读不动时仍返回 {}(传 None 不等于要 None), 
       and _compat.read_json_or_none(os.path.join(_tmp, "nope19.json")) is None,
       str((_compat.read_json(_trap19, None), _compat.read_json_or_none(_trap19),
           _compat.read_json_or_none(_empty19))))
+
+
+
+# --- 20) 第十一轮: 显存预算的三态 / offValue 未计入 / cudart 并入 / pnpm 的 PATH --
+# 20.1 cudart 包与主包一样带一层归档根目录(cudart-llama-bNNNN-bin-…/)。以前 copytree 把
+#      整棵根目录搬进安装目录 ⇒ .so 与 llama-server 不同目录(rpath=$ORIGIN)而日志写"已并入"。
+_croot20 = "cudart-llama-b12114-bin-ubuntu-cuda-13.4-x64"
+_cdir20 = os.path.join(_tmp, "cudart_cdir20")
+_src20 = os.path.join(_tmp, "llama_dir20")
+os.makedirs(os.path.join(_cdir20, _croot20))
+os.makedirs(_src20)
+with open(os.path.join(_src20, "llama-server"), "w", encoding="utf-8") as fh:
+    fh.write("#!/bin/sh\n")
+for _nm20 in ("libcublasLt.so.13", "libcublas.so.13"):
+    with open(os.path.join(_cdir20, _croot20, _nm20), "w", encoding="utf-8") as fh:
+        fh.write("x")
+_n20, _note20 = toolchain.merge_cudart_tree(_cdir20, _src20)
+check("cudart 并入必须剥掉归档根目录: .so 要与 llama-server 同目录且不留 cudart-* 子目录",
+      _n20 == 2
+      and all(os.path.isfile(os.path.join(_src20, f))
+              for f in ("libcublasLt.so.13", "libcublas.so.13"))
+      and not any(d.startswith("cudart-") for d in os.listdir(_src20)),
+      str(sorted(os.listdir(_src20))))
+check("确有 .so 同目录时才说\"已并入\"(并带上数量供核对)",
+      "已并入" in _note20 and "2 个 .so" in _note20, _note20)
+_cdir20b = os.path.join(_tmp, "cudart_empty20")
+_src20b = os.path.join(_tmp, "llama_dir20b")
+os.makedirs(_cdir20b)
+os.makedirs(_src20b)
+_n20b, _note20b = toolchain.merge_cudart_tree(_cdir20b, _src20b)
+check("并入后同目录没有 .so 时必须改成警告, 不得照报已并入",
+      _n20b == 0 and "⚠" in _note20b and "已并入" not in _note20b, _note20b)
+
+# 20.2 显存探针读不到时 total_vram=0, 与"0 显存的显卡"同形: 旧版据此报"在可用范围内",
+#      用户点启动然后 bad allocation。CPU-only / i915(无 mem_info_vram_*) / nvidia-smi
+#      挂掉都会走到这里。C# 侧本就有第三态, Linux 移植时丢了。(整段预算此前 0 断言)
+_defs20 = [
+    {"flag": "cache-type-k", "type": "Combo", "role": "cache_type_k", "default": "f16"},
+    {"flag": "cache-type-v", "type": "Combo", "role": "cache_type_v", "default": "f16"},
+    {"flag": "ctx-size", "type": "Combo", "role": "ctx_size", "default": "4096"},
+    {"flag": "n-gpu-layers", "type": "Combo", "role": "ngl", "default": ""},
+    {"flag": "ubatch-size", "type": "Combo", "role": "ubatch_size", "default": "512"},
+    {"flag": "flash-attn", "type": "Combo", "role": "flash_attn", "offValue": "off",
+     "default": "on"},
+]
+_model20 = os.path.join(_tmp, "model20.gguf")
+with open(_model20, "w", encoding="utf-8") as fh:
+    fh.write("x")
+_real_arch20, _real_shards20 = cmdline.read_gguf_arch, cmdline.gguf_shard_bytes
+cmdline.read_gguf_arch = lambda _p: {
+    "ok": True, "layers": 64, "kv_heads": 8, "head_dim": 128, "head_count": 40,
+    "embed": 5120, "context_len": 8192, "architecture": "qwen35", "sliding_window": 0,
+    "full_attention_interval": 1, "nextn_predict_layers": 0, "expert_count": 0,
+    "ssm_inner_size": 0, "ssm_state_size": 0, "ssm_conv_kernel": 0, "vocab_size": 151936}
+cmdline.gguf_shard_bytes = lambda _p: 20 * 1024 ** 3
+_prof20 = {"ModelPath": _model20, "NoMmprojOffload": True,
+           "ValueParams": {"cache-type-k": {"Enabled": True, "Value": "q8_0"},
+                           "cache-type-v": {"Enabled": True, "Value": "q4_0"},
+                           "ctx-size": {"Enabled": True, "Value": "32768"},
+                           "n-gpu-layers": {"Enabled": True, "Value": "-1"},
+                           "ubatch-size": {"Enabled": True, "Value": "512"},
+                           "flash-attn": {"Enabled": False, "Value": "on"}}}
+_GIB20 = 1024 ** 3
+_est_nodata = cmdline.estimate_vram_needed(_prof20, _defs20,
+                                           lambda: {"vram_total": 0, "vram_used": 0})
+_est_roomy = cmdline.estimate_vram_needed(_prof20, _defs20,
+                                          lambda: {"vram_total": 64 * _GIB20, "vram_used": _GIB20})
+_est_tight = cmdline.estimate_vram_needed(_prof20, _defs20,
+                                          lambda: {"vram_total": 8 * _GIB20, "vram_used": 7 * _GIB20})
+check("显存探针无数据时不得断言\"装得下\": fits 必须是 None 且 detail 说未取到",
+      _est_nodata is not None and _est_nodata.get("fits") is None
+      and _est_nodata.get("vram_known") is False and "未取到" in _est_nodata["detail"],
+      str({k: _est_nodata.get(k) for k in ("fits", "vram_known")} if _est_nodata else None))
+check("对照: 有显存数据时 fits 仍是布尔(宽裕 True / 紧张 False)",
+      isinstance(_est_roomy["fits"], bool) and _est_roomy["fits"] is True
+      and _est_tight["fits"] is False, str((_est_roomy["fits"], _est_tight["fits"])))
+
+# 20.3 Flash Attention 取消勾选时命令行是 --flash-attn off(build_cmd 写 offValue), 但预算用
+#      raw_value 看到的是 "" ⇒ 仍按 cache-type-v 的量化计价, 而实际 V 缓存回退 f16。
+_ps20 = cmdline.ParamState(_prof20, _defs20)
+check("raw_value 看不到 offValue 而 eff_value 看得到(与 build_cmd 实际生效值一致)",
+      _ps20.raw_value("flash-attn") == "" and _ps20.eff_value("flash-attn") == "off",
+      str((_ps20.raw_value("flash-attn"), _ps20.eff_value("flash-attn"))))
+_prof20_on = json.loads(json.dumps(_prof20))
+_prof20_on["ValueParams"]["flash-attn"] = {"Enabled": True, "Value": "on"}
+_est_fa_off = cmdline.estimate_vram_needed(_prof20, _defs20,
+                                           lambda: {"vram_total": 64 * _GIB20, "vram_used": 0})
+_est_fa_on = cmdline.estimate_vram_needed(_prof20_on, _defs20,
+                                          lambda: {"vram_total": 64 * _GIB20, "vram_used": 0})
+check("FA 关闭必须把 V 按 f16 计价: KV 明显变大且 detail 给出说明",
+      _est_fa_off["kv_bytes"] > _est_fa_on["kv_bytes"] * 1.5
+      and "FA 关闭" in _est_fa_off["detail"] and "FA 关闭" not in _est_fa_on["detail"],
+      "off=%.2f GiB on=%.2f GiB" % (_est_fa_off["kv_bytes"] / _GIB20,
+                                    _est_fa_on["kv_bytes"] / _GIB20))
+cmdline.read_gguf_arch, cmdline.gguf_shard_bytes = _real_arch20, _real_shards20
+# 20.4 pnpm: node 一侧认 ~/.local/bin, pnpm 一侧只认 PATH —— 而两条安装路线都把 pnpm 装进
+#      ~/.local/bin, 项目里也从没把它加进 PATH。GNOME 自启/systemd-user/sudo 下就是
+#      "明明装好了却报未安装", 一键安装反复点也不收敛。
+_real_lbin, _real_which20 = nodetool.LOCAL_BIN, procman.which
+_lbin20 = os.path.join(_tmp, "localbin20")
+os.makedirs(_lbin20)
+_pnpm20 = os.path.join(_lbin20, "pnpm")
+with open(_pnpm20, "w", encoding="utf-8") as fh:
+    fh.write("#!/bin/sh\necho 9.9.9\n")
+os.chmod(_pnpm20, 0o755)
+procman.which = lambda name: None               # PATH 里没有 pnpm
+nodetool.LOCAL_BIN = _lbin20
+_p20 = nodetool._pnpm_path()
+procman.which = _real_which20
+check("pnpm 装在 ~/.local/bin 且 PATH 不含它时必须能找到(否则装好了也报未安装)",
+      _p20 == _pnpm20, str(_p20))
+nodetool.LOCAL_BIN = _real_lbin
+
+#      超时/空输出两族: corepack 的 subprocess.run 超时(首次运行要联网)以前 r=None,
+#      紧接着 r.stderr 抛 AttributeError ⇒ 整个一键安装以 'NoneType' object has no
+#      attribute 'stderr' 收场; corepack "返回 0" 但 shim 还没取到包时, 以前只看 path
+#      就报 pnpm 就绪, 失败被推到后面的 DSH 安装里。
+_real_ppath = nodetool._pnpm_path
+_real_detect20, _real_v24_20 = nodetool.detect, nodetool.latest_v24
+_real_run20 = nodetool.subprocess.run
+_LOG20 = []
+_fake_pnpm20 = [None]
+_drop20 = [None]                            # corepack 落下哪个 shim(哑 shim / 正常 shim)
+_shim20 = os.path.join(_lbin20, "pnpm-silent")
+with open(_shim20, "w", encoding="utf-8") as fh:
+    fh.write("#!/bin/sh\nexit 0\n")          # corepack shim 取不到包: 退出码 0、零输出
+os.chmod(_shim20, 0o755)
+
+
+def _detect20(force=False):
+    return {"node24": {"path": os.path.join(_lbin20, "node"), "version": "v24.9.9"},
+            "any_node": {"path": os.path.join(_lbin20, "node"), "version": "v24.9.9"},
+            "pnpm": ({"path": _fake_pnpm20[0], "version": None} if _fake_pnpm20[0]
+                     else {"path": None, "version": None}),
+            "meets": False, "version_unknown": False}
+
+
+def _run_timeout(cmd, *a, **k):
+    raise nodetool.subprocess.TimeoutExpired(cmd=cmd, timeout=120)
+
+
+nodetool.LOCAL_BIN = _lbin20
+nodetool._pnpm_path = lambda: None            # 两条路线都没能让 pnpm 出现
+nodetool.detect = _detect20
+nodetool.latest_v24 = lambda: ("https://nodejs.org/dist", "v24.9.9")
+nodetool.subprocess.run = _run_timeout
+_ok20, _msg20 = nodetool.install_node_env(_LOG20.append)
+check("corepack 超时不得让任务以 AttributeError 收场(要看得出 node 已装好、超时在哪)",
+      _ok20 is False and "NoneType" not in (_msg20 or "")
+      and any("corepack enable 超时" in t for t in _LOG20), str((_ok20, _msg20, _LOG20[:3])))
+
+
+def _run_ok(cmd, *a, **k):
+    cmd_s = " ".join(str(x) for x in cmd)
+    if "corepack" in cmd_s:
+        _fake_pnpm20[0] = _drop20[0]         # corepack 落下什么 shim 由对照决定
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    if "install" in cmd_s:
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    return _real_run20(cmd, *a, **k)          # pnpm --version 真跑那个哑 shim
+
+
+nodetool.subprocess.run = _run_ok
+_drop20[0] = _shim20                        # corepack 落下一个 exit 0、零输出的 shim
+_ok20b, _msg20b = nodetool.install_node_env(_LOG20.append)
+check("pnpm 文件在但 --version 无输出时不得报就绪(corepack 首次运行要联网取包)",
+      _ok20b is False and "无输出" in (_msg20b or ""), str((_ok20b, _msg20b)))
+_drop20[0] = _pnpm20                         # 对照: 能报出版本时必须照常判就绪
+_ok20c, _msg20c = nodetool.install_node_env(_LOG20.append)
+check("对照: pnpm --version 有输出时仍要判就绪(不得把新校验变成一律失败)",
+      _ok20c is True and "9.9.9" in (_msg20c or ""), str((_ok20c, _msg20c)))
+nodetool.subprocess.run = _real_run20
+nodetool.detect, nodetool.latest_v24 = _real_detect20, _real_v24_20
+nodetool._pnpm_path, nodetool.LOCAL_BIN = _real_ppath, _real_lbin
+
+
+# 20.5 三态要一路走到确认弹窗: core.precheck → need_confirm → app.js。中途任何一处
+#      bool(...) 都会把"没读到"变成断言(旧版 bool(None)=False ⇒ 标题"显存不足"、按钮 danger)。
+import schema as _schema20
+_ldir20 = os.path.join(_tmp, "llama20_dir")
+os.makedirs(_ldir20)
+open(os.path.join(_ldir20, "llama-server"), "w", encoding="utf-8").write("#!/bin/sh\n")
+os.chmod(os.path.join(_ldir20, "llama-server"), 0o755)
+_prof20b = dict(_prof20, LlamaDir=_ldir20)
+_prof20b["ValueParams"] = dict(_prof20["ValueParams"], **{"port": {"Enabled": True, "Value": "34567"}})
+cmdline.read_gguf_arch = lambda _p: {
+    "ok": True, "layers": 64, "kv_heads": 8, "head_dim": 128, "head_count": 40,
+    "embed": 5120, "context_len": 8192, "architecture": "qwen35", "sliding_window": 0,
+    "full_attention_interval": 1, "nextn_predict_layers": 0, "expert_count": 0,
+    "ssm_inner_size": 0, "ssm_state_size": 0, "ssm_conv_kernel": 0, "vocab_size": 151936}
+cmdline.gguf_shard_bytes = lambda _p: 20 * 1024 ** 3
+_run20 = core.LlamaRunner(_Silent(), {"defs": _schema20.load()["defs"]})
+_qg20 = monitor.query_gpu
+_seen20 = {}
+for _lab20, _q20 in (("nodata", lambda: {"vram_total": 0, "vram_used": 0}),
+                     ("roomy", lambda: {"vram_total": 64 * _GIB20, "vram_used": _GIB20}),
+                     ("tight", lambda: {"vram_total": 8 * _GIB20, "vram_used": 7 * _GIB20})):
+    monitor.query_gpu = _q20
+    try:
+        _seen20[_lab20] = _run20.precheck(_prof20b)
+    finally:
+        monitor.query_gpu = _qg20
+check("确认链必须把\"探针无显存数据\"原样带到前端(vram_fits=None, 不得抹成 True/False)",
+      _seen20["nodata"].get("kind") == "confirm"
+      and "vram_fits" in _seen20["nodata"] and _seen20["nodata"]["vram_fits"] is None
+      and "未取到" in _seen20["nodata"]["vram"],
+      str({k: _seen20[k].get("vram_fits", "<无键>") for k in sorted(_seen20)}))
+check("对照: 有显存数据时确认链仍给布尔(宽裕 True / 超出 False)",
+      _seen20["roomy"]["vram_fits"] is True and _seen20["tight"]["vram_fits"] is False,
+      str((_seen20["roomy"]["vram_fits"], _seen20["tight"]["vram_fits"])))
+cmdline.read_gguf_arch, cmdline.gguf_shard_bytes = _real_arch20, _real_shards20
+
+# 20.6 启动 DSH 时 exec 的是裸命令名(node / pnpm / npx): 一键安装把它们链进 ~/.local/bin,
+#      而启动器进程(自启、systemd-user、sudo)的 PATH 常常不含它 ⇒ execvp 报"找不到命令",
+#      面板上与"根本没装"同形。HOME 临时指向自检目录, 不碰用户真实的 ~/.local/bin。
+_real_which20b, _real_home20 = procman.which, os.environ.get("HOME")
+_home20 = os.path.join(_tmp, "home20")
+_lbin_real20 = os.path.join(_home20, ".local", "bin")
+os.makedirs(_lbin_real20)
+_node20 = os.path.join(_lbin_real20, "node")
+open(_node20, "w", encoding="utf-8").write("#!/bin/sh\necho v24.9.9\n")
+os.chmod(_node20, 0o755)
+os.environ["HOME"] = _home20
+try:
+    procman.which = lambda name: None           # PATH 里没有 node(自启/systemd/sudo 常见)
+    _abs_ok20 = core._abs_exe("node")
+    _abs_none20 = core._abs_exe("no-such-exe-r11-zzz")
+    check("要 exec 的命令必须能在 PATH 之外解析到 ~/.local/bin(否则装了也报找不到命令)",
+          _abs_ok20 == _node20 and _abs_none20 is None, str((_abs_ok20, _abs_none20)))
+    _sysbin20 = os.path.join(_tmp, "sysbin20")
+    os.makedirs(_sysbin20, exist_ok=True)
+    _node_sys20 = os.path.join(_sysbin20, "node")
+    open(_node_sys20, "w", encoding="utf-8").write("#!/bin/sh\necho v24.9.9\n")
+    os.chmod(_node_sys20, 0o755)
+    procman.which = lambda name: _node_sys20 if name == "node" else None
+    check("对照: PATH 里有结果时必须优先用它(不得把解析变成硬编码 ~/.local/bin)",
+          core._abs_exe("node") == _node_sys20
+          and core._abs_exe("no-such-exe-r11-zzz") is None, str(core._abs_exe("node")))
+finally:
+    procman.which = _real_which20b
+    os.environ["HOME"] = _real_home20
 
 # --- 17) 自检自身的边界: 不得污染用户真实的日志目录 ---------------------------
 # 17.1 以前 selftest 直接往 ~/.dsh_launcher_logs 写: 每跑一次就多出几条测试噪声

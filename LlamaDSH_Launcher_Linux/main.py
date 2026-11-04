@@ -259,8 +259,9 @@ def api_preview(body):
         fmt += "\n⚠ " + qw
     return {"fmt_cmd": fmt, "cmd_line": " ".join(cmdline.qa(x) for x in lst),
             "violations": violations, "qwen35": qw, "flag_args": flag_args,
-            "vram": {"detail": est["detail"], "fits": bool(est.get("fits", True)),
-                     "over": (not est.get("fits", True)) and est["avail_bytes"] > 0} if est else None}
+            # fits 保持三态(None = 探针无显存数据); over 只在**确认**超出时为 True
+            "vram": {"detail": est["detail"], "fits": est.get("fits"),
+                     "over": est.get("fits") is False} if est else None}
 
 
 def api_llama_start(body):

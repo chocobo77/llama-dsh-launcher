@@ -1217,16 +1217,21 @@ async function _startLlamaInner() {
     if (nc.violations && nc.violations.length) {
       msg += "以下参数未通过依赖/校验检查,将被剔除:\n\n" + nc.violations.map(v => " • " + v).join("\n") + "\n\n";
     }
+    // vram_fits 三态: true=在范围内 / false=超出 / null|undefined=探针没读到显存(不得替用户
+    // 断言"装得下", 也不能报"超出" —— 对齐 CS 的"未取到显卡显存信息,无法判断")
+    const vramUnknown = !!nc.vram && nc.vram_fits !== true && nc.vram_fits !== false;
+    const vramOver = !!nc.vram && nc.vram_fits === false;
     if (nc.vram) {
-      msg += nc.vram + "\n\n判断: " + (nc.vram_fits
-        ? "在可用范围内"
-        : "超出可用范围,llama-server 很可能因显存耗尽而崩溃(bad allocation / GGML_ASSERT)") + "\n\n";
+      msg += nc.vram + "\n\n判断: " + (vramOver
+        ? "超出可用范围,llama-server 很可能因显存耗尽而崩溃(bad allocation / GGML_ASSERT)"
+        : (vramUnknown ? "未取到显卡显存信息,无法判断(按下面的估算自行确认)"
+                       : "在可用范围内")) + "\n\n";
     }
     if (nc.qwen35) msg += "⚠ " + nc.qwen35 + "\n\n";
     const v = await showModal({
-      title: nc.vram && !nc.vram_fits ? "显存不足" : "显存预算",
+      title: vramOver ? "显存不足" : "显存预算",
       body: mEsc(msg.trim()),
-      buttons: [{ label: "否,取消启动", value: "no" }, { label: nc.vram && !nc.vram_fits ? "仍然启动" : "继续启动", cls: nc.vram_fits ? "primary" : "danger", value: "yes" }]
+      buttons: [{ label: "否,取消启动", value: "no" }, { label: vramOver ? "仍然启动" : "继续启动", cls: vramOver ? "danger" : "primary", value: "yes" }]
     });
     if (v !== "yes") { logLine("--- 启动已取消 ---"); return; }
     const rr = await api("llama/start", { profile: prof, confirm: { done: true } });

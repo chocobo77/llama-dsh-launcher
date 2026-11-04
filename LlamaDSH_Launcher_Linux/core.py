@@ -86,6 +86,24 @@ def is_dsh_noise(content):
     return True
 
 
+def _abs_exe(name):
+    """把要 exec 的命令解析成绝对路径: PATH 之外再认 ~/.local/bin 与 /usr/local/bin。
+
+    与 nodetool 的安装位置对齐(一键安装把 node/npm/npx/corepack/pnpm 链到 ~/.local/bin),
+    而项目里没有任何地方给启动器加过这条 PATH。
+    """
+    p = procman.which(name)
+    if p:
+        return p
+    if os.path.isabs(name):
+        return name if os.path.isfile(name) and os.access(name, os.X_OK) else None
+    for d in (os.path.expanduser("~/.local/bin"), "/usr/local/bin"):
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
 # ===================================================================== 日志 ==
 
 class LogHub:
@@ -242,7 +260,10 @@ class LlamaRunner:
         est = cmdline.estimate_vram_needed(profile, defs, monitor.query_gpu)
         if est:
             confirm["vram"] = est["detail"]
-            confirm["vram_fits"] = bool(est.get("fits"))
+            # 三态原样传: True=在范围内 / False=超出 / None=探针无显存数据。
+            # bool(None)=False 会变成"超出可用范围"这种没发生过的断言, 而 None 被抹成
+            # True 则是"装得下"的断言 —— 两个方向都不能替用户下结论。
+            confirm["vram_fits"] = est.get("fits")
         qw = cmdline.qwen35_partial_offload_warning(profile, defs)
         if qw:
             confirm["qwen35"] = qw
@@ -632,6 +653,17 @@ class DshRunner:
         inner = {"compiled-js": ["node", "apps/cli/lib/bin.js", "web"],
                  "compiled-tsx": ["pnpm", "dsh", "web"],
                  "npx": ["npx", "--yes", "@deepseek-ai/dsh", "web"]}[mode]
+        # 把命令解析成绝对路径再 exec: 启动器自己的 PATH 可能不含 ~/.local/bin(GNOME 自启、
+        # systemd-user、sudo 的 PATH 都不含), 而一键安装正是把 node/pnpm 装在那里。
+        # 不解析的话 execvp 报"找不到命令", 面板上却与"没装"同形, 用户看不出装了却没用上。
+        _head = _abs_exe(inner[0])
+        if not _head:
+            self.hub.log("[DSH] ⚠ 找不到可执行文件 %s(PATH 与 ~/.local/bin 都没有) —— 请先在"
+                         "「📂 运行环境」里安装 Node/pnpm, 或把 ~/.local/bin 加进启动器的 PATH"
+                         % inner[0])
+            self.status = "failed"
+            return False, "缺少可执行文件 %s" % inner[0]
+        inner = [_head] + inner[1:]
         want_admin = bool(profile.get("DshAdminMode"))
         demoted = False
         if want_admin:

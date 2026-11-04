@@ -1039,7 +1039,10 @@ def _pnpm_env():
     env = dict(os.environ)
     pnpm_home = os.path.expanduser("~/.local/share/pnpm")
     env["PNPM_HOME"] = pnpm_home
-    env["PATH"] = pnpm_home + os.pathsep + env.get("PATH", "")
+    # ~/.local/bin 也要进子进程 PATH: corepack/npm 安装的 pnpm 就在那儿, 而启动器自己的
+    # PATH 常常不含它(GNOME 自启、systemd-user、sudo)。只加 PNPM_HOME 会覆盖一半路径。
+    env["PATH"] = (pnpm_home + os.pathsep + os.path.expanduser("~/.local/bin")
+                   + os.pathsep + env.get("PATH", ""))
     return env
 
 
