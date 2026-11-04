@@ -562,6 +562,9 @@ def api_open_dsh(_):
 
 _SHUTDOWN_LATCH = threading.Lock()
 _SHUTTING_DOWN = False
+# 收尾看门狗: 必须比 stop() 的最坏合法路径(≈32s)长, 又必须比"用户能忍"短。
+# 与 tray.py 兜底 SIGTERM 后的等待窗共用同一个数量级, 别让两侧互相误判。
+_EXIT_WATCHDOG_S = 45
 
 
 def _stop_all_and_exit(tag):
@@ -575,14 +578,47 @@ def _stop_all_and_exit(tag):
       进入这里; 两个收尾线程并发跑 kill + os._exit 会互相打断 —— 先退出的一方掐掉
       另一方正在进行的 SIGKILL, 恰好又造出孤儿。故第二次直接返回。
     · stop() 内部可能卡在 ss/lsof(各 10s)或坏掉的 IO 上, 那样进程永不退出, 托盘只能
-      干等。故挂一个 30s 看门狗强制退出(托盘那侧会按 PID 复核并把残留点名)。
+      干等。故挂一个看门狗兜底(托盘那侧会按 PID 复核并把残留点名)。
     """
     global _SHUTTING_DOWN
-    with _SHUTDOWN_LATCH:
+    with _SHUTTING_DOWN:
         if _SHUTTING_DOWN:
             return
         _SHUTTING_DOWN = True
-    watchdog = threading.Timer(30.0, lambda: os._exit(1))
+    # 停之前把 PID 抄下来: 看门狗到点时要**补杀**再退出, 不能只 os._exit。
+    # (C# Window_Closing 9237-9246 同语义: "Shutdown 不等后台线程池", 退出前按记录
+    #  的 PID 同步补杀; 只 _exit 等于把 stop() 打断在途的那一半留下当孤儿。)
+    svc_pids = []
+    for runner in (LLAMA, DSH):
+        for handle in (getattr(runner, "proc", None), getattr(runner, "tracker", None)):
+            pid = getattr(handle, "pid", None)
+            if pid:
+                svc_pids.append(int(pid))
+
+    def _watchdog_fire():
+        try:
+            HUB.log("[退出] ⚠ 收尾超过 %d 秒仍未完成, 补发 SIGKILL 并强制退出: %s"
+                    % (_EXIT_WATCHDOG_S, svc_pids or "未记录 PID"))
+            for pid in svc_pids:
+                try:
+                    victims = procman.child_pids(pid)
+                except Exception:
+                    victims = []
+                if pid not in victims:
+                    victims.append(pid)
+                for q in victims:
+                    try:
+                        os.kill(q, signal.SIGKILL)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        os._exit(1)
+
+    # 看门狗预算必须**大于** stop() 的最坏合法路径: llama 侧 ss 查端口 10s + 杀树 3s,
+    # DSH 侧杀树 3s + sudo kill 15s + 复核 0.6s ≈ 32s。以前取 30s 会在 sudo 还在途时
+    # 抢先 os._exit —— 拦腰打断一次"正常但慢"的收尾, 恰好留下活着的 DSH。
+    watchdog = threading.Timer(_EXIT_WATCHDOG_S, _watchdog_fire)
     watchdog.daemon = True
     watchdog.start()
     for name, runner in (("llama.cpp", LLAMA), ("DSH", DSH)):
@@ -597,14 +633,22 @@ def _stop_all_and_exit(tag):
                 if j["status"] == "running"]
     except Exception:
         busy = []
+    # 插件安装/卸载/升级是**同步**跑在 HTTP 线程里的 pnpm 写操作, 不在 JOBS 里 ——
+    # 而这恰恰是收尾时最危险的一种"在途"(把 package.json 写到一半就没了)。
+    try:
+        busy += compat.inflight_ops()
+    except Exception:
+        pass
     if busy:
-        HUB.log("[%s] ⚠ 仍有后台任务在运行(%s), 它们以独立会话启动, 会自行跑完"
+        HUB.log("[%s] ⚠ 仍有任务在进行(%s); 后台任务以独立会话启动会自行跑完, "
+                "但 pnpm 写依赖如果在中途被打断, 请到插件列表重新审计一次"
                 % (tag, ", ".join(busy)))
     HUB.log("[%s] 服务进程退出" % tag)
     try:
         sys.stdout.flush()
     except Exception:
         pass
+    watchdog.cancel()      # 正常收尾完成: 别让已经排好的看门狗在 os._exit 前抢跑
     os._exit(0)
 
 
@@ -842,10 +886,15 @@ def _dsh_running_guard():
     除了端口/cmdline 探测, 还要看服务自己手里的 DSH 句柄与状态: procman 的 cmdline
     探测带 10s 缓存(`_all_cmdlines`), 于是"DSH 刚 exec、端口还没监听"的窗口里两条外部
     探测都报假 —— pnpm 就可能在 DSH 启动/重建过程中改 node_modules。
+
+    句柄判定必须走 `DSH.running`(poll 感知, 且 tracker 带 StartTime 校验), 不能只判
+    "句柄不是 None": DSH 启动失败时 `_verify_loop` 会留下 proc 句柄, 接管来的 DSH 被
+    外部杀掉后 tracker 也还在 —— 那样这个 guard 会**永久**拒绝插件操作, 用户只能先点
+    一次"停止"才能解锁。
     """
-    if DSH.proc is not None or DSH.tracker is not None:
+    if DSH.running:
         return False
-    if DSH.status in ("starting", "running", "rebuilding"):
+    if DSH.status in ("starting", "running", "running_admin", "rebuilding"):
         return False
     if procman.find_process_by_port(DSH_PORT) or procman.node_host_running():
         return False
@@ -928,6 +977,17 @@ def api_health(_):
     """HealthCheck(5s):接管/短命进程的存活对账。"""
     if LLAMA.status in ("running", "starting", "taken_over") and LLAMA.proc and LLAMA.proc.poll() is not None:
         LLAMA.status = "failed"
+    # DSH 是分离会话启动的, **没有** exit 观察线程(C# 靠 PumpProcessStreams→OnDshDone):
+    # 它自己崩掉/被外部杀掉后, status 会永远停在"运行中" —— 面板假在线, 且
+    # _dsh_running_guard 从此永久拒绝所有插件操作。这里按 5s 一次把状态落回。
+    if DSH.status.startswith("running") and not DSH.running:
+        DSH.status = "stopped"
+        DSH.tracker = None
+        DSH.proc = None
+        DSH._stop_tailer()
+        state.clear_state_for("DshPid")
+        HUB.log("--- DSH 进程已不在(非启动器停止), 状态已回落; 若不是您手动关掉的, "
+                "请看 DSH 日志确认崩溃原因 ---")
     return {"ok": True}
 
 

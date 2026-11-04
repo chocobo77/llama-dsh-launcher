@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(132 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(150 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -855,21 +855,22 @@ check("确实停干净(PID 已消失)时才写'已停止'",
       "llama.cpp 与 DSH 已停止" in _b4.getvalue(), _b4.getvalue()[:120])
 
 main_src = open(os.path.join(APP, "main.py"), encoding="utf-8").read()
+_guard_src = main_src[main_src.index("def _dsh_running_guard"):][:700]
 check("服务端有 /api/shutdown 路由", '("shutdown",): api_shutdown' in main_src)
 i0 = main_src.index("def _stop_all_and_exit")
-shut_src = main_src[i0:i0 + 2000]
+shut_src = main_src[i0:main_src.index("\ndef api_shutdown", i0)]   # 按函数边界取, 不用固定长度
 check("退出收尾停完 llama.cpp 与 DSH 才结束进程(顺序不能反)",
       shut_src.index("os._exit(0)") > shut_src.index("LLAMA") and "DSH" in shut_src,
       shut_src[:60])
 check("收尾有幂等闩: 重复 SIGTERM/Ctrl+C 不会起第二个收尾线程互相打断",
       "_SHUTTING_DOWN" in shut_src and "if _SHUTTING_DOWN:" in shut_src, shut_src[:90])
 check("收尾挂看门狗: stop() 卡在 ss/lsof 时也不会永久挂住不退出",
-      "threading.Timer(30.0" in shut_src and "os._exit(1)" in shut_src, "")
+      "threading.Timer(_EXIT_WATCHDOG_S" in shut_src and "os._exit(1)" in shut_src, "")
 check("读 JOBS 前先取快照(直接迭代会和 run_job 的插入/pop 竞态)",
       "snapshot = dict(JOBS)" in shut_src and "with JOB_LOCK" in shut_src, "")
 check("_dsh_running_guard 也看服务自己的 DSH 句柄(cmdline 探测带 10s 缓存会漏启动窗口)",
-      "DSH.proc is not None" in main_src[main_src.index("def _dsh_running_guard"):][:500]
-      and "rebuilding" in main_src[main_src.index("def _dsh_running_guard"):][:500], "")
+      "if DSH.running:" in _guard_src
+      and "rebuilding" in _guard_src and "running_admin" in _guard_src, "")
 check("仍在跑的后台任务在退出前记进日志(os._exit 不让独立会话的长任务停下来)",
       'j["status"] == "running"' in shut_src, shut_src[:80])
 check("/api/shutdown 与信号收尾共用同一条路(不在两处各写一份)",
@@ -1269,7 +1270,134 @@ check("兜底清理分清已发出/杀不掉: root 属主的服务要按 PID 点
       "4343" in _b5.getvalue() and "属主不是本人" in _b5.getvalue()
       and str(_child.pid) in _b5.getvalue(), _b5.getvalue()[:220])
 check("兜底 SIGTERM 后还要等服务确认死亡(否则 llama/DSH 还在跑就收了托盘)",
-      "for _ in range(20)" in inspect.getsource(_tray.TrayIcon._stop_all_then_quit), "")
+      "for _ in range(50)" in inspect.getsource(_tray.TrayIcon._stop_all_then_quit), "")
+
+
+
+# --- 11) 第三轮 review: 在途重启 / DSH 停止 / 看门狗预算 / 打包黑名单分族 ---
+# 11.1 OOM 降层是"sleep 1s 后再 start": 这期间用户点"停止"必须能作废那次在途重启,
+#      否则 stop() 刚清完状态, 1s 后又冒出一个 llama-server(收尾时就是孤儿)。
+_started1 = []
+_r1 = core.LlamaRunner(_Silent(), {"defs": []})
+_r1.last_profile = {"OomRetryEnabled": True}
+_r1.start = lambda p, skip_vram_confirm=False: (_started1.append(1), (True, ""))[1]
+_r1.user_stopped = True
+_r1.oom_retry_active = True
+_r1._relaunch()
+check("用户已停止时, 已排下的 OOM 降层重启必须作废(单靠决策点的标志挡不住在途那次)",
+      _started1 == [] and _r1.oom_retry_active is False, str(_started1))
+_started2 = []
+_r2 = core.LlamaRunner(_Silent(), {"defs": []})
+_r2.last_profile = {"OomRetryEnabled": True}
+_r2.start = lambda p, skip_vram_confirm=False: (_started2.append(1), (True, ""))[1]
+_r2._relaunch()
+check("对照: 没有用户停止时降层重启照常进行(防线没把正常功能挡死)",
+      _started2 == [1], str(_started2))
+
+# 11.2 接管来的 DSH 退出后 PID 会被复用: 照 tracker.pid 杀整树 = 打死无辜进程。
+class _ReusedTracker:
+    pid = 0
+
+    def poll(self):
+        return -1                     # StartTime 变了 → 这个 PID 已不是当时那个进程
+
+
+_alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+_ReusedTracker.pid = _alive.pid
+_clear_real2 = core.state.clear_state_for
+core.state.clear_state_for = lambda which, state=None: None
+try:
+    _dr = core.DshRunner(_Silent(), {"defs": []})
+    _dr.tracker = _ReusedTracker()
+    _dr.status = "running"
+    _dr.stop()
+    time.sleep(0.6)
+    check("PID 已被复用时不得照 tracker.pid 杀进程树(tracker 带 StartTime 校验)",
+          _alive.poll() is None and _dr.tracker is None and _dr.user_stopped,
+          "child=%s tracker=%s" % (_alive.poll(), _dr.tracker))
+finally:
+    core.state.clear_state_for = _clear_real2
+    _alive.terminate()
+    _alive.wait()
+_vsrc = inspect.getsource(core.DshRunner._verify_loop)
+check("DSH 启动失败自动重试必须认 user_stopped(否则停止/收尾后又拉一个分离 DSH)",
+      "user_stopped" in _vsrc and "不再自动重试" in _vsrc, _vsrc[:80])
+check("提权停止要连子进程树一起 sudo kill(C# 用 taskkill /F /T, 只杀根 PID 会留 pnpm)",
+      "procman.child_pids(pid)" in inspect.getsource(core.DshRunner.stop), "")
+
+# 11.3 收尾看门狗: 预算必须大于 stop() 最坏合法路径, 到点要补杀 + 留痕
+check("收尾看门狗预算必须比 stop() 最坏合法路径长(ss 10s + sudo 15s + 两轮杀树 ≈ 32s)",
+      "_EXIT_WATCHDOG_S = 45" in main_src and "threading.Timer(_EXIT_WATCHDOG_S" in main_src, "")
+_wd0 = main_src.index("def _watchdog_fire")
+check("看门狗到点要先补发 SIGKILL 并把这件事写进日志(以前只 os._exit, 日志戛然而止)",
+      "signal.SIGKILL" in main_src[_wd0:_wd0 + 900]
+      and "child_pids" in main_src[_wd0:_wd0 + 900]
+      and "HUB.log" in main_src[_wd0:_wd0 + 900], main_src[_wd0:_wd0 + 120])
+check("正常收尾完成后要 cancel 看门狗(消除收尾耗时≈预算时两个 os._exit 抢跑)",
+      "watchdog.cancel()" in shut_src or "watchdog.cancel()" in main_src, "")
+check("_dsh_running_guard 要用 poll 感知的 DSH.running(句柄残留会让插件操作永久被拒)",
+      "if DSH.running:" in main_src
+      and "DSH.proc is not None or DSH.tracker is not None" not in main_src, "")
+check("DSH 崩掉/被外部杀掉后要有 5s 对账把状态落回(否则面板假在线且 guard 永久拒绝)",
+      'DSH.status.startswith("running") and not DSH.running' in main_src, "")
+
+# 11.4 打包忽略项分两族: 声明条目只豁免开发期目录, 结构性目录永不进包
+_pg = os.path.join(_tmp, "pack_glob")
+os.makedirs(os.path.join(_pg, "scripts", "node_modules", "dep"))
+os.makedirs(os.path.join(_pg, "dist"))
+for _leaf in ("scripts/keep.js", "scripts/node_modules/dep/x.js", "index.js", "dist/a.js"):
+    with open(os.path.join(_pg, _leaf), "w", encoding="utf-8") as fh:
+        fh.write("//x\n")
+with open(os.path.join(_pg, "package.json"), "w", encoding="utf-8") as fh:
+    json.dump({"name": "p3", "version": "1.0.0", "main": "index.js",
+               "files": ["scripts/*.js", "dist"]}, fh)
+_compat.subprocess.run = _fake_pack
+_compat._pack_staged(_pg, _pout, job_log=_plog.append)
+_f_glob = list(_pstage["files"])
+_pc = os.path.join(_tmp, "pack_case")
+os.makedirs(os.path.join(_pc, "Tests"))
+os.makedirs(os.path.join(_pc, "Docs"))
+for _leaf in ("Tests/x.txt", "Docs/y.md", "index.js"):
+    with open(os.path.join(_pc, _leaf), "w", encoding="utf-8") as fh:
+        fh.write("//x\n")
+with open(os.path.join(_pc, "package.json"), "w", encoding="utf-8") as fh:
+    json.dump({"name": "p4", "version": "1.0.0", "main": "index.js"}, fh)
+_compat._pack_staged(_pc, _pout, job_log=_plog.append)
+_f_case = list(_pstage["files"])
+_compat.subprocess.run = orig_compat_run
+check("声明的通配条目(scripts/*.js)要收到, 但 node_modules 任何情况都不能进包",
+      "scripts/keep.js" in _f_glob and "dist/a.js" in _f_glob
+      and not any("node_modules" in f for f in _f_glob), str(_f_glob))
+check("开发期目录按大小写无关比对也要甩掉(C# 用 OrdinalIgnoreCase; Tests/Docs 曾整目录进包)",
+      not any(f.split("/")[0] in ("Tests", "Docs") for f in _f_case)
+      and "index.js" in _f_case, str(_f_case))
+
+# 11.5 激活守卫: 版本检查被豁免 ≠ peer 真的对上了(C# FilterBundleActivation 2693)
+_k_ex, _d_ex = _compat.filter_bundle_activation(
+    ["demo-plugin"], [{"name": "demo-plugin", "compatible": True, "exempted": True,
+                       "peer_issues": [{"dep": "@deepseek-ai/dsh-core", "range": "^0.9",
+                                        "installed": "0.7"}],
+                       "missing_specs": [], "errors": []}], "web")
+check("已豁免版本检查但 peer 仍不匹配的包不得自动激活(激活后 DSH 模块加载会失败)",
+      _k_ex == [] and _d_ex and "豁免" in _d_ex[0]["reason"], str((_k_ex, _d_ex)))
+
+# 11.6 pnpm 写依赖不在 JOBS 里, 收尾退出时必须能点名
+_compat._mark_inflight("web", "本地插件安装")
+check("正在写依赖的动作要能被收尾点名(同步跑在 HTTP 线程, 不在 JOBS 里)",
+      any("本地插件安装" in x for x in _compat.inflight_ops()), str(_compat.inflight_ops()))
+check("在途集合必须成对清理(install 的 finally 里 clear)",
+      "_mark_inflight(profile" in src_ilp and "_clear_inflight(profile)" in src_ilp
+      and '_clear_inflight(profile)' in src_ilp, src_ilp[-120:])
+_compat._clear_inflight("web")
+check("clear 后在途集合必须为空(否则会一直误报有任务在跑)",
+      _compat.inflight_ops() == [], str(_compat.inflight_ops()))
+
+# 11.7 托盘兜底: 等待窗与文案要对齐服务端 45s 收尾预算
+_tsrc = inspect.getsource(_tray.TrayIcon._stop_all_then_quit)
+check("兜底 SIGTERM 后的等待窗要盖住服务端收尾预算(否则把正常收尾误报成残留)",
+      "for _ in range(50)" in _tsrc and "45s" in _tsrc, _tsrc[:100])
+check("杀不掉的(root 属主)服务要点名并给出动作(在所属账号下 sudo kill)",
+      "sudo kill" in _tsrc and "属主不是本人" in _tsrc, "")
 
 
 shutil.rmtree(_tmp, ignore_errors=True)

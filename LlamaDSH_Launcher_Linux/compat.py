@@ -646,6 +646,12 @@ def filter_bundle_activation(candidates, plugins, profile="web"):
         if info:
             if info.get("compatible") is False:
                 bad, why = True, "peer 兼容性未确认"
+            elif info.get("exempted") and info.get("peer_issues"):
+                # C# FilterBundleActivation(2693): **豁免过版本检查 ≠ peer 真的对上了**。
+                # audit_plugins 里 compatible = (not peer_issues) or exempted, 所以只看
+                # compatible 会让豁免过的错位包通过守卫被自动激活, 后果就是 C# 注释写的
+                # client module table 漂移、DSH 启动时模块加载失败。
+                bad, why = True, "peer 与当前 DSH 版本不匹配(版本检查已豁免)"
             if info.get("missing_specs"):
                 bad, why = True, "存在缺失依赖 (%s)" % ", ".join(info["missing_specs"][:3])
             if info.get("errors"):
@@ -992,9 +998,23 @@ def uninstall_plugin(profile, name):
 
 
 # ---------------------------------------------------- 本地插件安装(C# InstallLocalPlugin) --
-_PACK_IGNORE = {"node_modules", ".git", ".pnpm", ".pnpm-store", ".svn", "tests", "test",
-                "docs", "scripts", ".github", ".vscode", ".idea", "coverage", "__pycache__",
-                "pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc", ".gitignore"}
+# 打包忽略项必须分两族(C# TryPackStagedPackage 对**所有**条目都套 PackIgnoredNames):
+# ① _PACK_ALWAYS: 结构性目录, 任何情况都不能进 tgz —— node_modules 既炸体积又与 pnpm
+#    的依赖树冲突(npm 自己也永不打它), .git/.pnpm 同理。作者就算把它写进 files 也不带。
+# ② _PACK_SOFT: 开发期目录, 默认甩掉; 但插件把**运行期资产**放在名为 scripts/ 的目录
+#    并显式写进 files 时必须原样带上(否则打出的是缺资产的包)。
+# C# 用 OrdinalIgnoreCase, 这里也按小写比对, 否则 Tests/Docs 会被打进包。
+_PACK_ALWAYS = {"node_modules", ".git", ".pnpm", ".pnpm-store", ".svn", "__pycache__"}
+_PACK_SOFT = {"tests", "test", "docs", "scripts", ".github", ".vscode", ".idea",
+              "coverage", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc", ".gitignore"}
+_PACK_IGNORE = _PACK_ALWAYS | _PACK_SOFT
+
+
+def _ignore_fn(lower_set):
+    """shutil.copytree 的 ignore 回调: 按小写名比对(与 C# 的大小写无关语义一致)。"""
+    def _pick(_dir, names):
+        return [n for n in names if n.lower() in lower_set]
+    return _pick
 
 
 def _profile_deps(base):
@@ -1090,8 +1110,10 @@ def _pack_entries(src_dir, declared):
     带通配(* ? [)的条目要 glob 展开, 否则 "dist/*.js" 会被当成一个不存在的字面路径,
     结果是暂存包里什么产物都没有; "!" 开头是排除项(npm), 不参与复制。
     """
+    lowered = {str(x).lower() for x in _PACK_IGNORE}
+    always = {str(x).lower() for x in _PACK_ALWAYS}
     if not isinstance(declared, list):
-        return [leaf for leaf in sorted(os.listdir(src_dir)) if leaf not in _PACK_IGNORE]
+        return [leaf for leaf in sorted(os.listdir(src_dir)) if leaf.lower() not in lowered]
     out = []
     for raw in declared:
         entry = _rel_path(raw)
@@ -1100,7 +1122,10 @@ def _pack_entries(src_dir, declared):
         if any(ch in entry for ch in "*?["):
             for hit in glob.glob(os.path.join(src_dir, entry)):
                 rel = os.path.relpath(hit, src_dir)
-                if rel not in (".", "") and os.path.basename(rel) not in _PACK_IGNORE:
+                # 通配命中的是**作者声明**的条目: 只挡结构性目录(node_modules/.git/…),
+                # 不能拿整份 _PACK_IGNORE 去过滤, 否则声明了 "scripts/*.js" 反而什么
+                # 都收不到(而不声明 scripts 时它只是被甩掉) —— 两条路必须一致。
+                if rel not in (".", "") and os.path.basename(rel).lower() not in always:
                     out.append(rel)
         else:
             out.append(entry)
@@ -1135,16 +1160,18 @@ def _pnpm_error_tail(out, limit=600):
 def _copy_entry(src, dst, use_ignore=True):
     """复制一个条目, 返回是否真复制了。
 
-    use_ignore=False 用于 package.json 里**显式声明**的条目: `_PACK_IGNORE`(scripts/
+    use_ignore=False 用于 package.json 里**显式声明**的条目: `_PACK_SOFT`(scripts/
     docs/tests/…)是甩开发期目录的, 但插件完全可能把运行期资产放在名为 scripts/ 的
     目录里 —— 作者自己写进 files 的就必须原样带上, 否则打出的是缺资产的包。
+    注意**不是"什么都不甩"**: `_PACK_ALWAYS`(node_modules/.git/.pnpm/…)对声明条目
+    同样生效, 否则源码树里就地跑过 pnpm 的插件会把整棵 node_modules 打进 tgz
+    (体积爆炸 + 装进 profile 后与 pnpm 的依赖树双份冲突)。
     """
     if not os.path.exists(src):
         return False
     if os.path.isdir(src):
         shutil.copytree(src, dst, dirs_exist_ok=True,
-                        ignore=(shutil.ignore_patterns(*sorted(_PACK_IGNORE))
-                                if use_ignore else None))
+                        ignore=_ignore_fn(_PACK_IGNORE if use_ignore else _PACK_ALWAYS))
     else:
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
         shutil.copy2(src, dst)
@@ -1262,12 +1289,32 @@ def _pnpm_add_spec(cwd, spec):
 
 _INSTALL_LOCKS = {}
 _INSTALL_LOCKS_GUARD = threading.Lock()
+# 正在进行的 profile 级 pnpm 写操作。它们**同步跑在 HTTP 线程里**, 不在 main 的 JOBS
+# 里 —— 而"把 package.json 写到一半服务就退出了"恰是这一族最坏的收尾事故, 所以退出
+# 前必须点名(main._stop_all_and_exit 调 inflight_ops())。
+_INFLIGHT = {}
 
 
 def _install_lock(profile):
     """同一 profile 的本地安装必须串行(见 install_local_plugin 里的拒绝分支)。"""
     with _INSTALL_LOCKS_GUARD:
         return _INSTALL_LOCKS.setdefault(str(profile or ""), threading.Lock())
+
+
+def _mark_inflight(profile, what):
+    with _INSTALL_LOCKS_GUARD:
+        _INFLIGHT[str(profile or "")] = what
+
+
+def _clear_inflight(profile):
+    with _INSTALL_LOCKS_GUARD:
+        _INFLIGHT.pop(str(profile or ""), None)
+
+
+def inflight_ops():
+    """当前在跑的、会改 profile 依赖的动作(退出收尾用)。"""
+    with _INSTALL_LOCKS_GUARD:
+        return ["%s(profile %s)" % (what, key or "?") for key, what in _INFLIGHT.items()]
 
 
 def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
@@ -1342,6 +1389,7 @@ def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
         # 同一个 project。宁可明确拒绝, 不排队让用户以为卡死。
         return False, "已有本地插件安装正在进行中, 请等它结束后再试"
     try:
+        _mark_inflight(profile, "本地插件安装")   # 收尾退出时要点名
         if is_dir:
             name, version = _package_identity(src)
             if not name:
@@ -1474,6 +1522,7 @@ def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
     finally:
         if pack_temp:
             shutil.rmtree(pack_temp, ignore_errors=True)
+        _clear_inflight(profile)
         _install_lock(profile).release()
 
 

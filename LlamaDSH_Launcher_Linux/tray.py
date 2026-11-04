@@ -255,7 +255,9 @@ class TrayIcon:
         deadline = time.time() + 45         # 停止 llama/DSH 本身可能要几秒
         while time.time() < deadline and self._server_alive():
             time.sleep(0.5)
+        fallback_used = False
         if self._server_alive():
+            fallback_used = True
             # 兜底: 服务没自尽(老服务无 /api/shutdown 等), 按 /proc + 锁文件找出来终止
             targets = _find_py_pids("main.py")
             lp = _lock_pid("main.py")
@@ -272,16 +274,26 @@ class TrayIcon:
                     pass
             msg = "[tray] 服务未自行退出, 已发 SIGTERM: %s" % (killed or "未找到进程")
             if denied:
-                msg += "; ⚠ 这些进程属主不是本人(可能 sudo 启动), 普通权限杀不掉: %s" % denied
+                # "杀不掉"与"没找到"要分开说: 前者要给出动作(sudo kill), 后者才可能是
+                # 真的没有服务进程(比如相对路径启动的 root 进程读不到 cwd 而漏检)。
+                msg = ("[tray] ⚠ 找到服务进程但杀不掉(属主不是本人): %s"
+                       " —— 请在该进程所属账号下执行 sudo kill <PID>" % denied)
+                if killed:
+                    msg += "; 另外已向这些进程发过 SIGTERM: %s" % killed
             print(msg)
-            for _ in range(20):             # 新 main.py 收到 SIGTERM 也会自行收尾
+            # 新 main.py 收到 SIGTERM 也会自行收尾, 而它的收尾预算是 45s
+            # (main._EXIT_WATCHDOG_S)。这里只等 25s 就退场的话, 后面那句"残留进程"
+            # 可能只是"服务端还在正常收尾", 必须把这种可能性写在文案里。
+            for _ in range(50):
                 if not self._server_alive():
                     break
                 time.sleep(0.5)
         left = [p for p in svc_pids if os.path.isdir("/proc/%d" % p)]
         if left:
-            print("[tray] ⚠ llama.cpp/DSH 未能停止, 残留进程 PID: %s"
-                  " (若以 root 启动需手动关闭)" % ", ".join(str(p) for p in left))
+            hedge = ("(服务刚收到 SIGTERM, 它最长还会收尾 45s, 请稍后再确认一次)"
+                     if fallback_used else "(若以 root 启动需手动关闭)")
+            print("[tray] ⚠ llama.cpp/DSH 未能停止, 残留进程 PID: %s %s"
+                  % (", ".join(str(p) for p in left), hedge))
         elif svc_pids:
             print("[tray] llama.cpp 与 DSH 已停止")
         else:

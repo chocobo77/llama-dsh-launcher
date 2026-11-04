@@ -378,6 +378,13 @@ class LlamaRunner:
 
     def _relaunch(self):
         time.sleep(1.0)
+        # 决策与执行之间隔了 1s: 这期间用户点"停止"或走收尾都改不了已经排下的重启。
+        # user_stopped 是**实例级**标志, 只挡决策点(core.py:321/341)挡不住这里在途的
+        # 那一次 —— 收尾场景下 os._exit 之前 Popen 出来的 llama-server 直接是孤儿。
+        if self.user_stopped or self.running:
+            self.oom_retry_active = False
+            self.hub.log("[OOM] 已放弃自动降层重启(进程已被停止或已被接管)")
+            return
         ok, msg = self.start(self.last_profile, skip_vram_confirm=True)
         if not ok:
             self.hub.log("[OOM] 重试启动失败: %s" % msg)
@@ -442,6 +449,11 @@ class DshRunner:
         self.verify_stop = threading.Event()
         self.rebuild_stop = threading.Event()
         self.retries_left = 0
+        # 与 LlamaRunner 对称: 没有它, `_verify_loop` 的"启动失败自动重试"会在用户点
+        # 停止或正在收尾之后再拉一个分离会话的 DSH(孤儿 + 留 stale lock)。C# 里
+        # StartDsh 与 StopDshVerifyLoop 同在 UI 线程, 结构上不可能撞车, 所以那边没有
+        # 这个标志 —— 多线程的 Linux 侧必须自己挡。
+        self.user_stopped = False
         self.last_profile = {}
         self._tailer_fh = None
         self._deadline = 0.0
@@ -556,6 +568,7 @@ class DshRunner:
         self.proc = None
         self.tracker = None
         self.status = "starting"
+        self.user_stopped = False
         self.verify_stop.clear()
         self._deadline = time.time() + 30.0
 
@@ -687,6 +700,13 @@ class DshRunner:
                 return
             if fast_fail or time.time() >= self._deadline:
                 self.verify_stop.set()
+                if self.user_stopped:
+                    # 用户已经要"停"(或正在收尾): 既不该再自动重试, 也不该把状态
+                    # 落成 failed —— 那会让面板从"已停止"又跳成"失败"。
+                    self.hub.log("--- DSH 未启动成功, 但已按用户请求停止, 不再自动重试 ---")
+                    self.status = "stopped"
+                    state.clear_state_for("DshPid")
+                    return
                 self.hub.log("DSH failed (%s)" % ("启动日志报错" if fast_fail else "启动超时"))
                 if self.retries_left > 0:
                     self.retries_left -= 1
@@ -708,6 +728,18 @@ class DshRunner:
     def stop(self):
         self.verify_stop.set()
         self._stop_tailer()
+        # PID 复用防线: tracker 带 StartTime, poll() 非 None 就说明这个 PID 已经不是
+        # 我们记下的那一个(接管来的 DSH 退出后 PID 被复用是真实发生过的场景)。以前
+        # 直接拿 tracker.pid 送进 kill_process_tree → 给无辜进程发 SIGTERM 再 SIGKILL
+        # 整树。C# 侧的 HasDsh() + ProcessTracker.VerifyStartTime 就是防这个。
+        if self.tracker is not None and self.tracker.poll() is not None:
+            self.hub.log("[DSH] 记录的进程 PID %d 已不是当时那个进程(PID 被复用), 不动它"
+                         % self.tracker.pid)
+            self.tracker = None
+        if self.proc is not None and self.proc.poll() is not None:
+            self.proc = None
+        # 先立标志: _verify_loop 的自动重试/失败落账都要看到"用户要的是停"
+        self.user_stopped = True
         pid = self.tracker.pid if self.tracker else (self.proc.pid if self.proc else None)
         if pid:
             self.hub.log("--- 正在停止 DSH ---")
@@ -715,12 +747,22 @@ class DshRunner:
             if procman.alive(pid):
                 if procman.which("sudo"):
                     try:
-                        r = subprocess.run(["sudo", "-n", "kill", "-9", str(pid)],
+                        # 只杀根 PID 会把 root 属主的 pnpm/node 子进程留在原地
+                        # (C# 用的是 taskkill /F /T, 整树)
+                        try:
+                            targets = procman.child_pids(pid)
+                        except Exception:
+                            targets = []
+                        if pid not in targets:
+                            targets.append(pid)
+                        r = subprocess.run(["sudo", "-n", "kill", "-9"]
+                                           + [str(p) for p in targets],
                                            capture_output=True, text=True,
                                            encoding="utf-8", errors="replace", timeout=15)
                         time.sleep(0.6)
                         if not procman.alive(pid):
-                            self.hub.log("--- 提权 DSH 进程普通停止无效, 已用 sudo kill 停止 ---")
+                            self.hub.log("--- 提权 DSH 进程普通停止无效, 已用 sudo kill 停止"
+                                         "(含 %d 个子进程) ---" % max(0, len(targets) - 1))
                         elif r.returncode == 0:
                             self.hub.log("[DSH] ⚠ 已下发 sudo kill 但进程 PID %d 仍在, 请手动结束" % pid)
                         else:
