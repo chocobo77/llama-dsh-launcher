@@ -53,7 +53,7 @@ params:
     tooltip: "模型别名，用于 API 返回中的 model 字段标识。建议设为模型简称，方便上层应用识别。"
 
   - flag: host
-    subgroup: 服务监听与安全
+    subgroup: 监听与超时
     label: 主机 (Host)
     role: host
     type: String
@@ -63,7 +63,7 @@ params:
     tooltip: "监听 IP 地址。127.0.0.1 仅本机可访问；0.0.0.0 允许局域网访问（注意安全风险）。也支持 UNIX socket 路径（以 .sock 结尾）。建议：本地使用保持 127.0.0.1。"
 
   - flag: port
-    subgroup: 服务监听与安全
+    subgroup: 监听与超时
     label: 端口 (Port)
     role: port
     type: String
@@ -76,7 +76,7 @@ params:
       max: 65535
 
   - flag: timeout
-    subgroup: 服务监听与安全
+    subgroup: 监听与超时
     label: 超时 (Timeout)
     type: String
     default: "600"
@@ -135,7 +135,7 @@ params:
       leq: batch-size
 
   - flag: threads
-    subgroup: 进程与 CPU 亲和
+    subgroup: 线程与优先级
     label: 线程数 (Threads)
     role: threads
     type: String
@@ -147,7 +147,7 @@ params:
       min: -1
 
   - flag: gpu-layers
-    subgroup: 后端与显存
+    subgroup: 层卸载与 MoE
     label: GPU 层数
     role: ngl
     type: String
@@ -160,7 +160,7 @@ params:
       regex: '^(auto|all|\d+)$'
 
   - flag: main-gpu
-    subgroup: 后端与显存
+    subgroup: GPU 与多卡
     label: 主 GPU 编号
     type: String
     default: "0"
@@ -181,7 +181,7 @@ params:
       min: -1
 
   - flag: api-key
-    subgroup: 服务监听与安全
+    subgroup: 鉴权与 API
     label: API 密钥
     type: String
     default: ""
@@ -192,7 +192,7 @@ params:
       - api-key-file
 
   - flag: api-key-file
-    subgroup: 服务监听与安全
+    subgroup: 鉴权与 API
     label: API 密钥文件
     type: String
     default: ""
@@ -203,7 +203,7 @@ params:
       - api-key
 
   - flag: ssl-key-file
-    subgroup: 服务监听与安全
+    subgroup: 鉴权与 API
     label: SSL 私钥文件
     type: String
     default: ""
@@ -215,7 +215,7 @@ params:
       - ssl-cert-file
 
   - flag: ssl-cert-file
-    subgroup: 服务监听与安全
+    subgroup: 鉴权与 API
     label: SSL 证书文件
     type: String
     default: ""
@@ -227,7 +227,7 @@ params:
       - ssl-key-file
 
   - flag: cors-origins
-    subgroup: 服务监听与安全
+    subgroup: CORS 跨域
     label: CORS 允许来源
     type: String
     default: ""
@@ -236,7 +236,7 @@ params:
     tooltip: "跨域资源共享（CORS）允许的来源列表，逗号分隔。留空默认允许所有来源（*）。Web 前端跨域访问时需设置为前端域名。设为 localhost 只反射本机 Origin。"
 
   - flag: cors-methods
-    subgroup: 服务监听与安全
+    subgroup: CORS 跨域
     label: CORS 允许方法
     type: String
     default: ""
@@ -248,7 +248,7 @@ params:
       regex: '^[A-Za-z,\s]+$'
 
   - flag: cors-headers
-    subgroup: 服务监听与安全
+    subgroup: CORS 跨域
     label: CORS 允许请求头
     type: String
     default: ""
@@ -258,7 +258,7 @@ params:
     tooltip: "CORS 允许的请求头，逗号分隔。官方默认 *（全部）。留空=官方默认。"
 
   - flag: cors-credentials
-    subgroup: 服务监听与安全
+    subgroup: CORS 跨域
     label: CORS 允许凭证
     type: Bool
     default: "true"
@@ -268,7 +268,7 @@ params:
     offFlag: no-cors-credentials
 
   - flag: api-prefix
-    subgroup: 服务监听与安全
+    subgroup: 鉴权与 API
     label: API 前缀路径
     type: String
     default: ""
@@ -277,7 +277,7 @@ params:
     tooltip: "服务器提供服务的路径前缀（不带末尾斜杠）。如设为 /api 则接口位于 /api/v1/...。留空=无前缀。"
 
   - flag: reuse-port
-    subgroup: 服务监听与安全
+    subgroup: 监听与超时
     label: 端口复用
     type: Bool
     default: "false"
@@ -286,7 +286,7 @@ params:
     tooltip: "允许多个 socket 绑定同一端口（--reuse-port）。默认关闭。一般无需开启。"
 
   - flag: path
-    subgroup: 服务监听与安全
+    subgroup: Web UI 与静态资源
     label: 静态文件目录
     type: String
     default: ""
@@ -296,7 +296,7 @@ params:
     tooltip: "从该目录提供静态文件服务。留空=不提供静态文件。"
 
   - flag: tags
-    subgroup: 服务监听与安全
+    subgroup: Web UI 与静态资源
     label: 模型标签
     type: String
     default: ""
@@ -306,7 +306,7 @@ params:
     tooltip: "为模型设置标签（逗号分隔，仅信息用途，不参与路由）。"
 
   - flag: offline
-    subgroup: 服务监听与安全
+    subgroup: Web UI 与静态资源
     label: 离线模式
     type: Bool
     default: "false"
@@ -315,7 +315,7 @@ params:
     tooltip: "离线模式：强制使用缓存，阻止任何网络访问。配合 -hf/--model-url 下载场景禁用。"
 
   - flag: load-mode
-    subgroup: 后端与显存
+    subgroup: 显存适配与加载
     label: 模型加载模式
     type: Combo
     default: "auto"
@@ -388,7 +388,7 @@ params:
       - hf-file
 
   - flag: ui
-    subgroup: 服务监听与安全
+    subgroup: Web UI 与静态资源
     label: 启用 Web UI
     type: Bool
     default: "true"
@@ -397,7 +397,7 @@ params:
     offFlag: no-ui
 
   - flag: sse-ping-interval
-    subgroup: 服务监听与安全
+    subgroup: Web UI 与静态资源
     label: SSE Ping 间隔
     type: String
     default: "30"
@@ -432,7 +432,7 @@ params:
     tooltip: "Flash Attention 加速。需要 GPU 硬件支持（AMD RDNA2+/NVIDIA Ampere+）。可显著降低长上下文的显存占用并加速推理。推荐 on；若启动报错则改 auto。"
 
   - flag: tensor-split
-    subgroup: 后端与显存
+    subgroup: GPU 与多卡
     label: 张量拆分
     type: String
     default: ""
@@ -443,7 +443,7 @@ params:
       regex: '^\d+(\.\d+)?(,\d+(\.\d+)?)*$'
 
   - flag: threads-batch
-    subgroup: 进程与 CPU 亲和
+    subgroup: 线程与优先级
     label: 批处理线程数
     type: String
     default: ""
@@ -453,7 +453,7 @@ params:
       min: -1
 
   - flag: cpu-mask
-    subgroup: 进程与 CPU 亲和
+    subgroup: CPU 亲和与 NUMA
     label: CPU 亲和性掩码
     type: String
     default: ""
@@ -463,7 +463,7 @@ params:
     tooltip: "CPU 亲和性掩码（十六进制）。与 cpu-range 互补。用于将推理线程绑定到特定 CPU 核心。"
 
   - flag: cpu-range
-    subgroup: 进程与 CPU 亲和
+    subgroup: CPU 亲和与 NUMA
     label: CPU 亲和性范围
     type: String
     default: ""
@@ -472,7 +472,7 @@ params:
     tooltip: "CPU 亲和性范围，格式: lo-hi。与 cpu-mask 互补。用于将推理线程绑定到特定 CPU 核心范围。"
 
   - flag: cpu-strict
-    subgroup: 进程与 CPU 亲和
+    subgroup: CPU 亲和与 NUMA
     label: 严格 CPU 放置
     type: Combo
     default: "0"
@@ -485,7 +485,7 @@ params:
       - cpu-range
 
   - flag: prio
-    subgroup: 进程与 CPU 亲和
+    subgroup: 线程与优先级
     label: 进程优先级
     type: Combo
     default: "0"
@@ -497,7 +497,7 @@ params:
       regex: '^-?\d+$'
 
   - flag: prio-batch
-    subgroup: 进程与 CPU 亲和
+    subgroup: 线程与优先级
     label: 批处理优先级
     type: Combo
     default: "0"
@@ -509,7 +509,7 @@ params:
       regex: '^\d+$'
 
   - flag: poll
-    subgroup: 进程与 CPU 亲和
+    subgroup: 线程与优先级
     label: 轮询级别
     type: String
     default: "50"
@@ -518,7 +518,7 @@ params:
     tooltip: "轮询级别（0-100），用于等待工作。0=无轮询，默认 50。较高值可降低延迟但增加 CPU 占用。"
 
   - flag: poll-batch
-    subgroup: 进程与 CPU 亲和
+    subgroup: 线程与优先级
     label: 批处理轮询模式
     type: Combo
     default: "0"
@@ -528,7 +528,7 @@ params:
     tooltip: "批处理阶段是否使用轮询等待工作。默认与 --poll 相同。官方此参数需带 0/1 取值（0=关闭，默认 0）；勾选后按所选值发射 --poll-batch 0 或 1。"
 
   - flag: cpu-mask-batch
-    subgroup: 进程与 CPU 亲和
+    subgroup: CPU 亲和与 NUMA
     label: 批处理 CPU 亲和性掩码
     type: String
     default: ""
@@ -538,7 +538,7 @@ params:
     tooltip: "批处理阶段的 CPU 亲和性掩码（十六进制）。默认与 cpu-mask 相同。"
 
   - flag: cpu-range-batch
-    subgroup: 进程与 CPU 亲和
+    subgroup: CPU 亲和与 NUMA
     label: 批处理 CPU 亲和性范围
     type: String
     default: ""
@@ -547,7 +547,7 @@ params:
     tooltip: "批处理阶段的 CPU 亲和性范围，格式: lo-hi。默认与 cpu-range 相同。"
 
   - flag: cpu-strict-batch
-    subgroup: 进程与 CPU 亲和
+    subgroup: CPU 亲和与 NUMA
     label: 批处理严格 CPU 放置
     type: Combo
     default: "0"
@@ -560,7 +560,7 @@ params:
       - cpu-range-batch
 
   - flag: numa
-    subgroup: 进程与 CPU 亲和
+    subgroup: CPU 亲和与 NUMA
     label: NUMA 策略
     type: Combo
     default: "distribute"
@@ -647,7 +647,7 @@ params:
     tooltip: "YaRN：低修正维度或 beta（默认 -1.0）。"
 
   - flag: split-mode
-    subgroup: 后端与显存
+    subgroup: GPU 与多卡
     label: 多 GPU 拆分模式
     type: Combo
     default: "layer"
@@ -656,7 +656,7 @@ params:
     tooltip: "多 GPU 拆分方式。none=仅用单卡；layer=按层流水线拆分（默认，层与 KV 分散到各卡）；row=按行并行拆分权重；tensor=张量级拆分（实验性，DeepSeek 等支持）。单卡保持默认即可。"
 
   - flag: device
-    subgroup: 后端与显存
+    subgroup: GPU 与多卡
     label: 设备列表
     type: String
     default: ""
@@ -667,7 +667,7 @@ params:
       regex: '^[A-Za-z0-9\-_,]+$'
 
   - flag: fit
-    subgroup: 后端与显存
+    subgroup: 显存适配与加载
     label: 自动适配显存 (--fit)
     type: Combo
     default: "on"
@@ -678,7 +678,7 @@ params:
     tooltip: "自动调整未设置的参数以适配设备显存（--fit）。on=开启（官方默认），会根据显存自动设置 ctx/n-gpu-layers 等；off=关闭，仅用显式设置。GPU 部署建议保持 on。"
 
   - flag: fit-target
-    subgroup: 后端与显存
+    subgroup: 显存适配与加载
     label: Fit 显存余量 (MiB)
     type: String
     default: ""
@@ -691,7 +691,7 @@ params:
       regex: '^\d+(,\d+)*$'
 
   - flag: fit-ctx
-    subgroup: 后端与显存
+    subgroup: 显存适配与加载
     label: Fit 最小上下文
     type: String
     default: "4096"
@@ -703,7 +703,7 @@ params:
       min: 0
 
   - flag: kv-offload
-    subgroup: KV 缓存与量化
+    subgroup: KV 量化与碎片
     label: KV 缓存卸载
     type: Bool
     default: "true"
@@ -712,7 +712,7 @@ params:
     offFlag: no-kv-offload
 
   - flag: repack
-    subgroup: KV 缓存与量化
+    subgroup: 显存适配与加载
     label: 权重重打包
     type: Bool
     default: "true"
@@ -721,7 +721,7 @@ params:
     offFlag: no-repack
 
   - flag: no-host
-    subgroup: KV 缓存与量化
+    subgroup: GPU 与多卡
     label: 绕过 Host 缓冲
     type: Bool
     default: "false"
@@ -730,7 +730,7 @@ params:
     tooltip: "绕过 host 缓冲，允许使用额外缓冲。可略微提升显存利用率，视后端支持而定。"
 
   - flag: op-offload
-    subgroup: 后端与显存
+    subgroup: 层卸载与 MoE
     label: 运算卸载到设备
     type: Bool
     default: "true"
@@ -740,7 +740,7 @@ params:
     offFlag: no-op-offload
 
   - flag: override-tensor
-    subgroup: 后端与显存
+    subgroup: 层卸载与 MoE
     label: 张量缓冲覆盖
     type: String
     default: ""
@@ -750,7 +750,7 @@ params:
     tooltip: "覆盖指定张量的缓冲区类型。格式: <张量名匹配>=<缓冲类型>，多个用逗号分隔。高级调优用。"
 
   - flag: override-kv
-    subgroup: 后端与显存
+    subgroup: 显存适配与加载
     label: 覆盖模型元数据
     type: String
     default: ""
@@ -760,7 +760,7 @@ params:
     tooltip: "覆盖模型元数据（KV）。格式: KEY=TYPE:VALUE，如 tokenizer.ggml.add_bos_token=bool:false。类型: int/float/bool/str。高级功能慎用。"
 
   - flag: n-cpu-ffn
-    subgroup: 后端与显存
+    subgroup: 层卸载与 MoE
     label: 稠密 FFN CPU 层数
     type: String
     default: ""
@@ -770,7 +770,7 @@ params:
       min: 0
 
   - flag: lazy-mode
-    subgroup: 后端与显存
+    subgroup: GPU 与多卡
     label: 张量按需读取
     type: Combo
     default: "auto"
@@ -780,7 +780,7 @@ params:
     tooltip: "按需从磁盘读取大张量（如逐层 embedding）。auto=仅 >4GiB 的张量按需读取（默认）；on=全部按需读取（需 mmap）；off=常驻内存。"
 
   - flag: rpc
-    subgroup: 后端与显存
+    subgroup: GPU 与多卡
     label: RPC 服务器
     type: String
     default: ""
@@ -790,7 +790,7 @@ params:
     tooltip: "逗号分隔的 RPC 推理服务器列表（host:port）。用于跨机器分布式推理。"
 
   - flag: check-tensors
-    subgroup: 后端与显存
+    subgroup: 显存适配与加载
     label: 检查张量有效性
     type: Bool
     default: "false"
@@ -802,7 +802,7 @@ params:
   # KV 缓存
   # ================================================================
   - flag: cache-type-k
-    subgroup: KV 缓存与量化
+    subgroup: KV 量化与碎片
     label: Cache 类型 K
     role: cache_type_k
     type: Combo
@@ -813,7 +813,7 @@ params:
     tooltip: "KV 缓存 K 分量的数据类型。官方支持：f32/f16/bf16/q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1（默认 f16）。低 bit 可大幅扩展上下文（配合 Hadamard 旋转质量提升）。q6_0 与 tq3_0(TurboQuant 3.5bit) 为实验性/视构建版本而定，官方主线暂不支持，请确认你的 llama.cpp 包含该类型。24GB 显卡跑 27B 推荐 q8_0 或 q4_0。"
 
   - flag: cache-type-v
-    subgroup: KV 缓存与量化
+    subgroup: KV 量化与碎片
     label: Cache 类型 V
     role: cache_type_v
     type: Combo
@@ -824,7 +824,7 @@ params:
     tooltip: "KV 缓存 V 分量的数据类型。V 对精度不如 K 敏感，可更激进压缩。官方支持：f32/f16/bf16/q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1（默认 f16）。默认 q8_0 为官方兼容且质量/空间均衡；q4_0 可进一步省显存；tq3_0(TurboQuant) 仅特定 fork 支持，官方主线会报错，请勿在官方版选用。"
 
   - flag: cache-prompt
-    subgroup: KV 缓存与检查点
+    subgroup: 会话缓存与检查点
     label: 缓存 Prompt
     type: Bool
     default: "true"
@@ -834,7 +834,7 @@ params:
     offFlag: no-cache-prompt
 
   - flag: cache-reuse
-    subgroup: KV 缓存与检查点
+    subgroup: 会话缓存与检查点
     label: 缓存重用阈值
     type: String
     default: "0"
@@ -847,7 +847,7 @@ params:
       min: 0
 
   - flag: cache-ram
-    subgroup: KV 缓存与检查点
+    subgroup: 会话缓存与检查点
     label: 缓存 RAM 上限
     type: String
     default: ""
@@ -858,7 +858,7 @@ params:
       min: -1
 
   - flag: kv-unified
-    subgroup: KV 缓存与检查点
+    subgroup: 会话缓存与检查点
     label: 统一 KV 缓冲
     type: Bool
     default: "true"
@@ -868,7 +868,7 @@ params:
     offFlag: no-kv-unified
 
   - flag: kv-unified-per-slot
-    subgroup: KV 缓存与检查点
+    subgroup: 会话缓存与检查点
     label: 每槽上下文上限
     type: String
     default: ""
@@ -881,7 +881,7 @@ params:
       min: 0
 
   - flag: context-shift
-    subgroup: KV 缓存与检查点
+    subgroup: 会话缓存与检查点
     label: 上下文移位
     type: Bool
     default: "false"
@@ -890,7 +890,7 @@ params:
     tooltip: "无限文本生成时使用上下文移位（context shift）而非直接截断。官方默认关闭。适合长文本续写场景。"
 
   - flag: ctx-checkpoints
-    subgroup: KV 缓存与检查点
+    subgroup: 会话缓存与检查点
     label: 上下文检查点数
     type: String
     default: "32"
@@ -901,7 +901,7 @@ params:
       min: 0
 
   - flag: checkpoint-min-step
-    subgroup: KV 缓存与检查点
+    subgroup: 会话缓存与检查点
     label: 检查点最小间距
     type: String
     default: "8192"
@@ -914,7 +914,7 @@ params:
       min: 0
 
   - flag: cache-idle-slots
-    subgroup: KV 缓存与检查点
+    subgroup: 会话缓存与检查点
     label: 缓存空闲槽位
     type: Bool
     default: "true"
@@ -926,7 +926,7 @@ params:
       - {flag: cache-ram, op: enabled}
 
   - flag: defrag-thold
-    subgroup: KV 缓存与量化
+    subgroup: KV 量化与碎片
     label: KV 碎片整理阈值
     type: String
     default: ""
@@ -948,7 +948,7 @@ params:
   # MOE 专家
   # ================================================================
   - flag: cpu-moe
-    subgroup: 后端与显存
+    subgroup: 层卸载与 MoE
     label: MoE 专家全CPU (cpu-moe)
     role: cpu_moe
     type: Bool
@@ -957,7 +957,7 @@ params:
     tooltip: "将混合专家(MoE)模型的全部专家权重保留在 CPU 内存，仅注意力等共享权重进 GPU。适合 24GB 显存运行超大 MoE 模型。注意：--fit 在显存不足时会自动执行类似操作。"
 
   - flag: n-cpu-moe
-    subgroup: 后端与显存
+    subgroup: 层卸载与 MoE
     label: MoE 专家CPU层数 (n-cpu-moe)
     role: n_cpu_moe
     type: String
@@ -1348,7 +1348,7 @@ params:
     group: spec
     enabled: true
     offValue: "none"
-    options: [none, draft-simple, draft-eagle3, draft-mtp, draft-dflash, draft-dspark, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, ngram-cache]
+    options: [none, draft-simple, draft-eagle3, draft-mtp, draft-dflash, draft-dspark, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, ngram-cache,"ngram-mod,draft-mtp"]
     tooltip: "推测解码类型。none=禁用（默认，取消勾选本项等同设为 none）；draft-simple=简单外部草稿模型；draft-eagle3=EAGLE-3 草稿；draft-mtp=模型自带 MTP 层（Qwen3 推荐，可加速 2~3 倍）；draft-dflash/draft-dspark=DFlash 草稿（NVIDIA 系，需专用草稿 GGUF）；ngram-*=无草稿模型的 ngram 推测。draft-mtp 需模型自带 MTP 层（Qwen3 系列推荐，可加速 2~3 倍）。取消勾选本项即显式关闭推测解码。"
 
   - flag: spec-default
@@ -2478,7 +2478,7 @@ params:
     tooltip: "启用 POST /props 端点，允许运行时修改全局属性。默认禁用（安全考虑）。"
 
   - flag: ui-config
-    subgroup: 服务监听与安全
+    subgroup: Web UI 与静态资源
     label: WebUI 默认配置
     type: String
     default: ""
@@ -2488,7 +2488,7 @@ params:
     tooltip: "作为 WebUI 默认配置的 JSON 对象字符串。用于预设 WebUI 的 UI 设置。"
 
   - flag: ui-config-file
-    subgroup: 服务监听与安全
+    subgroup: Web UI 与静态资源
     label: WebUI 配置文件
     type: String
     default: ""
@@ -2572,7 +2572,7 @@ params:
     tooltip: "MCP 服务器配置（内联 JSON 格式）。与 --mcp-servers-config 二选一。支持 stdio 协议的 MCP 服务器。注意：此功能为实验性。"
 
   - flag: ui-mcp-proxy
-    subgroup: 服务监听与安全
+    subgroup: Web UI 与静态资源
     label: WebUI MCP 代理 (实验性)
     type: Bool
     default: "false"
@@ -2585,7 +2585,7 @@ params:
   # 2026-10-16 增补：llama-server 0.7.0-dev (b11675) --help 新增参数
   # ================================================================
   - flag: moe-cache-mib
-    subgroup: 后端与显存
+    subgroup: 层卸载与 MoE
     label: MoE 专家 GPU 缓存 (MiB)
     type: String
     default: "0"
