@@ -32,12 +32,16 @@ button, select, input[type=text], input[type=number], textarea {
 input[type=text]:focus, textarea:focus, select:focus {
   border-color: var(--accent); box-shadow: 0 0 0 2px #1f6feb40; }
 button { cursor: pointer; user-select: none; font-weight: 600; }
-button:hover { background: var(--border); border-color: var(--muted); }
-button:active { background: var(--box); }
-button:disabled { opacity: 1; cursor: default; filter: none; background: #1c2128;
-  border-color: var(--border); color: #9198a1; }
+button:not(:disabled):hover { background: var(--border); border-color: var(--muted); }
+button:not(:disabled):active { background: var(--box); }
 button.primary { background: var(--green); border-color: rgba(240,246,252,.1); color: #fff; }
 button.danger { background: var(--red); border-color: rgba(240,246,252,.1); color: #fff; }
+/* 禁用态特异性必须压过 .primary/.danger: 原来同为 (0,1,1) 还写在它们**前面**,
+   于是"停止"永远鲜红、"启动"永远翠绿 —— 四个键一律像可点(2026-11-04 反馈);
+   hover/active 同理要排除 :disabled, 否则灰掉的键一移上去又亮回去 */
+button:disabled, button.primary:disabled, button.danger:disabled {
+  opacity: 1; cursor: default; filter: none; background: #1c2128;
+  border-color: #262c36; color: #7d8590; }
 button.smallClear { width: 26px; padding: 2px 0; font-size: 11px; }
 .sz122 { width: 122px; height: 30px; font-size: 12px; text-align: left; }
 .mono, textarea, code { font-family: Consolas, "Cascadia Mono", "JetBrains Mono", monospace; }
