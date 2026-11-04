@@ -28,6 +28,8 @@ except Exception:
     _DBUS_OK = False
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, APP_DIR)
+import appicon   # noqa: E402  图标自举(纯标准库, 不导入 GTK)
 
 
 def _api_token():
@@ -92,20 +94,13 @@ class TrayIcon:
             pass
 
     def icon_dir(self):
-        for base in (os.path.dirname(os.path.abspath(__file__)),
-                     os.path.expanduser("~/.local/share/llamadsh-launcher")):
-            if os.path.isdir(os.path.join(base, "assets")):
-                return os.path.join(base, "assets")
-        return ""
+        # IconThemePath 必须指向**图标主题布局**的目录(hicolor/NxN/apps/<IconName>.png)。
+        # 以前直接给扁平 assets 目录 → 扩展按名查找必然失败, 加上 IconPixmap 为空,
+        # 结果就是"托盘里根本没有启动器图标"。自举见 appicon.py。
+        return appicon.theme_path()
 
-    def icon_path(self):
-        for base in (os.path.dirname(os.path.abspath(__file__)),
-                     os.path.expanduser("~/.local/share/llamadsh-launcher")):
-            for s in (64, 48, 32):
-                p = os.path.join(base, "assets", "icon%d.png" % s)
-                if os.path.isfile(p):
-                    return p
-        return ""
+    def pixmaps(self):
+        return appicon.icon_pixmaps()
 
     # dbusmenu 布局: (id, props, children)
     def _layout(self):
@@ -179,9 +174,10 @@ if _DBUS_OK:
                 "Id": "llamadsh-launcher",
                 "Title": "LlamaDSH 启动器",
                 "Status": "Active",
-                "IconName": "llamadsh-launcher",
+                "IconName": appicon.ICON_NAME,
                 "IconThemePath": self.tray.icon_dir(),
-                "IconPixmap": dbus.Array([], signature="(iiay)"),
+                # 自带位图兜底: 名称查找失败(主题/权限/桌面差异)时仍一定有图标
+                "IconPixmap": _pixmap_array(self.tray.pixmaps()),
                 "OverlayIconName": "",
                 "AttentionIconName": "",
                 "ItemIsMenu": True,
@@ -235,6 +231,15 @@ if _DBUS_OK:
                     pass
 
 
+
+
+def _pixmap_array(items):
+    """SNI IconPixmap: a(iiay), 像素是 ARGB32 网络字节序。"""
+    import dbus
+    return dbus.Array([dbus.Struct((dbus.Int32(w), dbus.Int32(h),
+                                    dbus.Array(argb, signature="y")),
+                                   signature=None)
+                       for (w, h, argb) in items], signature="(iiay)")
 
 
 def _layout_node(node, depth, variant=False):
@@ -327,6 +332,9 @@ def main():
         print("无法启动/连接本地服务")
         sys.exit(1)
 
+    # 图标先自举: SNI 一旦导出, 主题查找失败不会重试(要重注册才有图标)
+    if not appicon.install_user_icons():
+        print("[tray] 图标主题自举失败(仅用自带位图显示托盘图标)")
     from gi.repository import GLib
     loop = GLib.MainLoop()
     tray = TrayIcon(base,

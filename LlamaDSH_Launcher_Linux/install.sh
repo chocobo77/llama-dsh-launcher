@@ -23,6 +23,8 @@ for s in 16 32 48 64 128 256; do
   [ -f "$APP_DIR/assets/icon$s.png" ] && mkdir -p "$ICON_DIR/${s}x${s}/apps" && \
     cp "$APP_DIR/assets/icon$s.png" "$ICON_DIR/${s}x${s}/apps/llamadsh-launcher.png"
 done
+# hicolor 缺 index.theme 会被 Gtk/GNOME Shell 整目录忽略(图标文件铺好也查不到)——补齐
+[ -f "$ICON_DIR/index.theme" ] || cp /usr/share/icons/hicolor/index.theme "$ICON_DIR/index.theme" 2>/dev/null || true
 
 # .desktop(客户端; WebKit 缺失时 start.sh 自动降级为浏览器)
 cat > "$DESKTOP" <<DESK

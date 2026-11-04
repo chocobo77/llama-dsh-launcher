@@ -23,6 +23,8 @@ import subprocess
 import urllib.request
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, APP_DIR)
+import appicon   # noqa: E402  图标自举(hicolor 主题 + 窗口/托盘图标统一)
 
 try:  # python3-dbus: 托盘 SNI 需要; 缺失时客户端降级为无托盘模式
     import dbus
@@ -125,7 +127,15 @@ def run_gtk(base_url):
         GLib.set_application_name("DeepSeek Harness & Llama 启动器")
         win = Gtk.Window(title="DeepSeek Harness & Llama 启动器")
         win.set_default_size(1400, 950)
-        win.set_icon_from_file(os.path.join(ICON_DIR, "icon256.png"))
+        # 图标: 先自举进用户图标主题(托盘/应用菜单/窗口同一套), 再按文件挂到窗口
+        appicon.install_user_icons()
+        try:
+            Gtk.Window.set_default_icon_name(appicon.ICON_NAME)
+        except Exception:
+            pass
+        icon_file = appicon.window_icon_path() or os.path.join(ICON_DIR, "icon256.png")
+        if os.path.isfile(icon_file):
+            win.set_icon_from_file(icon_file)
         try:
             import warnings as _w
             with _w.catch_warnings():
