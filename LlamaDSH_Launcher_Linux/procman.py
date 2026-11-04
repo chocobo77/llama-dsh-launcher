@@ -252,6 +252,32 @@ def node_host_running():
     return False
 
 
+def proc_scan_ok():
+    """/proc 能不能枚举进程。挂不上/读不到时 node_host_running 只会给 False。"""
+    try:
+        return bool(glob.glob("/proc/[0-9]*"))
+    except OSError:
+        return False
+
+
+def dsh_activity(port):
+    """DSH 是否在跑: True=确认在跑, False=确认没跑, None=探针不可用(查不到)。
+
+    "查不到"必须单独成态: 没有 ss/lsof 时 find_process_by_port 只能返回 None, 那与
+    "端口确实空闲"**同形**; /proc 读不到时 node_host_running 也只能给 False。凡是据此
+    删锁或放行写操作的调用方只接受 False —— 把 None 当 False 就等于把活着的 DSH 当成
+    已停止: 删掉它的 ledger-v2.lock, 再起一个实例去抢同一本账(实测: 3080 有监听且探针
+    不可用时, 旧写法判定 stale=True)。
+    """
+    if not port_probe_ok() or not proc_scan_ok():
+        return None
+    if find_process_by_port(port):
+        return True
+    if node_host_running():
+        return True
+    return False
+
+
 def which(exe):
     for d in os.environ.get("PATH", "").split(os.pathsep):
         p = os.path.join(d, exe)

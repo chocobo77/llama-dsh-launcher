@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(209 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(215 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -2027,10 +2027,13 @@ def _audit_boom7(*a, **k):
     raise RuntimeError("审计自己炸了")
 
 
+_act7, _pc7 = procman.dsh_activity, dict(procman._probe_cache)
+procman.dsh_activity = lambda _p: False      # 修复现场必须是"已确认 DSH 没在跑"(见 18.3)
 _compat.audit = _audit_boom7
 _fixed7 = _compat.repair(_dsh7, {"fixables": [{"kind": "stale_lock", "path": _stale_lock7}]},
                          lambda t: _logs7.append(t))
 _compat.audit = _real_audit7
+procman.dsh_activity, procman._probe_cache = _act7, _pc7
 check("修复前重审失败必须留痕并说明本次按旧清单修(否则修的是陈旧快照还报已修复)",
       _fixed7 == 1 and not os.path.exists(_stale_lock7)
       and any("重审失败" in t for t in _logs7), str(_logs7[:3]))
@@ -2207,6 +2210,91 @@ check("对照: 正常 tar 照旧能解出并给 llama-* 补上可执行位(修�
       and os.access(os.path.join(_found8, "llama-server"), os.X_OK),
       str(_found8))
 
+
+
+# --- 18) 第九轮: "查不到"不得当成"没在跑" —— 删锁一族 ----------------------------
+# 18.1 现场取证: 3080 上有 DSH 在跑、ledger-v2.lock 存在, 但这台机器上 ss 与 lsof 都
+#      不可用(精简系统 / PATH 被改窄)。旧形态里 find_process_by_port 只能返回 None,
+#      node_host_running 只能返回 False, 于是 stale_lock_present()=True, 而
+#      _prepare_then_start 拿到 True 就 os.remove 那把锁, 再起第二个实例去抢同一本账
+#      (实测旧形态确为 True; 两本账同时写就是损坏, 且面板上看起来"一切正常")。
+class _DshProbe9(core.DshRunner):
+    def __init__(self):            # 只为拿到方法, 不接 HUB/SCHEMA
+        pass
+
+
+_d9 = _DshProbe9()
+_old_home_env9 = os.environ.get("DSH_HOME")
+os.environ["DSH_HOME"] = _home     # 自定义 DSH 根: core 与 compat 必须看同一个锁
+_lp9 = os.path.join(_home, "task-board", "ledger-v2.lock")
+os.makedirs(os.path.dirname(_lp9), exist_ok=True)
+_fp9, _nh9, _pc9 = procman.find_process_by_port, procman.node_host_running, dict(procman._probe_cache)
+
+open(_lp9, "w").close()
+procman.find_process_by_port = lambda *a, **k: None
+procman.node_host_running = lambda: False
+procman._probe_cache = {"at": time.time(), "ok": True}
+_st_a9 = _d9.stale_lock_present()                     # 确认没在跑 → 是残留锁
+procman._probe_cache = {"at": time.time(), "ok": False}
+_st_b9 = _d9.stale_lock_present()                     # 探针不可用 → 不得说它是残留
+procman._probe_cache = {"at": time.time(), "ok": True}
+procman.find_process_by_port = lambda *a, **k: 4242
+_st_c9 = _d9.stale_lock_present()                     # 端口上有人 → 不是残留
+procman.find_process_by_port, procman.node_host_running = _fp9, _nh9
+procman._probe_cache = _pc9
+check("残留锁必须只在\"确认 DSH 没在跑\"时为 True(探针不可用或端口有人都必须 False)",
+      _st_a9 is True and _st_b9 is False and _st_c9 is False, str((_st_a9, _st_b9, _st_c9)))
+check("core 与 compat 必须看同一把锁(DSH_HOME 自定义时旧版 core 写死 ~/.dsh, 两边互相矛盾)",
+      _d9.lock_path() == os.path.join(_compat.dsh_home(), "task-board", "ledger-v2.lock") == _lp9,
+      "%s | %s" % (_d9.lock_path(), _compat.dsh_home()))
+
+# 18.2 审计侧: 探针不可用时不得给出"可修复:删除"的建议(一键就会删掉活实例的账本锁),
+#      但也不能默默消失 —— 要说"无法判定", 用户才知道要自己确认。
+_dsh9 = os.path.join(_tmp, "dsh_tree9")
+os.makedirs(os.path.join(_dsh9, ".git"), exist_ok=True)
+os.makedirs(os.path.join(_dsh9, "apps", "cli", "lib"), exist_ok=True)
+open(os.path.join(_dsh9, "apps", "cli", "lib", "bin.js"), "w").write("//x\n")
+open(_lp9, "w").close()
+procman.find_process_by_port = lambda *a, **k: None
+procman.node_host_running = lambda: False
+procman._probe_cache = {"at": time.time(), "ok": True}
+_r9a = _compat.audit(_dsh9, lambda _t: None, include_dump=False)
+procman._probe_cache = {"at": time.time(), "ok": False}
+_r9b = _compat.audit(_dsh9, lambda _t: None, include_dump=False)
+procman._probe_cache = _pc9
+_txt9b = "\n".join(x["text"] for x in _r9b["items"])
+check("审计: 探针不可用时锁不得报成\"可修复:删除\", 要说明无法判定并让人工确认",
+      not any(f["kind"] == "stale_lock" for f in _r9b["fixables"])
+      and "无法判定" in _txt9b, _txt9b[:220])
+check("对照: 确认没在跑时照旧给出可删除的残留锁项(修法没把正常路径锁死)",
+      any(f["kind"] == "stale_lock" for f in _r9a["fixables"])
+      and "可修复:删除" in "\n".join(x["text"] for x in _r9a["items"]),
+      "\n".join(x["text"] for x in _r9a["items"])[:200])
+
+# 18.3 修复侧: 弹窗到点修复之间 DSH 可能已经被启动, 探针也可能失效, 所以删前再确认一次。
+_lock9 = os.path.join(_tmp, "live_lock9")
+open(_lock9, "w").close()
+_log9 = []
+_real_audit9, _act9 = _compat.audit, procman.dsh_activity
+_compat.audit = lambda *a, **k: {"items": [], "version": "",
+                                 "fixables": [{"kind": "stale_lock", "path": _lock9}]}
+for _state9 in (True, None, False):
+    procman.dsh_activity = lambda _p, _s=_state9: _s
+    _n9 = _compat.repair(_dsh9, {"fixables": [{"kind": "stale_lock", "path": _lock9}]},
+                         lambda t: _log9.append(t))
+    _log9.append("count=%d|锁仍在=%s" % (_n9, os.path.exists(_lock9)))
+_compat.audit, procman.dsh_activity = _real_audit9, _act9
+check("修复不得删活实例的锁, 探针不可用时同样拒删, 并把原因写进日志",
+      _log9.count("count=0|锁仍在=True") == 2
+      and any("仍在运行" in t for t in _log9) and any("无法确认" in t for t in _log9),
+      str(_log9[:6]))
+check("对照: 确认 DSH 已停止时残留锁照旧删除并计数(不是把所有删除都堵死)",
+      _log9.count("count=1|锁仍在=False") == 1 and not os.path.exists(_lock9),
+      str(_log9[-3:]))
+if _old_home_env9 is None:
+    os.environ.pop("DSH_HOME", None)
+else:
+    os.environ["DSH_HOME"] = _old_home_env9
 
 # --- 17) 自检自身的边界: 不得污染用户真实的日志目录 ---------------------------
 # 17.1 以前 selftest 直接往 ~/.dsh_launcher_logs 写: 每跑一次就多出几条测试噪声

@@ -513,15 +513,23 @@ class DshRunner:
 
     @staticmethod
     def lock_path():
-        return os.path.join(os.path.expanduser("~"), ".dsh", "task-board", "ledger-v2.lock")
+        # 与 compat.dsh_home 同一口径: DSH_HOME 可以指向自定义目录(还可能写成相对路径或带 ~)。
+        # 这里以前写死 ~/.dsh, 用户设了 DSH_HOME 时面板与启动清理看到的是**另一个**(通常不存在)
+        # 的锁文件 —— 真锁既不报也不清, 而兼容审计用的是正确地址, 两边结论互相矛盾。
+        raw = os.environ.get("DSH_HOME") or os.path.join(os.path.expanduser("~"), ".dsh")
+        return os.path.join(os.path.abspath(os.path.expanduser(raw)),
+                            "task-board", "ledger-v2.lock")
 
     def stale_lock_present(self):
-        lp = self.lock_path()
-        if not os.path.exists(lp):
+        """只有在**确认 DSH 没在跑**时才叫残留锁。
+
+        探针不可用(ss/lsof 都没装、/proc 读不到)时一律 False: 这里 True 的代价是
+        _prepare_then_start 会 os.remove 掉一个活实例正在用的 ledger-v2.lock,
+        然后再起一个实例去抢同一本账。宁可少清一次(用户可手工删)。
+        """
+        if not os.path.exists(self.lock_path()):
             return False
-        if procman.find_process_by_port(DSH_PORT):
-            return False
-        return not procman.node_host_running()
+        return procman.dsh_activity(DSH_PORT) is False
 
     @staticmethod
     def git_head(dsh_dir):

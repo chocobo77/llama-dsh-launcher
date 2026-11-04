@@ -218,9 +218,16 @@ def audit(dsh_dir, log, include_dump=True):
 
     # 残留锁
     lp = os.path.join(dsh_home(), "task-board", "ledger-v2.lock")
-    if os.path.exists(lp) and not procman.find_process_by_port(DSH_PORT) and not procman.node_host_running():
-        fixables.append({"kind": "stale_lock", "path": lp})
-        it("warn", "残留锁文件: %s(可修复:删除)" % lp)
+    if os.path.exists(lp):
+        # 判定要三态: "确认没在跑"才是残留锁, "查不到"不是。把探针失效当成空闲,
+        # 就会给出"可修复:删除"的建议, 一键删掉活实例正在用的账本锁。
+        _act = procman.dsh_activity(DSH_PORT)
+        if _act is False:
+            fixables.append({"kind": "stale_lock", "path": lp})
+            it("warn", "残留锁文件: %s(可修复:删除)" % lp)
+        elif _act is None:
+            it("warn", "锁文件存在但无法判定是否残留(端口/进程探针不可用), 不提供自动删除; "
+                       "请先确认 DSH 已停止, 再手工删除: %s" % lp)
 
     # manifest bundles
     mb = _manifest_bundles()
@@ -325,6 +332,16 @@ def repair(dsh_dir, report, log):
         kind = f["kind"]
         try:
             if kind == "stale_lock":
+                # 删锁前**再确认一次**: 弹窗到点修复之间 DSH 可能已经被启动, 探针也可能
+                # 在这期间失效。删掉活实例的 ledger-v2.lock 不是"清理", 是给第二个实例
+                # 让位 —— 两本账同时写就是数据损坏, 而且现场看起来"一切正常"。
+                _act = procman.dsh_activity(DSH_PORT)
+                if _act is not False:
+                    log("[兼容] ⚠ 未删除 %s: %s" % (
+                        f["path"],
+                        "端口/进程探针不可用, 无法确认 DSH 已停止" if _act is None
+                        else "DSH 仍在运行, 这把锁是活的"))
+                    continue
                 os.remove(f["path"])
                 log("[兼容] 已删除残留锁: %s" % f["path"])
                 fixed += 1
