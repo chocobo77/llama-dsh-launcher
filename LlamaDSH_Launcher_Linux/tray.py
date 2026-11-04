@@ -56,6 +56,7 @@ class TrayIcon:
         self.on_quit = on_quit
         self.lightweight = False
         self.revision = 1
+        self.xdg_token = ""
         self.bus = dbus.SessionBus()
         # 规范: org.kde.StatusNotifierItem-<pid>(不能把带 . : 的 URL 拼进总线名)
         self.name = "org.kde.StatusNotifierItem-%d" % os.getpid()
@@ -147,8 +148,11 @@ if _DBUS_OK:
             self.tray = tray
             super().__init__(bus, path)
 
-        @dbus.service.method("org.kde.StatusNotifierItem", in_signature="", out_signature="")
-        def Activate(self):
+        # 签名严格按 KDE SNI 规范: GNOME 的 appindicator 扩展是 **带坐标** 调
+        # Activate(x, y)/SecondaryActivate(x, y)。声明成无参 → 宿主调用直接
+        # TypeError(journal: "failed to activate"), 左键/双击永远打不开窗口。
+        @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii", out_signature="")
+        def Activate(self, x, y):
             self.tray.on_show()
 
         @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii", out_signature="")
@@ -159,13 +163,37 @@ if _DBUS_OK:
         def ContextMenu(self, x, y):
             pass  # 菜单由 ItemIsMenu + /MenuBar 承载
 
+        # Wayland 激活令牌: 宿主(扩展 appIndicator.js:774)会在 Activate 前递过来;
+        # 不实现则扩展记 hasProvideXdgActivationToken=false 并跳过(不报错, 但窗口焦点策略会退化)
+        @dbus.service.method("org.kde.StatusNotifierItem", in_signature="s", out_signature="")
+        def ProvideXdgActivationToken(self, token):
+            self.tray.xdg_token = str(token or "")
+
+        @dbus.service.method("org.kde.StatusNotifierItem", in_signature="u", out_signature="")
+        def XAyatanaSecondaryActivate(self, timestamp):
+            self.tray.on_show()
+
+        # 滚轮: 缺声明会让宿主每次滚动都收到 UnknownMethod(刷日志), 语义上我们没有快捷动作
+        @dbus.service.method("org.kde.StatusNotifierItem", in_signature="is", out_signature="")
+        def Scroll(self, delta, orientation):
+            pass
+
+        @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii", out_signature="")
+        def ScrollValue(self, x_value, y_value):
+            pass
+
         @dbus.service.method("org.kde.StatusNotifierItem", in_signature="", out_signature="s")
         def Title(self):
             return "LlamaDSH 启动器"
 
         @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ss", out_signature="v")
         def Get(self, iface, prop):
-            return self.GetAll(iface).get(prop)
+            vals = self.GetAll(iface)
+            if prop not in vals:
+                raise dbus.exceptions.DBusException(
+                    "No such property: %s" % prop,
+                    name="org.freedesktop.DBus.Error.UnknownProperty")
+            return vals[prop]   # 缺属性时返回 None 会撞 'v' 签名类型错误
 
         @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="s", out_signature="a{sv}")
         def GetAll(self, iface):
@@ -199,16 +227,25 @@ if _DBUS_OK:
             pass
 
     class _DBusMenuObject(dbus.service.Object):
-        """com.canonical.dbusmenu 最小实现(静态三项目录)。"""
+        """com.canonical.dbusmenu 最小实现(静态三项目录)。
+
+        入参签名必须按规范: GetLayout(i parent, i depth, **as** props)、
+        GetGroupProperties(**ai** ids, as props)。原来写成 iia{ss} / ias,
+        扩展按规范发 (i,i,as) / (ai,as) 时类型不符被 python-dbus 拒掉,
+        布局与属性永远取不到 → 右键弹出的是空菜单(即"无交互菜单")。
+        """
 
         def __init__(self, bus, path, tray):
             self.tray = tray
             super().__init__(bus, path)
 
-        @dbus.service.method("com.canonical.dbusmenu", in_signature="iia{ss}",
+        @dbus.service.method("com.canonical.dbusmenu", in_signature="iias",
                              out_signature="u(ia{sv}av)")
         def GetLayout(self, parent, depth, props):
-            return (self.tray.revision, _layout_node(self.tray._layout(), depth))
+            root = self.tray._layout()
+            node = _find_node(root, int(parent)) or root
+            # depth: -1 = 全展开, 0 = 只要本节点不带子项
+            return (self.tray.revision, _layout_node(node, int(depth)))
 
         @dbus.service.method("com.canonical.dbusmenu", in_signature="i", out_signature="b")
         def AboutToShow(self, _id):
@@ -218,9 +255,41 @@ if _DBUS_OK:
         def LayoutUpdated(self, revision, parent):
             pass
 
-        @dbus.service.method("com.canonical.dbusmenu", in_signature="ias", out_signature="a{ia{sv}}")
+        # 规范: GetGroupProperties(ai ids, as propertyNames) → **a(ia{sv})**(结构体数组)
+        # 扩展按 (ai, as) 调用并把回包当 a(ia{sv}) 解 —— 签名/回包形状任一处不合,
+        # 菜单项的 label/toggle 状态就全取不到(表现为右键弹出空菜单)。
+        @dbus.service.method("com.canonical.dbusmenu", in_signature="aias",
+                             out_signature="a(ia{sv})")
         def GetGroupProperties(self, ids, props):
-            return dbus.Dictionary({}, signature="ia{sv}")
+            flat = _flatten_layout(self.tray._layout())
+            rows = []
+            for raw in ids:
+                i = int(raw)
+                if i not in flat:
+                    continue
+                sel = {k: v for k, v in flat[i].items() if not props or k in props}
+                rows.append(dbus.Struct((dbus.Int32(i),
+                                         dbus.Dictionary(sel, signature="sv")),
+                                        signature=None))
+            return dbus.Array(rows, signature="(ia{sv})")
+
+        # 对象级属性(规范要求的 Status/IconName/IconThemePath): 宿主可能走 Properties 读
+        @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ss", out_signature="v")
+        def Get(self, iface, prop):
+            vals = self.GetAll(iface)
+            if prop not in vals:
+                raise dbus.exceptions.DBusException(
+                    "No such property: %s" % prop,
+                    name="org.freedesktop.DBus.Error.UnknownProperty")
+            return vals[prop]
+
+        @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="s", out_signature="a{sv}")
+        def GetAll(self, iface):
+            return {"Status": "normal", "IconName": "", "IconThemePath": ""}
+
+        @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ssv", out_signature="")
+        def Set(self, iface, prop, value):
+            pass
 
         @dbus.service.method("com.canonical.dbusmenu", in_signature="isvu", out_signature="")
         def Event(self, _id, event, _data, _ts):
@@ -240,6 +309,29 @@ def _pixmap_array(items):
                                     dbus.Array(argb, signature="y")),
                                    signature=None)
                        for (w, h, argb) in items], signature="(iiay)")
+
+
+def _find_node(node, target_id):
+    """按 id 定位子树(宿主可能只请求某个 submenu 的布局)。"""
+    rid, _props, children = node
+    if rid == target_id:
+        return node
+    for c in children:
+        got = _find_node(c, target_id)
+        if got:
+            return got
+    return None
+
+
+def _flatten_layout(node, out=None):
+    """布局展平成 {id: props}, 供 GetGroupProperties 应答。"""
+    if out is None:
+        out = {}
+    rid, props, children = node
+    out[rid] = props
+    for c in children:
+        _flatten_layout(c, out)
+    return out
 
 
 def _layout_node(node, depth, variant=False):
