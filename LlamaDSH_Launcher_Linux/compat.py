@@ -806,7 +806,14 @@ def shipped_dsh_package_names(dsh_dir):
 
 def is_dsh_package_dead(package_name, dsh_dir, profile_dir_):
     """上游已删除的 DSH 包: 所有 node_modules farm 均未安装, 且源码树无该 workspace 包。
-    只判定 @deepseek-ai/ 命名空间(C# IsDshPackageDead 同规则)。"""
+    只判定 @deepseek-ai/ 命名空间(C# IsDshPackageDead 同规则)。
+
+    返回 True/False/**None** —— None 是"看不到 DSH 安装, 无法判定": dsh_dir 没填、指向的
+    不是 DSH 源码树(扫不出任何 package.json)时, 依据只有"我在哪儿都没找到它", 而那个
+    "哪儿"本来就一个都没看成。判死是有后果的: 插件面板把它列成 error"死依赖";
+    升级预检据此说"最新版仍声明已删除的依赖"; 升级流程还会**改写插件的 package.json**,
+    把这些 peer 声明从依赖里删掉(有备份, 但仍是拿缺失的证据改用户的清单)。
+    """
     prefix = "@deepseek-ai/"
     if not package_name.startswith(prefix):
         return False
@@ -820,7 +827,12 @@ def is_dsh_package_dead(package_name, dsh_dir, profile_dir_):
     for farm in farms:
         if os.path.isdir(os.path.join(farm, "@deepseek-ai", short)):
             return False
-    return package_name not in shipped_dsh_package_names(dsh_dir)
+    if not dsh_dir or not os.path.isdir(dsh_dir):
+        return None
+    shipped = shipped_dsh_package_names(dsh_dir)
+    if not shipped:
+        return None     # 目录存在但不是 DSH 源码树(写错/搬走/只读了个空壳)
+    return package_name not in shipped
 
 
 # ------------------------------------------------------- 门禁(C# EvaluateGate) --
@@ -887,7 +899,7 @@ def audit_plugins(profile="web", dsh_dir=""):
                         "state_label": "无法核对", "spec": deps.get(rel, "") or "(bundle)",
                         "in_bundles": rel in in_bundles, "installed": True,
                         "compatible": False, "exempted": False, "peer_issues": [],
-                        "dead_peers": [], "missing_specs": [],
+                        "dead_peers": [], "peer_unknown": [], "missing_specs": [],
                         "errors": ["package.json 读不动(%s: %s)"
                                    % (type(ex).__name__, str(ex)[:100])],
                         "locked": rel in pinned,
@@ -904,11 +916,17 @@ def audit_plugins(profile="web", dsh_dir=""):
             peer_meta = doc.get("peerDependenciesMeta") or {}
             peer_issues = {}
             dead_peers = []
+            peer_unknown = []
             for dep, rng in peer.items():
                 if peer_meta.get(dep, {}).get("optional"):
                     continue  # optional peer 不参与探针(C# 同语义)
                 if dep.startswith("@deepseek-ai/"):
-                    if is_dsh_package_dead(dep, dsh_dir, pdir):
+                    _dead = is_dsh_package_dead(dep, dsh_dir, pdir)
+                    if _dead is None:
+                        # DSH 目录没填/不是源码树 ⇒ 只能报"没判定", 不能报"死依赖"
+                        peer_unknown.append(dep)
+                        continue
+                    if _dead:
                         dead_peers.append(dep)
                         continue
                 installed = _installed_version(base, dep)
@@ -942,7 +960,7 @@ def audit_plugins(profile="web", dsh_dir=""):
                 "peer_issues": [{"dep": k, "range": v,
                                  "installed": _installed_version(base, k) or "?"}
                                 for k, v in peer_issues.items()],
-                "dead_peers": dead_peers,
+                "dead_peers": dead_peers, "peer_unknown": peer_unknown,
                 "missing_specs": missing_specs, "errors": errors,
                 "locked": name in pinned,
                 "disabled_by_market": name in market_disabled,
@@ -952,7 +970,7 @@ def audit_plugins(profile="web", dsh_dir=""):
             "name": ".dsh-market/state.json", "version": "?", "dir": _mp,
             "state_label": "无法核对", "spec": "", "in_bundles": False,
             "installed": False, "compatible": False, "exempted": False,
-            "peer_issues": [], "dead_peers": [], "missing_specs": [],
+            "peer_issues": [], "dead_peers": [], "peer_unknown": [], "missing_specs": [],
             "errors": ["市场停用记录读不动 → 各插件的启用/停用状态本次未能核对"],
             "locked": False, "disabled_by_market": False,
         })
@@ -1021,18 +1039,26 @@ def preview_plugin_update(profile, name, dsh_dir=""):
         return {"up_to_date": True, "installed": installed, "latest": latest}
     dsh_version = get_dsh_version(dsh_dir) if dsh_dir else ""
     blocked, gate_name, gate_range = evaluate_gate(latest_meta, dsh_version)
-    dead_peers = []
+    dead_peers, unknown_peers = [], []
     for dep in (latest_meta.get("peerDependencies") or {}):
-        if dep.startswith("@deepseek-ai/") and is_dsh_package_dead(dep, dsh_dir, pdir):
+        if not dep.startswith("@deepseek-ai/"):
+            continue
+        _dead = is_dsh_package_dead(dep, dsh_dir, pdir)
+        if _dead is None:
+            unknown_peers.append(dep)
+        elif _dead:
             dead_peers.append(dep)
     concern = ""
     if blocked:
         concern = "升级可能被 DSH 门禁拒绝(%s %s)" % (gate_name, gate_range)
     elif dead_peers:
         concern = "最新版仍声明已删除的依赖: %s" % ", ".join(dead_peers)
+    elif unknown_peers:
+        concern = ("⚠ 未能核对最新版声明的 DSH 依赖(%s) —— DSH 目录未指明或指向的不是 DSH "
+                   "源码树; 升级后若插件加载失败请先核对 DSH 目录" % ", ".join(unknown_peers[:3]))
     return {"installed": installed, "latest": latest, "registry": reg,
             "gate_blocked": blocked, "gate_name": gate_name, "gate_range": gate_range,
-            "dead_peers": dead_peers, "concern": concern}
+            "dead_peers": dead_peers, "unknown_peers": unknown_peers, "concern": concern}
 
 
 def _pnpm_env():
@@ -1116,13 +1142,18 @@ def _upgrade_plugin_locked(profile, name, dsh_dir="", job_log=None):
     if got and prev.get("latest") and _semver_cmp(got, prev["latest"]) < 0:
         if job_log:
             job_log("⚠ 实际安装版本 %s 低于 registry latest %s" % (got, prev["latest"]))
-    # 升级后清理死 peer 依赖声明(基于重审)
+    # 升级后清理死 peer 依赖声明(基于重审)。必须是**确认**死(True)才动用户的清单:
+    # None(看不到 DSH 安装)时以前会把全部 @deepseek-ai peer 从 package.json 里删掉。
     pj = os.path.join(base, "node_modules", name, "package.json")
     doc = read_json(pj, None)
     if doc and dsh_dir:
         peers = doc.get("peerDependencies") or {}
-        dead = [d for d in peers if d.startswith("@deepseek-ai/")
-                and is_dsh_package_dead(d, dsh_dir, base)]
+        _verdicts = {d: is_dsh_package_dead(d, dsh_dir, base)
+                     for d in peers if d.startswith("@deepseek-ai/")}
+        if job_log and any(v is None for v in _verdicts.values()):
+            job_log("⚠ %s 的 %d 个 DSH peer 无法判定是否已被上游删除(DSH 目录指向的不是源码树), "
+                    "本次不改插件依赖声明" % (name, sum(1 for v in _verdicts.values() if v is None)))
+        dead = [d for d, v in _verdicts.items() if v is True]
         if dead:
             bak = _backup(pj)
             if bak:

@@ -525,6 +525,30 @@ class DshRunner:
         self.last_profile = {}
         self._tailer_fh = None
         self._deadline = 0.0
+        self._dsh_dir_cache = {"t": 0.0, "v": None}
+
+    def dsh_dir_of(self, profile):
+        """DSH 目录: 面板字段优先; 没填时按更新器同一套**已知位置**找(60s 缓存)。
+
+        旧写法是 `or "deepseek-harness"` —— 那是个相对目录: 模式判定对着幽灵路径做,
+        Popen 的 cwd 也用它, 于是启动报 "[Errno 2] No such file or directory:
+        'deepseek-harness'", 与"用户把目录写错了"同形, 而实际只是没填。
+        只查已知位置(known_only): 全盘 BFS 最长 SEARCH_DEADLINE=45s, 不能放在
+        点"启动"之后的 HTTP 处理线程里。
+        """
+        d = (profile.get("DshDir") or "").strip().strip('"')
+        if d:
+            return d
+        now = time.time()
+        if self._dsh_dir_cache["v"] is not None and now - self._dsh_dir_cache["t"] < 60:
+            return self._dsh_dir_cache["v"]
+        try:
+            import updates
+            found = updates.find_dsh_project(known_only=True) or ""
+        except Exception:
+            found = ""
+        self._dsh_dir_cache.update(t=now, v=found)
+        return found
 
     @property
     def running(self):
@@ -566,8 +590,8 @@ class DshRunner:
     def resolve_mode(self, profile):
         if (profile.get("DshMode") or 0) == 1:
             return "npx"
-        dsh_dir = (profile.get("DshDir") or "").strip().strip('"') or "deepseek-harness"
-        if os.path.isfile(os.path.join(dsh_dir, "apps", "cli", "lib", "bin.js")) and self.retries_left > 0:
+        dsh_dir = self.dsh_dir_of(profile)
+        if dsh_dir and os.path.isfile(os.path.join(dsh_dir, "apps", "cli", "lib", "bin.js")) and self.retries_left > 0:
             return "compiled-js"
         return "compiled-tsx"
 
@@ -595,7 +619,7 @@ class DshRunner:
                 self.hub.log("[DSH] 已清理残留锁: " + self.lock_path())
             except OSError as ex:
                 self.hub.error_ex(ex, "清理残留锁失败")
-        dsh_dir = (profile.get("DshDir") or "").strip().strip('"')
+        dsh_dir = self.dsh_dir_of(profile)
         mode = self.resolve_mode(profile)
         if mode != "npx" and dsh_dir:
             head = self.git_head(dsh_dir)
@@ -640,7 +664,17 @@ class DshRunner:
 
     def _start_inner(self, profile):
         mode = self.resolve_mode(profile)
-        dsh_dir = (profile.get("DshDir") or "").strip().strip('"') or "deepseek-harness"
+        dsh_dir = self.dsh_dir_of(profile)
+        if mode != "npx" and (not dsh_dir or not os.path.isdir(dsh_dir)):
+            # 旧写法把空目录兜底成相对路径 "deepseek-harness", Popen 的 cwd 用它 ⇒
+            # 报 "[Errno 2] No such file or directory: 'deepseek-harness'", 与"目录写错了"
+            # 同形; 真实情况只是没填(或 DSH 不在已知位置)。这里直接说明缺什么。
+            self.hub.log("[DSH] ⚠ 未指定 DSH 目录(或目录不存在) —— 已在常见位置查找无果: "
+                         "~/.local/share/deepseek-harness、~/deepseek-harness、~/code/deepseek-harness、"
+                         "/opt/deepseek-harness。请在「DSH 目录」里选择 DSH 项目目录, "
+                         "或改用 npx 模式启动")
+            self.status = "failed"
+            return False, "未指定有效的 DSH 目录(请在「DSH 目录」中选择, 或切换 npx 模式)"
         self.proc = None
         self.tracker = None
         self.status = "starting"

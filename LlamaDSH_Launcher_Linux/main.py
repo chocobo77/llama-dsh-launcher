@@ -385,6 +385,10 @@ def api_plugins(body):
             notes.append("peer 不兼容: " + "; ".join("%s %s" % (x["dep"], x["range"]) for x in p["peer_issues"]))
         if p["dead_peers"]:
             notes.append("死依赖: " + ", ".join(p["dead_peers"]))
+        if p.get("peer_unknown"):
+            # DSH 目录没填/不是源码树: 只能报"未判定", 报"死依赖"是替用户下结论
+            notes.append("依赖是否已被上游删除未判定(DSH 目录未指明或非源码树): "
+                         + ", ".join(p["peer_unknown"]))
         if p["missing_specs"]:
             notes.append("缺依赖: " + ", ".join(p["missing_specs"]))
         if p["errors"]:
@@ -921,7 +925,8 @@ def api_plugins_audit(body):
     writebacks = compat.enforce_pinned("web", HUB.log)
     plugins = compat.audit_plugins("web", dsh_dir)
     errs = sum(1 for p in plugins if p["errors"])
-    warns = sum(1 for p in plugins if p["peer_issues"] or p["missing_specs"] or p["dead_peers"])
+    warns = sum(1 for p in plugins if p["peer_issues"] or p["missing_specs"]
+                or p["dead_peers"] or p.get("peer_unknown"))
     locked = sum(1 for p in plugins if p["locked"])
     ver = compat.get_dsh_version(dsh_dir)
     return {"plugins": plugins, "writebacks": writebacks,

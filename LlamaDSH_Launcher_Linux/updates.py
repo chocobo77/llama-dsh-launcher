@@ -96,8 +96,12 @@ def find_llama_server():
     return _bfs([home, "/opt", "/usr/local"], lambda n: n == "llama-server", deadline)
 
 
-def find_dsh_project():
-    """返回包含 pnpm-workspace.yaml 的 DSH 项目目录或 None。"""
+def find_dsh_project(known_only=False):
+    """返回包含 pnpm-workspace.yaml 的 DSH 项目目录或 None。
+
+    known_only=True 只查已知位置(几次 stat): 启动路径上用它, 全盘 BFS 最长
+    SEARCH_DEADLINE=45s, 放在点"启动"之后的 HTTP 处理线程里就是一次长时间卡死。
+    """
     home = os.path.expanduser("~")
     known = [os.path.join(home, ".local", "share", "deepseek-harness"),
              os.path.join(home, "deepseek-harness"),
@@ -109,6 +113,8 @@ def find_dsh_project():
         if os.path.isfile(os.path.join(k, "pnpm-workspace.yaml")) or \
            os.path.isfile(os.path.join(k, "apps", "cli", "package.json")):
             return k
+    if known_only:
+        return None
     deadline = time.time() + SEARCH_DEADLINE
     roots = [os.path.join(home, "code"), os.path.join(home, "Projects"), os.path.join(home, "dev"), "/opt", home]
     return _bfs(roots, lambda n: n == "pnpm-workspace.yaml", deadline, max_depth=4)

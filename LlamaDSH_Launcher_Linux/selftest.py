@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(237 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(245 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -495,10 +495,21 @@ ctl._spawn = lambda argv, detached=True, cwd=None: spawned.setdefault("argv", ar
 ctl._start_tailer = lambda: None
 orig_thread = core.threading.Thread
 core.threading.Thread = lambda *a, **k: type("_N", (), {"start": lambda s: None})()
-ok, msg = ctl._start_inner({"DshAdminMode": True, "DshDir": "/tmp/no-such-dsh-dir",
-                            "DshMode": "compiled-js"})
-core.threading.Thread = orig_thread
-core.subprocess.run = orig_run
+# DshDir 必须是**存在**的目录: 第十二轮起 _start_inner 会先拒绝不存在/未指明的目录
+# (旧写法带着 /tmp/no-such-dsh-dir 一路走到 Popen, 真机上就是 cwd 的 Errno 2)。
+_dsh_demo = os.path.join(tempfile.mkdtemp(prefix="llamadsh_selftest_dshdir_"), "dsh")
+os.makedirs(os.path.join(_dsh_demo, "apps", "cli", "lib"))
+with open(os.path.join(_dsh_demo, "apps", "cli", "lib", "bin.js"), "w", encoding="utf-8") as fh:
+    fh.write("//x\n")
+_real_abs2 = core._abs_exe
+core._abs_exe = lambda name: "/bin/true"      # 钉住环境探针: 本机有没有 pnpm 都不该影响本断言
+try:
+    ok, msg = ctl._start_inner({"DshAdminMode": True, "DshDir": _dsh_demo,
+                                "DshMode": "compiled-js"})
+finally:
+    core._abs_exe = _real_abs2
+    core.threading.Thread = orig_thread
+    core.subprocess.run = orig_run
 argv0 = str((spawned.get("argv") or [""])[0])
 check("管理员模式不可用 → 自动降级普通启动(argv 不含 sudo)",
       ok and argv0 != "sudo", str(spawned))
@@ -2620,6 +2631,96 @@ try:
 finally:
     procman.which = _real_which20b
     os.environ["HOME"] = _real_home20
+
+
+# --- 21) 第十二轮: DSH 目录看不到时不得"判死" ------------------------------------
+# 21.1 is_dsh_package_dead 的三态: 面板没填 DSH 目录(或填的不是 DSH 源码树)时, 依据只有
+#      "我在哪儿都没找到这个包", 而那个"哪儿"一个都没看成。旧版一律 return True ⇒
+#      插件面板每个插件一行 error"死依赖", 升级预检说"最新版仍声明已删除的依赖",
+#      升级流程还会把插件 package.json 里的 peer 声明删掉。
+_t21dsh = os.path.join(_tmp, "dsh_tree21")
+os.makedirs(os.path.join(_t21dsh, "apps", "cli"))
+with open(os.path.join(_t21dsh, "package.json"), "w", encoding="utf-8") as fh:
+    json.dump({"name": "@deepseek-ai/dsh", "version": "1.0.0"}, fh)
+with open(os.path.join(_t21dsh, "apps", "cli", "package.json"), "w", encoding="utf-8") as fh:
+    json.dump({"name": "@deepseek-ai/dsh-cli", "version": "1.0.0"}, fh)
+check("看不到 DSH 安装时必须返回 None(无法判定), 不得返回 True 判死",
+      _compat.is_dsh_package_dead("@deepseek-ai/dsh-anything", "", _prof) is None
+      and _compat.is_dsh_package_dead("@deepseek-ai/dsh-anything", _dsh9, _prof) is None,
+      str((_compat.is_dsh_package_dead("@deepseek-ai/dsh-anything", "", _prof),
+           _compat.is_dsh_package_dead("@deepseek-ai/dsh-anything", _dsh9, _prof))))
+check("对照: 确实是 DSH 源码树时判定照旧(没 shipped 的判死, shipped 的判活)",
+      _compat.is_dsh_package_dead("@deepseek-ai/dsh-gone", _t21dsh, _prof) is True
+      and _compat.is_dsh_package_dead("@deepseek-ai/dsh", _t21dsh, _prof) is False,
+      str((_compat.is_dsh_package_dead("@deepseek-ai/dsh-gone", _t21dsh, _prof),
+           _compat.is_dsh_package_dead("@deepseek-ai/dsh", _t21dsh, _prof))))
+
+# 21.2 审计行: 未判定要单列 peer_unknown, 不能塞进 dead_peers
+with open(os.path.join(_prof, "package.json"), "w", encoding="utf-8") as fh:
+    json.dump({"name": "profile-web", "version": "1.0.0",
+               "dependencies": {"good-plugin": "^1.0.0", "broken-plugin": "^1.0.0",
+                                "peer-plugin": "^1.0.0"}}, fh)
+os.makedirs(os.path.join(_prof, "node_modules", "peer-plugin"), exist_ok=True)
+_peer_pj21 = os.path.join(_prof, "node_modules", "peer-plugin", "package.json")
+with open(_peer_pj21, "w", encoding="utf-8") as fh:
+    json.dump({"name": "peer-plugin", "version": "1.0.0",
+               "peerDependencies": {"@deepseek-ai/dsh-gone": ">=1.0.0"}}, fh)
+_rows21a = {r["name"]: r for r in _compat.audit_plugins("web", "")}
+_rows21b = {r["name"]: r for r in _compat.audit_plugins("web", _t21dsh)}
+check("DSH 目录未指明时该 peer 只能记为\"未判定\", 不得进 dead_peers",
+      "@deepseek-ai/dsh-gone" in _rows21a["peer-plugin"]["peer_unknown"]
+      and not _rows21a["peer-plugin"]["dead_peers"],
+      str({k: _rows21a["peer-plugin"][k] for k in ("peer_unknown", "dead_peers")}
+          if "peer-plugin" in _rows21a else sorted(_rows21a)))
+check("对照: 指明且确为源码树时照旧判死(不得把新三态变成一律不判)",
+      "@deepseek-ai/dsh-gone" in _rows21b["peer-plugin"]["dead_peers"]
+      and not _rows21b["peer-plugin"]["peer_unknown"],
+      str({k: _rows21b["peer-plugin"][k] for k in ("peer_unknown", "dead_peers")}
+          if "peer-plugin" in _rows21b else sorted(_rows21b)))
+
+# 21.3 升级流程里"清理死 peer"会改写插件的 package.json —— 未判定时必须不动用户的清单
+_real_reg21, _real_add21 = _compat._registry_query, _compat._pnpm_add
+_compat._registry_query = lambda name: ("https://registry.npmjs.org", "9.9.9",
+                                        {"peerDependencies": {"@deepseek-ai/dsh-gone": ">=1.0.0"}})
+_compat._pnpm_add = lambda base, name, spec: (True, "ok")
+_log21 = []
+# _dsh9 是"目录存在但不是 DSH 源码树"(没有 package.json) —— 旧版据此把全部 peer 判死
+_ok21a, _msg21a = _compat._upgrade_plugin_locked("web", "peer-plugin", _dsh9, job_log=_log21.append)
+_untouched21 = json.load(open(_peer_pj21, encoding="utf-8"))
+_ok21b, _msg21b = _compat._upgrade_plugin_locked("web", "peer-plugin", _t21dsh, job_log=_log21.append)
+_pruned21 = json.load(open(_peer_pj21, encoding="utf-8"))
+_compat._registry_query, _compat._pnpm_add = _real_reg21, _real_add21
+with open(_peer_pj21, "w", encoding="utf-8") as fh:
+    json.dump({"name": "peer-plugin", "version": "1.0.0",
+               "peerDependencies": {"@deepseek-ai/dsh-gone": ">=1.0.0"}}, fh)
+check("DSH 目录看不到时升级不得删插件的 peer 依赖声明, 且要把\"未判定\"说出来",
+      "@deepseek-ai/dsh-gone" in (_untouched21.get("peerDependencies") or {})
+      and any("无法判定" in t for t in _log21),
+      str({k: _untouched21.get(k) for k in ("peerDependencies",)} if _ok21a else (_ok21a, _msg21a)))
+check("对照: 确认已删除的依赖照旧清理(不得把三态变成永远不清理)",
+      "@deepseek-ai/dsh-gone" not in (_pruned21.get("peerDependencies") or {}),
+      str(_pruned21.get("peerDependencies")))
+
+# 21.4 DSH 目录为空时旧写法兜底成**相对**目录 "deepseek-harness": 模式判定对着幽灵路径做,
+#      Popen 的 cwd 也用它 ⇒ "[Errno 2] No such file or directory: 'deepseek-harness'",
+#      与"用户把目录写错了"同形。现在改成已知位置扫描 + 启动前明确拒绝。
+_real_home21 = os.environ.get("HOME")
+_home21 = os.path.join(_tmp, "home21_nodsh")
+os.makedirs(_home21)
+os.environ["HOME"] = _home21
+try:
+    _dr21 = core.DshRunner(_Silent(), {"defs": []})
+    _dr21._spawn = lambda *a, **k: False           # 对照里也不允许真的拉起进程
+    _d21 = _dr21.dsh_dir_of({})
+    _ok21c, _msg21c = _dr21._start_inner({"DshDir": ""})
+    _ok21d, _msg21d = _dr21._start_inner({"DshDir": _t21dsh})
+finally:
+    os.environ["HOME"] = _real_home21
+check("DSH 目录没填且已知位置扫不到时, 必须直接说明缺什么(不是 Popen 的 Errno 2)",
+      _d21 == "" and _ok21c is False and "未指定有效的 DSH 目录" in (_msg21c or "")
+      and "Errno 2" not in (_msg21c or ""), str((_d21, _ok21c, _msg21c)))
+check("对照: 指明有效目录时不得被这道新守卫拦住",
+      "未指定有效" not in (_msg21d or ""), str((_ok21d, _msg21d)))
 
 # --- 17) 自检自身的边界: 不得污染用户真实的日志目录 ---------------------------
 # 17.1 以前 selftest 直接往 ~/.dsh_launcher_logs 写: 每跑一次就多出几条测试噪声
