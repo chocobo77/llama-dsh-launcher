@@ -9,7 +9,7 @@
 # 核心功能: 思考强度控制 (reasoning / reasoning-effort / reasoning-budget / reasoning-preserve)
 # =====================================================================
 meta:
-  schema: 11
+  schema: 12
   adapt: "llama-server 0.7.0-dev (build 11680, b797b9ca8) 实测对齐 · schema v7（2026-10-22 全量比对 --help：332 个选项名 / 241 个参数，功能型选项无缺口；7 个 <0|1> 参数仍为 Combo、numa 无非法 disabled；<0|1> 裸旗标会 invalid stoul argument）；v10: 49 参数输入校验（数值边界/格式正则，启用且非空时触发）；v9: 因果/冲突/联动规则全量评审（requires+16 conflicts+14 implies/suggests，层级迁移 4 参数）"
   notes: >
     llama.cpp 更新时的维护方法（改完点启动器"⟳ 重载参数配置"即时生效）:
@@ -30,21 +30,22 @@ meta:
         spec-draft-ctx-size / spec-draft-replace / verbose-prompt / no-display-prompt / system-prompt-file
 
 groups:
-  # 顶层四组照搬 llama-server --help 官方分节:
-  # common params / sampling params / speculative params / example-specific params
-  # 子组按官方 help 各节内的排列顺序切块
-  - {id: common,   title: 通用与加载 (common),   order: 0}
-  - {id: sampling, title: 采样控制 (sampling),   order: 1}
-  - {id: spec,     title: 推测解码 (speculative), order: 2}
-  - {id: server,   title: 服务与扩展 (server),   order: 3}
-
+  # 功能语义分类(不照搬官方 help 分节): 每个 top-level = 用户的一个意图
+  # 模型与加载/推理与缓存/运行与调度/采样控制/推测解码/对话与多模态/服务与网络
+  - {id: model,    title: 模型与加载,   order: 0}
+  - {id: cache,    title: 推理与缓存,   order: 1}
+  - {id: perf,     title: 运行与调度,   order: 2}
+  - {id: sampling, title: 采样控制,     order: 3}
+  - {id: spec,     title: 推测解码,     order: 4}
+  - {id: dialog,   title: 对话与多模态, order: 5}
+  - {id: net,      title: 服务与网络,   order: 6}
 params:
   - flag: alias
     subgroup: 模型来源
     label: 别名 (Alias)
     type: String
     default: "qwen3.8-27b"
-    group: common
+    group: model
     wide: true
     enabled: true
     tooltip: "模型别名，用于 API 返回中的 model 字段标识。建议设为模型简称，方便上层应用识别。"
@@ -54,7 +55,7 @@ params:
     label: 模型下载 URL
     type: String
     default: ""
-    group: common
+    group: model
     wide: true
     advanced: true
     tooltip: "模型直接下载 URL（-mu）。通常不直接使用，推荐用 hf-repo 指定 Hugging Face 仓库。"
@@ -68,7 +69,7 @@ params:
     label: HuggingFace 仓库
     type: String
     default: ""
-    group: common
+    group: model
     wide: true
     advanced: true
     tooltip: "Hugging Face 模型仓库（-hf）。格式: <user>/<model>[:quant]。quant 可选，不区分大小写，默认 Q4_K_M（不存在则取仓库第一个文件）。mmproj 会自动下载，禁用加 --no-mmproj。示例: ggml-org/GLM-4.7-Flash-GGUF:Q4_K_M"
@@ -81,7 +82,7 @@ params:
     label: HF 指定文件
     type: String
     default: ""
-    group: common
+    group: model
     wide: true
     advanced: true
     tooltip: "Hugging Face 模型文件名（-hff）。指定后覆盖 hf-repo 中的 quant 设置。"
@@ -94,7 +95,7 @@ params:
     label: HF 访问令牌
     type: String
     default: ""
-    group: common
+    group: model
     wide: true
     advanced: true
     tooltip: "Hugging Face 访问令牌（-hft）。留空=使用 HF_TOKEN 环境变量。访问私有模型时需要。"
@@ -104,7 +105,7 @@ params:
     label: Docker 模型仓库
     type: String
     default: ""
-    group: common
+    group: model
     wide: true
     advanced: true
     tooltip: "Docker Hub 模型仓库（-dr）。格式: [<repo>/]<model>[:quant]。repo 可选默认 ai/，quant 可选默认 :latest。示例: gemma3"
@@ -118,7 +119,7 @@ params:
     label: 模型加载模式
     type: Combo
     default: "auto"
-    group: common
+    group: model
     options: [auto, none, mmap, mlock, mmap+mlock, dio]
     tooltip: "模型加载模式。auto=自动选择（CUDA/ROCm 和 Vulkan iGPU 上自动禁用 mmap）；none=无特殊模式（等价旧 --no-mmap）；mmap=内存映射（按需加载，省内存）；mlock=锁定到物理内存（防交换）；mmap+mlock=两者结合；dio=使用 DirectIO。推荐 auto。旧参数 --mmap/--no-mmap/--mlock/--direct-io 已合并为此参数。"
 
@@ -127,7 +128,7 @@ params:
     label: 自动适配显存 (--fit)
     type: Combo
     default: "on"
-    group: common
+    group: model
     offValue: "off"
     enabled: true
     options: ["on", "off"]
@@ -138,7 +139,7 @@ params:
     label: Fit 显存余量 (MiB)
     type: String
     default: ""
-    group: common
+    group: model
     wide: true
     tooltip: "--fit 为每设备保留的目标显存余量，逗号分隔多卡值，单值广播到所有设备。默认 1024 MiB。显存吃紧时可调小。"
     requires:
@@ -151,7 +152,7 @@ params:
     label: Fit 最小上下文
     type: String
     default: "4096"
-    group: common
+    group: model
     tooltip: "--fit 能自动设置的最小 ctx 大小（token）。默认 4096。防止自动适配把上下文压得过小。"
     requires:
       - {flag: fit, op: "==", value: "on"}
@@ -163,7 +164,7 @@ params:
     label: 权重重打包
     type: Bool
     default: "true"
-    group: common
+    group: model
     tooltip: "是否启用权重重打包（repacking）以优化加载。官方默认开启。个别量化格式可关闭以加速加载但增加运行开销。"
     offFlag: no-repack
 
@@ -172,7 +173,7 @@ params:
     label: 覆盖模型元数据
     type: String
     default: ""
-    group: common
+    group: model
     wide: true
     advanced: true
     tooltip: "覆盖模型元数据（KV）。格式: KEY=TYPE:VALUE，如 tokenizer.ggml.add_bos_token=bool:false。类型: int/float/bool/str。高级功能慎用。"
@@ -182,7 +183,7 @@ params:
     label: 检查张量有效性
     type: Bool
     default: "false"
-    group: common
+    group: model
     advanced: true
     tooltip: "加载时检查模型张量数据是否含无效值。默认关闭。怀疑模型文件损坏时可开启排查。"
 
@@ -194,7 +195,7 @@ params:
     label: Fit 打印显存估算
     type: Combo
     default: "on"
-    group: common
+    group: model
     options: [on, off]
     tooltip: "加载时是否打印预估显存占用明细(on/off)。与 --fit 配套, 排查显存适配问题时开启。"
   - flag: main-gpu
@@ -202,7 +203,7 @@ params:
     label: 主 GPU 编号
     type: String
     default: "0"
-    group: common
+    group: model
     enabled: true
     tooltip: "主 GPU 设备编号（从 0 开始）。单卡用户保持 0。多卡时指定存放中间结果和 KV 缓存的 GPU。"
     validate:
@@ -213,7 +214,7 @@ params:
     label: 张量拆分
     type: String
     default: ""
-    group: common
+    group: model
     wide: true
     tooltip: "多 GPU 张量拆分比例，逗号分隔。如 '3,5' 表示第一块 GPU 占 3/8、第二块占 5/8。按显存大小比例分配。单卡无需设置。DeepSeek 4 新增 -sm tensor 模式。"
     validate:
@@ -224,7 +225,7 @@ params:
     label: 多 GPU 拆分模式
     type: Combo
     default: "layer"
-    group: common
+    group: model
     options: [none, layer, row, tensor]
     tooltip: "多 GPU 拆分方式。none=仅用单卡；layer=按层流水线拆分（默认，层与 KV 分散到各卡）；row=按行并行拆分权重；tensor=张量级拆分（实验性，DeepSeek 等支持）。单卡保持默认即可。"
 
@@ -233,7 +234,7 @@ params:
     label: 设备列表
     type: String
     default: ""
-    group: common
+    group: model
     wide: true
     tooltip: "用于卸载的设备列表，逗号分隔（如 0,1）。none=完全不卸载到 GPU。使用 --list-devices 查看可用设备。留空=自动。"
     validate:
@@ -244,7 +245,7 @@ params:
     label: 绕过 Host 缓冲
     type: Bool
     default: "false"
-    group: common
+    group: model
     advanced: true
     tooltip: "绕过 host 缓冲，允许使用额外缓冲。可略微提升显存利用率，视后端支持而定。"
 
@@ -253,7 +254,7 @@ params:
     label: 张量按需读取
     type: Combo
     default: "auto"
-    group: common
+    group: model
     advanced: true
     options: ["auto", "on", "off"]
     tooltip: "按需从磁盘读取大张量（如逐层 embedding）。auto=仅 >4GiB 的张量按需读取（默认）；on=全部按需读取（需 mmap）；off=常驻内存。"
@@ -263,7 +264,7 @@ params:
     label: RPC 服务器
     type: String
     default: ""
-    group: common
+    group: model
     wide: true
     advanced: true
     tooltip: "逗号分隔的 RPC 推理服务器列表（host:port）。用于跨机器分布式推理。"
@@ -274,7 +275,7 @@ params:
     role: ngl
     type: String
     default: "auto"
-    group: common
+    group: model
     enabled: true
     aliases: [n-gpu-layers]
     tooltip: "卸载到 GPU 的模型层数。0=纯 CPU；99/auto=自动配平。27B Q4 模型 24GB 显卡建议留空让 --fit 自动分配。显存不足时 --fit 会自动将部分层移至 CPU。"
@@ -286,7 +287,7 @@ params:
     label: 运算卸载到设备
     type: Bool
     default: "true"
-    group: common
+    group: model
     advanced: true
     tooltip: "是否将 host 张量运算卸载到设备（--op-offload / --no-op-offload）。官方默认开启。"
     offFlag: no-op-offload
@@ -296,7 +297,7 @@ params:
     label: 张量缓冲覆盖
     type: String
     default: ""
-    group: common
+    group: model
     wide: true
     advanced: true
     tooltip: "覆盖指定张量的缓冲区类型。格式: <张量名匹配>=<缓冲类型>，多个用逗号分隔。高级调优用。"
@@ -306,7 +307,7 @@ params:
     label: 稠密 FFN CPU 层数
     type: String
     default: ""
-    group: common
+    group: model
     tooltip: "把前 N 层的稠密 FFN 权重放在 CPU（针对非 MoE 模型；MoE 专家用 --n-cpu-moe）。显存与速度的折中。"
     validate:
       min: 0
@@ -317,7 +318,7 @@ params:
     role: cpu_moe
     type: Bool
     default: "false"
-    group: common
+    group: model
     tooltip: "将混合专家(MoE)模型的全部专家权重保留在 CPU 内存，仅注意力等共享权重进 GPU。适合 24GB 显存运行超大 MoE 模型。注意：--fit 在显存不足时会自动执行类似操作。"
 
   - flag: n-cpu-moe
@@ -326,7 +327,7 @@ params:
     role: n_cpu_moe
     type: String
     default: ""
-    group: common
+    group: model
     tooltip: "只把前 N 层的 MoE 专家权重放在 CPU，其余层专家留在 GPU——显存与速度的折中。与 --fit 配合使用效果更佳。建议从 0 开始逐步增大直到显存刚好不 OOM。仅对 MoE 模型有效。"
     validate:
       min: 0
@@ -339,11 +340,70 @@ params:
     label: MoE 专家 GPU 缓存 (MiB)
     type: String
     default: "0"
-    group: common
+    group: model
     advanced: true
     tooltip: "为留在 CPU 的 MoE 专家权重分配 GPU 缓存（MiB）。0=禁用（官方默认）。多 GPU 时按 --tensor-split 比例分摊。显存充裕的 MoE 模型可用它减少专家换入换出。"
     validate:
       min: 0
+
+  - flag: lora
+    subgroup: LoRA 与控制向量
+    label: LoRA
+    type: String
+    default: ""
+    group: model
+    wide: true
+    advanced: true
+    tooltip: "LoRA 适配器路径。在基础模型上叠加微调效果。支持多个适配器（逗号分隔）。"
+
+  - flag: lora-init-without-apply
+    subgroup: LoRA 与控制向量
+    label: LoRA 不立即应用
+    type: Bool
+    default: "false"
+    group: model
+    advanced: true
+    tooltip: "加载 LoRA 适配器但不立即应用（scale 初始化为 0），稍后通过 POST /lora-adapters 应用。默认关闭。"
+
+  - flag: lora-scaled
+    subgroup: LoRA 与控制向量
+    label: LoRA (带比例)
+    type: String
+    default: ""
+    group: model
+    wide: true
+    advanced: true
+    tooltip: "带缩放因子的 LoRA。格式：路径:比例，如 adapter.safetensors:0.8。"
+
+  - flag: control-vector
+    subgroup: LoRA 与控制向量
+    label: 控制向量
+    type: String
+    default: ""
+    group: model
+    wide: true
+    advanced: true
+    tooltip: "控制向量（Control Vector）路径。通过向量运算引导模型行为。"
+
+  - flag: control-vector-scaled
+    subgroup: LoRA 与控制向量
+    label: 控制向量 (带比例)
+    type: String
+    default: ""
+    group: model
+    wide: true
+    advanced: true
+    tooltip: "带缩放因子的控制向量。格式：路径:比例。比例控制向量影响强度。"
+
+  - flag: control-vector-layer-range
+    subgroup: LoRA 与控制向量
+    label: 控制向量层范围
+    type: String
+    default: ""
+    group: model
+    wide: true
+    advanced: true
+    tooltip: "应用控制向量的层范围（起始 结束，含端点）。如 0 16。留空=应用到全部层。"
 
   - flag: ctx-size
     subgroup: 上下文与批处理
@@ -351,7 +411,7 @@ params:
     role: ctx_size
     type: String
     default: "0"
-    group: common
+    group: cache
     enabled: true
     tooltip: "Prompt 上下文窗口长度（token 数）。设为 0 时由 --fit 根据显存自动适配。支持 K/M 后缀（如 100K=102400）。27B Q4 模型 24GB 显卡建议 40K~48K；100K 以上极易 OOM。启动前会自动估算显存并预警。"
     validate:
@@ -362,7 +422,7 @@ params:
     label: 保留 Token 数
     type: String
     default: "0"
-    group: common
+    group: cache
     tooltip: "从初始提示中保留的 token 数量。0=不保留，-1=全部保留。用于在多轮对话中保留系统提示等固定前缀。"
     validate:
       min: -1
@@ -373,7 +433,7 @@ params:
     role: batch_size
     type: String
     default: "2048"
-    group: common
+    group: cache
     enabled: true
     tooltip: "逻辑最大批处理大小。控制 prompt 处理时一次送入模型的 token 上限。增大可加速 prompt 处理但增加显存占用。默认 2048，24GB 显卡建议 2048~4096。"
     validate:
@@ -385,7 +445,7 @@ params:
     role: ubatch_size
     type: String
     default: "512"
-    group: common
+    group: cache
     enabled: true
     validate: {leq: batch-size}
     tooltip: "物理微批处理大小。实际每次送入推理引擎的 token 数，必须 <= batch-size。较小值降低延迟但降低吞吐。默认 512，显存充裕可提至 1024。"
@@ -398,7 +458,7 @@ params:
     label: SWA 完整缓存
     type: Bool
     default: "false"
-    group: common
+    group: cache
     advanced: true
     tooltip: "使用完整尺寸的 SWA（Sliding Window Attention）缓存。默认禁用。启用后可能增加显存占用但提升长文本质量。"
 
@@ -410,17 +470,161 @@ params:
     label: 最大生成 Token
     type: String
     default: "-1"
-    group: common
+    group: cache
     tooltip: "单次请求最大生成 token 数。-1 = 无限（直到模型决定停止或达到上下文上限）。API 调用时通常由客户端的 max_completion_tokens 参数覆盖（max_tokens 已废弃）。"
     validate:
       min: -1
+
+  - flag: kv-offload
+    subgroup: KV 缓存与量化
+    label: KV 缓存卸载
+    type: Bool
+    default: "true"
+    group: cache
+    tooltip: "是否启用 KV 缓存卸载到 GPU。官方默认开启。多 GPU 时可配合 --split-mode 把 KV 分散到各卡。"
+    offFlag: no-kv-offload
+
+  - flag: cache-type-k
+    subgroup: KV 缓存与量化
+    label: Cache 类型 K
+    role: cache_type_k
+    type: Combo
+    default: "q8_0"
+    group: cache
+    enabled: true
+    options: [f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, tq3_0]
+    tooltip: "KV 缓存 K 分量的数据类型。官方支持：f32/f16/bf16/q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1（默认 f16）。低 bit 可大幅扩展上下文（配合 Hadamard 旋转质量提升）。q6_0 与 tq3_0(TurboQuant 3.5bit) 为实验性/视构建版本而定，官方主线暂不支持，请确认你的 llama.cpp 包含该类型。24GB 显卡跑 27B 推荐 q8_0 或 q4_0。"
+
+  - flag: cache-type-v
+    subgroup: KV 缓存与量化
+    label: Cache 类型 V
+    role: cache_type_v
+    type: Combo
+    default: "q8_0"
+    group: cache
+    enabled: true
+    options: [f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, tq3_0]
+    tooltip: "KV 缓存 V 分量的数据类型。V 对精度不如 K 敏感，可更激进压缩。官方支持：f32/f16/bf16/q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1（默认 f16）。默认 q8_0 为官方兼容且质量/空间均衡；q4_0 可进一步省显存；tq3_0(TurboQuant) 仅特定 fork 支持，官方主线会报错，请勿在官方版选用。"
+
+  - flag: defrag-thold
+    subgroup: KV 缓存与量化
+    label: KV 碎片整理阈值
+    type: String
+    default: ""
+    group: cache
+    advanced: true
+    deprecated: true
+    tooltip: "已废弃（DEPRECATED）：KV 缓存碎片整理阈值已被自动机制取代。留空即可，无需设置。"
+
+  - flag: cache-prompt
+    subgroup: 会话缓存与检查点
+    label: 缓存 Prompt
+    type: Bool
+    default: "true"
+    group: cache
+    advanced: true
+    tooltip: "缓存 prompt 的 KV 状态，避免重复计算相同前缀。默认开启。多轮对话时可显著加速后续请求的首 token 延迟。建议保持开启。"
+    offFlag: no-cache-prompt
+
+  - flag: cache-reuse
+    subgroup: 会话缓存与检查点
+    label: 缓存重用阈值
+    type: String
+    default: "0"
+    group: cache
+    advanced: true
+    requires:
+      - {flag: cache-prompt, op: enabled}
+    tooltip: "通过 KV 偏移复用缓存的最小 chunk 大小。需要启用 prompt 缓存。默认 0=禁用。设为 256~512 可在相似 prompt 间复用 KV，加速多轮对话。"
+    validate:
+      min: 0
+
+  - flag: cache-ram
+    subgroup: 会话缓存与检查点
+    label: 缓存 RAM 上限
+    type: String
+    default: ""
+    group: cache
+    advanced: true
+    tooltip: "设置 prompt 缓存的最大大小（MiB）。官方默认 8192；-1=无限制；0=禁用。超出限制时自动淘汰旧缓存。留空=使用官方默认。"
+    validate:
+      min: -1
+
+  - flag: kv-unified
+    subgroup: 会话缓存与检查点
+    label: 统一 KV 缓冲
+    type: Bool
+    default: "true"
+    group: cache
+    advanced: true
+    tooltip: "所有序列共享单个统一 KV 缓冲（--kv-unified / --no-kv-unified）。官方在槽位数自动时默认启用。可降低显存碎片。"
+    offFlag: no-kv-unified
+
+  - flag: kv-unified-per-slot
+    subgroup: 会话缓存与检查点
+    label: 每槽上下文上限
+    type: String
+    default: ""
+    group: cache
+    advanced: true
+    tooltip: "每个并行槽位的上下文限制（token）。设置后共享 KV 池按 n_parallel*N 分配。留空=行为不变。"
+    suggests:
+      - kv-unified
+    validate:
+      min: 0
+
+  - flag: context-shift
+    subgroup: 会话缓存与检查点
+    label: 上下文移位
+    type: Bool
+    default: "false"
+    group: cache
+    advanced: true
+    tooltip: "无限文本生成时使用上下文移位（context shift）而非直接截断。官方默认关闭。适合长文本续写场景。"
+
+  - flag: ctx-checkpoints
+    aliases: [swa-checkpoints]
+    subgroup: 会话缓存与检查点
+    label: 上下文检查点数
+    type: String
+    default: "32"
+    group: cache
+    advanced: true
+    tooltip: "每槽位最多创建的上下文检查点数量（--ctx-checkpoints，默认 32）。检查点支持缓存回退，值越大越灵活但占内存。"
+    validate:
+      min: 0
+
+  - flag: checkpoint-min-step
+    subgroup: 会话缓存与检查点
+    label: 检查点最小间距
+    type: String
+    default: "8192"
+    group: cache
+    advanced: true
+    tooltip: "上下文检查点之间的最小 token 间距（默认 8192；0=无最小限制）。用于控制检查点数量与内存。"
+    suggests:
+      - ctx-checkpoints
+    validate:
+      min: 0
+
+  - flag: cache-idle-slots
+    subgroup: 会话缓存与检查点
+    label: 缓存空闲槽位
+    type: Bool
+    default: "true"
+    group: cache
+    advanced: true
+    tooltip: "新任务到达时把空闲槽位保存到 prompt 缓存，统一 KV 模式下清除（--cache-idle-slots / --no-cache-idle-slots）。官方默认开启，需配合 cache-ram。"
+    offFlag: no-cache-idle-slots
+    requires:
+      - {flag: cache-ram, op: enabled}
 
   - flag: rope-freq-base
     subgroup: RoPE / YaRN 缩放
     label: RoPE 基础频率
     type: String
     default: ""
-    group: common
+    group: cache
     tooltip: "RoPE 旋转位置编码的基础频率。默认从模型元数据读取。NTK-aware 缩放时可调大此值以扩展上下文。一般无需手动设置，除非模型训练时使用了非标准值。"
 
   - flag: rope-freq-scale
@@ -428,7 +632,7 @@ params:
     label: RoPE 频率缩放
     type: String
     default: "1.0"
-    group: common
+    group: cache
     tooltip: "RoPE 频率缩放因子。值为 N 时上下文扩展 N 倍。与 rope-scale 互为倒数关系。1.0 = 不缩放。长上下文扩展时配合 rope-scaling 方法使用。"
 
   - flag: rope-scaling
@@ -436,7 +640,7 @@ params:
     label: RoPE 缩放方法
     type: Combo
     default: ""
-    group: common
+    group: cache
     options: [none, linear, yarn]
     tooltip: "RoPE 频率缩放方法。留空=默认 linear（除非模型指定）；linear=线性缩放（高频位置不截断）；yarn=YaRN 方法（配合 yarn-* 参数）。长上下文扩展推荐 yarn。"
 
@@ -445,7 +649,7 @@ params:
     label: RoPE 上下文缩放
     type: String
     default: "1.0"
-    group: common
+    group: cache
     tooltip: "RoPE 上下文缩放因子，上下文按 N 倍扩展。与 rope-freq-scale 互为倒数。1.0 = 不缩放。"
 
   - flag: yarn-orig-ctx
@@ -453,7 +657,7 @@ params:
     label: YaRN 原始上下文
     type: String
     default: "0"
-    group: common
+    group: cache
     advanced: true
     tooltip: "YaRN：模型原始训练上下文大小。0=使用模型训练上下文（默认）。"
 
@@ -462,7 +666,7 @@ params:
     label: YaRN 外推因子
     type: String
     default: "-1.0"
-    group: common
+    group: cache
     advanced: true
     tooltip: "YaRN：外推混合因子（默认 -1.0）。0.0=完全内插。"
 
@@ -471,7 +675,7 @@ params:
     label: YaRN 注意力因子
     type: String
     default: "-1.0"
-    group: common
+    group: cache
     advanced: true
     tooltip: "YaRN：sqrt(t) 缩放或注意力幅度因子（默认 -1.0）。"
 
@@ -480,7 +684,7 @@ params:
     label: YaRN 慢 Beta
     type: String
     default: "-1.0"
-    group: common
+    group: cache
     advanced: true
     tooltip: "YaRN：高修正维度或 alpha（默认 -1.0）。"
 
@@ -489,68 +693,9 @@ params:
     label: YaRN 快 Beta
     type: String
     default: "-1.0"
-    group: common
+    group: cache
     advanced: true
     tooltip: "YaRN：低修正维度或 beta（默认 -1.0）。"
-
-  - flag: lora
-    subgroup: LoRA 与控制向量
-    label: LoRA
-    type: String
-    default: ""
-    group: common
-    wide: true
-    advanced: true
-    tooltip: "LoRA 适配器路径。在基础模型上叠加微调效果。支持多个适配器（逗号分隔）。"
-
-  - flag: lora-init-without-apply
-    subgroup: LoRA 与控制向量
-    label: LoRA 不立即应用
-    type: Bool
-    default: "false"
-    group: common
-    advanced: true
-    tooltip: "加载 LoRA 适配器但不立即应用（scale 初始化为 0），稍后通过 POST /lora-adapters 应用。默认关闭。"
-
-  - flag: lora-scaled
-    subgroup: LoRA 与控制向量
-    label: LoRA (带比例)
-    type: String
-    default: ""
-    group: common
-    wide: true
-    advanced: true
-    tooltip: "带缩放因子的 LoRA。格式：路径:比例，如 adapter.safetensors:0.8。"
-
-  - flag: control-vector
-    subgroup: LoRA 与控制向量
-    label: 控制向量
-    type: String
-    default: ""
-    group: common
-    wide: true
-    advanced: true
-    tooltip: "控制向量（Control Vector）路径。通过向量运算引导模型行为。"
-
-  - flag: control-vector-scaled
-    subgroup: LoRA 与控制向量
-    label: 控制向量 (带比例)
-    type: String
-    default: ""
-    group: common
-    wide: true
-    advanced: true
-    tooltip: "带缩放因子的控制向量。格式：路径:比例。比例控制向量影响强度。"
-
-  - flag: control-vector-layer-range
-    subgroup: LoRA 与控制向量
-    label: 控制向量层范围
-    type: String
-    default: ""
-    group: common
-    wide: true
-    advanced: true
-    tooltip: "应用控制向量的层范围（起始 结束，含端点）。如 0 16。留空=应用到全部层。"
 
   - flag: threads
     subgroup: 线程与优先级
@@ -558,7 +703,7 @@ params:
     role: threads
     type: String
     default: "$cpu"
-    group: common
+    group: perf
     enabled: true
     tooltip: "生成阶段使用的 CPU 线程数。默认 -1 = 自动（使用全部物理核心）。建议设为 CPU 物理核心数（不含超线程），过多反而因上下文切换降低性能。"
     validate:
@@ -569,7 +714,7 @@ params:
     label: 批处理线程数
     type: String
     default: ""
-    group: common
+    group: perf
     tooltip: "Prompt 处理（批处理）时的 CPU 线程数。默认与 --threads 相同。Prompt 处理是计算密集型，可适当增加线程数以加速首次响应。"
     validate:
       min: -1
@@ -579,7 +724,7 @@ params:
     label: 进程优先级
     type: Combo
     default: "0"
-    group: common
+    group: perf
     advanced: true
     options: ["-1", "0", "1", "2", "3"]
     tooltip: "进程/线程优先级。-1=低，0=正常，1=中，2=高，3=实时。默认 0。"
@@ -591,7 +736,7 @@ params:
     label: 批处理优先级
     type: Combo
     default: "0"
-    group: common
+    group: perf
     advanced: true
     options: ["0", "1", "2", "3"]
     tooltip: "批处理阶段的进程/线程优先级。0=正常，1=中，2=高，3=实时。默认 0。"
@@ -603,7 +748,7 @@ params:
     label: 轮询级别
     type: String
     default: "50"
-    group: common
+    group: perf
     advanced: true
     tooltip: "轮询级别（0-100），用于等待工作。0=无轮询，默认 50。较高值可降低延迟但增加 CPU 占用。"
 
@@ -613,7 +758,7 @@ params:
     type: Combo
     default: "0"
     options: ["0", "1"]
-    group: common
+    group: perf
     advanced: true
     tooltip: "批处理阶段是否使用轮询等待工作。默认与 --poll 相同。官方此参数需带 0/1 取值（0=关闭，默认 0）；勾选后按所选值发射 --poll-batch 0 或 1。"
 
@@ -622,7 +767,7 @@ params:
     label: CPU 亲和性掩码
     type: String
     default: ""
-    group: common
+    group: perf
     wide: true
     advanced: true
     tooltip: "CPU 亲和性掩码（十六进制）。与 cpu-range 互补。用于将推理线程绑定到特定 CPU 核心。"
@@ -632,7 +777,7 @@ params:
     label: CPU 亲和性范围
     type: String
     default: ""
-    group: common
+    group: perf
     advanced: true
     tooltip: "CPU 亲和性范围，格式: lo-hi。与 cpu-mask 互补。用于将推理线程绑定到特定 CPU 核心范围。"
 
@@ -642,7 +787,7 @@ params:
     type: Combo
     default: "0"
     options: ["0", "1"]
-    group: common
+    group: perf
     advanced: true
     tooltip: "是否使用严格的 CPU 放置策略。启用后强制线程只运行在指定的 CPU 核心上。官方此参数需带 0/1 取值（0=关闭，默认 0）；勾选后按所选值发射 --cpu-strict 0 或 1。"
     suggests:
@@ -654,7 +799,7 @@ params:
     label: 批处理 CPU 亲和性掩码
     type: String
     default: ""
-    group: common
+    group: perf
     wide: true
     advanced: true
     tooltip: "批处理阶段的 CPU 亲和性掩码（十六进制）。默认与 cpu-mask 相同。"
@@ -664,7 +809,7 @@ params:
     label: 批处理 CPU 亲和性范围
     type: String
     default: ""
-    group: common
+    group: perf
     advanced: true
     tooltip: "批处理阶段的 CPU 亲和性范围，格式: lo-hi。默认与 cpu-range 相同。"
 
@@ -674,7 +819,7 @@ params:
     type: Combo
     default: "0"
     options: ["0", "1"]
-    group: common
+    group: perf
     advanced: true
     tooltip: "批处理阶段是否使用严格的 CPU 放置策略。默认与 cpu-strict 相同。官方此参数需带 0/1 取值（0=关闭，默认 0）；勾选后按所选值发射 --cpu-strict-batch 0 或 1。"
     suggests:
@@ -686,7 +831,7 @@ params:
     label: NUMA 策略
     type: Combo
     default: "distribute"
-    group: common
+    group: perf
     options: [distribute, isolate, numactl]
     tooltip: "NUMA 内存分配策略。仅多路 CPU（服务器）有意义。distribute=均匀分配；isolate=限制在启动 CPU 节点；numactl=使用 numactl 工具的映射。单路 CPU/桌面用户保持 disabled。官方仅接受 distribute/isolate/numactl 三个取值（disabled 不是合法取值，取消勾选即不发射）。"
 
@@ -695,7 +840,7 @@ params:
     label: Flash Attention
     type: Combo
     default: "on"
-    group: common
+    group: perf
     offValue: "off"
     enabled: true
     options: ["on", "off", "auto"]
@@ -706,7 +851,7 @@ params:
     label: 性能分析
     type: Bool
     default: "true"
-    group: common
+    group: perf
     advanced: true
     tooltip: "启用 llama-server 的 --perf 性能计时输出（PREFILL/EVAL t/s）。官方默认关闭；启动器默认开启以提供诊断信息，禁用可略微减少开销。"
 
@@ -715,7 +860,7 @@ params:
     label: 处理转义序列
     type: Bool
     default: "true"
-    group: common
+    group: perf
     advanced: true
     tooltip: "是否处理转义序列（\\n, \\r, \\t, \\', \\\", \\\\）。官方默认开启。关闭后原样输出反斜杠文本。"
     offFlag: no-escape
@@ -726,7 +871,7 @@ params:
     label: 日志详细度
     type: String
     default: "3"
-    group: common
+    group: perf
     advanced: true
     tooltip: "日志输出详细程度。0=仅关键信息；1=错误；2=警告；3=信息（默认）；4=追踪；5=调试。"
     validate:
@@ -737,7 +882,7 @@ params:
     label: 详细日志 (Verbose)
     type: Bool
     default: "false"
-    group: common
+    group: perf
     advanced: true
     tooltip: "设置日志详细度为无穷（--verbose / --log-verbose），输出全部日志便于调试。默认关闭。"
 
@@ -746,7 +891,7 @@ params:
     label: 彩色日志
     type: Combo
     default: "auto"
-    group: common
+    group: perf
     advanced: true
     aliases: [color]
     options: ["on", "off", "auto"]
@@ -757,7 +902,7 @@ params:
     label: 日志文件
     type: String
     default: ""
-    group: common
+    group: perf
     wide: true
     advanced: true
     tooltip: "将日志同时写入指定文件。留空=仅输出到控制台。"
@@ -767,7 +912,7 @@ params:
     label: JSONL 日志
     type: Bool
     default: "false"
-    group: common
+    group: perf
     enabled: false
     subgroup: 日志
     tooltip: "以 JSONL（每行一个 JSON 对象）输出结构化日志到 stdout；启用时会关闭彩色日志。便于程序化采集与分析。"
@@ -777,7 +922,7 @@ params:
     label: 日志前缀
     type: Bool
     default: "true"
-    group: common
+    group: perf
     advanced: true
     tooltip: "日志消息是否带前缀（--log-prefix / --no-log-prefix）。官方默认开启。"
 
@@ -786,7 +931,7 @@ params:
     label: 日志时间戳
     type: Bool
     default: "true"
-    group: common
+    group: perf
     advanced: true
     tooltip: "日志消息是否带时间戳（--log-timestamps / --no-log-timestamps）。官方默认开启。"
 
@@ -795,7 +940,7 @@ params:
     label: 禁用日志
     type: Bool
     default: "false"
-    group: common
+    group: perf
     advanced: true
     tooltip: "完全禁用日志输出（--log-disable）。默认关闭。"
 
@@ -804,7 +949,7 @@ params:
     label: Prompt 日志目录
     type: String
     default: ""
-    group: common
+    group: perf
     wide: true
     advanced: true
     tooltip: "把每个请求的 prompt 记录到指定目录（自动创建，仅用于调试）。留空=禁用。注意隐私。"
@@ -1159,933 +1304,6 @@ params:
   # ================================================================
   # 思考强度控制 (核心功能)
   # ================================================================
-  - flag: host
-    subgroup: 监听与超时
-    label: 主机 (Host)
-    role: host
-    type: String
-    default: "127.0.0.1"
-    group: server
-    enabled: true
-    tooltip: "监听 IP 地址。127.0.0.1 仅本机可访问；0.0.0.0 允许局域网访问（注意安全风险）。也支持 UNIX socket 路径（以 .sock 结尾）。建议：本地使用保持 127.0.0.1。"
-
-  - flag: port
-    subgroup: 监听与超时
-    label: 端口 (Port)
-    role: port
-    type: String
-    default: "1234"
-    group: server
-    enabled: true
-    tooltip: "HTTP 监听端口，范围 1-65535。llama-server 默认 8080，此启动器默认 1234 以避免与其他服务冲突。"
-    validate:
-      min: 1
-      max: 65535
-
-  - flag: timeout
-    subgroup: 监听与超时
-    label: 超时 (Timeout)
-    type: String
-    default: "600"
-    group: server
-    enabled: true
-    tooltip: "llama-server 读写超时（秒）。超时后断开空闲连接。长文本生成建议 >=300s，多轮对话建议 600s。设为 0 表示永不超时。"
-    validate:
-      min: 0
-
-  - flag: reuse-port
-    subgroup: 监听与超时
-    label: 端口复用
-    type: Bool
-    default: "false"
-    group: server
-    advanced: true
-    tooltip: "允许多个 socket 绑定同一端口（--reuse-port）。默认关闭。一般无需开启。"
-
-  - flag: api-key
-    subgroup: 鉴权与 API
-    label: API 密钥
-    type: String
-    default: ""
-    group: server
-    wide: true
-    tooltip: "API 认证密钥，多个用逗号分隔。留空表示无需认证。暴露在公网时务必设置，否则任何人都能调用你的模型。"
-    conflicts:
-      - api-key-file
-
-  - flag: api-key-file
-    subgroup: 鉴权与 API
-    label: API 密钥文件
-    type: String
-    default: ""
-    group: server
-    wide: true
-    tooltip: "从文件读取 API 密钥，每行一个，# 开头为注释。与 api-key 二选一或互补。"
-    conflicts:
-      - api-key
-
-  - flag: ssl-key-file
-    subgroup: 鉴权与 API
-    label: SSL 私钥文件
-    type: String
-    default: ""
-    group: server
-    wide: true
-    suggests: [ssl-cert-file]
-    tooltip: "PEM 格式的 SSL 私钥文件路径。与证书文件配合启用 HTTPS 加密通信。本地使用无需设置。"
-    implies:
-      - ssl-cert-file
-
-  - flag: ssl-cert-file
-    subgroup: 鉴权与 API
-    label: SSL 证书文件
-    type: String
-    default: ""
-    group: server
-    wide: true
-    suggests: [ssl-key-file]
-    tooltip: "PEM 格式的 SSL 证书文件路径。需与私钥文件配对使用。可用 Let's Encrypt 等免费证书。"
-    implies:
-      - ssl-key-file
-
-  - flag: api-prefix
-    subgroup: 鉴权与 API
-    label: API 前缀路径
-    type: String
-    default: ""
-    group: server
-    advanced: true
-    tooltip: "服务器提供服务的路径前缀（不带末尾斜杠）。如设为 /api 则接口位于 /api/v1/...。留空=无前缀。"
-
-  - flag: cors-origins
-    subgroup: CORS 跨域
-    label: CORS 允许来源
-    type: String
-    default: ""
-    group: server
-    wide: true
-    tooltip: "跨域资源共享（CORS）允许的来源列表，逗号分隔。留空默认允许所有来源（*）。Web 前端跨域访问时需设置为前端域名。设为 localhost 只反射本机 Origin。"
-
-  - flag: cors-methods
-    subgroup: CORS 跨域
-    label: CORS 允许方法
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "CORS 允许的 HTTP 方法，逗号分隔。官方默认 GET, POST, DELETE, OPTIONS。留空=官方默认。"
-    validate:
-      regex: '^[A-Za-z,\s]+$'
-
-  - flag: cors-headers
-    subgroup: CORS 跨域
-    label: CORS 允许请求头
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "CORS 允许的请求头，逗号分隔。官方默认 *（全部）。留空=官方默认。"
-
-  - flag: cors-credentials
-    subgroup: CORS 跨域
-    label: CORS 允许凭证
-    type: Bool
-    default: "true"
-    group: server
-    advanced: true
-    tooltip: "是否允许 CORS 携带凭证（--cors-credentials / --no-cors-credentials）。官方默认开启。注意：启用工具(--tools/--agent)时官方会把 cors-origins 限制为 localhost。"
-    offFlag: no-cors-credentials
-
-  - flag: parallel
-    subgroup: 并行与槽位
-    label: 并行序列数
-    type: String
-    default: "1"
-    group: server
-    enabled: true
-    tooltip: "服务器并发槽位数（同时处理的请求数）。默认 -1=自动。1=单用户（推荐本地使用）；2~4=多用户并发。每个槽位占用独立的 KV 缓存空间，增加会线性增加显存占用。MTP 推测解码建议保持 1。"
-    validate:
-      min: -1
-
-  - flag: cont-batching
-    subgroup: 并行与槽位
-    label: 连续批处理
-    type: Bool
-    default: "true"
-    group: server
-    advanced: true
-    tooltip: "启用连续批处理（continuous batching），多个请求可在同一批次中动态进出。官方默认开启。关闭可降低内存开销但吞吐下降。"
-    offFlag: no-cont-batching
-
-  - flag: prefill-assistant
-    subgroup: 并行与槽位
-    label: Assistant 预填充
-    type: Bool
-    default: "true"
-    group: server
-    advanced: true
-    tooltip: "当最后一条消息为 assistant 消息时预填充其响应（--prefill-assistant / --no-prefill-assistant）。官方默认开启（开启时最后一条 assistant 消息作为完整消息处理、不再预填充）。需配合 use_geometric t/s 参数。"
-    offFlag: no-prefill-assistant
-
-  - flag: slot-prompt-similarity
-    subgroup: 并行与槽位
-    label: 槽位 Prompt 相似度
-    type: String
-    default: "0.10"
-    group: server
-    advanced: true
-    tooltip: "多个请求时判断同一槽位 prompt 相似度的阈值（默认 0.10）。0.0=仅完全一致复用槽位；>0=部分复用缓存加速。"
-
-  - flag: warmup
-    subgroup: 提示处理
-    label: 空跑预热
-    type: Bool
-    default: "true"
-    group: server
-    advanced: true
-    tooltip: "启动时进行空跑预热（warmup），初始化 GPU 内核避免首次请求卡顿。官方默认开启。"
-    offFlag: no-warmup
-
-  # ================================================================
-  # 模板与对话 (含核心思考强度控制)
-  # ================================================================
-  - flag: reverse-prompt
-    subgroup: 提示处理
-    label: 停止字符串
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "检测到该字符串即停止生成并返回控制权（交互模式）。可指定多个（逗号分隔）。留空=不使用。"
-
-  - flag: special
-    subgroup: 提示处理
-    label: 特殊 Token 输出
-    type: Bool
-    default: "false"
-    group: server
-    advanced: true
-    tooltip: "是否在输出中包含特殊 token（如 <|im_end|> 等）。默认禁用。调试时可能需要开启。"
-
-  - flag: spm-infill
-    subgroup: 提示处理
-    label: SPM Infill 模式
-    type: Bool
-    default: "false"
-    group: server
-    advanced: true
-    tooltip: "使用 Suffix/Prefix/Middle 模式做 infill（部分模型偏好，区别于默认的 Prefix/Suffix/Middle）。默认关闭。"
-
-  - flag: kv-offload
-    subgroup: KV 缓存与量化
-    label: KV 缓存卸载
-    type: Bool
-    default: "true"
-    group: server
-    tooltip: "是否启用 KV 缓存卸载到 GPU。官方默认开启。多 GPU 时可配合 --split-mode 把 KV 分散到各卡。"
-    offFlag: no-kv-offload
-
-  - flag: cache-type-k
-    subgroup: KV 缓存与量化
-    label: Cache 类型 K
-    role: cache_type_k
-    type: Combo
-    default: "q8_0"
-    group: server
-    enabled: true
-    options: [f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, tq3_0]
-    tooltip: "KV 缓存 K 分量的数据类型。官方支持：f32/f16/bf16/q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1（默认 f16）。低 bit 可大幅扩展上下文（配合 Hadamard 旋转质量提升）。q6_0 与 tq3_0(TurboQuant 3.5bit) 为实验性/视构建版本而定，官方主线暂不支持，请确认你的 llama.cpp 包含该类型。24GB 显卡跑 27B 推荐 q8_0 或 q4_0。"
-
-  - flag: cache-type-v
-    subgroup: KV 缓存与量化
-    label: Cache 类型 V
-    role: cache_type_v
-    type: Combo
-    default: "q8_0"
-    group: server
-    enabled: true
-    options: [f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, tq3_0]
-    tooltip: "KV 缓存 V 分量的数据类型。V 对精度不如 K 敏感，可更激进压缩。官方支持：f32/f16/bf16/q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1（默认 f16）。默认 q8_0 为官方兼容且质量/空间均衡；q4_0 可进一步省显存；tq3_0(TurboQuant) 仅特定 fork 支持，官方主线会报错，请勿在官方版选用。"
-
-  - flag: defrag-thold
-    subgroup: KV 缓存与量化
-    label: KV 碎片整理阈值
-    type: String
-    default: ""
-    group: server
-    advanced: true
-    deprecated: true
-    tooltip: "已废弃（DEPRECATED）：KV 缓存碎片整理阈值已被自动机制取代。留空即可，无需设置。"
-
-  - flag: cache-prompt
-    subgroup: 会话缓存与检查点
-    label: 缓存 Prompt
-    type: Bool
-    default: "true"
-    group: server
-    advanced: true
-    tooltip: "缓存 prompt 的 KV 状态，避免重复计算相同前缀。默认开启。多轮对话时可显著加速后续请求的首 token 延迟。建议保持开启。"
-    offFlag: no-cache-prompt
-
-  - flag: cache-reuse
-    subgroup: 会话缓存与检查点
-    label: 缓存重用阈值
-    type: String
-    default: "0"
-    group: server
-    advanced: true
-    requires:
-      - {flag: cache-prompt, op: enabled}
-    tooltip: "通过 KV 偏移复用缓存的最小 chunk 大小。需要启用 prompt 缓存。默认 0=禁用。设为 256~512 可在相似 prompt 间复用 KV，加速多轮对话。"
-    validate:
-      min: 0
-
-  - flag: cache-ram
-    subgroup: 会话缓存与检查点
-    label: 缓存 RAM 上限
-    type: String
-    default: ""
-    group: server
-    advanced: true
-    tooltip: "设置 prompt 缓存的最大大小（MiB）。官方默认 8192；-1=无限制；0=禁用。超出限制时自动淘汰旧缓存。留空=使用官方默认。"
-    validate:
-      min: -1
-
-  - flag: kv-unified
-    subgroup: 会话缓存与检查点
-    label: 统一 KV 缓冲
-    type: Bool
-    default: "true"
-    group: server
-    advanced: true
-    tooltip: "所有序列共享单个统一 KV 缓冲（--kv-unified / --no-kv-unified）。官方在槽位数自动时默认启用。可降低显存碎片。"
-    offFlag: no-kv-unified
-
-  - flag: kv-unified-per-slot
-    subgroup: 会话缓存与检查点
-    label: 每槽上下文上限
-    type: String
-    default: ""
-    group: server
-    advanced: true
-    tooltip: "每个并行槽位的上下文限制（token）。设置后共享 KV 池按 n_parallel*N 分配。留空=行为不变。"
-    suggests:
-      - kv-unified
-    validate:
-      min: 0
-
-  - flag: context-shift
-    subgroup: 会话缓存与检查点
-    label: 上下文移位
-    type: Bool
-    default: "false"
-    group: server
-    advanced: true
-    tooltip: "无限文本生成时使用上下文移位（context shift）而非直接截断。官方默认关闭。适合长文本续写场景。"
-
-  - flag: ctx-checkpoints
-    aliases: [swa-checkpoints]
-    subgroup: 会话缓存与检查点
-    label: 上下文检查点数
-    type: String
-    default: "32"
-    group: server
-    advanced: true
-    tooltip: "每槽位最多创建的上下文检查点数量（--ctx-checkpoints，默认 32）。检查点支持缓存回退，值越大越灵活但占内存。"
-    validate:
-      min: 0
-
-  - flag: checkpoint-min-step
-    subgroup: 会话缓存与检查点
-    label: 检查点最小间距
-    type: String
-    default: "8192"
-    group: server
-    advanced: true
-    tooltip: "上下文检查点之间的最小 token 间距（默认 8192；0=无最小限制）。用于控制检查点数量与内存。"
-    suggests:
-      - ctx-checkpoints
-    validate:
-      min: 0
-
-  - flag: cache-idle-slots
-    subgroup: 会话缓存与检查点
-    label: 缓存空闲槽位
-    type: Bool
-    default: "true"
-    group: server
-    advanced: true
-    tooltip: "新任务到达时把空闲槽位保存到 prompt 缓存，统一 KV 模式下清除（--cache-idle-slots / --no-cache-idle-slots）。官方默认开启，需配合 cache-ram。"
-    offFlag: no-cache-idle-slots
-    requires:
-      - {flag: cache-ram, op: enabled}
-
-  - flag: reasoning-budget
-    subgroup: 对话模板与思考
-    label: 思考预算 (Reasoning Budget)
-    type: String
-    default: "-1"
-    group: server
-    tooltip: "【核心】思考 token 预算。-1=无限制（默认）；0=立即结束思考（慎用！会禁用思考过程）；正数（如 512）=限制思考长度，优先级高于 reasoning-effort。Qwen3 支持。"
-    validate:
-      min: -1
-
-  # ================================================================
-  # 推测解码
-  # ================================================================
-  - flag: jinja
-    subgroup: 对话模板与思考
-    label: 启用 Jinja
-    type: Bool
-    default: "true"
-    group: server
-    tooltip: "启用 Jinja2 模板引擎处理聊天模板。默认开启。大多数模型需要 Jinja 正确格式化对话。禁用后使用内置的简单模板，可能导致对话格式错误。建议保持开启。"
-    offFlag: no-jinja
-
-  - flag: skip-chat-parsing
-    subgroup: 对话模板与思考
-    label: 跳过聊天解析
-    type: Bool
-    default: "false"
-    group: server
-    advanced: true
-    tooltip: "强制使用纯内容解析器（即使指定了 Jinja 模板）：模型所有输出（含思考/工具调用）都留在 content 字段中不拆分。默认关闭。调试模板/排查输出丢失时使用。"
-
-  - flag: chat-template
-    subgroup: 对话模板与思考
-    label: 自定义模板
-    type: String
-    default: ""
-    group: server
-    wide: true
-    conflicts: [chat-template-file]
-    tooltip: "自定义 Jinja 聊天模板字符串。覆盖模型自带的模板。支持的内置模板名：chatml, llama2, llama3, gemma, mistral, deepseek 等。一般无需设置，使用模型自带模板即可。"
-    conflicts:
-      - chat-template-file
-
-  - flag: chat-template-file
-    subgroup: 对话模板与思考
-    label: 模板文件
-    type: String
-    default: ""
-    group: server
-    wide: true
-    conflicts: [chat-template]
-    tooltip: "从文件加载自定义聊天模板。与 --chat-template 功能相同但内容从文件读取。适合模板较长时使用。"
-    conflicts:
-      - chat-template
-
-  # ⭐⭐⭐ 核心：思考强度控制 ⭐⭐⭐
-  - flag: chat-template-kwargs
-    subgroup: 对话模板与思考
-    label: 聊天模板参数 (Chat Template Kwargs) ⭐思考强度
-    type: String
-    default: '{"reasoning_effort": "medium"}'
-    group: server
-    wide: true
-    tooltip: "【核心】以 JSON 格式传递给聊天模板的额外参数。Qwen3 模型设置 reasoning_effort 为 low/medium/xhigh 控制思考深度。设为 {\"enable_thinking\": false} 关闭思考。示例: low=快速响应, medium=平衡, xhigh=深度推理。"
-    suggests:
-      - jinja
-
-  - flag: reasoning-preserve
-    subgroup: 对话模板与思考
-    label: 保留思考轨迹 (Reasoning Preserve)
-    type: Bool
-    default: "false"
-    group: server
-    tooltip: "【核心】保留完整历史中的思考轨迹（reasoning trace），而不仅是最后一条助手消息。仅兼容支持 supports_preserve_reasoning 的模板（如部分 z.ai 风格模板）。默认 false。"
-    offFlag: no-reasoning-preserve
-
-  - flag: reasoning
-    subgroup: 对话模板与思考
-    label: 思考开关 (Reasoning)
-    type: Combo
-    default: "auto"
-    group: server
-    options: ["auto", "on", "off"]
-    tooltip: "【核心】是否在对话中使用思考/推理。auto=从聊天模板自动检测（默认）；on=强制开启；off=强制关闭。比 chat-template-kwargs 的 enable_thinking 更直接。"
-
-  - flag: reasoning-effort
-    subgroup: 对话模板与思考
-    label: 思考强度 (Reasoning Effort)
-    type: Combo
-    default: "default"
-    group: server
-    options: [default, minimal, low, medium, high, xhigh, max]
-    tooltip: "【核心】思考强度等级，作为 reasoning_effort 传给聊天模板。default=保持模板默认；minimal/low=快速响应；medium=平衡；high/xhigh/max=深度推理。Qwen3 支持。"
-
-  - flag: reasoning-format
-    subgroup: 对话模板与思考
-    label: 思考格式 (Reasoning Format)
-    type: Combo
-    default: "auto"
-    group: server
-    options: [auto, none, deepseek, deepseek-legacy]
-    tooltip: "思考标签的解析/返回格式。auto=自动（默认）；none=思考标签保留在 message.content；deepseek=思考内容放入 message.reasoning_content；deepseek-legacy=标签留在 content 同时填充 reasoning_content。兼容 DeepSeek API 客户端。"
-
-  - flag: reasoning-budget-message
-    subgroup: 对话模板与思考
-    label: 思考预算耗尽提示 (Budget Message)
-    type: String
-    default: ""
-    group: server
-    tooltip: "当思考 token 预算耗尽时，在结束思考标签前注入的提示信息。默认不注入。需配合 reasoning-budget 使用。"
-
-  # ================================================================
-  # 扩展功能
-  # ================================================================
-  - flag: mmproj
-    subgroup: 多模态
-    label: 多模态投影
-    type: String
-    default: ""
-    group: server
-    wide: true
-    hidden: true
-    tooltip: "多模态投影仪 GGUF 文件路径。启用视觉/音频等多模态能力。需与基础语言模型配对使用。v0.3.0 新增 dots3-note 视觉/音频支持。"
-
-  - flag: media-path
-    subgroup: 多模态
-    label: 媒体根目录
-    type: String
-    default: ""
-    group: server
-    wide: true
-    tooltip: "本地媒体文件的根目录。API 可通过 file:// 相对路径访问此目录下的图片/视频。用于多模态推理时加载本地媒体资源。"
-
-  - flag: mmproj-url
-    subgroup: 多模态
-    label: 投影文件 URL
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "多模态投影仪 GGUF 文件的下载 URL。配合 --model-url 自动下载使用。详见 tools/mtmd/README。"
-
-  - flag: mmproj-auto
-    subgroup: 多模态
-    label: 自动使用投影
-    type: Bool
-    default: "true"
-    group: server
-    advanced: true
-    tooltip: "模型文件可用时自动使用多模态投影（--mmproj-auto / --no-mmproj-auto）。配合 -hf 下载场景。官方默认开启。"
-    offFlag: no-mmproj-auto
-
-  - flag: mmproj-offload
-    subgroup: 多模态
-    label: 投影 GPU 卸载
-    type: Bool
-    default: "true"
-    group: server
-    advanced: true
-    tooltip: "多模态投影仪是否卸载到 GPU（--mmproj-offload / --no-mmproj-offload）。官方默认开启。"
-    offFlag: no-mmproj-offload
-
-  - flag: mmproj-device
-    subgroup: 多模态
-    label: 投影设备
-    type: String
-    default: "auto"
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "多模态投影仪使用的设备（none=不卸载，auto=自动，或指定设备序号）。默认 auto。"
-    validate:
-      regex: '^[A-Za-z0-9\-_,]+$'
-
-  - flag: image-min-tokens
-    subgroup: 多模态
-    label: 图像最小 Token
-    type: String
-    default: ""
-    group: server
-    advanced: true
-    tooltip: "每张图像可占用的最小 token 数，仅动态分辨率视觉模型使用。留空=读模型元数据（官方默认）。"
-    validate:
-      min: 0
-
-  - flag: image-max-tokens
-    subgroup: 多模态
-    label: 图像最大 Token
-    type: String
-    default: ""
-    group: server
-    advanced: true
-    tooltip: "每张图像可占用的最大 token 数，仅动态分辨率视觉模型使用。留空=读模型元数据（官方默认）。"
-    validate:
-      min: 0
-
-  - flag: mtmd-batch-max-tokens
-    subgroup: 多模态
-    label: 编码批最大 Token
-    type: String
-    default: "1024"
-    group: server
-    advanced: true
-    tooltip: "图像编码时每批的最大 token 数（默认 1024）。显存紧张可调低。"
-    validate:
-      min: 1
-
-  - flag: video-fps
-    subgroup: 多模态
-    label: 视频帧率
-    type: String
-    default: "4.0"
-    group: server
-    advanced: true
-    tooltip: "视频处理目标帧率（默认 4.0）。越低处理越快、token 越省。"
-    validate:
-      min: 0
-
-  - flag: video-timestamp-interval
-    subgroup: 多模态
-    label: 视频时间戳间隔
-    type: String
-    default: "5000"
-    group: server
-    advanced: true
-    tooltip: "视频文本时间戳之间的间隔（毫秒，默认 5000）。"
-    validate:
-      min: 0
-
-  - flag: video-ffmpeg-dir
-    subgroup: 多模态
-    label: FFmpeg 目录
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "包含 ffmpeg/ffprobe 的目录路径。留空=自动搜索 PATH。"
-
-  # ================================================================
-  # 并行与序列
-  # ================================================================
-  - flag: embedding
-    subgroup: 嵌入与重排
-    label: 启用 Embedding
-    type: Bool
-    default: "false"
-    group: server
-    advanced: true
-    tooltip: "启用 Embeddings API 端点（/embedding）。需要使用专门的 Embedding 模型。普通对话场景不要开启。"
-
-  - flag: pooling
-    subgroup: 嵌入与重排
-    label: Embedding 池化
-    type: Combo
-    default: ""
-    group: server
-    subgroup: 嵌入与重排
-    advanced: true
-    options: [none, mean, cls, last, rank]
-    tooltip: "Embedding 池化类型。留空=使用模型默认。none=返回所有 token 的未归一化 embedding；mean/cls/last=对应池化；rank=用于 rerank 模型。"
-
-  - flag: embd-normalize
-    subgroup: 嵌入与重排
-    label: Embedding 归一化
-    type: String
-    default: ""
-    group: server
-    advanced: true
-    tooltip: "Embedding 归一化方式（默认 2=欧氏）。-1=不归一化；0=max absolute int16；1=taxicab；2=欧氏；>2=p-norm。留空=官方默认 2。"
-
-  - flag: rerank
-    subgroup: 嵌入与重排
-    label: 启用 Rerank
-    type: Bool
-    default: "false"
-    group: server
-    advanced: true
-    tooltip: "启用 Rerank 端点 (/rerank)。用于文档重排序场景，需要专门的 rerank 模型（如 bge-reranker-v2-m3）+ --pooling rank。默认禁用。"
-
-  - flag: tools
-    subgroup: 工具与 MCP
-    label: 工具调用
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "启用工具/函数调用。设为 'all' 启用所有工具，或逗号分隔的列表启用特定工具。"
-
-  - flag: agent
-    subgroup: 工具与 MCP
-    label: Agent 模式 (实验性)
-    type: Bool
-    default: "false"
-    group: server
-    advanced: true
-    tooltip: "启用 CORS 代理和全部内置工具（--agent）。请勿在不可信环境开启！开启后出于安全原因会把 cors-origins 限制为 localhost。默认关闭。"
-
-  - flag: tools-runtime
-    subgroup: 工具与 MCP
-    label: 工具运行环境 (实验性)
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "在独立运行时环境中执行工具。默认 none=使用宿主机环境。可选：docker:<镜像> / podman:<镜像>（每次调用复用容器，退出清理）；docker-container:<ID> / podman-container:<ID>（复用现有容器，不自动停止）；ssh:<目标>（SSH 远程执行）。"
-
-  - flag: mcp-servers-config
-    subgroup: 工具与 MCP
-    label: MCP 服务器配置
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "MCP (Model Context Protocol) 服务器配置文件路径。2026年7月新增，支持通过 stdio 连接外部 MCP 服务器。配置格式兼容 Cursor 的 JSON 格式。"
-
-  - flag: mcp-servers-json
-    subgroup: 工具与 MCP
-    label: MCP 服务器 JSON
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "MCP 服务器配置（内联 JSON 格式）。与 --mcp-servers-config 二选一。支持 stdio 协议的 MCP 服务器。注意：此功能为实验性。"
-
-  - flag: path
-    subgroup: Web UI 与静态资源
-    label: 静态文件目录
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "从该目录提供静态文件服务。留空=不提供静态文件。"
-
-  - flag: tags
-    subgroup: Web UI 与静态资源
-    label: 模型标签
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "为模型设置标签（逗号分隔，仅信息用途，不参与路由）。"
-
-  - flag: offline
-    subgroup: Web UI 与静态资源
-    label: 离线模式
-    type: Bool
-    default: "false"
-    group: server
-    advanced: true
-    tooltip: "离线模式：强制使用缓存，阻止任何网络访问。配合 -hf/--model-url 下载场景禁用。"
-
-  - flag: ui
-    subgroup: Web UI 与静态资源
-    label: 启用 Web UI
-    type: Bool
-    default: "true"
-    group: server
-    tooltip: "是否启用内置 Web UI。默认开启。纯 API 服务可关闭以节省资源。"
-    offFlag: no-ui
-
-  - flag: sse-ping-interval
-    subgroup: Web UI 与静态资源
-    label: SSE Ping 间隔
-    type: String
-    default: "30"
-    group: server
-    tooltip: "SSE 心跳间隔（秒）。-1=禁用。默认 30。保持连接活跃，防止代理超时断开。"
-    validate:
-      min: 0
-
-  - flag: ui-config
-    subgroup: Web UI 与静态资源
-    label: WebUI 默认配置
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "作为 WebUI 默认配置的 JSON 对象字符串。用于预设 WebUI 的 UI 设置。"
-
-  - flag: ui-config-file
-    subgroup: Web UI 与静态资源
-    label: WebUI 配置文件
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "包含 WebUI 默认配置的 JSON 文件路径。与 --ui-config 二选一。"
-
-  - flag: ui-mcp-proxy
-    subgroup: Web UI 与静态资源
-    label: WebUI MCP 代理 (实验性)
-    type: Bool
-    default: "false"
-    group: server
-    advanced: true
-    aliases: [webui-mcp-proxy]
-    tooltip: "实验性：启用 MCP CORS 代理，让 WebUI 从浏览器访问远程 MCP 服务器。请勿在不可信环境中开启。旧参数名 --webui-mcp / --webui-mcp-proxy 已统一为 --ui-mcp-proxy。"
-
-  # ================================================================
-  # 2026-10-16 增补：llama-server 0.7.0-dev (b11675) --help 新增参数
-  # ================================================================
-  - flag: models-dir
-    subgroup: 模型目录
-    label: 模型目录 (Router)
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "Router 服务器模型目录。启用后可在此目录下动态加载多个模型。默认禁用。"
-
-  - flag: models-preset
-    subgroup: 模型目录
-    label: 模型预设文件
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "Router 服务器模型预设 INI 文件路径。需配合 models-dir 使用。"
-
-  - flag: models-max
-    subgroup: 模型目录
-    label: 最大同时加载模型数
-    type: String
-    default: "4"
-    group: server
-    advanced: true
-    tooltip: "Router 服务器最大同时加载模型数。0=无限制。默认 4。"
-    validate:
-      min: 0
-
-  - flag: models-autoload
-    subgroup: 模型目录
-    label: 模型自动加载
-    type: Bool
-    default: "true"
-    group: server
-    advanced: true
-    tooltip: "Router 服务器是否自动加载模型。默认开启。"
-    offFlag: no-models-autoload
-
-  # ================================================================
-  # MCP 工具 (2026年7月新增)
-  # ================================================================
-  - flag: models-memory-margin
-    subgroup: 模型目录
-    label: 模型驻留显存余量 (MiB)
-    type: String
-    default: ""
-    group: server
-    advanced: true
-    tooltip: "Router 服务器: 每设备预留的空闲显存(MiB), 新模型放不下时按 LRU 卸载已加载模型。0=禁用。"
-    validate:
-      min: 0
-  - flag: threads-http
-    subgroup: 服务管理
-    label: HTTP 线程数
-    type: String
-    default: "-1"
-    group: server
-    tooltip: "处理 HTTP 请求的线程数。默认 -1 = 自动（通常为 8）。高并发场景可适当增加，但过多会与推理线程争抢 CPU。建议：单用户保持 -1；多用户可设 4~8。"
-    validate:
-      min: -1
-
-  - flag: system-prompt-file
-    subgroup: 服务管理
-    deprecated: true
-    label: 系统提示文件
-    type: String
-    default: ""
-    group: server
-    hidden: true
-    deprecated: true
-    tooltip: "已废弃：llama-server 不支持 --system-prompt-file（该参数仅 llama-cli 等可用，已从 server 参数中排除）。如需固定系统提示，请在调用方注入 system 消息。"
-
-  # ================================================================
-  # 性能与内存
-  # ================================================================
-  - flag: metrics
-    subgroup: 服务管理
-    label: 启用 Metrics
-    role: metrics
-    type: Bool
-    default: "true"
-    group: server
-    advanced: true
-    tooltip: "启用 Prometheus 兼容的 /metrics 监控端点。启动器用它在运行中实时读取 TPS / Prefill / 首Token。"
-
-  - flag: slots
-    subgroup: 服务管理
-    label: 显示槽位
-    type: Bool
-    default: "true"
-    group: server
-    advanced: true
-    tooltip: "暴露 /slots 端点，显示各推理槽位的状态（正在处理、空闲等）。官方默认开启。"
-    offFlag: no-slots
-
-  - flag: sleep-idle-seconds
-    subgroup: 服务管理
-    label: 休眠空闲秒数
-    type: String
-    default: "-1"
-    group: server
-    subgroup: 服务管理
-    tooltip: "空闲多少秒后服务器自动休眠（卸载模型释放显存）。-1=禁用（默认）。"
-    validate:
-      min: -1
-
-  - flag: props
-    subgroup: 服务管理
-    label: 启用属性修改
-    type: Bool
-    default: "false"
-    group: server
-    advanced: true
-    tooltip: "启用 POST /props 端点，允许运行时修改全局属性。默认禁用（安全考虑）。"
-
-  - flag: slot-save-path
-    subgroup: 服务管理
-    label: Slot 缓存保存路径
-    type: String
-    default: ""
-    group: server
-    wide: true
-    advanced: true
-    tooltip: "保存 slot KV 缓存的路径。默认禁用。用于持久化缓存，加速重启后的恢复。"
-
-  - flag: verbose-prompt
-    subgroup: 已废弃
-    deprecated: true
-    label: 详细 Prompt
-    type: Bool
-    default: "false"
-    group: server
-    advanced: true
-    hidden: true
-    deprecated: true
-    tooltip: "已废弃：llama-server 不支持 --verbose-prompt（已从 server 参数移除）。调试模板请改用 --log-prompts-dir 或日志详细度。"
-
-  - flag: no-display-prompt
-    subgroup: 已废弃
-    deprecated: true
-    label: 不显示 Prompt
-    type: Bool
-    default: "false"
-    group: server
-    advanced: true
-    hidden: true
-    deprecated: true
-    tooltip: "已废弃：llama-server 不支持 --no-display-prompt（该参数仅 completion/cli 等工具可用）。隐私敏感场景请关闭 Web UI 或自行处理日志。"
-
   - flag: spec-type
     subgroup: 类型与草稿
     label: 推测类型
@@ -2636,3 +1854,785 @@ params:
   # ================================================================
   # 基础设置
   # ================================================================
+  - flag: warmup
+    subgroup: 提示处理
+    label: 空跑预热
+    type: Bool
+    default: "true"
+    group: dialog
+    advanced: true
+    tooltip: "启动时进行空跑预热（warmup），初始化 GPU 内核避免首次请求卡顿。官方默认开启。"
+    offFlag: no-warmup
+
+  # ================================================================
+  # 模板与对话 (含核心思考强度控制)
+  # ================================================================
+  - flag: reverse-prompt
+    subgroup: 提示处理
+    label: 停止字符串
+    type: String
+    default: ""
+    group: dialog
+    wide: true
+    advanced: true
+    tooltip: "检测到该字符串即停止生成并返回控制权（交互模式）。可指定多个（逗号分隔）。留空=不使用。"
+
+  - flag: special
+    subgroup: 提示处理
+    label: 特殊 Token 输出
+    type: Bool
+    default: "false"
+    group: dialog
+    advanced: true
+    tooltip: "是否在输出中包含特殊 token（如 <|im_end|> 等）。默认禁用。调试时可能需要开启。"
+
+  - flag: spm-infill
+    subgroup: 提示处理
+    label: SPM Infill 模式
+    type: Bool
+    default: "false"
+    group: dialog
+    advanced: true
+    tooltip: "使用 Suffix/Prefix/Middle 模式做 infill（部分模型偏好，区别于默认的 Prefix/Suffix/Middle）。默认关闭。"
+
+  - flag: reasoning-budget
+    subgroup: 对话模板与思考
+    label: 思考预算 (Reasoning Budget)
+    type: String
+    default: "-1"
+    group: dialog
+    tooltip: "【核心】思考 token 预算。-1=无限制（默认）；0=立即结束思考（慎用！会禁用思考过程）；正数（如 512）=限制思考长度，优先级高于 reasoning-effort。Qwen3 支持。"
+    validate:
+      min: -1
+
+  # ================================================================
+  # 推测解码
+  # ================================================================
+  - flag: jinja
+    subgroup: 对话模板与思考
+    label: 启用 Jinja
+    type: Bool
+    default: "true"
+    group: dialog
+    tooltip: "启用 Jinja2 模板引擎处理聊天模板。默认开启。大多数模型需要 Jinja 正确格式化对话。禁用后使用内置的简单模板，可能导致对话格式错误。建议保持开启。"
+    offFlag: no-jinja
+
+  - flag: skip-chat-parsing
+    subgroup: 对话模板与思考
+    label: 跳过聊天解析
+    type: Bool
+    default: "false"
+    group: dialog
+    advanced: true
+    tooltip: "强制使用纯内容解析器（即使指定了 Jinja 模板）：模型所有输出（含思考/工具调用）都留在 content 字段中不拆分。默认关闭。调试模板/排查输出丢失时使用。"
+
+  - flag: chat-template
+    subgroup: 对话模板与思考
+    label: 自定义模板
+    type: String
+    default: ""
+    group: dialog
+    wide: true
+    conflicts: [chat-template-file]
+    tooltip: "自定义 Jinja 聊天模板字符串。覆盖模型自带的模板。支持的内置模板名：chatml, llama2, llama3, gemma, mistral, deepseek 等。一般无需设置，使用模型自带模板即可。"
+    conflicts:
+      - chat-template-file
+
+  - flag: chat-template-file
+    subgroup: 对话模板与思考
+    label: 模板文件
+    type: String
+    default: ""
+    group: dialog
+    wide: true
+    conflicts: [chat-template]
+    tooltip: "从文件加载自定义聊天模板。与 --chat-template 功能相同但内容从文件读取。适合模板较长时使用。"
+    conflicts:
+      - chat-template
+
+  # ⭐⭐⭐ 核心：思考强度控制 ⭐⭐⭐
+  - flag: chat-template-kwargs
+    subgroup: 对话模板与思考
+    label: 聊天模板参数 (Chat Template Kwargs) ⭐思考强度
+    type: String
+    default: '{"reasoning_effort": "medium"}'
+    group: dialog
+    wide: true
+    tooltip: "【核心】以 JSON 格式传递给聊天模板的额外参数。Qwen3 模型设置 reasoning_effort 为 low/medium/xhigh 控制思考深度。设为 {\"enable_thinking\": false} 关闭思考。示例: low=快速响应, medium=平衡, xhigh=深度推理。"
+    suggests:
+      - jinja
+
+  - flag: reasoning-preserve
+    subgroup: 对话模板与思考
+    label: 保留思考轨迹 (Reasoning Preserve)
+    type: Bool
+    default: "false"
+    group: dialog
+    tooltip: "【核心】保留完整历史中的思考轨迹（reasoning trace），而不仅是最后一条助手消息。仅兼容支持 supports_preserve_reasoning 的模板（如部分 z.ai 风格模板）。默认 false。"
+    offFlag: no-reasoning-preserve
+
+  - flag: reasoning
+    subgroup: 对话模板与思考
+    label: 思考开关 (Reasoning)
+    type: Combo
+    default: "auto"
+    group: dialog
+    options: ["auto", "on", "off"]
+    tooltip: "【核心】是否在对话中使用思考/推理。auto=从聊天模板自动检测（默认）；on=强制开启；off=强制关闭。比 chat-template-kwargs 的 enable_thinking 更直接。"
+
+  - flag: reasoning-effort
+    subgroup: 对话模板与思考
+    label: 思考强度 (Reasoning Effort)
+    type: Combo
+    default: "default"
+    group: dialog
+    options: [default, minimal, low, medium, high, xhigh, max]
+    tooltip: "【核心】思考强度等级，作为 reasoning_effort 传给聊天模板。default=保持模板默认；minimal/low=快速响应；medium=平衡；high/xhigh/max=深度推理。Qwen3 支持。"
+
+  - flag: reasoning-format
+    subgroup: 对话模板与思考
+    label: 思考格式 (Reasoning Format)
+    type: Combo
+    default: "auto"
+    group: dialog
+    options: [auto, none, deepseek, deepseek-legacy]
+    tooltip: "思考标签的解析/返回格式。auto=自动（默认）；none=思考标签保留在 message.content；deepseek=思考内容放入 message.reasoning_content；deepseek-legacy=标签留在 content 同时填充 reasoning_content。兼容 DeepSeek API 客户端。"
+
+  - flag: reasoning-budget-message
+    subgroup: 对话模板与思考
+    label: 思考预算耗尽提示 (Budget Message)
+    type: String
+    default: ""
+    group: dialog
+    tooltip: "当思考 token 预算耗尽时，在结束思考标签前注入的提示信息。默认不注入。需配合 reasoning-budget 使用。"
+
+  # ================================================================
+  # 扩展功能
+  # ================================================================
+  - flag: mmproj
+    subgroup: 多模态
+    label: 多模态投影
+    type: String
+    default: ""
+    group: dialog
+    wide: true
+    hidden: true
+    tooltip: "多模态投影仪 GGUF 文件路径。启用视觉/音频等多模态能力。需与基础语言模型配对使用。v0.3.0 新增 dots3-note 视觉/音频支持。"
+
+  - flag: media-path
+    subgroup: 多模态
+    label: 媒体根目录
+    type: String
+    default: ""
+    group: dialog
+    wide: true
+    tooltip: "本地媒体文件的根目录。API 可通过 file:// 相对路径访问此目录下的图片/视频。用于多模态推理时加载本地媒体资源。"
+
+  - flag: mmproj-url
+    subgroup: 多模态
+    label: 投影文件 URL
+    type: String
+    default: ""
+    group: dialog
+    wide: true
+    advanced: true
+    tooltip: "多模态投影仪 GGUF 文件的下载 URL。配合 --model-url 自动下载使用。详见 tools/mtmd/README。"
+
+  - flag: mmproj-auto
+    subgroup: 多模态
+    label: 自动使用投影
+    type: Bool
+    default: "true"
+    group: dialog
+    advanced: true
+    tooltip: "模型文件可用时自动使用多模态投影（--mmproj-auto / --no-mmproj-auto）。配合 -hf 下载场景。官方默认开启。"
+    offFlag: no-mmproj-auto
+
+  - flag: mmproj-offload
+    subgroup: 多模态
+    label: 投影 GPU 卸载
+    type: Bool
+    default: "true"
+    group: dialog
+    advanced: true
+    tooltip: "多模态投影仪是否卸载到 GPU（--mmproj-offload / --no-mmproj-offload）。官方默认开启。"
+    offFlag: no-mmproj-offload
+
+  - flag: mmproj-device
+    subgroup: 多模态
+    label: 投影设备
+    type: String
+    default: "auto"
+    group: dialog
+    wide: true
+    advanced: true
+    tooltip: "多模态投影仪使用的设备（none=不卸载，auto=自动，或指定设备序号）。默认 auto。"
+    validate:
+      regex: '^[A-Za-z0-9\-_,]+$'
+
+  - flag: image-min-tokens
+    subgroup: 多模态
+    label: 图像最小 Token
+    type: String
+    default: ""
+    group: dialog
+    advanced: true
+    tooltip: "每张图像可占用的最小 token 数，仅动态分辨率视觉模型使用。留空=读模型元数据（官方默认）。"
+    validate:
+      min: 0
+
+  - flag: image-max-tokens
+    subgroup: 多模态
+    label: 图像最大 Token
+    type: String
+    default: ""
+    group: dialog
+    advanced: true
+    tooltip: "每张图像可占用的最大 token 数，仅动态分辨率视觉模型使用。留空=读模型元数据（官方默认）。"
+    validate:
+      min: 0
+
+  - flag: mtmd-batch-max-tokens
+    subgroup: 多模态
+    label: 编码批最大 Token
+    type: String
+    default: "1024"
+    group: dialog
+    advanced: true
+    tooltip: "图像编码时每批的最大 token 数（默认 1024）。显存紧张可调低。"
+    validate:
+      min: 1
+
+  - flag: video-fps
+    subgroup: 多模态
+    label: 视频帧率
+    type: String
+    default: "4.0"
+    group: dialog
+    advanced: true
+    tooltip: "视频处理目标帧率（默认 4.0）。越低处理越快、token 越省。"
+    validate:
+      min: 0
+
+  - flag: video-timestamp-interval
+    subgroup: 多模态
+    label: 视频时间戳间隔
+    type: String
+    default: "5000"
+    group: dialog
+    advanced: true
+    tooltip: "视频文本时间戳之间的间隔（毫秒，默认 5000）。"
+    validate:
+      min: 0
+
+  - flag: video-ffmpeg-dir
+    subgroup: 多模态
+    label: FFmpeg 目录
+    type: String
+    default: ""
+    group: dialog
+    wide: true
+    advanced: true
+    tooltip: "包含 ffmpeg/ffprobe 的目录路径。留空=自动搜索 PATH。"
+
+  # ================================================================
+  # 并行与序列
+  # ================================================================
+  - flag: embedding
+    subgroup: 嵌入与重排
+    label: 启用 Embedding
+    type: Bool
+    default: "false"
+    group: dialog
+    advanced: true
+    tooltip: "启用 Embeddings API 端点（/embedding）。需要使用专门的 Embedding 模型。普通对话场景不要开启。"
+
+  - flag: pooling
+    subgroup: 嵌入与重排
+    label: Embedding 池化
+    type: Combo
+    default: ""
+    group: dialog
+    subgroup: 嵌入与重排
+    advanced: true
+    options: [none, mean, cls, last, rank]
+    tooltip: "Embedding 池化类型。留空=使用模型默认。none=返回所有 token 的未归一化 embedding；mean/cls/last=对应池化；rank=用于 rerank 模型。"
+
+  - flag: embd-normalize
+    subgroup: 嵌入与重排
+    label: Embedding 归一化
+    type: String
+    default: ""
+    group: dialog
+    advanced: true
+    tooltip: "Embedding 归一化方式（默认 2=欧氏）。-1=不归一化；0=max absolute int16；1=taxicab；2=欧氏；>2=p-norm。留空=官方默认 2。"
+
+  - flag: rerank
+    subgroup: 嵌入与重排
+    label: 启用 Rerank
+    type: Bool
+    default: "false"
+    group: dialog
+    advanced: true
+    tooltip: "启用 Rerank 端点 (/rerank)。用于文档重排序场景，需要专门的 rerank 模型（如 bge-reranker-v2-m3）+ --pooling rank。默认禁用。"
+
+  - flag: tools
+    subgroup: 工具与 MCP
+    label: 工具调用
+    type: String
+    default: ""
+    group: dialog
+    wide: true
+    advanced: true
+    tooltip: "启用工具/函数调用。设为 'all' 启用所有工具，或逗号分隔的列表启用特定工具。"
+
+  - flag: agent
+    subgroup: 工具与 MCP
+    label: Agent 模式 (实验性)
+    type: Bool
+    default: "false"
+    group: dialog
+    advanced: true
+    tooltip: "启用 CORS 代理和全部内置工具（--agent）。请勿在不可信环境开启！开启后出于安全原因会把 cors-origins 限制为 localhost。默认关闭。"
+
+  - flag: tools-runtime
+    subgroup: 工具与 MCP
+    label: 工具运行环境 (实验性)
+    type: String
+    default: ""
+    group: dialog
+    wide: true
+    advanced: true
+    tooltip: "在独立运行时环境中执行工具。默认 none=使用宿主机环境。可选：docker:<镜像> / podman:<镜像>（每次调用复用容器，退出清理）；docker-container:<ID> / podman-container:<ID>（复用现有容器，不自动停止）；ssh:<目标>（SSH 远程执行）。"
+
+  - flag: mcp-servers-config
+    subgroup: 工具与 MCP
+    label: MCP 服务器配置
+    type: String
+    default: ""
+    group: dialog
+    wide: true
+    advanced: true
+    tooltip: "MCP (Model Context Protocol) 服务器配置文件路径。2026年7月新增，支持通过 stdio 连接外部 MCP 服务器。配置格式兼容 Cursor 的 JSON 格式。"
+
+  - flag: mcp-servers-json
+    subgroup: 工具与 MCP
+    label: MCP 服务器 JSON
+    type: String
+    default: ""
+    group: dialog
+    wide: true
+    advanced: true
+    tooltip: "MCP 服务器配置（内联 JSON 格式）。与 --mcp-servers-config 二选一。支持 stdio 协议的 MCP 服务器。注意：此功能为实验性。"
+
+  - flag: host
+    subgroup: 监听与超时
+    label: 主机 (Host)
+    role: host
+    type: String
+    default: "127.0.0.1"
+    group: net
+    enabled: true
+    tooltip: "监听 IP 地址。127.0.0.1 仅本机可访问；0.0.0.0 允许局域网访问（注意安全风险）。也支持 UNIX socket 路径（以 .sock 结尾）。建议：本地使用保持 127.0.0.1。"
+
+  - flag: port
+    subgroup: 监听与超时
+    label: 端口 (Port)
+    role: port
+    type: String
+    default: "1234"
+    group: net
+    enabled: true
+    tooltip: "HTTP 监听端口，范围 1-65535。llama-server 默认 8080，此启动器默认 1234 以避免与其他服务冲突。"
+    validate:
+      min: 1
+      max: 65535
+
+  - flag: timeout
+    subgroup: 监听与超时
+    label: 超时 (Timeout)
+    type: String
+    default: "600"
+    group: net
+    enabled: true
+    tooltip: "llama-server 读写超时（秒）。超时后断开空闲连接。长文本生成建议 >=300s，多轮对话建议 600s。设为 0 表示永不超时。"
+    validate:
+      min: 0
+
+  - flag: reuse-port
+    subgroup: 监听与超时
+    label: 端口复用
+    type: Bool
+    default: "false"
+    group: net
+    advanced: true
+    tooltip: "允许多个 socket 绑定同一端口（--reuse-port）。默认关闭。一般无需开启。"
+
+  - flag: api-key
+    subgroup: 鉴权与 API
+    label: API 密钥
+    type: String
+    default: ""
+    group: net
+    wide: true
+    tooltip: "API 认证密钥，多个用逗号分隔。留空表示无需认证。暴露在公网时务必设置，否则任何人都能调用你的模型。"
+    conflicts:
+      - api-key-file
+
+  - flag: api-key-file
+    subgroup: 鉴权与 API
+    label: API 密钥文件
+    type: String
+    default: ""
+    group: net
+    wide: true
+    tooltip: "从文件读取 API 密钥，每行一个，# 开头为注释。与 api-key 二选一或互补。"
+    conflicts:
+      - api-key
+
+  - flag: ssl-key-file
+    subgroup: 鉴权与 API
+    label: SSL 私钥文件
+    type: String
+    default: ""
+    group: net
+    wide: true
+    suggests: [ssl-cert-file]
+    tooltip: "PEM 格式的 SSL 私钥文件路径。与证书文件配合启用 HTTPS 加密通信。本地使用无需设置。"
+    implies:
+      - ssl-cert-file
+
+  - flag: ssl-cert-file
+    subgroup: 鉴权与 API
+    label: SSL 证书文件
+    type: String
+    default: ""
+    group: net
+    wide: true
+    suggests: [ssl-key-file]
+    tooltip: "PEM 格式的 SSL 证书文件路径。需与私钥文件配对使用。可用 Let's Encrypt 等免费证书。"
+    implies:
+      - ssl-key-file
+
+  - flag: api-prefix
+    subgroup: 鉴权与 API
+    label: API 前缀路径
+    type: String
+    default: ""
+    group: net
+    advanced: true
+    tooltip: "服务器提供服务的路径前缀（不带末尾斜杠）。如设为 /api 则接口位于 /api/v1/...。留空=无前缀。"
+
+  - flag: cors-origins
+    subgroup: CORS 跨域
+    label: CORS 允许来源
+    type: String
+    default: ""
+    group: net
+    wide: true
+    tooltip: "跨域资源共享（CORS）允许的来源列表，逗号分隔。留空默认允许所有来源（*）。Web 前端跨域访问时需设置为前端域名。设为 localhost 只反射本机 Origin。"
+
+  - flag: cors-methods
+    subgroup: CORS 跨域
+    label: CORS 允许方法
+    type: String
+    default: ""
+    group: net
+    wide: true
+    advanced: true
+    tooltip: "CORS 允许的 HTTP 方法，逗号分隔。官方默认 GET, POST, DELETE, OPTIONS。留空=官方默认。"
+    validate:
+      regex: '^[A-Za-z,\s]+$'
+
+  - flag: cors-headers
+    subgroup: CORS 跨域
+    label: CORS 允许请求头
+    type: String
+    default: ""
+    group: net
+    wide: true
+    advanced: true
+    tooltip: "CORS 允许的请求头，逗号分隔。官方默认 *（全部）。留空=官方默认。"
+
+  - flag: cors-credentials
+    subgroup: CORS 跨域
+    label: CORS 允许凭证
+    type: Bool
+    default: "true"
+    group: net
+    advanced: true
+    tooltip: "是否允许 CORS 携带凭证（--cors-credentials / --no-cors-credentials）。官方默认开启。注意：启用工具(--tools/--agent)时官方会把 cors-origins 限制为 localhost。"
+    offFlag: no-cors-credentials
+
+  - flag: parallel
+    subgroup: 并行与槽位
+    label: 并行序列数
+    type: String
+    default: "1"
+    group: net
+    enabled: true
+    tooltip: "服务器并发槽位数（同时处理的请求数）。默认 -1=自动。1=单用户（推荐本地使用）；2~4=多用户并发。每个槽位占用独立的 KV 缓存空间，增加会线性增加显存占用。MTP 推测解码建议保持 1。"
+    validate:
+      min: -1
+
+  - flag: cont-batching
+    subgroup: 并行与槽位
+    label: 连续批处理
+    type: Bool
+    default: "true"
+    group: net
+    advanced: true
+    tooltip: "启用连续批处理（continuous batching），多个请求可在同一批次中动态进出。官方默认开启。关闭可降低内存开销但吞吐下降。"
+    offFlag: no-cont-batching
+
+  - flag: prefill-assistant
+    subgroup: 并行与槽位
+    label: Assistant 预填充
+    type: Bool
+    default: "true"
+    group: net
+    advanced: true
+    tooltip: "当最后一条消息为 assistant 消息时预填充其响应（--prefill-assistant / --no-prefill-assistant）。官方默认开启（开启时最后一条 assistant 消息作为完整消息处理、不再预填充）。需配合 use_geometric t/s 参数。"
+    offFlag: no-prefill-assistant
+
+  - flag: slot-prompt-similarity
+    subgroup: 并行与槽位
+    label: 槽位 Prompt 相似度
+    type: String
+    default: "0.10"
+    group: net
+    advanced: true
+    tooltip: "多个请求时判断同一槽位 prompt 相似度的阈值（默认 0.10）。0.0=仅完全一致复用槽位；>0=部分复用缓存加速。"
+
+  - flag: path
+    subgroup: Web UI 与静态资源
+    label: 静态文件目录
+    type: String
+    default: ""
+    group: net
+    wide: true
+    advanced: true
+    tooltip: "从该目录提供静态文件服务。留空=不提供静态文件。"
+
+  - flag: tags
+    subgroup: Web UI 与静态资源
+    label: 模型标签
+    type: String
+    default: ""
+    group: net
+    wide: true
+    advanced: true
+    tooltip: "为模型设置标签（逗号分隔，仅信息用途，不参与路由）。"
+
+  - flag: offline
+    subgroup: Web UI 与静态资源
+    label: 离线模式
+    type: Bool
+    default: "false"
+    group: net
+    advanced: true
+    tooltip: "离线模式：强制使用缓存，阻止任何网络访问。配合 -hf/--model-url 下载场景禁用。"
+
+  - flag: ui
+    subgroup: Web UI 与静态资源
+    label: 启用 Web UI
+    type: Bool
+    default: "true"
+    group: net
+    tooltip: "是否启用内置 Web UI。默认开启。纯 API 服务可关闭以节省资源。"
+    offFlag: no-ui
+
+  - flag: sse-ping-interval
+    subgroup: Web UI 与静态资源
+    label: SSE Ping 间隔
+    type: String
+    default: "30"
+    group: net
+    tooltip: "SSE 心跳间隔（秒）。-1=禁用。默认 30。保持连接活跃，防止代理超时断开。"
+    validate:
+      min: 0
+
+  - flag: ui-config
+    subgroup: Web UI 与静态资源
+    label: WebUI 默认配置
+    type: String
+    default: ""
+    group: net
+    wide: true
+    advanced: true
+    tooltip: "作为 WebUI 默认配置的 JSON 对象字符串。用于预设 WebUI 的 UI 设置。"
+
+  - flag: ui-config-file
+    subgroup: Web UI 与静态资源
+    label: WebUI 配置文件
+    type: String
+    default: ""
+    group: net
+    wide: true
+    advanced: true
+    tooltip: "包含 WebUI 默认配置的 JSON 文件路径。与 --ui-config 二选一。"
+
+  - flag: ui-mcp-proxy
+    subgroup: Web UI 与静态资源
+    label: WebUI MCP 代理 (实验性)
+    type: Bool
+    default: "false"
+    group: net
+    advanced: true
+    aliases: [webui-mcp-proxy]
+    tooltip: "实验性：启用 MCP CORS 代理，让 WebUI 从浏览器访问远程 MCP 服务器。请勿在不可信环境中开启。旧参数名 --webui-mcp / --webui-mcp-proxy 已统一为 --ui-mcp-proxy。"
+
+  # ================================================================
+  # 2026-10-16 增补：llama-server 0.7.0-dev (b11675) --help 新增参数
+  # ================================================================
+  - flag: models-dir
+    subgroup: 模型目录
+    label: 模型目录 (Router)
+    type: String
+    default: ""
+    group: net
+    wide: true
+    advanced: true
+    tooltip: "Router 服务器模型目录。启用后可在此目录下动态加载多个模型。默认禁用。"
+
+  - flag: models-preset
+    subgroup: 模型目录
+    label: 模型预设文件
+    type: String
+    default: ""
+    group: net
+    wide: true
+    advanced: true
+    tooltip: "Router 服务器模型预设 INI 文件路径。需配合 models-dir 使用。"
+
+  - flag: models-max
+    subgroup: 模型目录
+    label: 最大同时加载模型数
+    type: String
+    default: "4"
+    group: net
+    advanced: true
+    tooltip: "Router 服务器最大同时加载模型数。0=无限制。默认 4。"
+    validate:
+      min: 0
+
+  - flag: models-autoload
+    subgroup: 模型目录
+    label: 模型自动加载
+    type: Bool
+    default: "true"
+    group: net
+    advanced: true
+    tooltip: "Router 服务器是否自动加载模型。默认开启。"
+    offFlag: no-models-autoload
+
+  # ================================================================
+  # MCP 工具 (2026年7月新增)
+  # ================================================================
+  - flag: models-memory-margin
+    subgroup: 模型目录
+    label: 模型驻留显存余量 (MiB)
+    type: String
+    default: ""
+    group: net
+    advanced: true
+    tooltip: "Router 服务器: 每设备预留的空闲显存(MiB), 新模型放不下时按 LRU 卸载已加载模型。0=禁用。"
+    validate:
+      min: 0
+  - flag: threads-http
+    subgroup: 服务管理
+    label: HTTP 线程数
+    type: String
+    default: "-1"
+    group: net
+    tooltip: "处理 HTTP 请求的线程数。默认 -1 = 自动（通常为 8）。高并发场景可适当增加，但过多会与推理线程争抢 CPU。建议：单用户保持 -1；多用户可设 4~8。"
+    validate:
+      min: -1
+
+  - flag: system-prompt-file
+    subgroup: 服务管理
+    deprecated: true
+    label: 系统提示文件
+    type: String
+    default: ""
+    group: net
+    hidden: true
+    deprecated: true
+    tooltip: "已废弃：llama-server 不支持 --system-prompt-file（该参数仅 llama-cli 等可用，已从 server 参数中排除）。如需固定系统提示，请在调用方注入 system 消息。"
+
+  # ================================================================
+  # 性能与内存
+  # ================================================================
+  - flag: metrics
+    subgroup: 服务管理
+    label: 启用 Metrics
+    role: metrics
+    type: Bool
+    default: "true"
+    group: net
+    advanced: true
+    tooltip: "启用 Prometheus 兼容的 /metrics 监控端点。启动器用它在运行中实时读取 TPS / Prefill / 首Token。"
+
+  - flag: slots
+    subgroup: 服务管理
+    label: 显示槽位
+    type: Bool
+    default: "true"
+    group: net
+    advanced: true
+    tooltip: "暴露 /slots 端点，显示各推理槽位的状态（正在处理、空闲等）。官方默认开启。"
+    offFlag: no-slots
+
+  - flag: sleep-idle-seconds
+    subgroup: 服务管理
+    label: 休眠空闲秒数
+    type: String
+    default: "-1"
+    group: net
+    subgroup: 服务管理
+    tooltip: "空闲多少秒后服务器自动休眠（卸载模型释放显存）。-1=禁用（默认）。"
+    validate:
+      min: -1
+
+  - flag: props
+    subgroup: 服务管理
+    label: 启用属性修改
+    type: Bool
+    default: "false"
+    group: net
+    advanced: true
+    tooltip: "启用 POST /props 端点，允许运行时修改全局属性。默认禁用（安全考虑）。"
+
+  - flag: slot-save-path
+    subgroup: 服务管理
+    label: Slot 缓存保存路径
+    type: String
+    default: ""
+    group: net
+    wide: true
+    advanced: true
+    tooltip: "保存 slot KV 缓存的路径。默认禁用。用于持久化缓存，加速重启后的恢复。"
+
+  - flag: verbose-prompt
+    subgroup: 已废弃
+    deprecated: true
+    label: 详细 Prompt
+    type: Bool
+    default: "false"
+    group: net
+    advanced: true
+    hidden: true
+    deprecated: true
+    tooltip: "已废弃：llama-server 不支持 --verbose-prompt（已从 server 参数移除）。调试模板请改用 --log-prompts-dir 或日志详细度。"
+
+  - flag: no-display-prompt
+    subgroup: 已废弃
+    deprecated: true
+    label: 不显示 Prompt
+    type: Bool
+    default: "false"
+    group: net
+    advanced: true
+    hidden: true
+    deprecated: true
+    tooltip: "已废弃：llama-server 不支持 --no-display-prompt（该参数仅 completion/cli 等工具可用）。隐私敏感场景请关闭 Web UI 或自行处理日志。"
