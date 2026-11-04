@@ -894,6 +894,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def handle_error(self, request, client_address):
+        """客户端中途断开(刷新页面/放弃慢请求)是常态: 静默, 别把栈打到 stderr。"""
+        ex = sys.exc_info()[1]
+        if isinstance(ex, (BrokenPipeError, ConnectionResetError)):
+            return
+        BaseHTTPRequestHandler.handle_error(self, request, client_address)
+
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -968,10 +975,18 @@ class Handler(BaseHTTPRequestHandler):
         if fn is None:
             return self._send(404, {"error": "unknown api: " + path})
         try:
-            self._send(200, fn(body))
+            result = fn(body)
         except Exception as ex:
             HUB.error_ex(ex, "API %s" % path)
-            self._send(500, {"error": str(ex)})
+            code, result = 500, {"error": str(ex)}
+        else:
+            code = 200
+        try:
+            self._send(code, result)
+        except (BrokenPipeError, ConnectionResetError):
+            # 客户端刷新页面/放弃长请求(如 check_update 走镜像慢)→ 管道断了。
+            # 这不是服务端故障, 打 ERROR + 栈只会污染 error.log
+            HUB.log("[API] %s: 客户端已断开(响应未送达)" % path)
 
 
 def main():

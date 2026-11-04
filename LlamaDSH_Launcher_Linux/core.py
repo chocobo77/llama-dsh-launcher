@@ -494,6 +494,35 @@ class DshRunner:
                 state.save_build_state(head)
         return self._start_inner(profile)
 
+    def _sudo_preflight(self):
+        """管理员模式预检: 返回 None = 可无人值守提权, 否则返回不可用的原因。
+
+        不预检的后果: `sudo -n` **立刻**退出(报错只落在 DSH boot log 里), 而 _spawn 只
+        判断 Popen 是否成功 → 白等 30s 超时 + 自动重试再一次, 用户只看到
+        "DSH failed (启动超时)"。两类真实原因:
+          - NoNewPrivs: 启动器进程继承了内核 NNP 位(从受限会话/沙箱里拉起的后台服务),
+            该位禁止任何 exec 获得新权限 → sudo 永久失效
+          - 需要密码: 无人值守服务无法交互输密码
+        """
+        if not procman.which("sudo"):
+            return "环境里没有 sudo"
+        try:
+            r = subprocess.run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, timeout=8)
+        except Exception as ex:
+            return "sudo 预检异常: %s" % ex
+        if r.returncode == 0:
+            return None
+        lines = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        reason = lines[0] if lines else ("sudo -n 退出码 %d" % r.returncode)
+        low = reason.lower()
+        if "no new privileges" in low:
+            reason += " —— 启动器进程带 NoNewPrivs 位(常见于从受限会话/沙箱里拉起的后台服务)," \
+                      "请从应用菜单/桌面图标重新启动启动器"
+        elif "password" in low:
+            reason += " —— 后台服务无法交互输密码; 确需提权请在 sudoers 为该用户配置 NOPASSWD"
+        return reason
+
     def _start_inner(self, profile):
         mode = self.resolve_mode(profile)
         dsh_dir = (profile.get("DshDir") or "").strip().strip('"') or "deepseek-harness"
@@ -505,18 +534,32 @@ class DshRunner:
 
         # 不拼 bash -c 脚本:目录走 Popen 的 cwd,命令走 argv 列表——
         # DshDir 是 webui 可编辑字段,拼进 shell 等于命令注入。
-        if profile.get("DshAdminMode"):
-            inner = {"compiled-js": ["node", "apps/cli/lib/bin.js", "web"],
-                     "compiled-tsx": ["pnpm", "dsh", "web"],
-                     "npx": ["npx", "--yes", "@deepseek-ai/dsh", "web"]}[mode]
-            if not procman.which("sudo"):
-                self.hub.log("[DSH] 管理员模式需要 sudo,当前环境不可用 → 启动失败(不回退普通启动)")
-                self.status = "failed"
-                return False, "sudo 不可用"
+        inner = {"compiled-js": ["node", "apps/cli/lib/bin.js", "web"],
+                 "compiled-tsx": ["pnpm", "dsh", "web"],
+                 "npx": ["npx", "--yes", "@deepseek-ai/dsh", "web"]}[mode]
+        want_admin = bool(profile.get("DshAdminMode"))
+        demoted = False
+        if want_admin:
+            why = self._sudo_preflight()
+            if why:
+                # 与 Windows 不同: 那边提权是读游戏内存的硬需求(失败必须停), Linux 下
+                # DSH 装在用户目录, root 并非必需 → 降级普通启动并显式告知原因
+                self.hub.log("[DSH] ⚠ 管理员模式不可用: %s" % why)
+                self.hub.log("[DSH] 本次自动按普通启动(Linux 下 DSH 不需要 root);"
+                             "确需提权请给该用户配 sudoers NOPASSWD, 或取消勾选“管理员模式”")
+                want_admin, demoted = False, True
+        if want_admin:
+            # 提权启动要显式带环境与绝对路径: sudo 的 env_reset 会把 HOME 变成 /root
+            # (DSH 会在 /root/.local/share 下另建一套数据), 而 secure_path 里没有
+            # ~/.local/share/pnpm → `sudo pnpm` 直接 command not found。
+            binx = procman.which(inner[0]) or inner[0]
+            argv = (["sudo", "-n", "env",
+                     "HOME=" + os.path.expanduser("~"),
+                     "PATH=" + (os.environ.get("PATH") or "")]
+                    + [binx] + inner[1:])
             self.hub.log("--- 正在启动 DSH (%s · sudo 提权) ---" % mode)
-            ok = self._spawn(["sudo", "-n"] + inner, detached=True, cwd=dsh_dir or None)
-            if not ok:
-                self.hub.log("[DSH] sudo 提权启动失败(可能需要密码),不回退普通启动")
+            if not self._spawn(argv, detached=True, cwd=dsh_dir or None):
+                self.hub.log("[DSH] sudo 提权启动失败")
                 self.status = "failed"
                 state.clear_state_for("DshPid")
                 return False, "sudo 启动失败"
@@ -531,7 +574,8 @@ class DshRunner:
                 argv = ["pnpm", "dsh", "web"]
             else:
                 argv = ["npx", "--yes", "@deepseek-ai/dsh", "web"]
-            self.hub.log("--- 正在启动 DSH (%s · 分离模式) ---" % mode)
+            self.hub.log("--- 正在启动 DSH (%s · 分离模式%s) ---"
+                         % (mode, " · 管理员模式已降级" if demoted else ""))
             if not self._spawn(argv, detached=True, cwd=dsh_dir or None):
                 self.status = "failed"
                 return False, "启动失败"
