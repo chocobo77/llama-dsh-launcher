@@ -2076,6 +2076,125 @@ check("探针(ss/lsof)缺失时插件操作要被拒, 不能把\"查不到\"当�
       _guard_nossp is False and _guard_ok is True, str((_guard_nossp, _guard_ok)))
 
 
+# --- 16) 第八轮: 打包/解压的边界(符号链接外带、自制 tgz 冒充身份) --------------
+# 16.1 shutil.copytree 默认**跟随符号链接**: 插件里一个 dist/assets -> ../../secrets
+#      就把包外的内容原样打进 tgz。这个包随后被装进别的 profile、或发给别人, 就是
+#      把别人的文件外带(实测旧形态: 包外 secret 与整棵包外目录都进了暂存目录)。
+_pl8 = os.path.join(_tmp, "pack_link8")
+_outside8 = os.path.join(_tmp, "outside8")
+os.makedirs(os.path.join(_pl8, "dist"))
+os.makedirs(_outside8)
+with open(os.path.join(_outside8, "secret.json"), "w", encoding="utf-8") as fh:
+    fh.write("SECRET-OUT-OF-TREE\n")
+with open(os.path.join(_pl8, "dist", "real.js"), "w", encoding="utf-8") as fh:
+    fh.write("//real\n")
+os.symlink(os.path.join(_outside8, "secret.json"), os.path.join(_pl8, "dist", "link.json"))
+os.symlink(_outside8, os.path.join(_pl8, "outlink"))
+os.symlink(os.path.join(_pl8, "dist", "real.js"), os.path.join(_pl8, "dist", "inlink.js"))
+with open(os.path.join(_pl8, "index.js"), "w", encoding="utf-8") as fh:
+    fh.write("//main\n")
+with open(os.path.join(_pl8, "package.json"), "w", encoding="utf-8") as fh:
+    json.dump({"name": "lk", "version": "1.0.0", "main": "index.js",
+               "files": ["dist", "outlink"]}, fh)
+_lklog8 = []
+_compat.subprocess.run = _fake_pack
+_compat._pack_staged(_pl8, _pout, job_log=_lklog8.append)
+_compat.subprocess.run = orig_compat_run
+_files8 = list(_pstage["files"])
+check("打包不得把包外符号链接的内容打进 tgz(copytree 跟随链接 = 把别人的文件外带)",
+      "dist/link.json" not in _files8 and not any("outlink" in f or "secret" in f
+                                                 for f in _files8), str(_files8))
+check("包内符号链接照常进包, 被甩掉的包外链接必须在日志里点名",
+      "dist/inlink.js" in _files8 and "dist/real.js" in _files8
+      and any("符号链接" in str(x) and "link.json" in str(x) for x in _lklog8),
+      "%s | %s" % (_files8, _lklog8[-2:]))
+
+# 16.2 只认包根的 package.json 这条, 把 `../package.json` 也算了一层包根(rel=".." 的
+#      depth 恰好是 1): 自制 tgz 于是能把安装记录里的 name/version 写成任意值(实测旧版
+#      返回 ('evil-root','9.9')), 卸载/清理就会瞄错条目。绝对路径成员同样不该参与。
+_evil8 = os.path.join(_tmp, "evil_ident8.tgz")
+with tarfile.open(_evil8, "w:gz") as tf:
+    for _n8, _d8 in (("../package.json", {"name": "evil-root", "version": "9.9"}),
+                     ("/abs/package.json", {"name": "abs-root", "version": "8.8"}),
+                     ("package/package.json", {"name": "@real/pkg", "version": "1.2.3"})):
+        _raw8 = json.dumps(_d8).encode("utf-8")
+        _ti8 = tarfile.TarInfo(_n8)
+        _ti8.size = len(_raw8)
+        tf.addfile(_ti8, io.BytesIO(_raw8))
+check("自制 tgz 里 ../ 或绝对路径的 package.json 不得冒充包身份",
+      _compat._tarball_identity(_evil8) == ("@real/pkg", "1.2.3"),
+      str(_compat._tarball_identity(_evil8)))
+_evil_only8 = os.path.join(_tmp, "evil_only8.tgz")
+with tarfile.open(_evil_only8, "w:gz") as tf:
+    _raw8 = json.dumps({"name": "evil-root", "version": "9.9"}).encode("utf-8")
+    _ti8 = tarfile.TarInfo("../package.json")
+    _ti8.size = len(_raw8)
+    tf.addfile(_ti8, io.BytesIO(_raw8))
+check("整包只有越界 package.json 时身份必须为空(不能照抄越界成员)",
+      _compat._tarball_identity(_evil_only8) == ("", ""),
+      str(_compat._tarball_identity(_evil_only8)))
+
+# 16.3 解压侧 filter="data" 是恶意资产包的唯一防线(绝对路径/../穿越/包外符号链接),
+#      但它零回归覆盖: 谁哪天"顺手"去掉这个参数, 更新流程就会把文件写到到处。
+def _malice_tgz8(tag, name, typefield=tarfile.REGTYPE, link=""):
+    p = os.path.join(_tmp, "malice_%s8.tgz" % tag)
+    with tarfile.open(p, "w:gz") as tf:
+        ti = tarfile.TarInfo(name)
+        ti.type = typefield
+        ti.linkname = link
+        if typefield == tarfile.REGTYPE:
+            ti.size = 2
+            tf.addfile(ti, io.BytesIO(b"hi"))
+        else:
+            ti.size = 0
+            tf.addfile(ti)
+    return p
+
+
+for _tag8, _name8, _type8, _link8, _out8, _raise8, _in8, _badlink8, _note8 in (
+        ("dotdot", "../escaped8.txt", tarfile.REGTYPE, "", os.path.join(_tmp, "escaped8.txt"),
+         True, None, None, "必须报错"),
+        ("abs", "/tmp/llamadsh_abs_member8.txt", tarfile.REGTYPE, "",
+         "/tmp/llamadsh_abs_member8.txt", False,
+         os.path.join("tmp", "llamadsh_abs_member8.txt"), None, "不得写到解压目录外"),
+        ("link", "evil_link", tarfile.SYMTYPE, "/tmp/evil_link_target8",
+         "/tmp/evil_link_target8", True, None, "evil_link", "必须报错")):
+    _ex8 = os.path.join(_tmp, "ex8_%s" % _tag8)
+    os.makedirs(_ex8)
+    _why8 = ""
+    try:
+        toolchain._extract_tar(_malice_tgz8(_tag8, _name8, _type8, _link8), _ex8)
+    except Exception as _ex8e:
+        _why8 = "%s: %s" % (type(_ex8e).__name__, _ex8e)
+    _badlink8 = _badlink8 is not None and os.path.islink(os.path.join(_ex8, _badlink8))
+    # 绝对路径成员由 tarfile 先把 "/" 剥掉(不报错, 但被折进解压目录内);
+    # .. 穿越与"指向解压目录外"的符号链接成员由 filter="data" 直接拒 —— 后者尤其要紧:
+    # 没有 filter 时它会照原样在解压目录里建一个链到 /etc/passwd 之类的链接, 之后任何
+    # 一次复制/覆盖(更新流程就有 copy2 + chmod)都会写到链接的目标上。
+    check("恶意 tar(%s 成员)解压%s, 且不得在解压目录外落文件或留下越界链接" % (_tag8, _note8),
+          (bool(_why8) == _raise8) and not os.path.exists(_out8) and not _badlink8
+          and (_in8 is None or os.path.isfile(os.path.join(_ex8, _in8))),
+          "%s | out_exists=%s bad_link=%s in_dest=%s" % (
+              _why8[:110], os.path.exists(_out8), _badlink8,
+              _in8 is not None and os.path.isfile(os.path.join(_ex8, _in8))))
+_ok8 = os.path.join(_tmp, "good8.tgz")
+with tarfile.open(_ok8, "w:gz") as tf:
+    ti = tarfile.TarInfo("llama.cpp-build/llama-server")
+    ti.size = 4
+    ti.mode = 0o644
+    tf.addfile(ti, io.BytesIO(b"#!/s"))
+    ti2 = tarfile.TarInfo("llama.cpp-build/README.md")
+    ti2.size = 2
+    tf.addfile(ti2, io.BytesIO(b"hi"))
+_exok8 = os.path.join(_tmp, "exok8")
+os.makedirs(_exok8)
+toolchain._extract_tar(_ok8, _exok8)
+_found8 = toolchain._find_dir_containing(_exok8, "llama-server")
+check("对照: 正常 tar 照旧能解出并给 llama-* 补上可执行位(修法没把正常路径锁死)",
+      _found8 is not None
+      and os.access(os.path.join(_found8, "llama-server"), os.X_OK),
+      str(_found8))
+
 shutil.rmtree(_tmp, ignore_errors=True)
 
 print()

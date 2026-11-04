@@ -1085,10 +1085,45 @@ _PACK_SOFT = {"tests", "test", "docs", "scripts", ".github", ".vscode", ".idea",
 _PACK_IGNORE = _PACK_ALWAYS | _PACK_SOFT
 
 
-def _ignore_fn(lower_set):
-    """shutil.copytree 的 ignore 回调: 按小写名比对(与 C# 的大小写无关语义一致)。"""
+_PACK_LINK_SKIP = []      # 本次打包被甩掉的"指向包外"符号链接(供 _pack_staged 留痕)
+
+
+def _links_skipped():
+    """取走并清空本次打包甩掉的越界符号链接清单(与 _OP_IMBALANCE 同一手法)。"""
+    out = list(_PACK_LINK_SKIP)
+    del _PACK_LINK_SKIP[:]
+    return out
+
+
+def _escapes(src_dir, path):
+    """path(解析符号链接后)是否落在 src_dir 之外。判不准时按"越界"处理。"""
+    try:
+        root = os.path.realpath(src_dir)
+        tgt = os.path.realpath(path)
+    except OSError:
+        return True
+    return tgt != root and not tgt.startswith(root + os.sep)
+
+
+def _ignore_fn(lower_set, src_dir=None):
+    """shutil.copytree 的 ignore 回调: 按小写名比对(与 C# 的大小写无关语义一致)。
+
+    src_dir 给定时**额外甩掉指向包目录之外的符号链接**: copytree 默认跟随符号链接,
+    把目标内容原样复制进暂存目录 —— `dist/assets -> ../../secrets` 这类链接会把包外
+    的东西(别人的密钥、另一个 profile 的配置、另一棵 node_modules)打进 tgz。包随后被
+    装进别的 profile 或发给别人, 就成了外带 + 体积爆炸。npm pack 对包外链接同样是拒绝。
+    """
     def _pick(_dir, names):
-        return [n for n in names if n.lower() in lower_set]
+        skip = [n for n in names if n.lower() in lower_set]
+        if src_dir:
+            for n in names:
+                if n in skip:
+                    continue
+                p = os.path.join(_dir, n)
+                if os.path.islink(p) and _escapes(src_dir, p):
+                    skip.append(n)
+                    _PACK_LINK_SKIP.append(os.path.relpath(p, src_dir))
+        return skip
     return _pick
 
 
@@ -1115,8 +1150,14 @@ def _tarball_identity(tgz):
             cands = []
             for m in tf.getmembers():
                 n = m.name.replace("\\", "/")
-                while n.startswith(("./", "/")):
-                    n = n[2:] if n.startswith("./") else n[1:]
+                if n.startswith("/") or ".." in n.split("/"):
+                    # 绝对路径 / .. 穿越成员一律不认: 否则 `../package.json` 这种"包根上一层"
+                    # 会被当成包身份(实测旧版返回它的 name/version), 一个自制 tgz 就能把
+                    # 安装记录的 name/version 伪造成任意值, 卸错目标、盖掉别的条目。
+                    # (解压侧 toolchain._extract_tar 用 filter="data" 也会拒这类成员。)
+                    continue
+                while n.startswith("./"):
+                    n = n[2:]
                 if not n.endswith("package.json"):
                     continue
                 rel = n[: -len("package.json")].rstrip("/")
@@ -1232,8 +1273,10 @@ def _pnpm_error_tail(out, limit=600):
     return ("\n".join(hits) if any(hits) else text)[-limit:]
 
 
-def _copy_entry(src, dst, use_ignore=True):
+def _copy_entry(src, dst, use_ignore=True, root=None):
     """复制一个条目, 返回是否真复制了。
+
+    root 是打包的源目录(插件根): 条目本身或其内部指向 root 之外的符号链接不进包。
 
     use_ignore=False 用于 package.json 里**显式声明**的条目: `_PACK_SOFT`(scripts/
     docs/tests/…)是甩开发期目录的, 但插件完全可能把运行期资产放在名为 scripts/ 的
@@ -1244,9 +1287,13 @@ def _copy_entry(src, dst, use_ignore=True):
     """
     if not os.path.exists(src):
         return False
+    if root and os.path.islink(src) and _escapes(root, src):
+        # files/main/patch 指到包外的链接: 不复制, 但要让用户知道包里少了东西
+        _PACK_LINK_SKIP.append(os.path.relpath(src, root))
+        return False
     if os.path.isdir(src):
         shutil.copytree(src, dst, dirs_exist_ok=True,
-                        ignore=_ignore_fn(_PACK_IGNORE if use_ignore else _PACK_ALWAYS))
+                        ignore=_ignore_fn(_PACK_IGNORE if use_ignore else _PACK_ALWAYS, root))
     else:
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
         shutil.copy2(src, dst)
@@ -1259,6 +1306,7 @@ def _pack_staged(src_dir, out_dir, job_log=None):
     保留 dist 等已构建产物, 得到可安装的稳定 tgz(C# TryPackStagedPackage 同语义)。
     """
     stage = tempfile.mkdtemp(prefix="llamadsh_packstage_")
+    _links_skipped()          # 清掉上一轮可能留下的记录, 免得串到本次日志里
     try:
         missing = _missing_build_entry(src_dir)
         if missing:
@@ -1274,7 +1322,7 @@ def _pack_staged(src_dir, out_dir, job_log=None):
         absent = []
         for entry in _pack_entries(src_dir, doc.get("files")):
             if not _copy_entry(os.path.join(src_dir, entry), os.path.join(stage, entry),
-                               use_ignore=not declared):
+                               use_ignore=not declared, root=src_dir):
                 absent.append(entry)
         if absent and job_log:
             job_log("[插件安装] 注意: files 声明的条目在源目录里不存在: %s"
@@ -1286,14 +1334,19 @@ def _pack_staged(src_dir, out_dir, job_log=None):
         main_rel = _rel_path(doc.get("main"))
         if main_rel and not os.path.exists(os.path.join(stage, main_rel)):
             if _copy_entry(os.path.join(src_dir, main_rel), os.path.join(stage, main_rel),
-                           use_ignore=False) and job_log:
+                           use_ignore=False, root=src_dir) and job_log:
                 job_log("[插件安装] 注意: main 入口 %s 不在 files 声明里, 已一并打入包内"
                         % main_rel)
         bundle = (doc.get("dsh") or {}).get("bundle")
         patch = _rel_path(bundle.get("patch")) if isinstance(bundle, dict) else ""
         if patch:
             _copy_entry(os.path.join(src_dir, patch), os.path.join(stage, patch),
-                        use_ignore=False)
+                        use_ignore=False, root=src_dir)
+        # 包外符号链接: 少了东西必须说出来, 否则用户只会看到"装上去缺资产"
+        skipped = _links_skipped()
+        if skipped and job_log:
+            job_log("[插件安装] 注意: %d 个符号链接指向插件目录之外, 未打入包内(否则包会把"
+                    "别人的文件一起带走): %s" % (len(skipped), ", ".join(skipped[:6])))
         scripts = doc.get("scripts")
         if isinstance(scripts, dict):
             for name in ("prepack", "prepare", "postinstall"):
