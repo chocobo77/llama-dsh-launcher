@@ -172,6 +172,17 @@ def _disk_rows_cached():
     return [dict(d) for d in c["rows"]]
 
 
+def disks_pending():
+    """"一块盘都没有"与"第一盘还没采到"必须能区分: 后台首刷是异步的, 服务刚起来的
+    头几拍缓存是空的, 以前面板直接把空缓存显示成"没有盘"(实测第一次轮询 0 行)。"""
+    return _disk_rows["at"] == 0.0
+
+
+def prewarm_disks():
+    """服务启动时主动踢一次后台首刷(不阻塞启动), 让第一帧就有盘。"""
+    _disk_rows_cached()
+
+
 def _parent_disk(name):
     """分区名 → 整盘名: nvme0n1p2→nvme0n1、mmcblk0p1→mmcblk0、sda2→sda、xvda1→xvda。
     整盘名(sda/nvme0n1)原样返回。规则不对会导致整盘 I/O 被算到每个分区上(表头翻倍)。"""
@@ -459,6 +470,8 @@ def sample_system():
     snap = {"cpu": cm["cpu"], "cpu_cores": cm["cpu_cores"], "cpu_model": cpu_model(),
             "mem_used": cm["mem_used"], "mem_total": cm["mem_total"], "mem_pct": cm["mem_pct"],
             "disks": all_disks[:DISK_ROWS_LIMIT],
+            # 空列表有两种意思: 真的没有可显示的文件系统, 或后台首刷还没回来 ⇒ 必须分开
+            "disks_pending": disks_pending(),
             # 面板最多 6 行, 多出来的必须说有几块, 否则"截断"与"只有这么多盘"同形
             "disks_dropped": max(0, len(all_disks) - DISK_ROWS_LIMIT),
             # 表头读写速率按**全部**盘求和: 截断只是不再显示那些行, 不是那些盘不存在

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(280 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(282 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -3256,6 +3256,30 @@ check("自检的日志必须落在自己的临时目录, ~/.dsh_launcher_logs �
 check("core/applog/main/toolchain 必须共用同一份 LOG_DIR(改一处仍会写真目录)",
       core.applog.LOG_DIR == main.applog.LOG_DIR == toolchain.applog.LOG_DIR == _applog_top.LOG_DIR,
       str((core.applog.LOG_DIR, main.applog.LOG_DIR, toolchain.applog.LOG_DIR)))
+# 23.6 磁盘行是后台首刷的, 缓存冷的时候 sample_system 拿到空列表: 以前面板把"还没采到"
+#      直接显示成"没有盘"(实测: 服务启动后第一次 /api/monitor 是 0 行, 第二次才有 4 行)。
+_dc23, _real_dc23 = dict(monitor._disk_rows), monitor._disk_rows_cached
+monitor._disk_rows.update(rows=[], at=0.0, busy=False)
+monitor._disk_rows_cached = lambda: []
+monitor._sys_cache.update(t=0.0, v=None)
+_cold23 = monitor.sample_system()
+check("冷启动首帧不得把\"还没采到\"当成\"没有盘\"(payload 要带 disks_pending)",
+      _cold23["disks"] == [] and _cold23["disks_pending"] is True,
+      str((len(_cold23["disks"]), _cold23.get("disks_pending"))))
+monitor._disk_rows_cached = _real_dc23               # 换回真接缝, 否则 prewarm 踢的是假函数
+monitor.prewarm_disks()                              # 服务启动时踢的那一次首刷
+for _ in range(60):
+    if monitor._disk_rows["rows"]:
+        break
+    time.sleep(0.05)
+monitor._sys_cache.update(t=0.0, v=None)
+_warm23 = monitor.sample_system()
+monitor._disk_rows.update(**_dc23)
+monitor._sys_cache.update(t=0.0, v=None)
+check("对照: 首刷回来后必须真有行且 disks_pending 变 False(不得卡在\"采不到\")",
+      len(_warm23["disks"]) >= 1 and _warm23["disks_pending"] is False,
+      str((len(_warm23["disks"]), _warm23.get("disks_pending"))))
+
 
 shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)

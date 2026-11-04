@@ -859,7 +859,7 @@ function renderSystem(sys) {
       <span class="dinfo">${fmtN(d.used / GIB, 0)}G / ${fmtN(d.total / GIB, 0)}G (${d.pct}%)</span>`;
     dh.appendChild(row);
   }
-  if (!disks.length) dh.innerHTML = `<div class="tiny">—</div>`;
+  if (!disks.length) dh.innerHTML = `<div class="tiny">${sys.disks_pending ? "磁盘信息还没采到…" : "—"}</div>`;
   else if (sys.disks_dropped > 0) {
     const more = document.createElement("div");
     more.className = "tiny";

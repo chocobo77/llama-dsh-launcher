@@ -1236,6 +1236,7 @@ def main():
     state.set_error_sink(HUB.log)
     toolchain.cleanup_update_tmp()   # 上次崩溃留下的 .part/解压目录, 启动时清掉
     takeover_on_boot()
+    monitor.prewarm_disks()          # 踢一次磁盘行首刷, 否则第一帧面板显示成"没有盘"
     threading.Thread(target=MON.loop, daemon=True).start()
     threading.Thread(target=_health_loop, daemon=True).start()
 
