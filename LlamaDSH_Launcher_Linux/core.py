@@ -23,10 +23,33 @@ import monitor
 import procman
 import state
 
-TMP_DIR = os.environ.get("TMPDIR", "/tmp")
-DSH_BOOT_LOG = os.path.join(TMP_DIR, "LlamaDSH_dsh_boot.log")
-DSH_REBUILD_LOG = os.path.join(TMP_DIR, "LlamaDSH_dsh_rebuild.log")
-DSH_REBUILD_SCRIPT = os.path.join(TMP_DIR, "LlamaDSH_dsh_rebuild.sh")
+def _private_tmp_ns():
+    """DSH 的 boot/rebuild 日志与 rebuild 脚本不能再放 $TMPDIR 根下的固定名。
+
+    旧写法是 `/tmp/LlamaDSH_dsh_rebuild.sh`: 共享目录 + 固定名 + **可执行**。同机另一个
+    账号或另一个会话可以先把它做成指向本用户可写文件的符号链接 —— 我们的
+    `open(DSH_REBUILD_SCRIPT, "w")` 会跟随链接, 于是构建脚本被写进**那个文件**, 紧接着
+    又以 0755 交 bash 执行; boot/rebuild 日志的 open("wb") 同理能截断任意本用户可写的
+    文件, 且日志内容带用户的绝对路径。故收进一个按 uid 命名、模式 0700 的私有命名空间:
+    链接被别人预置过就改用 mkdtemp 的不可预测名。跨账号读日志也一并断掉。
+    """
+    base = os.environ.get("TMPDIR", "/tmp")
+    d = os.path.join(base, "llamadsh-%d" % os.getuid())
+    try:
+        if os.path.islink(d):
+            raise OSError("命名空间已被预置成符号链接")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)                     # 已存在但被放宽过 → 收紧
+    except OSError:
+        import tempfile
+        d = tempfile.mkdtemp(prefix="llamadsh-ns-")   # mkdtemp 本身是 0700
+    return d
+
+
+_TMP_NS = _private_tmp_ns()
+DSH_BOOT_LOG = os.path.join(_TMP_NS, "dsh_boot.log")
+DSH_REBUILD_LOG = os.path.join(_TMP_NS, "dsh_rebuild.log")
+DSH_REBUILD_SCRIPT = os.path.join(_TMP_NS, "dsh_rebuild.sh")
 CONVERT_LOG_NAME = "llamadsh_convert.log"
 TOOLS_DIR = os.path.join(os.path.expanduser("~"), ".dsh_launcher_tools")
 
@@ -396,7 +419,14 @@ class LlamaRunner:
             self.oom_retry_active = False
             self.hub.log("[OOM] 已放弃自动降层重启(进程已被停止或已被接管)")
             return
-        ok, msg = self.start(self.last_profile, skip_vram_confirm=True)
+        try:
+            ok, msg = self.start(self.last_profile, skip_vram_confirm=True)
+        except Exception as ex:
+            # start() 抛异常(Popen 失败、参数落盘炸了)时这个线程当场死掉, oom_retry_active
+            # 永远卡在 True —— 此后的 OOM 都不再补降层额度, 表现成"越跑越容易 OOM"且无痕迹。
+            self.oom_retry_active = False
+            self.hub.log("[OOM] 降层重启异常(%s: %s), 已放弃本次重试" % (type(ex).__name__, ex))
+            return
         if not ok:
             self.hub.log("[OOM] 重试启动失败: %s" % msg)
             self.oom_retry_active = False
@@ -433,7 +463,10 @@ class LlamaRunner:
         if not killed:
             # kill_process_tree 的返回值以前被丢掉, 于是 root 属主/杀不掉的进程
             # 也照样打印"已停止", 面板还把 Start 重新点亮(再点就是撞端口)
-            self.hub.log("[Llama] ⚠ 进程 PID %s 未能停止(可能以 root 启动), 请手动结束" % pid)
+            # killed=False 现在有两种含义: 进程真杀不掉, 或整树没数清(root 属主时
+            # /proc 的 children 读不到) —— 两种都不能说"已停止"。
+            self.hub.log("[Llama] ⚠ 进程 PID %s 未能停止或其子进程未能确认全部结束"
+                         "(可能以 root 启动), 请手动结束并复核 1234 端口" % pid)
         self._finish_stop(ok=killed)
 
     def _finish_stop(self, quiet=False, ok=True):
@@ -766,6 +799,11 @@ class DshRunner:
                         try:
                             targets = procman.child_pids(pid)
                         except Exception:
+                            targets = None
+                        tree_known = targets is not None
+                        if targets is None:
+                            # /proc 的 children 只对同 uid 可读: root 属主的树枚举不出来,
+                            # 这里只能保证打到根 PID, 文案就不许再报"含 N 个子进程"
                             targets = []
                         if pid not in targets:
                             targets.append(pid)
@@ -775,8 +813,9 @@ class DshRunner:
                                            encoding="utf-8", errors="replace", timeout=15)
                         time.sleep(0.6)
                         if not procman.alive(pid):
-                            self.hub.log("--- 提权 DSH 进程普通停止无效, 已用 sudo kill 停止"
-                                         "(含 %d 个子进程) ---" % max(0, len(targets) - 1))
+                            self.hub.log("--- 提权 DSH 进程普通停止无效, 已用 sudo kill 停止(%s) ---"
+                                         % (("含 %d 个子进程" % max(0, len(targets) - 1)) if tree_known
+                                            else "但未能枚举其子进程(属主不是本人), 请复核 3080 是否真已释放"))
                         elif r.returncode == 0:
                             self.hub.log("[DSH] ⚠ 已下发 sudo kill 但进程 PID %d 仍在, 请手动结束" % pid)
                         else:

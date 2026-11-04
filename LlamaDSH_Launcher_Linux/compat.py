@@ -1338,6 +1338,8 @@ _PROFILE_LOCKS_GUARD = threading.Lock()
 # main 的 JOBS 里 —— 而"把 package.json 写到一半服务就退出了"恰是这一族最坏的收尾事故,
 # 所以退出前必须点名(main._stop_all_and_exit 调 inflight_ops())。
 _INFLIGHT = {}
+# end_profile_op 放锁时发现"本来不是自己持的" —— 记录下来(end_profile_op/op_imbalance)
+_OP_IMBALANCE = []
 
 
 def _profile_lock(profile):
@@ -1369,16 +1371,31 @@ def begin_profile_op(profile, what):
 
 
 def end_profile_op(profile):
-    """与 begin_profile_op 成对; 重入时只减深度, 回到 0 才真正放锁。"""
+    """与 begin_profile_op 成对; 重入时只减深度, 回到 0 才真正放锁。
+
+    放锁与记账必须分开: 以前"登记已经没了"就直接 return, 把下面的 release 一起跳过 ——
+    一旦 _INFLIGHT 与真实持锁状态脱节, 该 profile 的锁就**永久**泄漏, 之后所有插件操作
+    都回"已有插件操作正在进行中", 用户只能重启服务自救。现在无条件尝试放锁: 真的持有过
+    就放掉, 本来不是自己持的(begin 失败后 finally 也调 end)则 RLock 自己抛 RuntimeError,
+    既不破坏别人的互斥, 也把失衡登记下来供自检与排障。
+    """
     key = str(profile or "")
     with _PROFILE_LOCKS_GUARD:
         rec = _INFLIGHT.get(key)
-        if rec is None:
-            return
-        rec[1] -= 1
-        if rec[1] <= 0:
-            _INFLIGHT.pop(key, None)
-    _profile_lock(key).release()
+        if rec is not None:
+            rec[1] -= 1
+            if rec[1] <= 0:
+                _INFLIGHT.pop(key, None)
+    try:
+        _profile_lock(key).release()
+    except RuntimeError:
+        _OP_IMBALANCE.append(key)
+
+
+def op_imbalance():
+    """begin/end 失衡的次数与 profile(begin 失败后 finally 仍调 end 是正常来源)。"""
+    with _PROFILE_LOCKS_GUARD:
+        return list(_OP_IMBALANCE)
 
 
 def inflight_ops():

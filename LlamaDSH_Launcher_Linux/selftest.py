@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(171 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(192 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -1670,6 +1670,310 @@ finally:
         _proc5.kill()
         _proc5.wait()
     _errf5.close()
+
+# --- 14) 第六轮: 锁误用、静态/Host 边界、停止谎报、静默吞异常 -----------------
+# 这三族都由三份独立审查(锁与 with 用法 / 安全面断言级别 / except 吞点)挖出并已实测复现。
+
+import subprocess as _sub6
+import socket as _sock6
+import threading as _th6
+import http.client as _hc6
+
+# 14.1 llapimon: 在 `with self._lock:` 里调 add_event(同一把非重入 Lock) = 当场自死锁。
+#      触发条件是"运行中换模型", 后果是采集线程永久卡住 + 事件流与 UI 全冻, 零异常零日志。
+_mon6 = llapimon.LlamaApiMonitor(lambda: 1234)
+_mon6._ports = lambda _fast=False: [1234]
+_payload6 = [{"props": {"model_path": "/m/a.gguf", "model_alias": "a"}},
+             {"props": {"model_path": "/m/b.gguf", "model_alias": "b"}}]
+_mon6._get_json = lambda port, path, timeout=2.0: (
+    (_payload6.pop(0) if _payload6 else {}) if path == "/props" else {"data": []})
+
+
+def _fetch6():
+    for _ in range(2):
+        try:
+            _mon6._fetch_props_and_models()   # 第二次模型路径不同 → 走"模型已变化"那一支
+        except Exception:
+            pass
+_t6 = _th6.Thread(target=_fetch6, daemon=True)
+_t6.start()
+_t6.join(5.0)
+_snap6 = []
+_t6b = _th6.Thread(target=lambda: _snap6.append(_mon6.events_snapshot()), daemon=True)
+_t6b.start()
+_t6b.join(3.0)
+_msgs6 = [e["msg"] for e in (_snap6[0][0] if _snap6 else [])]
+check("换模型时采集线程不得自死锁(锁内调 add_event 就是这条, 卡死后事件流与 UI 全冻)",
+      not _t6.is_alive() and not _t6b.is_alive() and len(_snap6) == 1,
+      "采集线程活着=%s 快照线程活着=%s" % (_t6.is_alive(), _t6b.is_alive()))
+check("对照: 模型路径变化仍要留下那条 warn 事件(修法没把功能一起删掉)",
+      any("模型路径已变化" in m for m in _msgs6), str(_msgs6[:4]))
+_init6 = [l for l in inspect.getsource(llapimon.LlamaApiMonitor.__init__).splitlines()
+          if not l.strip().startswith("#")]
+check("不得再留着从未 acquire 的相似名锁(_http_lock 就是这次误用的诱因)",
+      not any("_http_lock" in l for l in _init6), "")
+
+# 14.2 child_pids 读不到时必须报告"数不清", 而不是"没有子进程": root 属主的 DSH 树会读到空,
+#      旧写法只杀根 PID 就宣称"已停止", 实际 node/pnpm 还占着端口。
+_kid6 = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+_tree6 = procman.child_pids(_kid6.pid)
+check("同 uid 的进程树要能枚举出来(含自身), 这是停止整树的前提",
+      isinstance(_tree6, list) and _kid6.pid in _tree6, str(_tree6))
+check("枚举不到时必须返回 None(旧写法返回 [] 会被当成\"确实没有子进程\"从而谎报已停止)",
+      procman.child_pids(999999999) is None, repr(procman.child_pids(999999999)))
+_kid6.terminate()
+_kid6.wait()
+
+
+class _P6:
+    def __init__(self, pid):
+        self.pid = pid
+        self.returncode = None
+
+    def poll(self):
+        return None
+
+
+_live6 = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+_realcp6, _realcl6 = core.procman.child_pids, core.procman.alive
+core.procman.child_pids = lambda pid: None          # 冒充 root 属主: /proc children 读不到
+_lr6 = core.LlamaRunner(_Silent(), {"defs": []})
+_lr6.proc = _P6(_live6.pid)
+try:
+    _lr6.stop()
+finally:
+    core.procman.child_pids, core.procman.alive = _realcp6, _realcl6
+check("整树没数清时不得落成 stopped(面板会把 Start 点亮, 再点就是撞端口)",
+      _lr6.status == "stop_failed", "%s pid 活着=%s" % (_lr6.status, _live6.poll() is None))
+_live6.terminate()
+_live6.wait()
+
+# 14.3 静态服务与 Host 边界: 隔离实例上真发包(旧版实测 GET /../main.py 直接吐服务端源码,
+#      且 GET 完全不看 Host → DNS rebinding 能同源读走注入的 API token)。
+_h6 = os.path.join(_tmp, "sec_home")
+_web6 = os.path.join(_tmp, "sec_webui")
+os.makedirs(_h6, exist_ok=True)
+shutil.copytree(os.path.join(APP, "webui"), _web6)
+os.symlink("../secret_source.py", os.path.join(_web6, "sneaky"))
+with open(os.path.join(_tmp, "secret_source.py"), "w", encoding="utf-8") as _fh6:
+    _fh6.write("DEF_MARKER def api_shutdown():\n")
+_s6 = _sock6.socket()
+_s6.bind(("127.0.0.1", 0))
+_p6 = _s6.getsockname()[1]
+_s6.close()
+_s6b = _sock6.socket()
+_s6b.bind(("127.0.0.1", 0))
+_dp6 = _s6b.getsockname()[1]
+_s6b.close()
+_code6 = ("import sys; sys.argv = ['main.py', '-p', '%d']; import main; "
+          "main.DSH_PORT = %d; main.WEBUI_DIR = %r; main.takeover_on_boot = lambda: None; "
+          "main.LLAMA.get_port = lambda: 0; main.webbrowser.open = lambda *a, **k: False; "
+          "main.main()") % (_p6, _dp6, _web6)
+_log6 = open(os.path.join(_tmp, "sec_stderr.txt"), "wb")
+_pr6 = _sub6.Popen([sys.executable, "-c", _code6], cwd=APP,
+                   env=dict(os.environ, HOME=_h6, XDG_CACHE_HOME=os.path.join(_h6, ".cache")),
+                   stdout=_log6, stderr=_log6)
+
+
+def _req6(method, path, host=None, tok=None, body=None):
+    _c = _hc6.HTTPConnection("127.0.0.1", _p6, timeout=5)
+    _h = {}
+    if host is None:
+        _c.putrequest(method, path)
+    else:
+        _c.putrequest(method, path, skip_host=True)
+        _h["Host"] = host
+    if tok:
+        _h["X-Auth"] = tok
+    _d = json.dumps(body) if body is not None else ""
+    _h["Content-Length"] = str(len(_d))
+    for _k, _v in _h.items():
+        _c.putheader(_k, _v)
+    _c.endheaders(_d.encode() if _d else None)
+    _r = _c.getresponse()
+    _t = _r.read().decode("utf-8", "replace")
+    _c.close()
+    return _r.status, _t
+
+
+_up6 = False
+try:
+    for _ in range(120):
+        if _pr6.poll() is not None:
+            break
+        try:
+            _q6 = _sock6.create_connection(("127.0.0.1", _p6), 0.2)
+            _q6.close()
+            _up6 = True
+            break
+        except OSError:
+            time.sleep(0.1)
+    _st1, _bd1 = _req6("GET", "/", host="evil.example")
+    check("GET 也要过 Host 白名单(否则 DNS rebinding 页面能同源读走注入的 API token)",
+          _st1 == 403 and "__DSH_TOKEN" not in _bd1, str(_st1))
+    _st2, _bd2 = _req6("GET", "/", host="127.0.0.1:%d" % _p6)
+    _st2b, _ = _req6("GET", "/", host="[::1]:%d" % _p6)
+    check("本机访问照常放行, 且 IPv6 字面量 [::1]:端口不被误拒",
+          _st2 == 200 and "__DSH_TOKEN" in _bd2 and _st2b == 200, str((_st2, _st2b)))
+    _trav = {}
+    for _pp in ("/../main.py", "/x/../../main.py", "//../main.py", "/./../main.py",
+                "/..%2fmain.py", "/%2e%2e/main.py", "/../../etc/passwd", "/sneaky"):
+        _trav[_pp] = _req6("GET", _pp)
+    _bad = {k: (v[0], "DEF_MARKER" in v[1] or "root:" in v[1]) for k, v in _trav.items()
+            if v[0] != 404 or "DEF_MARKER" in v[1] or "root:" in v[1]}
+    check("静态服务不得越出 webui(../ 变体、编码变体、树外符号链接一律 404 且不吐内容)",
+          _up6 and not _bad, str(_bad))
+    _st3, _bd3 = _req6("GET", "/app.js")
+    check("对照: webui 内的正常资产照样能取(边界没把前端锁死)",
+          _st3 == 200 and "stop_failed" in _bd3, str(_st3))
+    _tokfile6 = os.path.join(_h6, ".dsh_launcher_token")
+    _tok6 = open(_tokfile6, encoding="utf-8").read().strip() if os.path.isfile(_tokfile6) else ""
+    _mode6 = os.stat(_tokfile6).st_mode & 0o777 if _tok6 else 0
+    _inj6 = ""
+    _mm6 = _re.search(r'window\.__DSH_TOKEN=("(?:[^"\\]|\\.)*")', _bd2)
+    if _mm6:
+        _inj6 = json.loads(_mm6.group(1))
+    check("token 文件必须 0600 且与注入页面的那一份一致(umask 一变就退化成同机可读凭证)",
+          len(_tok6) >= 16 and _mode6 == 0o600 and _inj6 == _tok6, "mode=%o" % _mode6)
+    _st4 = _req6("POST", "/api/browse", body={"path": "/tmp"})[0]
+    _st5 = _req6("POST", "/api/browse", tok="deadbeef", body={"path": "/tmp"})[0]
+    _st6 = _req6("POST", "/api/browse", host="evil.example", tok=_tok6, body={"path": "/tmp"})[0]
+    _st7 = _req6("POST", "/api/no_such_route", tok=_tok6, body={})[0]
+    check("POST 无 token / 错 token 一律 401(鉴权在路由查表之前, 不存在的路由也不透露)",
+          _st4 == 401 and _st5 == 401 and _st7 == 404, str((_st4, _st5, _st7)))
+    check("带对 token 但 Host 不合法要 403: Host 与 token 两道各自独立生效",
+          _st6 == 403, str(_st6))
+finally:
+    if _pr6.poll() is None:
+        _pr6.kill()
+        _pr6.wait()
+    _log6.close()
+
+# 14.4 /tmp 下固定名的可执行脚本与日志: 共享目录里固定名 + 0755 + bash 执行, 符号链接劫持
+#      面(open("w") 跟随链接 → 把构建脚本写进任意本用户可写的文件)。
+_ns6 = os.path.join(_tmp, "tmpns")
+os.makedirs(_ns6, exist_ok=True)
+_oldenv6 = os.environ.get("TMPDIR")
+os.environ["TMPDIR"] = _ns6
+try:
+    _d6 = core._private_tmp_ns()
+    _mode_ns = os.stat(_d6).st_mode & 0o777
+    _link6 = os.path.join(_ns6, "llamadsh-%d" % os.getuid())
+    _canary6 = os.path.join(_ns6, "canary_dir")
+    os.makedirs(_canary6, exist_ok=True)
+    shutil.rmtree(_d6, ignore_errors=True)      # 撤掉真目录, 换成指向 canary 的符号链接
+    os.symlink(_canary6, _link6)
+    _d6b = core._private_tmp_ns()
+    check("boot/rebuild 日志与脚本要落在按 uid 命名、0700 的私有命名空间里",
+          _d6.startswith(_ns6) and _mode_ns == 0o700, "%s mode=%o" % (_d6, _mode_ns))
+    check("命名空间被预置成符号链接时必须改用不可预测名, 且不得跟随链接写进目标目录",
+          _d6b != _link6 and os.path.realpath(_d6b) != os.path.realpath(_canary6)
+          and os.listdir(_canary6) == [], "%s vs %s" % (_d6b, _canary6))
+    check("三个路径都必须落在命名空间内, 不再是 /tmp 根下的固定名(旧版 = /tmp/LlamaDSH_dsh_rebuild.sh)",
+          all(os.path.dirname(p) == core._TMP_NS
+              for p in (core.DSH_BOOT_LOG, core.DSH_REBUILD_LOG, core.DSH_REBUILD_SCRIPT))
+          and core._TMP_NS not in ("/tmp", "/"),
+          str([core._TMP_NS, core.DSH_REBUILD_SCRIPT]))
+finally:
+    if _oldenv6 is None:
+        os.environ.pop("TMPDIR", None)
+    else:
+        os.environ["TMPDIR"] = _oldenv6
+
+# 14.5 日志地基写不进去时必须留痕: HOME 只读/盘满/错位会让四个日志文件整体静默归零,
+#      于是"到底有没有异常"都无从判断(本轮排障就被这一点坑过一次)。
+_oldlog6 = core.applog.LOG_DIR
+core.applog.LOG_DIR = os.path.join(_tmp, "a_file_not_a_dir")
+with open(os.path.join(_tmp, "a_file_not_a_dir"), "w", encoding="utf-8") as _fh6b:
+    _fh6b.write("x")
+core.applog._write_warned = False
+_errbuf6 = io.StringIO()
+_olderr6 = sys.stderr
+try:
+    sys.stderr = _errbuf6
+    core.applog.run("第一条")
+    core.applog.run("第二条")
+finally:
+    sys.stderr = _olderr6
+    core.applog.LOG_DIR = _oldlog6
+    core.applog._write_warned = False
+_etr6 = _errbuf6.getvalue()
+check("日志写入失败必须往 stderr 说一次(只说一次), 而不是整族静默归零",
+      "日志写入失败" in _etr6 and _etr6.count("日志写入失败") == 1, _etr6[:160])
+
+# 14.6 profile 锁: 放锁与记账必须分开。旧写法在登记缺失时直接 return, 把 release 一起跳过。
+_held6 = []
+
+
+def _hold6():
+    _held6.append(_compat.begin_profile_op("lockprobe", "持锁者"))
+    time.sleep(1.5)                     # 真持有一段时间, 让主线程的"野 end"撞上别人的锁
+    _compat.end_profile_op("lockprobe")
+
+
+_th6c = _th6.Thread(target=_hold6)
+_th6c.start()
+time.sleep(0.3)
+_imb_before6 = len(_compat.op_imbalance())
+_end_ret6 = None
+try:
+    _end_ret6 = _compat.end_profile_op("lockprobe")      # 主线程不是持锁者: 不得崩, 也不得放别人的锁
+except Exception as _ex6:
+    _end_ret6 = "raised:%s" % _ex6
+_after6 = _compat.begin_profile_op("lockprobe", "外人")
+_ops6 = _compat.inflight_ops()
+_th6c.join(3.0)
+_ok_again6 = _compat.begin_profile_op("lockprobe", "收尾检查")
+_compat.end_profile_op("lockprobe")
+check("end 在无对应 begin 时不得崩, 也不能把别人持有的锁放掉(外人仍进不去)",
+      _end_ret6 is None and len(_compat.op_imbalance()) > _imb_before6 and _after6 is False,
+      str((_end_ret6, _after6)))
+check("锁不能被一次失衡的 end 永久泄漏(否则之后所有插件操作都回\"正在进行的插件操作\")",
+      _ok_again6 is True and _compat.inflight_ops() == [],
+      str((_after6, _ops6, _ok_again6)))
+
+# 14.7 5s 健康对账本身出错要能看见: 它是"DSH 崩了/llama 短命退出"唯一的状态回落点。
+import main                                    # 第 13 节只 import 成 _m5, 这里要模块名
+
+
+class _StopLoop6(Exception):
+    pass
+
+
+_calls6 = []
+_real_api_health6 = main.api_health
+_real_time6 = main.time
+_real_err_ex6 = main.HUB.error_ex
+main.api_health = lambda _b: (_ for _ in ()).throw(RuntimeError("对账内部炸了"))
+main.HUB.error_ex = lambda ex, ctx: _calls6.append((type(ex).__name__, ctx))
+
+
+def _sleep6(_s):
+    if len(_calls6) >= 1:
+        raise _StopLoop6()
+    time.sleep(0.05)
+
+
+# 只替换 main 模块看到的 time, 不动全局 time 模块(否则会波及本进程其它线程)
+main.time = types.SimpleNamespace(sleep=_sleep6, time=time.time)
+_loop6 = _th6.Thread(target=main._health_loop, daemon=True)
+_errbuf6b = io.StringIO()
+_olderr6b = sys.stderr
+try:
+    sys.stderr = _errbuf6b
+    _loop6.start()
+    _loop6.join(5.0)
+finally:
+    sys.stderr = _olderr6b
+    main.api_health, main.time = _real_api_health6, _real_time6
+    main.HUB.error_ex = _real_err_ex6
+    if _loop6.is_alive():                   # 兜底: 别让这个循环带着真 api_health 继续跑
+        main.api_health = lambda _b: None
+check("健康对账抛异常要进 error.log(旧写法吞掉 → 面板永远显示运行中且 guard 永久拒绝插件操作)",
+      len(_calls6) >= 1 and "健康对账" in _calls6[0][1], str(_calls6))
+check("信号处理器注册失败也必须留痕(挂不上等于整条收尾链不存在, 服务被杀就是孤儿)",
+      "信号处理器注册失败" in main_src, "")
+
 
 shutil.rmtree(_tmp, ignore_errors=True)
 

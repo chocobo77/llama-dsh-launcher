@@ -126,7 +126,8 @@ class LlamaApiMonitor:
     def __init__(self, port_getter):
         self._port_getter = port_getter      # () -> int, 只读线程安全缓存
         self._lock = threading.Lock()
-        self._http_lock = threading.Lock()  # urlopen 无并发问题, 仅保护计数
+        # 原先这里还有一把从未被 acquire 的 _http_lock: 死字段 + 与 _lock 形成相似名对,
+        # 正是下面那处"锁内调 add_event"误用的诱因(425 行前后), 删掉以免再踩。
         self._active_port = 0
         self._fail_streak = 0
         self._rescan_at = 0.0
@@ -402,6 +403,7 @@ class LlamaApiMonitor:
             leaf = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] if path else ""
             name = (body.get("model_alias") or "") or leaf
             mods = body.get("modalities") or []
+            changed_to = ""
             with self._lock:
                 prev = self._model.get("path") or ""
                 self._model = {
@@ -417,7 +419,13 @@ class LlamaApiMonitor:
                     "size": self._model.get("size"),
                 }
                 if prev and path and prev != path:
-                    self.add_event("warn", "服务加载的模型路径已变化 → %s" % path)
+                    changed_to = path
+            # 事件必须在锁**外**发: add_event 自己也要拿这把非重入 Lock, 在 with 块里调它
+            # 就是当场自死锁 —— 运行中换一次模型, 采集线程永久卡在这里, 且 _lock 一直被
+            # 持有, 于是 events_snapshot / 日志泵 add_event 全部阻塞: 监测与 UI 事件流整体
+            # 静默瘫痪, 没有任何异常或日志(2026-11-05 review 发现)。
+            if changed_to:
+                self.add_event("warn", "服务加载的模型路径已变化 → %s" % changed_to)
         models = self._get_json(port, "/v1/models")
         if isinstance(models, dict) and isinstance(models.get("data"), list) and models["data"]:
             d0 = models["data"][0] or {}

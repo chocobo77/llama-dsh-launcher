@@ -49,8 +49,13 @@ def _write_token_file():
         fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(API_TOKEN)
-    except OSError:
-        pass
+    except OSError as ex:
+        # token 文件是托盘/客户端拿鉴权凭证的**唯一**来源(网页端走 index.html 注入)。
+        # 写不出来时它们每次调用都 401, 而现场只看得到"unauthorized" —— 必须把原因
+        # (最常见是 HOME 只读/以 root 启动导致错位)落在 error.log 与 stdout 上。
+        applog.error("[鉴权] token 文件写入失败(%s: %s), 路径 %s —— 托盘与网页端会持续 401"
+                     % (type(ex).__name__, ex, TOKEN_FILE))
+        print("⚠ token 文件写入失败(%s): 托盘与网页端会持续 401, 路径 %s" % (ex, TOKEN_FILE))
 
 applog.info("========== LlamaDSH Launcher (Linux) 启动 ==========")
 
@@ -603,6 +608,8 @@ def _stop_all_and_exit(tag):
                 try:
                     victims = procman.child_pids(pid)
                 except Exception:
+                    victims = None
+                if victims is None:       # 整树枚举不出来(root 属主): 只能点名根 PID
                     victims = []
                 if pid not in victims:
                     victims.append(pid)
@@ -1070,7 +1077,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # Host 白名单: 挡跨站 POST(text/plain 表单能拼合法 JSON)与 DNS rebinding。
+    # **GET 也必须过**: 否则 rebinding 场景(evil.example → 127.0.0.1)下攻击者页面是
+    # 同源, 可直接读走 index.html 里注入的 API token —— 实测旧版 GET 完全不看 Host。
+    _ALLOWED_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+    def _host_ok(self):
+        h = (self.headers.get("Host") or "").strip()
+        if h.startswith("["):
+            h = h[1:].split("]")[0]         # IPv6 字面量写法是 [::1]:8788
+        else:
+            h = h.split(":")[0]             # 127.0.0.1:8788 / localhost:8788
+        return h in self._ALLOWED_HOSTS
+
     def do_GET(self):
+        if not self._host_ok():
+            return self._send(403, {"error": "forbidden host"})
         path = self.path.split("?")[0]
         if path in ("/", "/index.html"):
             return self._static_index()
@@ -1083,13 +1105,17 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as ex:
                 return self._send(500, {"error": str(ex)})
         safe = os.path.normpath(path.lstrip("/"))
-        full = os.path.join(WEBUI_DIR, safe)
-        if ((full == WEBUI_DIR or full.startswith(WEBUI_DIR + os.sep)) and os.path.isfile(full)):
-            return self._static(safe)
+        base = os.path.realpath(WEBUI_DIR)
+        full = os.path.realpath(os.path.join(base, safe))
+        # 必须按 realpath 比对再放行: 旧写法是 join 之后**不归一**直接 startswith, 于是
+        # safe="../main.py" 时那个串照样以 webui/ 开头 —— 实测 GET /../main.py 与
+        # /x/../../main.py 都返回 200 把服务端源码发出去。realpath 同时把 webui 里
+        # 被投下的符号链接(指向树外)一并挡掉。
+        if full != base and full.startswith(base + os.sep) and os.path.isfile(full):
+            return self._static(full)
         self._send(404, {"error": "not found"})
 
-    def _static(self, rel):
-        full = os.path.join(WEBUI_DIR, rel)
+    def _static(self, full):
         ext = os.path.splitext(full)[1]
         try:
             with open(full, "rb") as f:
@@ -1124,9 +1150,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, {"error": "bad request"})
         # CSRF: 浏览器可跨站提交 text/plain 表单拼合法 JSON 驱动全部 POST API;
-        # 校验 Host 白名单(DNS rebinding 同时被挡)
-        host = (self.headers.get("Host") or "").split(":")[0]
-        if host not in ("127.0.0.1", "localhost", "::1"):
+        # 校验 Host 白名单(DNS rebinding 同时被挡)。与 GET 用同一个 _host_ok,
+        # 免得两半白名单各自漂移(IPv6 字面量 [::1]:8788 以前在 POST 侧会被误拒)。
+        if not self._host_ok():
             return self._send(403, {"error": "forbidden host"})
         # 鉴权: 本机任意进程此前可无凭证驱动全部 POST(启停进程/装插件/浏览全盘)
         if (self.headers.get("X-Auth") or "") != API_TOKEN:
@@ -1226,8 +1252,13 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             signal.signal(sig, _on_term)
-        except (ValueError, OSError):
-            pass
+        except (ValueError, OSError) as ex:
+            # 挂不上就等于整条"收到信号 → 停 llama/DSH → 退出"的收尾链**不存在**: 服务被
+            # kill 或注销桌面会话时两者变孤儿, DSH 还留 stale lock(正是这段代码原本要修的
+            # 故障)。以前静默 pass, 事后连"有没有收到过信号"都看不出来。
+            applog.error("[收尾] 信号处理器注册失败(%s: %s) —— kill/注销不会走收尾, "
+                         "llama.cpp 与 DSH 会变孤儿" % (type(ex).__name__, ex))
+            print("⚠ 无法注册 SIGTERM/SIGINT 收尾处理器(%s): 结束服务时不会停止 llama.cpp/DSH" % ex)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1235,11 +1266,17 @@ def main():
 
 
 def _health_loop():
+    last_err = 0.0
     while True:
         try:
             api_health({})
-        except Exception:
-            pass
+        except Exception as ex:
+            # 这条 5s 对账是"DSH 崩了 / llama 短命退出"唯一的状态回落点: 它一断, 面板就
+            # 永远显示运行中, 插件操作也被 _dsh_running_guard 永久拒绝。以前连"对账本身
+            # 在报错"都看不见, 只能看到用户报的"明明没跑却装不了插件"。限流 60s 以免刷盘。
+            if time.time() - last_err > 60.0:
+                last_err = time.time()
+                HUB.error_ex(ex, "健康对账异常(此后每 60s 最多报一次, 对账仍在继续)")
         time.sleep(5)
 
 

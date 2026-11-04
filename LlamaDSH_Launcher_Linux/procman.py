@@ -52,16 +52,26 @@ def alive(pid):
 
 
 def child_pids(pid, max_depth=16):
-    """WMI ParentProcessId 递归的 /proc 等价;返回含自身 pid 的列表(叶子在前)。"""
-    out, frontier = [], [int(pid)]
-    seen = {int(pid)}
+    """WMI ParentProcessId 递归的 /proc 等价;返回含自身 pid 的列表(叶子在前)。
+
+    **枚举不了时返回 None, 不是 []**: `/proc/<pid>/task/<pid>/children` 只对同 uid 可读,
+    所以 root 属主的 DSH/llama 树会读到空。以前把"读不到"当成"确实没有子进程", 于是只杀
+    根 PID 就宣称"已停止", 实际 node/pnpm 还占着 3080(与"停止失败被说成已停止"同族缺陷)。
+    调用方要把"没数清"如实说出去。
+    """
+    root = int(pid)
+    out, frontier = [], [root]
+    seen = {root}
     depth = 0
+    enumerated = False
     while frontier and depth < max_depth:
         nxt = []
         for p in frontier:
             try:
                 with open("/proc/%d/task/%d/children" % (p, p)) as f:
                     kids = [int(x) for x in f.read().split()]
+                if p == root:
+                    enumerated = True
             except Exception:
                 kids = []
             for k in kids:
@@ -71,7 +81,9 @@ def child_pids(pid, max_depth=16):
                     nxt.append(k)
         frontier = nxt
         depth += 1
-    out.append(int(pid))
+    if not enumerated:
+        return None
+    out.append(root)
     out.reverse()  # 叶子先死
     return out
 
@@ -85,10 +97,14 @@ def kill_process_tree(pid, timeout=3.0):
     """
     if pid is None:
         return False
+    tree_certain = True
     try:
         pids = child_pids(pid)
     except Exception:
+        pids = None
+    if pids is None:          # 数不清整树(root 属主 / hidepid): 只能保证打到根 PID
         pids = [int(pid)]
+        tree_certain = False
     for p in pids:
         try:
             os.kill(p, signal.SIGTERM)
@@ -104,7 +120,9 @@ def kill_process_tree(pid, timeout=3.0):
             os.kill(p, signal.SIGKILL)
         except OSError:
             pass
-    return not any(alive(p) for p in pids)
+    # True 只表示"**确认**整树都不在了": 树没能枚举时即使根已死也返回 False, 让上层落在
+    # "未能确认已停止"(面板保持 Stop 可点、Start 不亮)而不是谎报"已停止"。
+    return (not any(alive(p) for p in pids)) and tree_certain
 
 
 def find_process_by_port(*ports, name_filter=None):
