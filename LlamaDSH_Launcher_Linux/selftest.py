@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(115 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(132 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -267,6 +267,74 @@ joined = "\n".join(logged)
 check("转换日志不拆半行", "part" not in joined.replace("partial2", "")
       and "partial2" in joined and "[转换] line1" in joined, joined[-300:])
 check("转换完成判定仍生效", done.get("p") is None and not conv.running, str(done))
+
+# run.log 每行由 applog 统一加日期: LogHub 再带一份就变成 "[日期] [时刻] 内容"
+import inspect as _insp
+_hlog = _insp.getsource(core.LogHub.log)
+check("run.log 不双时间戳(applog 已带日期, LogHub 只喂正文)",
+      "applog.run(text)" in _hlog and 'applog.run("[%s' not in _hlog
+      and 'self.run.append("[%s' in _hlog, _hlog.strip()[-120:])
+# --------------- LlamaRunner.stop 的幂等 / 用户停止不被 OOM 重启推翻 --------
+# 本轮 A1: 端口缓存存在而 proc is None 时, stop() 把 None 交给 kill_process_tree,
+#          它的 except 里 `pids = [int(pid)]` 对 None 再抛一次同一个 TypeError,
+#          异常逃出 stop() → 状态清理整段被跳过, 面板永远显示 running。
+# 本轮 A2: stop() 发的 SIGTERM 退出码是 -15, 以前走"异常退出"分支; 本轮见过 OOM
+#          时接着自动降层重启一个 llama-server —— 收尾场景下它就是孤儿。
+import procman
+
+_clear_real = core.state.clear_state_for
+core.state.clear_state_for = lambda which, state=None: None
+try:
+    class _Silent:
+        def log(self, text):
+            pass
+
+        def error_ex(self, *a):
+            pass
+
+    class _FakeProc:
+        pid = 4321
+
+        def wait(self):
+            return -15                    # SIGTERM: 我们自己 stop() 发的
+
+    def _drive(oom, user):
+        r = core.LlamaRunner(_Silent(), {"defs": []})
+        r.last_profile = {"OomRetryEnabled": True}
+        r.mem_state = {"oom_seen": oom, "offloaded": 30,
+                       "total_layers": 40, "buffers": {}}
+        r.proc = _FakeProc()
+        r.user_stopped = user
+        gone = []
+        r._relaunch = lambda: gone.append(1)
+        r._wait_exit()
+        time.sleep(0.3)                   # 降层重启在独立线程里
+        return r, gone
+
+    r_stop, gone_stop = _drive(True, True)
+    check("用户/收尾要的停不被 OOM 自动降层重启推翻(否则收尾时新 llama-server 变孤儿)",
+          gone_stop == [] and r_stop.status == "stopped" and r_stop.oom_retry_left == 3,
+          "%s %s" % (gone_stop, r_stop.status))
+    r_crash, gone_crash = _drive(True, False)
+    check("对照: 真崩溃且本轮 OOM 时仍会自动降层重启(新防线没把正常功能挡死)",
+          gone_crash == [1] and r_crash.status == "crashed",
+          "%s %s" % (gone_crash, r_crash.status))
+
+    r_idle = core.LlamaRunner(_Silent(), {"defs": []})
+    r_idle.proc = None
+    r_idle._cached_port = 8080            # 端口缓存还在, 进程早已自己退出
+    r_idle.status = "running"
+    try:
+        r_idle.stop()
+        err = ""
+    except Exception as ex:
+        err = "%s: %s" % (type(ex).__name__, ex)
+    check("stop() 只有端口缓存没有进程时幂等收尾(原必现 TypeError 的回归)",
+          not err and r_idle.status == "stopped" and r_idle.user_stopped, err)
+    check("kill_process_tree(None) 干净返回 False(端口查不到属主/进程已退)",
+          procman.kill_process_tree(None) is False, "")
+finally:
+    core.state.clear_state_for = _clear_real
 
 # ------------------------------------------------------- monitor 磁盘快照 --
 import monitor
@@ -645,14 +713,24 @@ def _boom(req, timeout=None):
 
 
 _urlopen_keep = _tray.urllib.request.urlopen
+_lockpid_keep = _tray._lock_pid
 _tray.urllib.request.urlopen = _boom
+_tray._lock_pid = lambda script: 0
 _tray._find_py_pids = lambda script: [4242]
 check("HTTP 不通但服务进程仍在 → 仍判活(不能就此跳过兜底清理)",
       _tray.TrayIcon._server_alive(_Fake()) is True, "")
 _tray._find_py_pids = lambda script: []
 check("HTTP 与进程都不在 → 判死", _tray.TrayIcon._server_alive(_Fake()) is False, "")
+# 锁文件里的 PID 也算活: 按脚本路径扫 /proc 会漏掉异目录安装/非 .py 入口/root 进程
+_tray._find_py_pids = lambda script: []
+_tray._lock_pid = lambda script: 4343
+check("服务锁文件里记着活 PID → 判活(/proc 扫不到时的第二条路)",
+      _tray.TrayIcon._server_alive(_Fake()) is True, "")
 _tray.urllib.request.urlopen = _urlopen_keep
+_tray._lock_pid = _lockpid_keep
 _tray._find_py_pids = _fp_orig
+check("_lock_pid 会校验 cmdline 防 PID 复用(否则会给无辜进程发 SIGTERM)",
+      "cmdline" in inspect.getsource(_tray._lock_pid), "")
 
 # 兜底 SIGTERM 的目标必须限定"本目录那份脚本": 只按文件名匹配会命中用户自己
 # 从别的目录(或安装副本)跑的 main.py, 一按"关闭服务并退出"就把无辜实例杀了
@@ -745,16 +823,53 @@ try:
     _tray.TrayIcon._stop_all_then_quit(g3)
 finally:
     sys.stdout = _s3
-check("确实停干净时在日志里明确写“已停止”(不能只留一句沉默)",
-      "已停止" in _b3.getvalue(), _b3.getvalue()[:120])
+# 注意: “未能确认”那行文案里本来就含“是否已停止”四个字, 所以判定不能粗到
+# 只查“已停止”子串(断言自己会假失败), 要查的是那句下结论的完整文案。
+_out3 = _b3.getvalue()
+check("停服前没拿到 PID 时说'未能确认', 不能武断报'已停止'",
+      "未能确认 llama.cpp/DSH" in _out3
+      and "llama.cpp 与 DSH 已停止" not in _out3 and "残留进程" not in _out3,
+      _out3[:140])
+
+
+class _FakeGone(_Fake):
+    """停服前抄到的是已经死掉的 PID —— 这次才允许报'已停止'"""
+
+    def _service_pids(self):
+        return [_dead_pid]
+
+
+_proc_gone = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.2)"])
+_dead_pid = _proc_gone.pid
+_proc_gone.wait()
+g4 = _FakeGone()
+g4.base_url = "http://127.0.0.1:1"
+_b4 = io.StringIO()
+_s4 = sys.stdout
+sys.stdout = _b4
+try:
+    _tray.TrayIcon._stop_all_then_quit(g4)
+finally:
+    sys.stdout = _s4
+check("确实停干净(PID 已消失)时才写'已停止'",
+      "llama.cpp 与 DSH 已停止" in _b4.getvalue(), _b4.getvalue()[:120])
 
 main_src = open(os.path.join(APP, "main.py"), encoding="utf-8").read()
 check("服务端有 /api/shutdown 路由", '("shutdown",): api_shutdown' in main_src)
 i0 = main_src.index("def _stop_all_and_exit")
-shut_src = main_src[i0:i0 + 1300]
+shut_src = main_src[i0:i0 + 2000]
 check("退出收尾停完 llama.cpp 与 DSH 才结束进程(顺序不能反)",
-      shut_src.index("os._exit") > shut_src.index("LLAMA") and "DSH" in shut_src,
+      shut_src.index("os._exit(0)") > shut_src.index("LLAMA") and "DSH" in shut_src,
       shut_src[:60])
+check("收尾有幂等闩: 重复 SIGTERM/Ctrl+C 不会起第二个收尾线程互相打断",
+      "_SHUTTING_DOWN" in shut_src and "if _SHUTTING_DOWN:" in shut_src, shut_src[:90])
+check("收尾挂看门狗: stop() 卡在 ss/lsof 时也不会永久挂住不退出",
+      "threading.Timer(30.0" in shut_src and "os._exit(1)" in shut_src, "")
+check("读 JOBS 前先取快照(直接迭代会和 run_job 的插入/pop 竞态)",
+      "snapshot = dict(JOBS)" in shut_src and "with JOB_LOCK" in shut_src, "")
+check("_dsh_running_guard 也看服务自己的 DSH 句柄(cmdline 探测带 10s 缓存会漏启动窗口)",
+      "DSH.proc is not None" in main_src[main_src.index("def _dsh_running_guard"):][:500]
+      and "rebuilding" in main_src[main_src.index("def _dsh_running_guard"):][:500], "")
 check("仍在跑的后台任务在退出前记进日志(os._exit 不让独立会话的长任务停下来)",
       'j["status"] == "running"' in shut_src, shut_src[:80])
 check("/api/shutdown 与信号收尾共用同一条路(不在两处各写一份)",
@@ -986,6 +1101,177 @@ _k, _d = _compat.filter_bundle_activation(
                        "missing_specs": [], "errors": []}], "web")
 check("装成功后有 dsh.bundle 也要先过激活守卫(审计不兼容就不自动激活)",
       _k == [] and _d and "peer" in _d[0]["reason"], str((_k, _d)))
+
+# --- 9) 本轮 review 补: 并发/回滚方向/打包忽略/空值守卫 --------------
+# 9.1 两个安装请求并发(main.py 是 ThreadingHTTPServer, 每请求一线程): 各自的备份与
+#     回滚会把对方刚写好的依赖覆盖掉 —— 等于悄悄丢掉别人装好的包。必须明确拒绝。
+_lk = _compat._install_lock("web")
+_lk.acquire()
+ok_conc, msg_conc = _compat.install_local_plugin("web", _tgz)
+_lk.release()
+check("并发本地安装被明确拒绝(两个安装不能互相覆盖 package.json)",
+      (not ok_conc) and "已有本地插件安装正在进行中" in msg_conc, msg_conc)
+
+# 9.2 pnpm add **成功之后**再出错(典型: 激活写 manifest 时备份失败抛 IOError):
+#     回滚方向是反的, 会把已经装好的包删掉还谎报"安装失败"。只报告, 不回滚。
+_m = json.load(open(os.path.join(_prof, "package.json")))
+_m["dependencies"]["demo-plugin"] = "file:/gone/again/demo-plugin-9.9.9.tgz"
+json.dump(_m, open(os.path.join(_prof, "package.json"), "w"))
+_act_keep = _compat.set_bundle_active
+
+
+def _boom_activate(profile, name, active):
+    raise IOError("备份 package.json 失败")
+
+
+_compat.set_bundle_active = _boom_activate
+_compat.subprocess.run = _fake_pnpm
+ok_ad, msg_ad = _compat.install_local_plugin("web", _tgz)
+_compat.subprocess.run = orig_compat_run
+_compat.set_bundle_active = _act_keep
+_dep_now = str((json.load(open(os.path.join(_prof, "package.json")))
+                .get("dependencies") or {}).get("demo-plugin"))
+check("pnpm add 成功之后的失败不得回滚成功安装(否则删掉好包还谎报失败)",
+      (not ok_ad) and "已安装成功" in msg_ad and "后续处理失败" in msg_ad
+      and _dep_now.startswith(os.path.join(_home, "packages")),
+      "%s | dep=%s" % (msg_ad[:150], _dep_now))
+
+# 9.3 备份失败时不许谎称"已回滚": 那句文案会让人以为 profile 还是原样。
+_orig_backup = _compat._backup
+_compat._backup = lambda path: None
+_compat.subprocess.run = _boom_run
+ok_nb, msg_nb = _compat.install_local_plugin("web", _tgz)
+_compat.subprocess.run = orig_compat_run
+_compat._backup = _orig_backup
+check("备份失败时文案必须说未能回滚, 不能报已回滚 package.json/lock",
+      (not ok_nb) and "备份失败未能回滚" in msg_nb
+      and "已回滚 package.json/lock" not in msg_nb, msg_nb[:150])
+
+# 9.4 打包: 作者写进 files 的条目原样带(哪怕目录叫 scripts/), main 入口缺失要补上。
+#     借 pnpm pack 的 cwd(就是暂存目录)直接看打进包里的文件清单。
+_pstage = {"files": [], "pj": {}}
+_pout = os.path.join(_tmp, "packout")
+os.makedirs(_pout)
+
+
+def _fake_pack(cmd, cwd=None, **kw):
+    _pstage["files"] = sorted(os.path.relpath(os.path.join(r, f), cwd)
+                              for r, _d, fs in os.walk(cwd) for f in fs)
+    _pstage["pj"] = json.load(open(os.path.join(cwd, "package.json")))
+    with open(os.path.join(_pout, "p2-1.0.0.tgz"), "wb") as fh:
+        fh.write(b"x")
+
+    class _R:
+        returncode, stdout, stderr = 0, "", ""
+    return _R()
+
+
+def _mk_pack_src(dirname, files_declared):
+    d = os.path.join(_tmp, dirname)
+    os.makedirs(os.path.join(d, "scripts", "node_modules"))
+    os.makedirs(os.path.join(d, "dist"))
+    for leaf in ("scripts/keep.js", "scripts/node_modules/inner.js",
+                 "index.js", "dist/a.js"):
+        with open(os.path.join(d, leaf), "w", encoding="utf-8") as fh:
+            fh.write("//x\n")
+    doc = {"name": "p2", "version": "1.0.0", "main": "index.js",
+           "scripts": {"prepack": "tsc", "start": "node index.js"}}
+    if files_declared:
+        doc["files"] = ["dist", "scripts"]
+    with open(os.path.join(d, "package.json"), "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    return d
+
+
+_plog = []
+_compat.subprocess.run = _fake_pack
+_p_decl = _compat._pack_staged(_mk_pack_src("pack_declared", True), _pout,
+                               job_log=_plog.append)
+_files_decl = list(_pstage["files"])
+_p_plain = _compat._pack_staged(_mk_pack_src("pack_plain", False), _pout,
+                                job_log=_plog.append)
+_files_plain = list(_pstage["files"])
+_compat.subprocess.run = orig_compat_run
+check("files 里显式声明的 scripts/ 必须原样进包(_PACK_IGNORE 只甩未声明的)",
+      "scripts/keep.js" in _files_decl and "dist/a.js" in _files_decl
+      and "scripts/keep.js" not in _files_plain,
+      "decl=%s plain=%s" % (_files_decl, _files_plain))
+check("main 入口被 files 排除时也要补进包(缺入口的包装上去就 ENOENT)",
+      "index.js" in _files_decl and "index.js" in _files_plain
+      and any("main 入口" in str(x) for x in _plog),
+      "%s | %s" % (_files_decl, _plog[-2:]))
+check("暂存打包必须剥掉 prepack(否则 pnpm 会在缺 devDependencies 的机器上跑 tsc)",
+      "prepack" not in _pstage["pj"].get("scripts", {})
+      and _pstage["pj"].get("scripts", {}).get("start") == "node index.js",
+      str(_pstage["pj"].get("scripts")))
+check("_pack_staged 返回本次新打的 tgz 而不是暂存目录",
+      _p_decl == os.path.join(_pout, "p2-1.0.0.tgz")
+      and _p_plain == os.path.join(_pout, "p2-1.0.0.tgz"),
+      "%s %s" % (_p_decl, _p_plain))
+
+# 9.5 空 dsh_dir 守卫: join("", "package.json") 会退化成读当前工作目录里的
+#     package.json —— 启动器自己的版本号会被当成 DSH 版本。
+_dshv = os.path.join(_tmp, "dshroot")
+os.makedirs(_dshv)
+with open(os.path.join(_dshv, "package.json"), "wb") as fh:
+    fh.write(b"\xef\xbb\xbf" + b'{"name": "dsh", "version": "0.9.31"}')
+check("空 dsh_dir 一律返回空版本/空集合(不能拿启动器自己的 package.json 冒充)",
+      _compat.get_dsh_version("") == "" and _compat.shipped_dsh_package_names("") == set()
+      and _compat.shipped_dsh_package_names(None) == set(), "")
+check("dsh 版本读取认带 BOM 的 package.json(utf-8 直读会炸 json)",
+      _compat.get_dsh_version(_dshv) == "0.9.31",
+      repr(_compat.get_dsh_version(_dshv)))
+
+# --- 10) 兜底 SIGTERM 遇到 root 属主的服务必须点名, 不能静默 ------------
+class _FakeDeny(_Fake):
+    """服务收到 SIGTERM 后仍没退出(老服务没有信号处理): 走兜底杀进程那条路。"""
+
+    def __init__(self):
+        _Fake.__init__(self)
+        self._probe = 0
+
+    def _server_alive(self):
+        # 探活序列: while 判定(活, 等) → while 判定(活, 等) → while 判定(死, 出循环)
+        # → if 判定(活 → 进兜底) → 之后一律判死。必须交替, 否则进不了兜底分支。
+        seq = (True, True, False, True)
+        return seq[self._probe] if self._probe < len(seq) else False
+
+
+_child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+_kill_real = _tray.os.kill
+_kill_seen = []
+
+
+def _kill_partial(pid, sig):
+    _kill_seen.append(pid)
+    if pid == 4343:
+        raise PermissionError(1, "Operation not permitted")
+    return _kill_real(pid, sig)
+
+
+_pids_keep, _lock_keep = _tray._find_py_pids, _tray._lock_pid
+_tray._find_py_pids = lambda script: [_child.pid, 4343]
+_tray._lock_pid = lambda script: 0
+_tray.os.kill = _kill_partial
+_d4 = _FakeDeny()
+_d4.base_url = "http://127.0.0.1:1"
+_b5 = io.StringIO()
+_s5 = sys.stdout
+sys.stdout = _b5
+try:
+    _tray.TrayIcon._stop_all_then_quit(_d4)
+finally:
+    sys.stdout = _s5
+    _tray.os.kill = _kill_real
+    _tray._find_py_pids, _tray._lock_pid = _pids_keep, _lock_keep
+_child.wait()
+check("兜底清理分清已发出/杀不掉: root 属主的服务要按 PID 点名(否则用户以为已停)",
+      "4343" in _b5.getvalue() and "属主不是本人" in _b5.getvalue()
+      and str(_child.pid) in _b5.getvalue(), _b5.getvalue()[:220])
+check("兜底 SIGTERM 后还要等服务确认死亡(否则 llama/DSH 还在跑就收了托盘)",
+      "for _ in range(20)" in inspect.getsource(_tray.TrayIcon._stop_all_then_quit), "")
+
+
 shutil.rmtree(_tmp, ignore_errors=True)
 
 print()

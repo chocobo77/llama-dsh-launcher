@@ -77,7 +77,14 @@ def child_pids(pid, max_depth=16):
 
 
 def kill_process_tree(pid, timeout=3.0):
-    """先杀叶子后杀父;SIGTERM → SIGKILL。"""
+    """先杀叶子后杀父;SIGTERM → SIGKILL。
+
+    pid 为 None(端口查不到属主 / 进程早已自行退出)时必须直接返回 False: 以前
+    except 分支里的 `pids = [int(pid)]` 会对 None 再抛一次同一个 TypeError, 异常
+    逃出 stop() → 上层把"其实没事"记成"停止失败", 其后的状态清理也被跳过。
+    """
+    if pid is None:
+        return False
     try:
         pids = child_pids(pid)
     except Exception:

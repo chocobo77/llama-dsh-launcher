@@ -560,19 +560,40 @@ def api_open_dsh(_):
     return {"url": url, "opened": opened}
 
 
+_SHUTDOWN_LATCH = threading.Lock()
+_SHUTTING_DOWN = False
+
+
 def _stop_all_and_exit(tag):
     """停 llama.cpp 与 DSH、交代在途任务, 然后结束服务进程。
 
     **所有**退出路径都必须走这里: 以前 Ctrl+C 与 SIGTERM 直接杀进程, llama.cpp 与 DSH
     就成了没人管的孤儿, DSH 还留下 stale lock, 下次启动表现为撞端口"启动失败"。
+
+    幂等 + 看门狗(两条都是 review 找出来的):
+    · 连按两次 Ctrl+C、托盘 45s 后补发的 SIGTERM、前端重复点"关闭服务并退出"都会二次
+      进入这里; 两个收尾线程并发跑 kill + os._exit 会互相打断 —— 先退出的一方掐掉
+      另一方正在进行的 SIGKILL, 恰好又造出孤儿。故第二次直接返回。
+    · stop() 内部可能卡在 ss/lsof(各 10s)或坏掉的 IO 上, 那样进程永不退出, 托盘只能
+      干等。故挂一个 30s 看门狗强制退出(托盘那侧会按 PID 复核并把残留点名)。
     """
+    global _SHUTTING_DOWN
+    with _SHUTDOWN_LATCH:
+        if _SHUTTING_DOWN:
+            return
+        _SHUTTING_DOWN = True
+    watchdog = threading.Timer(30.0, lambda: os._exit(1))
+    watchdog.daemon = True
+    watchdog.start()
     for name, runner in (("llama.cpp", LLAMA), ("DSH", DSH)):
         try:
             runner.stop()
         except Exception as ex:
             HUB.log("[%s] 停止 %s 失败: %s" % (tag, name, ex))
     try:
-        busy = ["%s(#%s)" % (j["name"], k) for k, j in JOBS.items()
+        with JOB_LOCK:                 # 直接迭代 JOBS 会和 run_job 的插入/pop 竞态
+            snapshot = dict(JOBS)     # (RuntimeError 被下面吞掉 → 警告静默消失)
+        busy = ["%s(#%s)" % (j["name"], k) for k, j in snapshot.items()
                 if j["status"] == "running"]
     except Exception:
         busy = []
@@ -816,7 +837,16 @@ def _dsh_dir_of(prof):
 
 
 def _dsh_running_guard():
-    """pnpm 会写 node_modules, 运行中拒绝(C# RequireDshStopped)。"""
+    """pnpm 会写 node_modules, 运行中拒绝(C# RequireDshStopped)。
+
+    除了端口/cmdline 探测, 还要看服务自己手里的 DSH 句柄与状态: procman 的 cmdline
+    探测带 10s 缓存(`_all_cmdlines`), 于是"DSH 刚 exec、端口还没监听"的窗口里两条外部
+    探测都报假 —— pnpm 就可能在 DSH 启动/重建过程中改 node_modules。
+    """
+    if DSH.proc is not None or DSH.tracker is not None:
+        return False
+    if DSH.status in ("starting", "running", "rebuilding"):
+        return False
     if procman.find_process_by_port(DSH_PORT) or procman.node_host_running():
         return False
     return True
@@ -873,7 +903,8 @@ def api_plugins_uninstall(body):
 def api_plugins_install_local(body):
     if not _dsh_running_guard():
         return {"error": "该操作需要先停止 DSH(会运行 pnpm 修改插件目录)。"}
-    # dsh_dir 必传: 装成功后的自动激活要先过审计守卫, 而审计需要 DSH 版本
+    # dsh_dir 传上: 激活守卫读的审计里, 死依赖(dead_peers)判定需要 DSH 源码树位置
+    # (peer 兼容本身只看 node_modules, 不依赖它)
     ok, msg = compat.install_local_plugin("web", body.get("source") or "", HUB.log,
                                           _dsh_dir_of(current_profile()[1]))
     return {"ok": ok, "msg": msg}

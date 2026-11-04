@@ -92,7 +92,7 @@ class LogHub:
             self._dsh_hidden = 0
         self._emit(text)
         self.run.append("[%s] %s" % (ts, text))
-        applog.run("[%s] %s" % (ts, text))
+        applog.run(text)      # applog 自己带日期: 再传一遍时间戳会在 run.log 里双戳
 
     def error_ex(self, ex, ctx):
         applog.error_ex(ex, ctx)
@@ -131,6 +131,10 @@ class LlamaRunner:
         # OOM 自动降层重试(0314b6b + 4bf9416)
         self.oom_retry_left = 3
         self.oom_retry_active = False
+        # 用户/收尾主动停止的标志: 没有它, stop() 发出的 SIGTERM 会被 _wait_exit
+        # 当成"异常退出"(退出码 -15), 本轮见过 OOM 时接着自动降层重启一个
+        # llama-server —— 收尾场景下那个新进程直接变成孤儿。
+        self.user_stopped = False
         self.mem_state = {"oom_seen": False, "offloaded": 0, "total_layers": 0, "buffers": {}}
         self.persist_config = None  # main.py 注入: 降层落盘
         self._pump_threads = []
@@ -236,6 +240,7 @@ class LlamaRunner:
         if self.running:
             return False, "Already running"
         self.last_profile = profile
+        self.user_stopped = False     # 新会话开始, 清掉上一次的"用户已停"
         self.cache_port_from_profile(profile)
         if cmd_list is None:
             try:
@@ -313,7 +318,14 @@ class LlamaRunner:
         self.api.reset_log_machine()
         self.proc = None
         state.clear_state_for("LlamaPid")
-        if code != 0:
+        if self.user_stopped:
+            # stop() 自己发的 SIGTERM: 退出码是 -15/-9, 绝不能走下面的"异常退出"
+            # 分支, 否则本轮见过 OOM 时会自动降层再拉一个 llama-server 起来
+            # (收尾/关服务时那个新进程就是孤儿)。
+            self.status = "stopped"
+            self.hub.log("--- Llama 已停止(用户请求) ---")
+            self.oom_retry_left = 3
+        elif code != 0:
             self.status = "crashed"
             self.hub.log("--- Llama 异常退出 (退出码 %s) --- 请查看上方日志,通常是显存不足或参数错误导致 ---" % code)
             self._maybe_oom_retry()
@@ -326,6 +338,8 @@ class LlamaRunner:
     # ------------------------------------------------------------ OOM 降层 --
     def _maybe_oom_retry(self):
         """退出码非 0 且检测到 OOM → --gpu-layers ×0.85(下限 4)自动重启,最多 3 次。"""
+        if self.user_stopped:
+            return                      # 二次防线: 用户/收尾要的"停"不能被重启推翻
         st = self.mem_state
         if not (st.get("oom_seen") and self.oom_retry_left > 0 and self.last_profile):
             return
@@ -389,15 +403,28 @@ class LlamaRunner:
         elif port > 0:
             pid = procman.find_process_by_port(port, name_filter=("llama-server",))
         else:
+            pid = None
+        # 先立标志再杀: _wait_exit 会看到它, 不会把 SIGTERM 的 -15 当崩溃去 OOM 重启
+        self.user_stopped = True
+        if pid is None:
+            # 没在跑(或已经自己退出): 幂等收尾, 不谎报"停止失败"也不抛异常
+            self._finish_stop(quiet=True)
             return
         self.hub.log("--- 正在停止 Llama ---")
-        procman.kill_process_tree(pid)
+        if not procman.kill_process_tree(pid):
+            # kill_process_tree 的返回值以前被丢掉, 于是 root 属主/杀不掉的进程
+            # 也照样打印"已停止"
+            self.hub.log("[Llama] ⚠ 进程 PID %s 未能停止(可能以 root 启动), 请手动结束" % pid)
+        self._finish_stop()
+
+    def _finish_stop(self, quiet=False):
         self.proc = None
         self.status = "stopped"
         self.api.reset_log_machine()
         self.mem_state = {"oom_seen": False, "offloaded": 0, "total_layers": 0, "buffers": {}}
         self.oom_retry_active = False
-        self.hub.log("--- 已停止 ---")
+        if not quiet:
+            self.hub.log("--- 已停止 ---")
         state.clear_state_for("LlamaPid")
 
 
@@ -688,17 +715,27 @@ class DshRunner:
             if procman.alive(pid):
                 if procman.which("sudo"):
                     try:
-                        subprocess.Popen(["sudo", "-n", "kill", "-9", str(pid)],
-                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        self.hub.log("--- 提权 DSH 进程普通停止无效,已下发 sudo kill ---")
-                    except OSError:
-                        self.hub.log("[DSH] 无法停止进程 PID %d,请手动结束" % pid)
+                        r = subprocess.run(["sudo", "-n", "kill", "-9", str(pid)],
+                                           capture_output=True, text=True,
+                                           encoding="utf-8", errors="replace", timeout=15)
+                        time.sleep(0.6)
+                        if not procman.alive(pid):
+                            self.hub.log("--- 提权 DSH 进程普通停止无效, 已用 sudo kill 停止 ---")
+                        elif r.returncode == 0:
+                            self.hub.log("[DSH] ⚠ 已下发 sudo kill 但进程 PID %d 仍在, 请手动结束" % pid)
+                        else:
+                            # 以前 Popen 不查返回码, sudo 要密码/无 NOPASSWD 时也报"已下发"
+                            self.hub.log("[DSH] ⚠ 进程 PID %d 属主不是本人且提权失败(%s), 请手动 sudo kill"
+                                         % (pid, ((r.stderr or r.stdout or "").strip() or "无权限")[:120]))
+                    except OSError as ex:
+                        self.hub.log("[DSH] 无法停止进程 PID %d,请手动结束: %s" % (pid, ex))
                 else:
                     self.hub.log("[DSH] 进程 PID %d 仍存活,请手动结束" % pid)
         self.tracker = None
         self.proc = None
         self.status = "stopped"
-        self.hub.log("--- 已停止 DSH ---")
+        if pid:                         # 从没运行过就别报告"已停止"
+            self.hub.log("--- 已停止 DSH ---")
         state.clear_state_for("DshPid")
 
     def rebuild(self, profile, on_done=None):

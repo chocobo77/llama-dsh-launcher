@@ -11,6 +11,7 @@ import glob
 import json
 import time
 import shutil
+import threading
 import datetime
 import subprocess
 import tempfile
@@ -45,10 +46,16 @@ def profile_dir(profile="web"):
 
 
 def get_dsh_version(dsh_dir):
+    dsh_dir = (dsh_dir or "").strip().strip('"')
+    if not dsh_dir:
+        # 空 dsh_dir 时 os.path.join("", "package.json") 退化成相对路径 → 读到
+        # **当前工作目录**里某个无关 package.json 的版本号(启动器 cwd 就在自己目录,
+        # 但被别的调用方换过 cwd 时会拿到假版本)
+        return ""
     for rel in (os.path.join("apps", "cli", "package.json"), "package.json"):
         p = os.path.join(dsh_dir, rel)
         try:
-            with open(p, encoding="utf-8") as f:
+            with open(p, encoding="utf-8-sig") as f:
                 v = (json.load(f) or {}).get("version")
             if v:
                 return v
@@ -665,6 +672,9 @@ def _manifest_name(path):
 
 def shipped_dsh_package_names(dsh_dir):
     """DSH 源码树中所有 workspace 包名(packages/apps/vendor/native/benchmarks/website)。"""
+    dsh_dir = (dsh_dir or "").strip().strip('"')
+    if not dsh_dir:
+        return set()          # 不知道 DSH 在哪: 空集比"把启动器自己当成源码树"诚实
     key = os.path.abspath(dsh_dir)
     if key in _shipped_cache:
         return _shipped_cache[key]
@@ -1122,15 +1132,23 @@ def _pnpm_error_tail(out, limit=600):
     return ("\n".join(hits) if any(hits) else text)[-limit:]
 
 
-def _copy_entry(src, dst):
+def _copy_entry(src, dst, use_ignore=True):
+    """复制一个条目, 返回是否真复制了。
+
+    use_ignore=False 用于 package.json 里**显式声明**的条目: `_PACK_IGNORE`(scripts/
+    docs/tests/…)是甩开发期目录的, 但插件完全可能把运行期资产放在名为 scripts/ 的
+    目录里 —— 作者自己写进 files 的就必须原样带上, 否则打出的是缺资产的包。
+    """
     if not os.path.exists(src):
-        return
+        return False
     if os.path.isdir(src):
         shutil.copytree(src, dst, dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns(*sorted(_PACK_IGNORE)))
+                        ignore=(shutil.ignore_patterns(*sorted(_PACK_IGNORE))
+                                if use_ignore else None))
     else:
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
         shutil.copy2(src, dst)
+    return True
 
 
 def _pack_staged(src_dir, out_dir, job_log=None):
@@ -1150,14 +1168,30 @@ def _pack_staged(src_dir, out_dir, job_log=None):
         doc = read_json(src_pj, None)
         if not doc:
             return None
+        declared = isinstance(doc.get("files"), list)
+        absent = []
         for entry in _pack_entries(src_dir, doc.get("files")):
-            _copy_entry(os.path.join(src_dir, entry), os.path.join(stage, entry))
+            if not _copy_entry(os.path.join(src_dir, entry), os.path.join(stage, entry),
+                               use_ignore=not declared):
+                absent.append(entry)
+        if absent and job_log:
+            job_log("[插件安装] 注意: files 声明的条目在源目录里不存在: %s"
+                    % ", ".join(absent[:6]))
         # package.json 与 bundle patch 必须在, 即使 files 没列
         _copy_entry(src_pj, os.path.join(stage, "package.json"))
+        # main 入口被 files 排除时, pnpm 会照常打出一个缺入口的包(装上去就 ENOENT),
+        # 所以这里补进来 —— 缺入口的包比多几个文件危险得多
+        main_rel = _rel_path(doc.get("main"))
+        if main_rel and not os.path.exists(os.path.join(stage, main_rel)):
+            if _copy_entry(os.path.join(src_dir, main_rel), os.path.join(stage, main_rel),
+                           use_ignore=False) and job_log:
+                job_log("[插件安装] 注意: main 入口 %s 不在 files 声明里, 已一并打入包内"
+                        % main_rel)
         bundle = (doc.get("dsh") or {}).get("bundle")
         patch = _rel_path(bundle.get("patch")) if isinstance(bundle, dict) else ""
         if patch:
-            _copy_entry(os.path.join(src_dir, patch), os.path.join(stage, patch))
+            _copy_entry(os.path.join(src_dir, patch), os.path.join(stage, patch),
+                        use_ignore=False)
         scripts = doc.get("scripts")
         if isinstance(scripts, dict):
             for name in ("prepack", "prepare", "postinstall"):
@@ -1197,6 +1231,9 @@ def _spec_ok(s):
         return True, ""
     head, sep, tail = s.rpartition("@")
     if sep and _safe_pkg(head):
+        # name@file:<本地包> / name@link:<目录> 也是合法 spec(回填旧依赖时就会用到)
+        if tail.startswith(("file:", "link:")):
+            return True, ""
         if not _RANGE_RE.match(tail):
             return False, "非法版本范围: %r" % (s,)
         return True, ""
@@ -1221,6 +1258,16 @@ def _pnpm_add_spec(cwd, spec):
     r = subprocess.run(["pnpm", "add", s], cwd=cwd, capture_output=True, text=True,
                        encoding="utf-8", errors="replace", timeout=900, env=_pnpm_env())
     return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
+
+
+_INSTALL_LOCKS = {}
+_INSTALL_LOCKS_GUARD = threading.Lock()
+
+
+def _install_lock(profile):
+    """同一 profile 的本地安装必须串行(见 install_local_plugin 里的拒绝分支)。"""
+    with _INSTALL_LOCKS_GUARD:
+        return _INSTALL_LOCKS.setdefault(str(profile or ""), threading.Lock())
 
 
 def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
@@ -1251,6 +1298,8 @@ def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
     packages_dir = os.path.join(dsh_home(), "packages")
     pack_temp = None
     spec, name, version = "", "", ""
+    installed, got = "", ""            # 安装成功后的包名/版本(异常文案要用, 必须先绑定)
+    add_done = False                   # pnpm add 成功后不得再回滚
     manifest = os.path.join(base, "package.json")
     lockfile = os.path.join(base, "pnpm-lock.yaml")
     manifest_bak = lock_bak = None
@@ -1281,10 +1330,17 @@ def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
                 return None
         except ValueError:
             return None
-        if os.path.realpath(tgz_src) != dest:
+        # 两边都要 realpath: ~/.dsh 本身是符号链接时, 拿 realpath(src) 和逻辑 dest
+        # 永远不相等 → 对同一文件 copy2 → SameFileError 被当成"安装异常"
+        if os.path.realpath(tgz_src) != os.path.realpath(dest):
             shutil.copy2(tgz_src, dest)
         return dest
 
+    if not _install_lock(profile).acquire(blocking=False):
+        # main.py 是 ThreadingHTTPServer, 两个安装请求会并发跑到这里: 各自的备份/回滚会用
+        # "自己进入时"的快照覆盖对方刚写好的依赖(等于丢掉对方装好的包), pnpm 也会同时改
+        # 同一个 project。宁可明确拒绝, 不排队让用户以为卡死。
+        return False, "已有本地插件安装正在进行中, 请等它结束后再试"
     try:
         if is_dir:
             name, version = _package_identity(src)
@@ -1348,16 +1404,20 @@ def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
         ok, out = _pnpm_add_spec(base, spec)
         if not ok:
             _rollback()
-            note = "(已回滚 package.json/lock)"
+            rolled = "已回滚 package.json/lock" if manifest_bak else \
+                     "⚠ 备份失败, 无法回滚 package.json/lock"
+            note = "(%s)" % rolled
             if removed_spec:
                 # 旧依赖已被 pnpm remove 掉而新装又失败: manifest 回滚了但 node_modules
                 # 里还是缺包, 尽力把旧 spec 装回去, 装不回去就把话说清楚
-                back_ok, _ = _pnpm_add(base, name, "@" + removed_spec)
-                note = ("已回滚 package.json/lock, 并已把原依赖 %s%s 装回"
-                        % (name, removed_spec)) if back_ok else (
-                        "已回滚 package.json/lock, 但同名旧依赖此前已被移除且未能装回: "
-                        "如插件不可用请在插件列表点\"修复\"")
+                spec_ok, _ = _spec_ok(name + "@" + removed_spec)
+                back_ok = spec_ok and _pnpm_add(base, name, "@" + removed_spec)[0]
+                note = ("%s, 并已把原依赖 %s%s 装回" % (rolled, name, removed_spec)
+                        if back_ok else
+                        ("%s, 但同名旧依赖此前已被移除且未能装回: "
+                         "如插件不可用请在插件列表点\"修复\"") % rolled)
             return False, "本地插件安装失败: %s %s" % (_pnpm_error_tail(out), note)
+        add_done = True                   # 从这里起 pnpm 已经装成功, 后面再错也不能回滚
 
         after = _profile_deps(base)
         installed = name
@@ -1398,13 +1458,23 @@ def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
     except Exception as ex:
         # pnpm 超时/OSError/package.json 坏 JSON 等: 不回滚就把 profile 停在半安装状态,
         # 而且裸 traceback 会冒到 API 层变成"未知错误"
-        _rollback()
         tail = "超时" if isinstance(ex, subprocess.TimeoutExpired) else repr(ex)
-        return False, ("本地插件安装异常(%s), %s已重试请查看日志"
-                       % (tail, "已回滚 package.json/lock; " if manifest_bak else ""))
+        if add_done:
+            # pnpm **已经装成功**之后的失败(典型: 激活写 manifest 时备份失败抛 IOError):
+            # 这时候回滚方向是反的 —— 会把成功的安装删掉并谎报失败。只报告, 不回滚。
+            return False, ("插件 %s%s 已安装成功, 但后续处理失败(%s): 依赖声明已生效,"
+                           " 请在插件列表里手动激活/刷新确认"
+                           % (installed or name or "(包名未识别)",
+                              ("@" + got) if got else (("@" + version) if version else ""),
+                              tail))
+        _rollback()
+        return False, ("本地插件安装异常(%s), %s请重试并查看日志"
+                       % (tail, "已回滚 package.json/lock; " if manifest_bak else
+                          "⚠ 备份失败未能回滚; "))
     finally:
         if pack_temp:
             shutil.rmtree(pack_temp, ignore_errors=True)
+        _install_lock(profile).release()
 
 
 def exempt_plugin(profile, name, version):

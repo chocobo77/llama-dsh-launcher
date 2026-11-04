@@ -175,11 +175,13 @@ class TrayIcon:
             print("[tray] 退出确认已在进行中, 忽略重复点击")
             return
         # 窗口开着就一直占住, 直到 _do_exit 里判定"取消"才放开(见 _do_exit),
-        # 免得用户在 45s 等待期间再点一次, 弹第二个框/重复停服。
-        self._exit_busy_until = now + 320   # 确认框自身 timeout=300
+        # 免得用户在等待期间再点一次, 弹第二个框/重复停服。
+        # 上界要盖住 worker 的两段超时: --check 30s + 确认框 300s + 回投余量。
+        self._exit_busy_until = now + 400
 
         def worker():
             rc, out, err = 2, "", ""
+            stage = "check"
             try:
                 dlg = os.path.join(APP_DIR, "traydialog.py")
                 # 先 --check: 无桌面/GTK3 缺失时 GTK 自己 exit(1), 会被当成"用户取消"
@@ -190,6 +192,7 @@ class TrayIcon:
                     err = (chk.stderr or chk.stdout or "").strip() or "桌面不可用"
                     rc = 2
                 else:
+                    stage = "dialog"
                     p = subprocess.run(
                         [sys.executable, dlg,
                          "退出 LlamaDSH 启动器",
@@ -201,7 +204,8 @@ class TrayIcon:
                     rc, out, err = (p.returncode, (p.stdout or "").strip(),
                                     (p.stderr or "").strip())
             except subprocess.TimeoutExpired:
-                rc, err = 4, "确认框超过 300s 没有应答"
+                rc, err = 4, ("桌面探测(--check)超过 30s 未返回" if stage == "check"
+                              else "确认框超过 300s 没有应答")
             except Exception as ex:
                 rc, err = 3, repr(ex)
             try:
@@ -252,14 +256,24 @@ class TrayIcon:
         while time.time() < deadline and self._server_alive():
             time.sleep(0.5)
         if self._server_alive():
-            # 兜底: 服务没自尽(老服务无 /api/shutdown 等), 按 /proc 找出来终止
-            pids = _find_py_pids("main.py")
-            for pid in pids:
+            # 兜底: 服务没自尽(老服务无 /api/shutdown 等), 按 /proc + 锁文件找出来终止
+            targets = _find_py_pids("main.py")
+            lp = _lock_pid("main.py")
+            if lp and lp not in targets:
+                targets.append(lp)          # 异目录/非 .py 入口时 /proc 扫不到, 锁文件能兜住
+            killed, denied = [], []
+            for pid in targets:
                 try:
                     os.kill(pid, signal.SIGTERM)
+                    killed.append(pid)
+                except PermissionError:
+                    denied.append(pid)      # root 属主的服务普通权限杀不掉, 必须说出来
                 except OSError:
                     pass
-            print("[tray] 服务未自行退出, 已发 SIGTERM: %s" % (pids or "未找到进程"))
+            msg = "[tray] 服务未自行退出, 已发 SIGTERM: %s" % (killed or "未找到进程")
+            if denied:
+                msg += "; ⚠ 这些进程属主不是本人(可能 sudo 启动), 普通权限杀不掉: %s" % denied
+            print(msg)
             for _ in range(20):             # 新 main.py 收到 SIGTERM 也会自行收尾
                 if not self._server_alive():
                     break
@@ -268,11 +282,19 @@ class TrayIcon:
         if left:
             print("[tray] ⚠ llama.cpp/DSH 未能停止, 残留进程 PID: %s"
                   " (若以 root 启动需手动关闭)" % ", ".join(str(p) for p in left))
-        else:
+        elif svc_pids:
             print("[tray] llama.cpp 与 DSH 已停止")
+        else:
+            # 停服前一个 PID 都没拿到(服务没回 /api/status, 或 llama 只按端口存在而
+            # status 里 pid 为 null): 这是"不知道", 不是"已停止" —— 不能替用户下结论
+            print("[tray] 未能确认 llama.cpp/DSH 是否已停止(停服前服务未回 PID),"
+                  " 请在 Web 界面确认一眼")
         self._close_window()
-        from gi.repository import GLib
-        GLib.idle_add(self.on_quit)
+        try:
+            from gi.repository import GLib
+            GLib.idle_add(self.on_quit)
+        except Exception as ex:
+            print("[tray] 退出主循环投递失败: %s" % ex)
 
     def _service_pids(self):
         """当前在跑的 llama.cpp / DSH 进程 PID(退出后复核用)。"""
@@ -296,11 +318,17 @@ class TrayIcon:
             return True
         except Exception:
             pass
+        if _lock_pid("main.py"):
+            return True                     # 服务自己写的锁文件里还记着活 PID
         return bool(_find_py_pids("main.py"))
 
     def _close_window(self):
         """关掉主窗口进程(若开着): 走它自己的 SIGTERM 收尾路径。"""
-        for pid in _find_py_pids("client.py"):
+        pids = _find_py_pids("client.py")
+        lp = _lock_pid("client.py")
+        if lp and lp not in pids:
+            pids.append(lp)
+        for pid in pids:
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
@@ -540,6 +568,31 @@ def _layout_node(node, depth, variant=False):
 
 
 
+
+
+def _lock_pid(script):
+    """服务/窗口自己写的 fcntl 锁文件里记的 PID —— 判定"我们这一份实例"是否在跑。
+
+    按脚本路径扫 /proc 会漏: 非 .py 入口、`python3 -m`、装在别的目录的同一份、
+    cwd 已被删除的进程, 以及 root 进程读不到 cwd 的情况。锁文件里的 PID 是进程自己
+    写的, 不依赖这些; 这里再校验一次 cmdline 里有同名脚本, 防 PID 被复用。
+    """
+    leaf = ".llamadsh_launcher_linux.lock" if script == "main.py" \
+        else ".llamadsh_launcher_window.lock"
+    try:
+        pid = int((open(os.path.join(os.path.expanduser("~"), leaf)).read() or "0").strip())
+    except (OSError, ValueError):
+        return 0
+    if pid <= 0 or not os.path.isdir("/proc/%d" % pid):
+        return 0
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            args = fh.read().split(b"\0")
+    except OSError:
+        return 0
+    if not any(os.path.basename(a.decode("utf-8", "ignore")) == script for a in args):
+        return 0
+    return pid
 
 
 def _find_py_pids(script):
