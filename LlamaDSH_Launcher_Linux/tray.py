@@ -60,8 +60,9 @@ class TrayIcon:
         self.bus = dbus.SessionBus()
         # 规范: org.kde.StatusNotifierItem-<pid>(不能把带 . : 的 URL 拼进总线名)
         self.name = "org.kde.StatusNotifierItem-%d" % os.getpid()
+        self.menu_path = "/MenuBar"
         self.item = _SniObject(self.bus, "/StatusNotifierItem", self)
-        self.menu = _DBusMenuObject(self.bus, "/MenuBar", self)
+        self.menu = _DBusMenuObject(self.bus, self.menu_path, self)
         # 申请 well-known 名; 结果不校验——真正的注册是 RegisterStatusNotifierItem
         self.bus.request_name(self.name)
 
@@ -122,6 +123,16 @@ class TrayIcon:
         if fn:
             GLib.idle_add(fn)
 
+    def dbg(self, what, *args):
+        """宿主(桌面)对托盘的每一次调用留痕(默认关闭, DSH_TRAY_DEBUG=1 打开)。
+
+        "右键无菜单/左键无反应"这类问题的答案只存在于宿主侧: 是宿主没调用、
+        调用了但参数不同、还是我们应答失败 —— 有留痕一眼可判(本轮的 Menu 属性
+        类型错误就是靠"宿主一个方法都没调用"这条反证定位的)。"""
+        if not os.environ.get("DSH_TRAY_DEBUG"):
+            return
+        print("[tray.dbus] %s %s" % (what, " ".join(str(a)[:70] for a in args)), flush=True)
+
     def toggle_light(self):
         on = not self.lightweight
         def post():
@@ -153,15 +164,18 @@ if _DBUS_OK:
         # TypeError(journal: "failed to activate"), 左键/双击永远打不开窗口。
         @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii", out_signature="")
         def Activate(self, x, y):
+            self.tray.dbg("Activate", "x=%s y=%s" % (x, y))
             self.tray.on_show()
 
         @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii", out_signature="")
         def SecondaryActivate(self, x, y):
+            self.tray.dbg("SecondaryActivate", "x=%s y=%s" % (x, y))
             self.tray.on_show()
 
         @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii", out_signature="")
         def ContextMenu(self, x, y):
-            pass  # 菜单由 ItemIsMenu + /MenuBar 承载
+            self.tray.dbg("ContextMenu", "x=%s y=%s" % (x, y))
+            # 菜单由 ItemIsMenu + /MenuBar 承载; 宿主若走这条路说明它没建 dbusmenu 客户端
 
         # Wayland 激活令牌: 宿主(扩展 appIndicator.js:774)会在 Activate 前递过来;
         # 不实现则扩展记 hasProvideXdgActivationToken=false 并跳过(不报错, 但窗口焦点策略会退化)
@@ -209,7 +223,11 @@ if _DBUS_OK:
                 "OverlayIconName": "",
                 "AttentionIconName": "",
                 "ItemIsMenu": True,
-                "Menu": "/MenuBar",
+                # Menu 在规范里是 **object path(o)**, 不是字符串: GDBus 按 StatusNotifierItem.xml
+                # 校验属性类型, s 与声明的 o 不符就把整个属性丢掉(journal: "Received property Menu
+                # with type s does not match expected type o"), 扩展的 this._proxy.Menu 变 null
+                # → menuPath 为空 → 宿主从不创建 dbusmenu 客户端 → 右键只有空菜单
+                "Menu": dbus.ObjectPath(self.tray.menu_path),
                 "ToolTip": dbus.Struct(
                     (dbus.String("llamadsh-launcher"),
                      dbus.Array([], signature="(iiay)"),
@@ -242,6 +260,8 @@ if _DBUS_OK:
         @dbus.service.method("com.canonical.dbusmenu", in_signature="iias",
                              out_signature="u(ia{sv}av)")
         def GetLayout(self, parent, depth, props):
+            self.tray.dbg("GetLayout", "parent=%s" % parent, "depth=%s" % depth,
+                          "props=%s" % list(props))
             root = self.tray._layout()
             node = _find_node(root, int(parent)) or root
             # depth: -1 = 全展开, 0 = 只要本节点不带子项
@@ -249,9 +269,11 @@ if _DBUS_OK:
 
         @dbus.service.method("com.canonical.dbusmenu", in_signature="i", out_signature="b")
         def AboutToShow(self, _id):
+            self.tray.dbg("AboutToShow", "id=%s" % _id)
             return True  # 让客户端每次弹出前重取布局(轻量化复选状态会变)
 
-        @dbus.service.signal("com.canonical.dbusmenu", signature="uu")
+        # 规范: LayoutUpdated(**u** revision, **i** parent) —— parent 是 int32 不是 uint32
+        @dbus.service.signal("com.canonical.dbusmenu", signature="ui")
         def LayoutUpdated(self, revision, parent):
             pass
 
@@ -261,6 +283,8 @@ if _DBUS_OK:
         @dbus.service.method("com.canonical.dbusmenu", in_signature="aias",
                              out_signature="a(ia{sv})")
         def GetGroupProperties(self, ids, props):
+            self.tray.dbg("GetGroupProperties", "ids=%s" % list(ids),
+                          "props=%s" % list(props))
             flat = _flatten_layout(self.tray._layout())
             rows = []
             for raw in ids:
@@ -273,7 +297,9 @@ if _DBUS_OK:
                                         signature=None))
             return dbus.Array(rows, signature="(ia{sv})")
 
-        # 对象级属性(规范要求的 Status/IconName/IconThemePath): 宿主可能走 Properties 读
+        # 对象级属性: 宿主(GNOME 扩展)用自带 DBusMenu.xml 建 GDBus 代理并按声明类型校验
+        # 缓存属性 —— 类型不符(比如把 as 写成 s)会让代理报 "property is invalid"。
+        # XML 声明: Version(u) TextDirection(s) Status(s) IconThemePath(**as**)
         @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ss", out_signature="v")
         def Get(self, iface, prop):
             vals = self.GetAll(iface)
@@ -285,7 +311,12 @@ if _DBUS_OK:
 
         @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="s", out_signature="a{sv}")
         def GetAll(self, iface):
-            return {"Status": "normal", "IconName": "", "IconThemePath": ""}
+            return {
+                "Version": dbus.UInt32(3),
+                "TextDirection": "none",
+                "Status": "normal",
+                "IconThemePath": dbus.Array([], signature="s"),
+            }
 
         @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ssv", out_signature="")
         def Set(self, iface, prop, value):
@@ -293,6 +324,7 @@ if _DBUS_OK:
 
         @dbus.service.method("com.canonical.dbusmenu", in_signature="isvu", out_signature="")
         def Event(self, _id, event, _data, _ts):
+            self.tray.dbg("Event", "id=%s" % _id, "event=%s" % event)
             if event == "clicked":
                 try:
                     self.tray._fire(int(_id))
