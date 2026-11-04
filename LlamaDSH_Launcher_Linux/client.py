@@ -127,14 +127,26 @@ def run_gtk(base_url):
         win.set_default_size(1400, 950)
         win.set_icon_from_file(os.path.join(ICON_DIR, "icon256.png"))
         try:
-            win.set_wmclass(APP_ID, APP_ID)  # XWayland 下的 StartupWMClass
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.simplefilter("ignore", DeprecationWarning)
+                win.set_wmclass(APP_ID, APP_ID)  # XWayland 下的 StartupWMClass
         except Exception:
             pass
 
+        # WebKit 磁盘缓存: set_disk_cache_directory 在新版已废弃且"does nothing"
+        # (实测告警), 改用 WebsiteDataManager —— 必须在创建 WebView 之前挂上
+        ctx = WebKit2.WebContext.get_default()
+        try:
+            mgr = WebKit2.WebsiteDataManager(
+                base_data_directory=os.path.expanduser(
+                    "~/.local/share/llamadsh-launcher/webkit"),
+                base_cache_directory=os.path.expanduser(
+                    "~/.cache/llamadsh-launcher/webkit"))
+            ctx.set_website_data_manager(mgr)
+        except Exception:
+            pass
         web = WebKit2.WebView()
-        ctx = web.get_context()
-        ctx.set_disk_cache_directory(os.path.expanduser(
-            "~/.cache/llamadsh-launcher/webkit"))
         # 外部链接(http://127.0.0.1:3080 等)交给系统浏览器打开
         web.connect("decide-policy", _on_policy)
         sw = Gtk.ScrolledWindow()
@@ -164,7 +176,12 @@ def run_gtk(base_url):
 
     def _on_policy(_web, decision, dtype):
         try:
-            uri = decision.get_request().get_uri()
+            import warnings as _w
+            with _w.catch_warnings():
+                # 新 WebKit 废弃 get_request(导航类才有 navigation_request),
+                # 但非导航决定仍需它取 URI —— 静音警告, 语义不变
+                _w.simplefilter("ignore", DeprecationWarning)
+                uri = decision.get_request().get_uri()
             internal = uri == base_url or uri.startswith(base_url + "/")
             if dtype == WebKit2.PolicyDecisionType.RESPONSE and not internal:
                 # 外部主资源响应交系统浏览器

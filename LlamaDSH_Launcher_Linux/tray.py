@@ -310,6 +310,10 @@ def main():
     if not _DBUS_OK:
         print("python3-dbus 不可用, 托盘助手无法运行(apt install python3-dbus)")
         sys.exit(1)
+    # 必须在创建任何总线连接之前挂 GLib 主循环: 默认总线会被缓存,
+    # _session_bus_ready() 的预检先建连接的话, 后面导出 SNI 对象会直接抛
+    # "D-Bus connections must be attached to a main loop"
+    DBusGMainLoop(set_as_default=True)
     if not _session_bus_ready():
         print("会话总线/StatusNotifierWatcher 不可达(SSH 会话或未装托盘扩展), 托盘不可用")
         sys.exit(2)  # 约定: start.sh 捕获 2 → 降级浏览器模式
@@ -322,11 +326,8 @@ def main():
     if base is None:
         print("无法启动/连接本地服务")
         sys.exit(1)
-    DBusGMainLoop(set_as_default=True)
 
     from gi.repository import GLib
-    GLib.threads_init()
-
     loop = GLib.MainLoop()
     tray = TrayIcon(base,
                     on_show=lambda: _spawn_window(base),
