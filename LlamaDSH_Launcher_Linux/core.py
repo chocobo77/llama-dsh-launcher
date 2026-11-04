@@ -79,8 +79,13 @@ class LogHub:
         self.seq += 1
         self.ring.append((self.seq, text))
 
+    # 去重只该吞"刷屏"的重复行。收尾/退出这类一行代表**一次请求**的行被吞掉, 就会让
+    # "为什么又没退成功"在 run.log 里完全看不见(连点两次"关闭服务并退出", 第二次零痕迹,
+    # 现场排障时只能看到一次请求, 误判成"请求根本没到服务端")。
+    _DEDUP_EXEMPT = ("[Perf] Error", "[退出]", "[收到 SIGINT]", "[收到 SIGTERM]")
+
     def log(self, text):
-        if text == self._last_line and not text.startswith("[Perf] Error"):
+        if text == self._last_line and not text.startswith(self._DEDUP_EXEMPT):
             return
         self._last_line = text
         ts = time.strftime("%H:%M:%S")

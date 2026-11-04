@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(170 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(171 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -1568,6 +1568,28 @@ check("收尾真的停了 llama.cpp 与 DSH 并留了日志(不是只 os._exit �
       str((_stop5, _log5[-2:])))
 check("重复收尾只退出一次(两个收尾线程并发就是互相掐断 kill, 恰好又造孤儿)",
       _exit5 == [0] and _stop5 == ["llama", "dsh"], str((_exit5, _stop5)))
+
+
+# 13.1b 去重不能把"代表一次请求"的收尾行也吞掉: 连点两次"关闭服务并退出", 第二次必须
+#       在 run.log 里看得见, 否则现场只能看到一次请求, 会误判成"请求没到服务端"。
+_h5b = core.LogHub()
+_w5b = []
+_realw5b = core.applog.run
+core.applog.run = lambda t: _w5b.append(t)
+try:
+    _h5b.log("[退出] 关闭服务并退出: 停止 llama.cpp 与 DSH…")
+    _h5b.log("[退出] 关闭服务并退出: 停止 llama.cpp 与 DSH…")
+    _h5b.log("普通的一行")
+    _h5b.log("普通的一行")
+    _h5b.log("收到 SIGTERM 也要留两次")
+    _h5b.log("[收到 SIGTERM] 开始收尾")
+    _h5b.log("[收到 SIGTERM] 开始收尾")
+finally:
+    core.applog.run = _realw5b
+check("重复的收尾/信号行必须照样落日志(去重吞掉就等于第二次退出请求零痕迹)",
+      len([x for x in _w5b if x.startswith("[退出]")]) == 2
+      and len([x for x in _w5b if x.startswith("[收到 SIGTERM]")]) == 2
+      and len([x for x in _w5b if x == "普通的一行"]) == 1, str(_w5b))
 
 # 13.2 端到端: 隔离 HOME 起一个真服务实例, 真打一次 /api/shutdown, 它必须真的退出。
 # 三处必须中和, 否则测试会去动用户的真环境: takeover_on_boot(可能接管真 DSH)、
