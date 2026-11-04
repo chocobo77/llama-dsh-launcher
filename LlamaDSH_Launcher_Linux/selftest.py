@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(199 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(209 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
+自检自己也被约束(第 17 节): applog.LOG_DIR 在**任何被测模块 import 之前**就改到临时目录,
+     跑自检不得往用户的 ~/.dsh_launcher_logs 里写一行。
 注意: 本机没有 Xvfb/输入注入工具, traydialog 的退出码契约只能真弹一次窗
       (约 0.2s 一闪), 否则那 4 项只能空转。
 每项断言都对应一个真实踩过的坑, 修 bug 前先跑它, 修完再跑它。
@@ -14,6 +16,7 @@ import os
 import shutil
 import struct
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -22,6 +25,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0] or ".")))
 APP = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP)
 os.chdir(APP)
+
+# 自检绝不能往用户的真实日志目录里写。以前每跑一次 selftest, ~/.dsh_launcher_logs/
+# error.log 里就多几条测试噪声(2026-11-05 实测: 一次跑留下 "资产名形态非法:
+# ../evil.tar.gz" 与"摘要不一致"两条), 用户排障时会把它们当成真事故, 真事故的密度
+# 也被稀释。必须**在任何被测模块 import 之前**改好 —— LOG_DIR 全进程只有一份。
+import applog as _applog_top          # noqa: E402
+_REAL_LOG_DIR = _applog_top.LOG_DIR
+_SELFTEST_HOME = tempfile.mkdtemp(prefix="llamadsh_selftest_home_")
+_applog_top.LOG_DIR = os.path.join(_SELFTEST_HOME, "logs")
 
 FAILS = []
 
@@ -2195,6 +2207,34 @@ check("对照: 正常 tar 照旧能解出并给 llama-* 补上可执行位(修�
       and os.access(os.path.join(_found8, "llama-server"), os.X_OK),
       str(_found8))
 
+
+# --- 17) 自检自身的边界: 不得污染用户真实的日志目录 ---------------------------
+# 17.1 以前 selftest 直接往 ~/.dsh_launcher_logs 写: 每跑一次就多出几条测试噪声
+#      ("资产名形态非法: ../evil.tar.gz"、"摘要与直连不一致"), 用户排障时会把它们当成
+#      真事故, 同时真事故的密度被稀释。今天(2026-11-05)的四次自检运行在 error.log 里
+#      留下了 8 行这样的内容, 由 grep 直接取证。
+_mk17 = "SELFTEST-MARKER-%d" % os.getpid()
+_applog_top.run(_mk17)
+_applog_top.error(_mk17)
+_real_txt17 = ""
+if os.path.isdir(_REAL_LOG_DIR):
+    for _f17 in sorted(os.listdir(_REAL_LOG_DIR)):
+        try:
+            with open(os.path.join(_REAL_LOG_DIR, _f17), encoding="utf-8", errors="replace") as _fh17:
+                _real_txt17 += _fh17.read()
+        except OSError:
+            pass
+check("自检的日志必须落在自己的临时目录, ~/.dsh_launcher_logs 里不得出现自检标记",
+      _applog_top.LOG_DIR != _REAL_LOG_DIR
+      and _applog_top.LOG_DIR.startswith(_SELFTEST_HOME)
+      and _mk17 in open(os.path.join(_applog_top.LOG_DIR, "run.log"), encoding="utf-8").read()
+      and _mk17 not in _real_txt17,
+      "%s | 真目录里命中=%s" % (_applog_top.LOG_DIR, _mk17 in _real_txt17))
+check("core/applog/main/toolchain 必须共用同一份 LOG_DIR(改一处仍会写真目录)",
+      core.applog.LOG_DIR == main.applog.LOG_DIR == toolchain.applog.LOG_DIR == _applog_top.LOG_DIR,
+      str((core.applog.LOG_DIR, main.applog.LOG_DIR, toolchain.applog.LOG_DIR)))
+
+shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)
 
 print()
