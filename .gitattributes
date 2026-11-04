@@ -11,6 +11,9 @@
 *.cmd text eol=crlf
 *.bat text eol=crlf
 *.md text eol=lf
+# shell 脚本必须 LF: autocrlf 下检出成 CRLF 会让 Linux 侧 bash 报 bad interpreter
+*.sh text eol=lf
+*.py text eol=lf
 
 # Binary files
 *.png binary

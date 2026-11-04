@@ -122,7 +122,11 @@ def latest_v24():
     for base in DIST_MIRRORS:
         try:
             data = json.loads(_http_get(base + "/index.json", timeout=20))
-            cands = [d["version"] for d in data if d.get("version", "").startswith("v24.")]
+            # 版本号随后要拼进下载 URL 与本地文件名: 含 ../、引号、空格即为
+            # 路径穿越/参数注入面, 先过形态白名单(对齐 Windows NodeSetup)。
+            cands = [d["version"] for d in data
+                     if d.get("version", "").startswith("v24.")
+                     and re.fullmatch(r"v\d+\.\d+\.\d+", d["version"])]
             if cands:
                 def key(v):
                     return tuple(int(x) for x in v.lstrip("v").split("."))

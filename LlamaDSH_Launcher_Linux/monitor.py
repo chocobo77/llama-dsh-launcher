@@ -10,6 +10,7 @@
 import os
 import re
 import glob
+import threading
 import time
 import subprocess
 
@@ -127,6 +128,33 @@ def _disk_statvfs():
         except OSError:
             continue
     return out[:6]
+
+
+# 磁盘容量行后台快照: statvfs 打到失联的 fuse/网络设备会卡进内核 D 态,
+# 每拍在采集线程上直接跑会把 llama 状态/GPU 采样/显存熔断整条链一起挂住。
+# 后台 30s 刷新、采集侧只读缓存(Windows 版 DrivesCached 的 Linux 等价);
+# 读写速率仍走 /proc/diskstats 每拍差分, 不受影响。
+_disk_rows = {"rows": [], "at": 0.0, "busy": False}
+
+
+def _disk_rows_cached():
+    now = time.time()
+    c = _disk_rows
+    if now - c["at"] > 30.0 and not c["busy"]:
+        c["busy"] = True
+
+        def refresh():
+            try:
+                rows = _disk_statvfs()
+                if rows:                    # 刷新失败保留旧行, 面板不清空
+                    c["rows"] = rows
+            except Exception:
+                pass
+            finally:
+                c["at"] = time.time()
+                c["busy"] = False
+        threading.Thread(target=refresh, daemon=True).start()
+    return [dict(d) for d in c["rows"]]
 
 
 def _disk_io_rates():
@@ -374,7 +402,7 @@ def sample_system():
     if now - _sys_cache["t"] < _CACHE_SECS and _sys_cache["v"]:
         return _sys_cache["v"]
     cm = cpu_mem_usage()
-    disks = _disk_statvfs()
+    disks = _disk_rows_cached()
     io = _disk_io_rates()
     for d in disks:
         key = next((k for k in io if d["dev"].startswith(k) or k.startswith(d["dev"])), None)

@@ -10,6 +10,7 @@ import sys
 import json
 import time
 import fcntl
+import secrets
 import argparse
 import threading
 import traceback
@@ -34,6 +35,21 @@ WEBUI_DIR = os.path.join(APP_DIR, "webui")
 LOCK_FILE = os.path.join(os.path.expanduser("~"), ".llamadsh_launcher_linux.lock")
 DSH_PORT = 3080
 DEFAULT_PORT = 8788
+
+# 本机 API 鉴权 token: POST 面能启停进程/pnpm 装插件/浏览全盘,
+# 此前仅 Host 白名单——本机任意进程即可驱动全部 API(等价本机 RCE)。
+# 浏览器经 index.html 注入获得; client.py/tray.py 经 token 文件(0600)获得。
+API_TOKEN = secrets.token_urlsafe(24)
+TOKEN_FILE = os.path.join(os.path.expanduser("~"), ".dsh_launcher_token")
+
+
+def _write_token_file():
+    try:
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(API_TOKEN)
+    except OSError:
+        pass
 
 applog.info("========== LlamaDSH Launcher (Linux) 启动 ==========")
 
@@ -890,7 +906,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         if path in ("/", "/index.html"):
-            return self._static("index.html")
+            return self._static_index()
         if path == "/favicon.ico":
             return self._send(204, b"", "image/x-icon")
         # GET /api/status: 供客户端自举探测与轻量轮询使用(客户端 _probe 走 GET)
@@ -914,6 +930,20 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             self._send(404, {"error": "not found"})
 
+    def _static_index(self):
+        """index.html + 注入本次启动的 API token(app.js 统一带 X-Auth 头)。"""
+        try:
+            with open(os.path.join(WEBUI_DIR, "index.html"), encoding="utf-8") as f:
+                html = f.read()
+        except OSError:
+            return self._send(404, {"error": "not found"})
+        inject = "<script>window.__DSH_TOKEN=%s;</script>" % json.dumps(API_TOKEN)
+        if "</head>" in html:
+            html = html.replace("</head>", inject + "</head>", 1)
+        else:
+            html = inject + html
+        self._send(200, html.encode("utf-8"), MIME[".html"])
+
     def do_POST(self):
         path = self.path.split("?")[0].strip("/")
         if path.startswith("api/"):
@@ -931,6 +961,9 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").split(":")[0]
         if host not in ("127.0.0.1", "localhost", "::1"):
             return self._send(403, {"error": "forbidden host"})
+        # 鉴权: 本机任意进程此前可无凭证驱动全部 POST(启停进程/装插件/浏览全盘)
+        if (self.headers.get("X-Auth") or "") != API_TOKEN:
+            return self._send(401, {"error": "unauthorized"})
         fn = ROUTES.get((path,))
         if fn is None:
             return self._send(404, {"error": "unknown api: " + path})
@@ -967,12 +1000,16 @@ def main():
         # "a" 模式: 第二实例 flock 失败即退出, 但 open("w") 已截断运行实例写的 pid
         _lockfh = open(LOCK_FILE, "a")
         fcntl.flock(_lockfh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # 拿到锁后清空旧 pid 再写本次的, 残留旧 pid 不再误导排障
+        _lockfh.truncate(0)
         _lockfh.write(str(os.getpid()))
         _lockfh.flush()
     except OSError:
         print("已经在运行中(锁文件 %s)。如确认未运行,请删除该文件。" % LOCK_FILE)
         sys.exit(1)
 
+    _write_token_file()
+    toolchain.cleanup_update_tmp()   # 上次崩溃留下的 .part/解压目录, 启动时清掉
     takeover_on_boot()
     threading.Thread(target=MON.loop, daemon=True).start()
     threading.Thread(target=_health_loop, daemon=True).start()

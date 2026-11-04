@@ -76,11 +76,21 @@ def ensure_server(port):
     return None
 
 
+def _api_token():
+    """main.py 启动时写入的 0600 token 文件; POST 需带 X-Auth。"""
+    try:
+        with open(os.path.expanduser("~/.dsh_launcher_token"), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def set_lightweight(base, on):
     try:
         req = urllib.request.Request(base + "/api/lightweight",
                                      data=json.dumps({"on": bool(on)}).encode(),
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json",
+                                              "X-Auth": _api_token()})
         urllib.request.urlopen(req, timeout=3)
         return True
     except Exception:

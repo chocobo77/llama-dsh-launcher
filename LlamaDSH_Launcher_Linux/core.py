@@ -9,6 +9,7 @@ import os
 import re
 import glob
 import json
+import shlex
 import time
 import shutil
 import threading
@@ -269,7 +270,7 @@ class LlamaRunner:
         self._pump()
         threading.Thread(target=self._verify_after, args=(3.0,), daemon=True).start()
         self.hub.log("--- 正在启动 Llama ---\n" + cmdline.fmt_cmd(cmd_list, defs))
-        state.save_state({"LlamaPid": p.pid})
+        state.update_state(LlamaPid=p.pid)
         return True, None
 
     def _pump(self):
@@ -502,17 +503,18 @@ class DshRunner:
         self.verify_stop.clear()
         self._deadline = time.time() + 30.0
 
+        # 不拼 bash -c 脚本:目录走 Popen 的 cwd,命令走 argv 列表——
+        # DshDir 是 webui 可编辑字段,拼进 shell 等于命令注入。
         if profile.get("DshAdminMode"):
-            inner = {"compiled-js": "node apps/cli/lib/bin.js web",
-                     "compiled-tsx": "pnpm dsh web",
-                     "npx": "npx --yes @deepseek-ai/dsh web"}[mode]
+            inner = {"compiled-js": ["node", "apps/cli/lib/bin.js", "web"],
+                     "compiled-tsx": ["pnpm", "dsh", "web"],
+                     "npx": ["npx", "--yes", "@deepseek-ai/dsh", "web"]}[mode]
             if not procman.which("sudo"):
                 self.hub.log("[DSH] 管理员模式需要 sudo,当前环境不可用 → 启动失败(不回退普通启动)")
                 self.status = "failed"
                 return False, "sudo 不可用"
-            script = "cd \"%s\" && exec %s" % (dsh_dir, inner)
             self.hub.log("--- 正在启动 DSH (%s · sudo 提权) ---" % mode)
-            ok = self._spawn(["sudo", "-n", "bash", "-c", script], detached=True)
+            ok = self._spawn(["sudo", "-n"] + inner, detached=True, cwd=dsh_dir or None)
             if not ok:
                 self.hub.log("[DSH] sudo 提权启动失败(可能需要密码),不回退普通启动")
                 self.status = "failed"
@@ -522,27 +524,29 @@ class DshRunner:
         else:
             self.admin_mode = False
             if mode == "compiled-js":
-                script = "cd \"%s\" && exec node apps/cli/lib/bin.js web" % dsh_dir
+                argv = ["node", "apps/cli/lib/bin.js", "web"]
             elif mode == "compiled-tsx":
                 if os.path.isfile(os.path.join(dsh_dir, "apps", "cli", "lib", "bin.js")):
                     self.hub.log("--- 编译版启动失败,本次回退到 pnpm dsh web ---")
-                script = "cd \"%s\" && exec pnpm dsh web" % dsh_dir
+                argv = ["pnpm", "dsh", "web"]
             else:
-                script = "exec npx --yes @deepseek-ai/dsh web"
+                argv = ["npx", "--yes", "@deepseek-ai/dsh", "web"]
             self.hub.log("--- 正在启动 DSH (%s · 分离模式) ---" % mode)
-            if not self._spawn(["bash", "-c", script], detached=True):
+            if not self._spawn(argv, detached=True, cwd=dsh_dir or None):
                 self.status = "failed"
                 return False, "启动失败"
         self._start_tailer()
         threading.Thread(target=self._verify_loop, daemon=True).start()
         return True, None
 
-    def _spawn(self, argv, detached=True):
+    def _spawn(self, argv, detached=True, cwd=None):
         try:
             fh = open(DSH_BOOT_LOG, "ab")
             kwargs = {}
             if detached:
                 kwargs["start_new_session"] = True
+            if cwd:
+                kwargs["cwd"] = cwd
             self.proc = subprocess.Popen(argv, stdout=fh, stderr=subprocess.STDOUT,
                                          stdin=subprocess.DEVNULL, **kwargs)
             self._tailer_fh = fh
@@ -607,7 +611,7 @@ class DshRunner:
                 self.verify_stop.set()
                 self.tracker = procman.ProcessTracker(pid)
                 self.status = "running_admin" if self.admin_mode else "running"
-                state.save_state({"DshPid": pid, "DshDir": self.last_profile.get("DshDir", "")})
+                state.update_state(DshPid=pid, DshDir=self.last_profile.get("DshDir", ""))
                 self.hub.log("DSH real PID:%d" % pid)
                 return
             if fast_fail or time.time() >= self._deadline:
@@ -628,7 +632,7 @@ class DshRunner:
         self.status = "running"
         self.hub.log("%s (PID %d)" % (log_prefix, pid))
         if save_state:
-            state.save_state({"DshPid": pid})
+            state.update_state(DshPid=pid)
 
     def stop(self):
         self.verify_stop.set()
@@ -670,7 +674,7 @@ class DshRunner:
                 return False, "DSH 仍在运行,中止重建"
         script = "\n".join([
             "#!/usr/bin/env bash",
-            "cd \"%s\" || exit 1" % dsh_dir,
+            "cd %s || exit 1" % shlex.quote(dsh_dir),
             "echo \"=== 1/3 pnpm clean ===\"",
             "pnpm clean",
             "if [ $? -ne 0 ]; then echo EXITCODE:1; exit 1; fi",
@@ -946,6 +950,11 @@ class Converter:
         return None
 
     def start(self, src_dir, outtype, on_done):
+        # 白名单前置:outtype 直接来自请求体,后面会拼进产物文件名与命令行
+        if outtype not in ("f16", "f32", "q8_0"):
+            self.hub.log("[转换] 非法 outtype: %r(仅支持 f16/f32/q8_0),中止" % (outtype,))
+            on_done(None)
+            return
         script = self.find_convert_script()
         if not script:
             self.hub.log("[转换] 未找到 convert_hf_to_gguf.py(需要 llama.cpp 仓库或 ~/.dsh_launcher_tools)。")
@@ -996,8 +1005,11 @@ class Converter:
         log_path = os.path.join(src_dir, CONVERT_LOG_NAME)
         open(log_path, "wb").close()
         self._log_pos = 0
-        cmd = "python3 \"%s\" \"%s\" --outfile \"%s\" --outtype %s >> \"%s\" 2>&1; echo EXITCODE:$? >> \"%s\"" % (
-            script, src_dir, out_file, outtype, log_path, log_path)
+        # 每个元素都过 shlex.quote:src_dir 直接来自请求体,
+        # 未加引号的拼接是命令注入(payload: `f16; echo X #`)。
+        argv = ["python3", script, src_dir, "--outfile", out_file, "--outtype", outtype]
+        cmd = " ".join(shlex.quote(a) for a in argv) + \
+            " >> %s 2>&1; echo EXITCODE:$? >> %s" % (shlex.quote(log_path), shlex.quote(log_path))
         try:
             subprocess.Popen(["nice", "-n", "10", "bash", "-c", cmd],
                              stdin=subprocess.DEVNULL, start_new_session=True)
@@ -1016,11 +1028,21 @@ class Converter:
         deadline = time.time() + 3 * 3600
         while time.time() < deadline:
             time.sleep(2)
+            chunk = ""   # OSError 首轮即发生时也要有定义, 否则下面 `if chunk` 直接炸线程
             try:
-                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                # 按真实字节取尾, 且只消费到最后一个换行:
+                # 半行既会被拆成两条, 文本模式 tell() 的不透明记账与
+                # 下一轮 seek 的字节位也可能错位(Windows 版同型 bug 的 Linux 修复)
+                with open(log_path, "rb") as f:
                     f.seek(self._log_pos)
-                    chunk = f.read()
-                    self._log_pos = f.tell()
+                    raw = f.read()
+                    nl = raw.rfind(b"\n")
+                    if nl < 0:
+                        raw = b""
+                    else:
+                        raw = raw[:nl + 1]
+                        self._log_pos += nl + 1
+                chunk = raw.decode("utf-8", "replace")
                 for ln in chunk.splitlines():
                     if ln.strip():
                         self.hub.log("[转换] " + ln.strip()[:200])

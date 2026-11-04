@@ -44,9 +44,9 @@ python3 main.py            # 默认端口 8788,被占用自动 +1
 
 ## 本轮同步内容(相对 2026-09-29 功能基线)
 
-### 监测子系统(llama-lens/Strata 对齐)
-- **LlamaApiMonitor 全量移植**(`llapimon.py`):/slots 快轮询 + /props、/v1/models
-  慢轮询(30s 节流),每槽差分算速;13 条 llama-lens 日志正则状态机
+### 监测子系统
+- **LlamaApiMonitor**(`llapimon.py`, 2026-11-04 起独立实现):/slots 快轮询 + /props、
+  /v1/models 慢轮询(30s 节流),每槽差分算速;llama.cpp 日志正则状态机
   (相位机/任务落账/MTP 接受率/graphs 复用);旧解析层(ParseTimings、/metrics 兜底、
   TTFT、请求表)按 f564fe7 删除。
 - **端口解析与自动发现**(f919fd5+58247ff):配置端口勾选启用才可信 → 命令行

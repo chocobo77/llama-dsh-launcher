@@ -19,7 +19,7 @@ STATE_FILE = os.path.join(_HOME, ".dsh_launcher_state.json")
 BUILD_STATE_FILE = os.path.join(_HOME, ".llamadsh_dsh_build.json")
 DEFAULT_CONFIG_FILENAME = "LlamaDSH_Launcher_config.json"
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 
 def default_profile():
@@ -77,9 +77,7 @@ def set_config_dir(d):
     d = (d or "").strip()
     if not d or not os.path.isdir(d):
         raise ValueError("目录不存在: %s" % d)
-    with _lock:
-        with open(CFG_PATH_FILE, "w", encoding="utf-8") as f:
-            json.dump({"Dir": d}, f, indent=2, ensure_ascii=False)
+    _atomic_write_json(CFG_PATH_FILE, {"Dir": d})
 
 
 def config_file_path():
@@ -144,8 +142,22 @@ def _atomic_write_json(path, obj):
 
 
 def save_state(state):
+    """全量替换 —— 调用方必须持有完整状态字典;只想更新个别键请用 update_state。"""
     try:
         _atomic_write_json(STATE_FILE, state)
+    except Exception:
+        pass
+
+
+def update_state(**updates):
+    """合并写:先读现有状态,只更新传入的键再原子写回。
+    此前 core.py 用 save_state({"LlamaPid": ...}) 单键全量写,
+    会抹掉 DshPid/DshDir,重启后另一侧进程无法接管。"""
+    try:
+        with _lock:
+            st = load_state()
+            st.update(updates)
+            _atomic_write_json(STATE_FILE, st)
     except Exception:
         pass
 

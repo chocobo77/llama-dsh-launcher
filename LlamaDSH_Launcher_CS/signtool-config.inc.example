@@ -1,0 +1,31 @@
+; signtool-config.inc.example —— 代码签名配置模板(一键封包.cmd 读取)
+;
+; 用法:
+;   1) 复制本文件为同目录的 signtool-config.inc(该文件已被 .gitignore 排除, 不会入库)。
+;   2) 取消下面三选一的注释, 按你的证书情况填好参数, 保存。
+;   3) 跑一键封包.cmd —— [6.5] 步会自动签名 Setup.exe 并用 Get-AuthenticodeSignature 复核;
+;      签名失败或证书无效会直接中止(绝不产出"以为签了其实没签"的包)。
+;   ※ 占位符: 命令里的 %SETUPFILE% 会被替换为安装包完整路径(路径含空格请保留两侧引号)。
+;   ※ & 在引号内可直接写(已实测); 不要写 ^(转义), 会变成 ^^& 打进证书描述。
+;   ※ 手动双击 iss 编译不会签名; 分发用的包一律走一键封包.cmd。
+;
+; 前提: signtool.exe 在 PATH(安装 Windows 10/11 SDK 即有:
+;       C:\Program Files (x86)\Windows Kits\10\bin\<版本>\x64\signtool.exe)。
+;
+; ⚠ 只有【受信任 CA 签发】的代码签名证书才有分发价值(消除 SmartScreen"未知发布者"警告):
+;   - Azure Trusted Signing(推荐: 约 ¥40/月, Azure 账号+实名核身, 个人可申请)
+;       https://learn.microsoft.com/azure/trusted-signing/
+;   - 或 SSL.com / Sectigo / GlobalSign / DigiCert 等 CA 的代码签名证书。
+;   - ❌ 自签名证书会显示"不受信任的发布者", 没有分发价值, 仅内部测试。
+
+; ---- 方案 A: CA 证书导出的 PFX 文件 ----
+; 密码别写进本文件: 先设系统环境变量 PFX_PASSWORD, 命令里用 %PFX_PASSWORD% 引用。
+;SIGNCMD=signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f "C:\certs\codesign.pfx" /p %PFX_PASSWORD% /d "DeepSeek Harness & Llama 启动器" /du "https://github.com/chocobo77/llama-dsh-launcher" "%SETUPFILE%"
+
+; ---- 方案 B: Azure Trusted Signing(官方 azure-code-signing CLI, 免密码/免PFX) ----
+; 前置: 安装 azure-code-signing CLI 并登录; <profile-name> 换成你的签名配置 profile 名。
+;SIGNCMD=azure-code-signing sign --file-name "%SETUPFILE%" --file-digest sha256 --timestamp-rfc3161 http://timestamp.trusted-signing.azure.com --certificate-profile <profile-name>
+
+; ---- 方案 C: 证书已导入"当前用户\个人"存储, 按指纹引用(无密码入库风险) ----
+; 查看指纹: PowerShell Get-ChildItem Cert:\CurrentUser\My
+;SIGNCMD=signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /sha1 <40位hex指纹> /d "DeepSeek Harness & Llama 启动器" /du "https://github.com/chocobo77/llama-dsh-launcher" "%SETUPFILE%"

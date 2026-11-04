@@ -41,3 +41,22 @@ LlamaDSH_Launcher_CS/installer_staging_linux/
 /显存占用计算指南.md
 vendor/Strata/
 vendor/llama-lens/
+
+# ===== 本次审查补充(2026-11-04) =====
+# Python 字节码(Linux 启动器)
+__pycache__/
+*.pyc
+
+# Linux 发布产物(由 build_release.sh 复现, 不入库)
+LlamaDSH_Launcher_Linux/dist/
+
+# 调试截图(git rm --cached 移出; 源码复现足够)
+LlamaDSH_Launcher_Linux/gui-test-screenshots/
+
+# 本地杂物: 验证用大文件/一次性补丁脚本/工具会话产物, 严禁 git add -A 顺带入库
+/_verify/
+/_test/
+/_u5.py
+/_ggml_h.txt
+/.zcode/
+

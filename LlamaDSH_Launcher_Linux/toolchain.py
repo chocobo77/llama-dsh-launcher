@@ -18,8 +18,10 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 
+import urllib.parse
 import urllib.request
 
 import applog
@@ -41,6 +43,15 @@ RE_TAG_LOOSE = re.compile(r"^b(\d+)$", re.I)
 RE_TAG_NUM = re.compile(r"^(\d+)$")
 RE_TAG_EMBED = re.compile(r"b(\d{3,})", re.I)
 RE_CUDA = re.compile(r"cuda-([\d.]+)-x64", re.I)
+
+# 资产名来自远端 JSON, 会被拼进 UPDATE_TMP_ROOT 下的路径:
+# 绝对路径或 ../ 直接逃出缓存目录, 必须先过形态白名单(对齐 Windows IsSafeAssetName)。
+RE_ASSET_NAME = re.compile(r"^[A-Za-z0-9._\-]+$")
+
+
+def is_safe_asset_name(name):
+    return bool(name) and name == os.path.basename(name) and ".." not in name \
+        and bool(RE_ASSET_NAME.match(name))
 
 
 # ---------------------------------------------------------------- HTTP ----
@@ -176,9 +187,16 @@ def pick_assets(assets, backend):
 
     候选: 名含 -bin-ubuntu- 且 .tar.gz 结尾;排除 cudart/arm64/s390x;须含 x64。
     """
-    names = [a["name"] for a in assets]
-    sizes = {a["name"]: a.get("size") or 0 for a in assets}
-    digests = {a["name"]: a.get("digest") or "" for a in assets}
+    names = []
+    for a in assets:
+        n = a.get("name") or ""
+        if not is_safe_asset_name(n):
+            if n:
+                applog.error("toolchain.pick_assets: 资产名形态非法, 已跳过: %s" % n)
+            continue
+        names.append(n)
+    sizes = {a["name"]: a.get("size") or 0 for a in assets if a.get("name") in names}
+    digests = {a["name"]: a.get("digest") or "" for a in assets if a.get("name") in names}
     cands = [n for n in names
              if PLATFORM_TOKEN in n and n.endswith(ARCHIVE_SUFFIX)
              and "cudart" not in n.lower()
@@ -311,7 +329,64 @@ def _release_info(repo, rel, pick, stable_version):
     }
 
 
+def _gh_api_direct(path, timeout=15):
+    """只走直连的 GitHub API GET(不经镜像): 把 release 摘要锚定到官方源。失败返回 None。"""
+    try:
+        req = urllib.request.Request(GITHUB_API + path, headers=UA)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def anchor_release_digests(release):
+    """release JSON 可能经镜像取得(镜像与载荷同源, 可自证一致)。
+    下载前尽力直连 api.github.com 复核资产摘要; 直连不通沿用现有摘要,
+    摘要缺失时 download_asset 会 fail-closed(拒绝仅凭体积放行)。"""
+    try:
+        m = re.match(r"https://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/([^/]+)",
+                     release.get("asset_url") or "")
+        if not m:
+            return
+        owner, repo, tag = m.group(1), m.group(2), m.group(3)
+        doc = _gh_api_direct("/repos/%s/%s/releases/tags/%s"
+                             % (owner, repo, urllib.parse.quote(tag, safe="")))
+        if doc is None:
+            applog.info("toolchain: 直连 api.github.com 不可达, 沿用当前通道摘要(可能来自镜像)")
+            return
+        for a in doc.get("assets") or []:
+            name = a.get("name") or ""
+            dig = a.get("digest") or ""
+            if not dig:
+                continue
+            if name == release.get("asset_name"):
+                old = release.get("digest") or ""
+                if old and old != dig:
+                    applog.error("toolchain: %s 的摘要与直连 GitHub 不一致(镜像可疑), 以直连为准" % name)
+                release["digest"] = dig
+            elif release.get("cudart_name") and name == release["cudart_name"]:
+                release["cudart_digest"] = dig
+    except Exception as ex:
+        applog.error("toolchain.anchor_release_digests 异常: %s" % ex)
+
+
 # ------------------------------------------------------------- 下载/安装 --
+
+_active_downloads = 0
+_dl_lock = threading.Lock()
+
+
+def cleanup_update_tmp():
+    """启动时清理缓存更新目录的崩溃残留(.part/解压目录)。
+    有下载在途时跳过, 防止互删正在写入的文件。"""
+    with _dl_lock:
+        if _active_downloads:
+            return
+    try:
+        shutil.rmtree(UPDATE_TMP_ROOT, ignore_errors=True)
+    except Exception:
+        pass
+
 
 def _sha256_file(path):
     import hashlib
@@ -323,7 +398,15 @@ def _sha256_file(path):
 
 
 def download_asset(url, dest, expected_size=0, job_log=None, timeout_secs=1200, expected_digest=""):
-    """直连 → 三镜像;.part 临时文件 + 原子改名;长度 <1MB 拒收;±1% 对账。"""
+    """直连 → 三镜像;.part 临时文件 + 原子改名;长度 <1MB 拒收;±1% 对账。
+
+    摘要缺失 fail-closed: 产物随后会被直接执行, "只看体积"不构成完整性保证。
+    应急覆盖: 环境变量 LLAMADSH_ALLOW_UNVERIFIED_UPDATE=1。
+    """
+    if not expected_digest and os.environ.get("LLAMADSH_ALLOW_UNVERIFIED_UPDATE") != "1":
+        raise IOError("该 release 资产无 sha256 摘要, 拒绝仅凭体积校验"
+                      "(镜像链任一环都可能返回等长篡改内容); "
+                      "应急可用环境变量 LLAMADSH_ALLOW_UNVERIFIED_UPDATE=1 覆盖(不建议)")
     urls = [url] + [m + url for m in MIRRORS]
     part = dest + ".part"
     last = None
@@ -442,7 +525,12 @@ def llama_running(dir_hint=None):
 
 def apply_llama_update(dir_, release, job_log=None):
     """下载 → 解压 → 覆盖 → build 硬校验。返回 (ok, msg)。"""
+    global _active_downloads
     dir_ = os.path.abspath(dir_)
+    # 纵深防御: 上游 pick_assets 已白名单, 拼路径前再兜底一次(远端元数据不可信)
+    if not is_safe_asset_name(release.get("asset_name") or "") \
+            or (release.get("cudart_name") and not is_safe_asset_name(release["cudart_name"])):
+        return False, "release 元数据含非法资产名, 已拒绝下载(路径穿越防护)"
     os.makedirs(dir_, exist_ok=True)
     if llama_running(dir_):
         return False, "该目录的 llama-server 正在运行,请先停止再更新(防半套混合二进制)"
@@ -456,6 +544,11 @@ def apply_llama_update(dir_, release, job_log=None):
     ok2, free2, _ = _disk_precheck(dir_, need)
     if not ok2:
         return False, "目标磁盘空间不足(需要约 %.1f GB,可用 %.1f GB)" % (need / GIB, free2 / GIB)
+    # 在途下载计数: 并发实例(两个变体同时更新)完成时的 rmtree 不得删掉彼此
+    # 正在写的 .part/资产文件; 归零才清整个缓存目录
+    with _dl_lock:
+        _active_downloads += 1
+    anchor_release_digests(release)
     main_path = os.path.join(UPDATE_TMP_ROOT, release["asset_name"])
     try:
         download_asset(release["asset_url"], main_path, release.get("size", 0), job_log,
@@ -540,7 +633,10 @@ def apply_llama_update(dir_, release, job_log=None):
         # 契约是 (ok, msg): 下载/解压异常直接 raise 会穿透 run_job 之外的调用方
         return False, "安装失败: %s" % ex
     finally:
-        shutil.rmtree(UPDATE_TMP_ROOT, ignore_errors=True)
+        with _dl_lock:
+            _active_downloads -= 1
+            if _active_downloads <= 0:
+                shutil.rmtree(UPDATE_TMP_ROOT, ignore_errors=True)
 
 
 GIB = 1073741824.0

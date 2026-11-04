@@ -596,14 +596,19 @@ def gguf_shard_bytes(model_path):
 def read_gguf_tensor_stats(model_path, layer_count):
     """解析 GGUF 张量表,按张量名的层号与是否专家精确拆分字节。
 
-    分片模型的张量表在各分片头部各自列出,逐片累加;单分片失败继续其余。
-    返回 dict: ok/embed_output_bytes/dense_per_layer/expert_per_layer/expert_total_bytes/layer_count
+    分片模型的张量表在各分片头部各自列出,逐片累加;单分片失败继续其余,
+    但"部分分片解析成功"绝不冒充完整(ok 仅全部分片成功才置位, 其余标 partial)。
+    返回 dict: ok/partial/embed_output_bytes/dense_per_layer/expert_per_layer/expert_total_bytes/layer_count
     """
-    r = {"ok": False, "embed_output_bytes": 0.0,
+    r = {"ok": False, "partial": False, "embed_output_bytes": 0.0,
          "dense_per_layer": [0.0] * layer_count if layer_count > 0 else [],
          "expert_per_layer": [0.0] * layer_count if layer_count > 0 else [],
          "expert_total_bytes": 0.0, "layer_count": layer_count}
+    shards_total = 0
+    shards_ok = 0
     for shard in gguf_shard_paths(model_path):
+        shards_total += 1
+        parsed = False
         try:
             with open(shard, "rb") as f:
                 if f.read(4) != b"GGUF":
@@ -638,9 +643,15 @@ def read_gguf_tensor_stats(model_path, layer_count):
                             r["dense_per_layer"][l] += nbytes
                     else:
                         r["embed_output_bytes"] += nbytes
-                    r["ok"] = True
+                parsed = True
         except Exception:
             continue
+        if parsed:
+            shards_ok += 1
+    # 部分分片成功若被当成功, 显存预估偏乐观 → 启动后 OOM 且用户无从知道
+    # 估算基于残缺数据(Windows 版同型修复: Ok 仅全部分片成功才置位)
+    r["ok"] = shards_ok > 0 and shards_ok == shards_total
+    r["partial"] = 0 < shards_ok < shards_total
     return r
 
 
@@ -755,6 +766,8 @@ def estimate_vram_needed(profile, defs, query_gpu_fn):
         rec_state_bytes = 0.0
         swa_note = ""
         meta_warn = []
+        if ts.get("partial"):
+            meta_warn.append("⚠ 张量表仅解析到部分分片, 显存预估可能偏乐观(请核对分片文件是否齐全)")
         swa_full = st.bools.get("swa-full", False)
         if swa_layers > 0:
             if gi["sliding_window"] > 0 and gi["kv_heads"] > 0 and head_dim > 0 and ctx > 0:

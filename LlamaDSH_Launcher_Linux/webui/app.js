@@ -39,7 +39,7 @@ const GIB = 1073741824;
 
 async function api(path, body, timeoutMs = 12000) {
   const r = await fetch("/api/" + path, {
-    method: "POST", headers: { "Content-Type": "application/json" },
+    method: "POST", headers: { "Content-Type": "application/json", "X-Auth": window.__DSH_TOKEN || "" },
     body: JSON.stringify(body || {}),
     signal: AbortSignal.timeout(timeoutMs)   // 服务卡顿时请求不无限挂起
   });

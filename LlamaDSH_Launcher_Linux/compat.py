@@ -30,7 +30,13 @@ def dsh_home():
 
 
 def profile_dir(profile="web"):
-    return os.path.join(dsh_home(), "profiles", profile)
+    p = str(profile or "")
+    # 请求体直传的 profile 名: 拒绝路径穿越(/ \ ..), 否则 write_json/package.json
+    # 会被写到 ~/.dsh/profiles 之外(payload: profile="../../x")。
+    if (not p or p in (".", "..") or p != os.path.basename(p)
+            or any(c in p for c in '\\/:*?"<>|\r\n') or p.startswith(".")):
+        raise ValueError("非法 profile 名: %r" % (profile,))
+    return os.path.join(dsh_home(), "profiles", p)
 
 
 def get_dsh_version(dsh_dir):
@@ -890,9 +896,19 @@ def _pnpm_env():
     return env
 
 
+_PKG_RE = re.compile(r"^(?:@[A-Za-z0-9._~-]+/)?[A-Za-z0-9_~][A-Za-z0-9._~-]*$")
+
+
+def _safe_pkg(name):
+    """包名形态白名单: 未校验的 name 可注入 --force/registry 等 pnpm 参数。"""
+    return bool(_PKG_RE.match(str(name or "")))
+
+
 def _pnpm_add(cwd, name, spec):
     # 注意: pnpm 的 CLI 不认 --fetch-timeout(那是 npm 参数), 传了会直接
     # "unexpected argument" 拒绝执行——超时放宽走 .npmrc/PNPM_HOME 配置, 不走这里
+    if not _safe_pkg(name):
+        return False, "非法包名: %r" % (name,)
     if not procman_which_pnpm():
         return False, "pnpm 不在 PATH(可先在 Node 环境面板一键安装)"
     r = subprocess.run(["pnpm", "add", name + spec],
@@ -906,6 +922,8 @@ def procman_which_pnpm():
 
 
 def _pnpm_remove(cwd, name):
+    if not _safe_pkg(name):
+        return False, "非法包名: %r" % (name,)
     r = subprocess.run(["pnpm", "remove", name], cwd=cwd, capture_output=True,
                        text=True, timeout=600, env=_pnpm_env())
     return r.returncode == 0, (r.stdout or "") + (r.stderr or "")

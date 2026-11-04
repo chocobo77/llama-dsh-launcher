@@ -29,6 +29,16 @@ except Exception:
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+def _api_token():
+    """main.py 启动时写入的 0600 token 文件; POST 需带 X-Auth。"""
+    try:
+        with open(os.path.expanduser("~/.dsh_launcher_token"), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 class TrayIcon:
     """org.kde.StatusNotifierItem + com.canonical.dbusmenu 最小实现。
 
@@ -122,7 +132,7 @@ class TrayIcon:
             try:
                 req = urllib.request.Request(self.base_url + "/api/lightweight",
                     data=json.dumps({"on": on}).encode(),
-                    headers={"Content-Type": "application/json"})
+                    headers={"Content-Type": "application/json", "X-Auth": _api_token()})
                 urllib.request.urlopen(req, timeout=5)
                 # 回主线程更新菜单复选态并推送 LayoutUpdated
                 from gi.repository import GLib
@@ -327,7 +337,7 @@ def main():
         import urllib.request as _u
         req = _u.Request(base + "/api/lightweight",
                          data=json.dumps({"on": True}).encode(),
-                         headers={"Content-Type": "application/json"})
+                         headers={"Content-Type": "application/json", "X-Auth": _api_token()})
         _u.urlopen(req, timeout=5)
         print("[tray] 轻量化模式: 开(后台低频保活)")
     except Exception:
