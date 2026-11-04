@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(55 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(115 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -511,6 +511,8 @@ else:
 
 # --- 7) "打开 Web" 与 托盘退出的二次确认 ---
 import inspect
+import subprocess
+import tempfile
 import tray as _tray
 
 
@@ -524,7 +526,14 @@ class _Fake:
 
     def __init__(self):
         self.calls = []
-        self._exiting = False
+        self._exit_busy_until = 0.0
+
+    def _service_pids(self):
+        return []
+
+    def _do_exit(self, choice, rc, err):
+        self.calls.append("do_exit")
+        return False
 
     def on_show(self):
         self.calls.append("show")
@@ -551,15 +560,15 @@ check("点“退出”走 ask_exit 而不是直接退出",
       src_fire.strip()[:120])
 
 # ask_exit 必须把三选按约定顺序交给一次性确认框子进程
-captured = {}
+captured = {"calls": []}
 orig_run = _tray.subprocess.run
 
 
 def _fake_run(argv, **kw):
-    captured["argv"] = list(argv)
+    captured["calls"].append(list(argv))
 
     class _R:
-        returncode, stdout, stderr = 1, "", ""
+        returncode, stdout, stderr = (0, "", "") if "--check" in argv else (1, "", "")
     return _R()
 
 
@@ -567,15 +576,35 @@ _tray.subprocess.run = _fake_run
 _f = _Fake()
 _tray.TrayIcon.ask_exit(_f)
 for _ in range(40):
-    if captured.get("argv"):
+    if captured["calls"]:
         break
     time.sleep(0.05)
-_tray.subprocess.run = orig_run
-argv = captured.get("argv") or []
+argv = (captured["calls"][1] if len(captured["calls"]) > 1
+        else (captured["calls"][0] if captured["calls"] else []))
 check("确认框由一次性子进程弹(不在 D-Bus 主线程里等 GTK)",
       len(argv) > 1 and os.path.basename(argv[1]) == "traydialog.py", str(argv[:3]))
+check("弹框前先 --check 探桌面/GTK3(否则 GTK 自己 exit(1) 会被当成'用户取消')",
+      "--check" in (captured["calls"][0] if captured["calls"] else []),
+      str(captured["calls"][:1])[:120])
 check("二次确认三选顺序 = 关闭服务并退出 / 退出 / 取消",
       argv[-3:] == [_Fake.BTN_SERVICES, _Fake.BTN_CLIENT, _Fake.BTN_CANCEL], str(argv[-3:]))
+
+# 闩: 弹框期间再点“退出”不得再起一个框(否则 45s 等待期能重复停服)
+_n0 = len(captured["calls"])
+_tray.TrayIcon.ask_exit(_f)
+time.sleep(0.3)
+check("确认框在弹时重复点“退出”被忽略(时间闩)", len(captured["calls"]) == _n0,
+      "%d → %d" % (_n0, len(captured["calls"])))
+# 取消之后必须放开闩, 否则这一行菜单从此再也点不动(仍在假 subprocess 下测, 不弹真框)
+_tray.TrayIcon._do_exit(_f, _Fake.BTN_CANCEL, 1, "")
+_tray.TrayIcon.ask_exit(_f)
+for _ in range(40):
+    if len(captured["calls"]) > _n0:
+        break
+    time.sleep(0.05)
+check("取消后放开闩(否则“退出”菜单永久失效)", len(captured["calls"]) > _n0,
+      str(len(captured["calls"])))
+_tray.subprocess.run = orig_run
 
 for choice, expect in ((_Fake.BTN_CANCEL, []),
                        (_Fake.BTN_CLIENT, ["close_window", "quit"]),
@@ -595,6 +624,59 @@ finally:
 check("确认框弹不出来(rc=2)时既不退出也要把原因留在日志",
       g.calls == [] and "无法显示" in _buf.getvalue(),
       "%s | %s" % (g.calls, _buf.getvalue()[:80]))
+for rc, kw in ((3, "进程异常"), (4, "按取消处理")):
+    g = _Fake()
+    _b = io.StringIO()
+    _so = sys.stdout
+    sys.stdout = _b
+    try:
+        _tray.TrayIcon._do_exit(g, "", rc, "模拟")
+    finally:
+        sys.stdout = _so
+    check("确认框 rc=%d 与 rc=2 语义分开(日志里说清是哪一种)" % rc,
+          g.calls == [] and kw in _b.getvalue(), "%s | %s" % (g.calls, _b.getvalue()[:80]))
+
+# 服务存活判定: 只靠 HTTP 会在"服务正忙到连接超时"时假阴性 → 跳过兜底 → llama 变孤儿
+_fp_orig = _tray._find_py_pids
+
+
+def _boom(req, timeout=None):
+    raise OSError("connection refused")
+
+
+_urlopen_keep = _tray.urllib.request.urlopen
+_tray.urllib.request.urlopen = _boom
+_tray._find_py_pids = lambda script: [4242]
+check("HTTP 不通但服务进程仍在 → 仍判活(不能就此跳过兜底清理)",
+      _tray.TrayIcon._server_alive(_Fake()) is True, "")
+_tray._find_py_pids = lambda script: []
+check("HTTP 与进程都不在 → 判死", _tray.TrayIcon._server_alive(_Fake()) is False, "")
+_tray.urllib.request.urlopen = _urlopen_keep
+_tray._find_py_pids = _fp_orig
+
+# 兜底 SIGTERM 的目标必须限定"本目录那份脚本": 只按文件名匹配会命中用户自己
+# 从别的目录(或安装副本)跑的 main.py, 一按"关闭服务并退出"就把无辜实例杀了
+_pa_dir = tempfile.mkdtemp(prefix="llamadsh_ps_a_")
+_pb_dir = tempfile.mkdtemp(prefix="llamadsh_ps_b_")
+for _d in (_pa_dir, _pb_dir):
+    with open(os.path.join(_d, "main.py"), "w", encoding="utf-8") as _fh:
+        _fh.write("import time\ntime.sleep(30)\n")
+_pa = subprocess.Popen([sys.executable, os.path.join(_pa_dir, "main.py")])
+_pb = subprocess.Popen([sys.executable, os.path.join(_pb_dir, "main.py")])
+time.sleep(0.7)
+_ad = _tray.APP_DIR
+_tray.APP_DIR = _pa_dir
+try:
+    _hits = _tray._find_py_pids("main.py")
+finally:
+    _tray.APP_DIR = _ad
+for _p in (_pa, _pb):
+    _p.terminate()
+shutil.rmtree(_pa_dir, ignore_errors=True)
+shutil.rmtree(_pb_dir, ignore_errors=True)
+check("_find_py_pids 只认本目录那份脚本(兜底 SIGTERM 不会误杀别的实例)",
+      _pa.pid in _hits and _pb.pid not in _hits,
+      "hits=%s a=%s b=%s" % (_hits, _pa.pid, _pb.pid))
 
 # "关闭服务并退出"必须先让服务端停 llama+DSH
 opened_urls = []
@@ -622,17 +704,63 @@ g = _Fake()
 g.base_url = "http://127.0.0.1:1"
 threading.Thread(target=lambda: _tray.TrayIcon._stop_all_then_quit(g)).start()
 time.sleep(1.0)
+
+
+class _FakeSvc(_Fake):
+    """服务已退出, 但它停 llama/DSH 没成功(以 root 启动时必然如此)"""
+
+    def _service_pids(self):
+        return [os.getpid(), 999999999]
+
+
+g2 = _FakeSvc()
+g2.base_url = "http://127.0.0.1:1"
+_b2 = io.StringIO()
+_s2 = sys.stdout
+sys.stdout = _b2
+try:
+    _tray.TrayIcon._stop_all_then_quit(g2)
+finally:
+    sys.stdout = _s2
 _tray.urllib.request.urlopen = orig_urlopen
 check("“关闭服务并退出”先 POST /api/shutdown",
       any(u.endswith("/api/shutdown") for u in opened_urls), str(opened_urls))
+check("停完服务后按 PID 复核 llama.cpp/DSH, 残留进程要点名(否则只见“托盘没了”)",
+      "残留进程" in _b2.getvalue() and str(os.getpid()) in _b2.getvalue(),
+      _b2.getvalue()[:160])
+check("复核不改变收尾动作(照样收窗口与托盘)", "close_window" in g2.calls, str(g2.calls))
+
+
+class _FakeClean(_Fake):
+    def _service_pids(self):
+        return []
+
+
+g3 = _FakeClean()
+g3.base_url = "http://127.0.0.1:1"
+_b3 = io.StringIO()
+_s3 = sys.stdout
+sys.stdout = _b3
+try:
+    _tray.TrayIcon._stop_all_then_quit(g3)
+finally:
+    sys.stdout = _s3
+check("确实停干净时在日志里明确写“已停止”(不能只留一句沉默)",
+      "已停止" in _b3.getvalue(), _b3.getvalue()[:120])
 
 main_src = open(os.path.join(APP, "main.py"), encoding="utf-8").read()
 check("服务端有 /api/shutdown 路由", '("shutdown",): api_shutdown' in main_src)
-i0 = main_src.index("def api_shutdown")
-shut_src = main_src[i0:i0 + 1200]
-check("/api/shutdown 停完 llama.cpp 与 DSH 才自尽(顺序不能反)",
+i0 = main_src.index("def _stop_all_and_exit")
+shut_src = main_src[i0:i0 + 1300]
+check("退出收尾停完 llama.cpp 与 DSH 才结束进程(顺序不能反)",
       shut_src.index("os._exit") > shut_src.index("LLAMA") and "DSH" in shut_src,
       shut_src[:60])
+check("仍在跑的后台任务在退出前记进日志(os._exit 不让独立会话的长任务停下来)",
+      'j["status"] == "running"' in shut_src, shut_src[:80])
+check("/api/shutdown 与信号收尾共用同一条路(不在两处各写一份)",
+      "_stop_all_and_exit" in main_src[main_src.index("def api_shutdown"):][:500], "")
+check("SIGTERM/SIGINT 也走收尾 —— 否则服务被杀后 llama/DSH 变孤儿且留 stale lock",
+      "signal.signal(sig, _on_term)" in main_src and "signal.SIGTERM" in main_src, "")
 check("open/dsh 由服务端交系统浏览器(WebKit 客户端里 window.open 会被静默吞掉)",
       "def _open_external" in main_src and '"opened": opened' in main_src)
 check("_open_external 只接 http/https(不把任意串交给 xdg-open)",
@@ -645,6 +773,16 @@ check("前端不再把 window.open 当唯一出路(服务端开不成才回落, 
 cli = open(os.path.join(APP, "client.py"), encoding="utf-8").read()
 check("客户端接了 WebKit create 信号(window.open/_blank 交系统浏览器)",
       'web.connect("create", _on_create)' in cli)
+check("客户端交系统浏览器时只认 http/https(页面里可能是 mailto:/file: 等任意 scheme)",
+      "def hand_off_url(uri):" in cli and 'uri.startswith(("http://", "https://"))' in cli, "")
+_pol = cli[cli.index("def _on_policy"):cli.index("def _on_create")]
+_pol_code = "\n".join(ln for ln in _pol.splitlines() if not ln.strip().startswith("#"))
+check("decide-policy 先绑定 uri 再决策, 取不到 URI 时绝不 ignore(否则内部导航被吞成白屏)",
+      _pol_code.index('uri = ""') < _pol_code.index("try:")
+      and _pol_code.count("decision.ignore()") == 1 and "decision.use()" in _pol_code,
+      _pol_code[:110].replace("\n", " | "))
+check("窗口锁以 append 打开(用 w 会在抢锁前把别人的 PID 抹掉)",
+      'open(path, "a")' in cli, "")
 
 # traydialog 的退出码契约: 0=选中并把标签写 stdout / 2=无显示环境
 td = os.path.join(APP, "traydialog.py")
@@ -663,6 +801,12 @@ r = subprocess.run([sys.executable, td, "T", "B", _Fake.BTN_CLIENT],
                    env={"HOME": os.path.expanduser("~"), "PATH": os.environ.get("PATH", "")})
 check("无显示环境 → 退出码 2(调用方据此提示, 而不是'点了没反应')",
       r.returncode == 2 and "无显示" in r.stderr, "rc=%s %s" % (r.returncode, r.stderr[:80]))
+r = subprocess.run([sys.executable, td, "--respond", "根本没有这个按钮", "--delay", "0.2",
+                    "T", "B", _Fake.BTN_SERVICES, _Fake.BTN_CLIENT, _Fake.BTN_CANCEL],
+                   capture_output=True, text=True, timeout=30)
+check("--respond 标签不存在时报错退 2(静默按取消应答会让回归测试假绿)",
+      r.returncode == 2 and "没有这个按钮" in r.stderr,
+      "rc=%s %s" % (r.returncode, r.stderr[:80]))
 
 # --- 8) 本地插件安装(装 dsh-infinite-context-0.8.8.tgz 报"非法包名"那一族) ---
 import compat as _compat
@@ -746,24 +890,102 @@ _compat.procman_which_pnpm = lambda: True
 
 
 def _fail_add(cmd, cwd=None, **kw):
+    pnpm_calls.append(list(cmd))
+
     class _R:
         returncode, stdout, stderr = (1, "", "ERR_PNPM_ENOENT old tarball missing") if cmd[:2] == ["pnpm", "add"] else (0, "", "")
     return _R()
 
 
+# 上一轮装成功后声明已经等于新 spec, 这里再把它改成不一致, 才能测到 remove + 装回
+_m = json.load(open(os.path.join(_prof, "package.json")))
+_m["dependencies"]["demo-plugin"] = "file:/gone/other/demo-plugin-9.9.9.tgz"
+json.dump(_m, open(os.path.join(_prof, "package.json"), "w"))
+_manifest["dependencies"]["demo-plugin"] = "file:/gone/other/demo-plugin-9.9.9.tgz"
+before_manifest = open(os.path.join(_prof, "package.json"), encoding="utf-8").read()
+_n_before = len(pnpm_calls)
 _compat.subprocess.run = _fail_add
 ok2, msg2 = _compat.install_local_plugin("web", _tgz)
 _compat.subprocess.run = orig_compat_run
+adds2 = [c for c in pnpm_calls[_n_before:] if c[:2] == ["pnpm", "add"]]
 check("pnpm add 失败 → 回滚 package.json 并说明原因",
       (not ok2) and open(os.path.join(_prof, "package.json"), encoding="utf-8").read() == before_manifest
       and "已回滚" in msg2, msg2[:160])
+check("同名旧依赖已被 remove 而新装又失败时, 尽力把旧 spec 装回并把话说清楚",
+      len(adds2) == 2 and adds2[-1][2] == "demo-plugin@" + _manifest["dependencies"]["demo-plugin"]
+      and "未能装回" in msg2, "%s | %s" % (adds2, msg2[:120]))
+check("失败信息里保留 ERR_PNPM_* 行(末尾常被进度条/警告挤掉)",
+      "ERR_PNPM_ENOENT" in msg2, msg2[:200])
+
+
+# 超时/OSError 这类异常也必须回滚, 且不能把裸 traceback 冒到 API 层
+def _boom_run(cmd, cwd=None, **kw):
+    raise _compat.subprocess.TimeoutExpired(cmd=cmd, timeout=600)
+
+
+_compat.subprocess.run = _boom_run
+ok_e, msg_e = _compat.install_local_plugin("web", _tgz)
+_compat.subprocess.run = orig_compat_run
+check("pnpm 超时 → 回滚 + 可读错误(不是未捕获的 traceback)",
+      (not ok_e) and "安装异常" in msg_e
+      and open(os.path.join(_prof, "package.json"), encoding="utf-8").read() == before_manifest,
+      msg_e[:160])
 
 src_ilp = inspect.getsource(_compat.install_local_plugin)
-check("install_local_plugin 不再调用按包名校验的 _pnpm_add(",
-      "_pnpm_add(" not in src_ilp and "_pnpm_add_spec(" in src_ilp, src_ilp[:80])
+check("安装新包只走 _pnpm_add_spec(tgz 路径不能送进包名白名单)",
+      "_pnpm_add_spec(base, spec)" in src_ilp, src_ilp[:80])
 ok3, msg3 = _compat._pnpm_add_spec(_prof, "-force")
 check("以 '-' 开头的 spec 被挡掉(否则会被 pnpm 当命令行参数)",
       not ok3 and "非法安装参数" in msg3, msg3)
+
+# review 补: 参数形态 / 文件名 / 路径 / 时间戳 这几处校验
+_ok_a, _ = _compat._spec_ok("demo-plugin@^1.2.3")
+_ok_b, _ = _compat._spec_ok("@scope/pkg@2.0.0")
+_ok_c, _ = _compat._spec_ok("@scope/pkg")
+_no_a, _ = _compat._spec_ok("--registry=http://evil")
+_no_b, _ = _compat._spec_ok("demo-plugin@$(rm -rf)")
+check("spec 收紧后仍放行 name@range 与 scoped 包名", _ok_a and _ok_b and _ok_c, "")
+check("以 - 开头或 range 里带 shell 元字符仍被挡", not _no_a and not _no_b, "")
+_fn = _compat._pkg_filename("@evil/../../etc/passwd", "1.0;rm")
+check("包名/版本拼进 packages 文件名前必须消毒(否则文件能写到 packages 之外)",
+      "/" not in _fn and ".." not in _fn and ";" not in _fn, _fn)
+check("_rel_path 不误伤 .hidden(lstrip('./') 会把它削成 hidden)",
+      _compat._rel_path("./.hidden/x") == ".hidden/x"
+      and _compat._rel_path("../escape") == "" and _compat._rel_path("!nope") == "",
+      repr(_compat._rel_path("./.hidden/x")))
+_psrc = os.path.join(_tmp, "packsrc")
+os.makedirs(os.path.join(_psrc, "dist"))
+for _leaf in ("a.js", "b.js"):
+    with open(os.path.join(_psrc, "dist", _leaf), "w", encoding="utf-8") as fh:
+        fh.write("//x\n")
+_ents = _compat._pack_entries(_psrc, ["dist/*.js"])
+check("files 里的通配条目要 glob 展开(当字面路径复制 → 暂存包里没有产物)",
+      sorted(_ents) == [os.path.join("dist", "a.js"), os.path.join("dist", "b.js")], str(_ents))
+_tdir = os.path.join(_tmp, "tgzdir")
+os.makedirs(_tdir)
+_old = os.path.join(_tdir, "old-1.0.0.tgz")
+with open(_old, "wb") as fh:
+    fh.write(b"x")
+os.utime(_old, (time.time() - 3600, time.time() - 3600))
+check("_newest_tgz 能按时间过滤: 上一轮失败留下的旧包不能被当成本次产物",
+      _compat._newest_tgz(_tdir) == _old
+      and _compat._newest_tgz(_tdir, not_before=time.time() - 60) is None, "")
+_bom = os.path.join(_tmp, "bom.json")
+with open(_bom, "wb") as fh:
+    fh.write(b"\xef\xbb\xbf" + b'{"name": "bom-ok"}')
+check("package.json 带 BOM 也要能读(node/Windows 写的首字符会炸 json)",
+      _compat.read_json(_bom, {}).get("name") == "bom-ok", str(_compat.read_json(_bom, {})))
+_bare = os.path.join(_tmp, "bare.tgz")
+with tarfile.open(_bare, "w:gz") as tf:
+    tf.add(_pkg, arcname=".")
+_ident_bare = _compat._tarball_identity(_bare)
+check("_tarball_identity 认裸根布局且仍取最浅一层(examples/ 不算本体)",
+      _ident_bare == ("demo-plugin", "9.9.9"), str(_ident_bare))
+_k, _d = _compat.filter_bundle_activation(
+    ["demo-plugin"], [{"name": "demo-plugin", "compatible": False,
+                       "missing_specs": [], "errors": []}], "web")
+check("装成功后有 dsh.bundle 也要先过激活守卫(审计不兼容就不自动激活)",
+      _k == [] and _d and "peer" in _d[0]["reason"], str((_k, _d)))
 shutil.rmtree(_tmp, ignore_errors=True)
 
 print()

@@ -67,7 +67,7 @@ class TrayIcon:
         self.lightweight = False
         self.revision = 1
         self.xdg_token = ""
-        self._exiting = False   # 确认框在弹/退出流程进行中(防重复弹)
+        self._exit_busy_until = 0.0   # 确认框在弹/退出流程进行中(防重复弹)的时间闩
         self.bus = dbus.SessionBus()
         # 规范: org.kde.StatusNotifierItem-<pid>(不能把带 . : 的 URL 拼进总线名)
         self.name = "org.kde.StatusNotifierItem-%d" % os.getpid()
@@ -170,49 +170,77 @@ class TrayIcon:
         确认框不能在 D-Bus 主线程里等: 那会卡死主循环, 托盘图标当场失联,
         宿主还会以为我们死了。所以子进程放后台线程, 结果用 idle_add 回主线程。
         """
-        if self._exiting:
+        now = time.time()
+        if now < self._exit_busy_until:
+            print("[tray] 退出确认已在进行中, 忽略重复点击")
             return
-        self._exiting = True
+        # 窗口开着就一直占住, 直到 _do_exit 里判定"取消"才放开(见 _do_exit),
+        # 免得用户在 45s 等待期间再点一次, 弹第二个框/重复停服。
+        self._exit_busy_until = now + 320   # 确认框自身 timeout=300
 
         def worker():
             rc, out, err = 2, "", ""
             try:
-                p = subprocess.run(
-                    [sys.executable, os.path.join(APP_DIR, "traydialog.py"),
-                     "退出 LlamaDSH 启动器",
-                     "“退出”只关掉本客户端(托盘助手与主窗口),"
-                     " llama.cpp 与 DSH 继续运行;\n"
-                     "“关闭服务并退出”先停止 llama.cpp 与 DSH, 再退出客户端与本地服务。",
-                     self.BTN_SERVICES, self.BTN_CLIENT, self.BTN_CANCEL],
-                    capture_output=True, text=True, timeout=300)
-                rc, out, err = p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+                dlg = os.path.join(APP_DIR, "traydialog.py")
+                # 先 --check: 无桌面/GTK3 缺失时 GTK 自己 exit(1), 会被当成"用户取消"
+                # 而静默无动作 —— 那就又像"点了没反应"。先问一句, 把原因留在日志里。
+                chk = subprocess.run([sys.executable, dlg, "--check"],
+                                     capture_output=True, text=True, timeout=30)
+                if chk.returncode != 0:
+                    err = (chk.stderr or chk.stdout or "").strip() or "桌面不可用"
+                    rc = 2
+                else:
+                    p = subprocess.run(
+                        [sys.executable, dlg,
+                         "退出 LlamaDSH 启动器",
+                         "“退出”只关掉本客户端(托盘助手与主窗口),"
+                         " llama.cpp 与 DSH 继续运行;\n"
+                         "“关闭服务并退出”先停止 llama.cpp 与 DSH, 再退出客户端与本地服务。",
+                         self.BTN_SERVICES, self.BTN_CLIENT, self.BTN_CANCEL],
+                        capture_output=True, text=True, timeout=300)
+                    rc, out, err = (p.returncode, (p.stdout or "").strip(),
+                                    (p.stderr or "").strip())
+            except subprocess.TimeoutExpired:
+                rc, err = 4, "确认框超过 300s 没有应答"
             except Exception as ex:
-                err = str(ex)
-            from gi.repository import GLib
-            GLib.idle_add(self._do_exit, out, rc, err)
+                rc, err = 3, repr(ex)
+            try:
+                from gi.repository import GLib
+                GLib.idle_add(self._do_exit, out, rc, err)
+            except Exception as ex:
+                # 回主线程失败也必须放开闩, 否则"退出"这一行从此永远点不动
+                print("[tray] 退出结果回投失败: %s" % ex)
+                self._exit_busy_until = 0.0
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _do_exit(self, choice, rc, err):
-        self._exiting = False
-        if choice in (self.BTN_CANCEL, ""):
-            if choice or rc != 2:
-                return                      # 用户取消(或关窗) —— 什么都不做
-            # 确认框弹不出来(无桌面/GTK 缺失)必须讲清楚, 否则又像"点了没反应"
-            print("[tray] 退出确认框无法显示: %s" % (err or "未知原因"))
-            return
         if choice == self.BTN_SERVICES:
             print("[tray] %s: 停止 llama.cpp 与 DSH…" % choice)
             threading.Thread(target=self._stop_all_then_quit, daemon=True).start()
-        else:
+        elif choice == self.BTN_CLIENT:
             print("[tray] %s: 仅退出客户端(llama.cpp/DSH/服务不动)" % choice)
+            self._exit_busy_until = 0.0
             self._close_window()
             self.on_quit()
+        else:
+            self._exit_busy_until = 0.0     # 取消/弹框失败 → 允许再点一次
+            if rc == 2:
+                print("[tray] 退出确认框无法显示: %s" % (err or "未知原因"))
+            elif rc == 3:
+                print("[tray] 退出确认框进程异常: %s" % (err or "未知原因"))
+            elif rc == 4:
+                print("[tray] %s, 按取消处理" % err)
         return False                        # idle_add 只跑一次
 
     def _stop_all_then_quit(self):
         """"关闭服务并退出": POST /api/shutdown(服务端停 llama+DSH 后自尽),
-        确认服务真的没了再收托盘 —— 否则用户会看到"托盘没了但 llama 还在跑"。"""
+        确认服务真的没了再收托盘 —— 否则用户会看到"托盘没了但 llama 还在跑"。
+
+        停服前先把 llama.cpp/DSH 的 PID 抄下来: 服务一死就再也问不到, 只能按 PID
+        复核它们是否真的停了(以 root 启动的服务我们停不掉, 必须把残留说清楚)。
+        """
+        svc_pids = self._service_pids()
         try:
             req = urllib.request.Request(
                 self.base_url + "/api/shutdown", data=b"{}",
@@ -232,17 +260,43 @@ class TrayIcon:
                 except OSError:
                     pass
             print("[tray] 服务未自行退出, 已发 SIGTERM: %s" % (pids or "未找到进程"))
+            for _ in range(20):             # 新 main.py 收到 SIGTERM 也会自行收尾
+                if not self._server_alive():
+                    break
+                time.sleep(0.5)
+        left = [p for p in svc_pids if os.path.isdir("/proc/%d" % p)]
+        if left:
+            print("[tray] ⚠ llama.cpp/DSH 未能停止, 残留进程 PID: %s"
+                  " (若以 root 启动需手动关闭)" % ", ".join(str(p) for p in left))
+        else:
+            print("[tray] llama.cpp 与 DSH 已停止")
         self._close_window()
         from gi.repository import GLib
         GLib.idle_add(self.on_quit)
 
+    def _service_pids(self):
+        """当前在跑的 llama.cpp / DSH 进程 PID(退出后复核用)。"""
+        try:
+            with urllib.request.urlopen(self.base_url + "/api/status", timeout=3) as r:
+                st = json.loads(r.read().decode("utf-8", "replace"))
+            return [p for p in ((st.get("llama") or {}).get("pid"),
+                                (st.get("dsh") or {}).get("pid")) if p]
+        except Exception:
+            return []
+
     def _server_alive(self):
+        """服务是否还活着: HTTP 通 **或** 服务进程还在。
+
+        只靠 HTTP 会假阴性 —— 服务在 stop() 里忙到连接超时/被拒时, 托盘会以为它已经
+        没了, 于是跳过兜底, 结果就是"托盘消失了但 llama 还在跑"。
+        """
         try:
             with urllib.request.urlopen(self.base_url + "/api/status", timeout=1.5) as r:
                 json.loads(r.read().decode("utf-8", "replace"))
             return True
         except Exception:
-            return False
+            pass
+        return bool(_find_py_pids("main.py"))
 
     def _close_window(self):
         """关掉主窗口进程(若开着): 走它自己的 SIGTERM 收尾路径。"""
@@ -489,14 +543,18 @@ def _layout_node(node, depth, variant=False):
 
 
 def _find_py_pids(script):
-    """按 /proc 找在跑的 <script> 进程(用于收主窗口进程 / 兜底终止服务)。
+    """按 /proc 找在跑的 **本目录** <script> 进程(收窗口进程 / 兜底终止服务)。
 
-    不用 pgrep -f: 它的正则会被包裹 shell 自己的命令行命中(本轮踩过一次,
-    结果把自己杀掉且没有任何输出); 这里再校验 comm 是 python, bash 壳必然排除。
+    不用 pgrep -f: 它的正则会被包裹 shell 自己的命令行命中(踩过一次: 把自己杀掉
+    且没有任何输出), 这里校验 comm 是 python, bash 壳必然排除。
+    按 realpath 比对而不只看文件名: 只看 basename 会把用户自己从别处跑的 main.py
+    也算进来, 兜底 SIGTERM 就可能杀掉无关实例。
     """
+    target = os.path.realpath(os.path.join(APP_DIR, script))
+    me = os.getpid()
     pids = []
     for entry in os.listdir("/proc"):
-        if not entry.isdigit():
+        if not entry.isdigit() or int(entry) == me:
             continue
         try:
             with open("/proc/%s/comm" % entry, encoding="utf-8", errors="replace") as fh:
@@ -504,11 +562,23 @@ def _find_py_pids(script):
             if not comm.startswith("python"):
                 continue
             with open("/proc/%s/cmdline" % entry, "rb") as fh:
-                args = fh.read().split(b"\0")
-            if any(os.path.basename(a.decode("utf-8", "ignore")) == script for a in args):
-                pids.append(int(entry))
+                args = [a.decode("utf-8", "ignore") for a in fh.read().split(b"\0")]
         except OSError:
             continue
+        try:  # 相对路径要靠 cwd 还原; root 进程的 cwd 读不到 → 只认绝对路径
+            cwd = os.readlink("/proc/%s/cwd" % entry)
+        except OSError:
+            cwd = ""
+        hit = False
+        for arg in args[1:]:
+            if not arg.endswith(".py"):
+                continue
+            path = arg if os.path.isabs(arg) else (os.path.join(cwd, arg) if cwd else "")
+            if path and os.path.realpath(path) == target:
+                hit = True
+                break
+        if hit:
+            pids.append(int(entry))
     return pids
 
 

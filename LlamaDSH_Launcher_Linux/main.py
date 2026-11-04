@@ -10,6 +10,7 @@ import sys
 import json
 import time
 import fcntl
+import signal
 import secrets
 import argparse
 import threading
@@ -559,6 +560,33 @@ def api_open_dsh(_):
     return {"url": url, "opened": opened}
 
 
+def _stop_all_and_exit(tag):
+    """停 llama.cpp 与 DSH、交代在途任务, 然后结束服务进程。
+
+    **所有**退出路径都必须走这里: 以前 Ctrl+C 与 SIGTERM 直接杀进程, llama.cpp 与 DSH
+    就成了没人管的孤儿, DSH 还留下 stale lock, 下次启动表现为撞端口"启动失败"。
+    """
+    for name, runner in (("llama.cpp", LLAMA), ("DSH", DSH)):
+        try:
+            runner.stop()
+        except Exception as ex:
+            HUB.log("[%s] 停止 %s 失败: %s" % (tag, name, ex))
+    try:
+        busy = ["%s(#%s)" % (j["name"], k) for k, j in JOBS.items()
+                if j["status"] == "running"]
+    except Exception:
+        busy = []
+    if busy:
+        HUB.log("[%s] ⚠ 仍有后台任务在运行(%s), 它们以独立会话启动, 会自行跑完"
+                % (tag, ", ".join(busy)))
+    HUB.log("[%s] 服务进程退出" % tag)
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    os._exit(0)
+
+
 def api_shutdown(body):
     """托盘"关闭服务并退出": 停 llama.cpp 与 DSH, 然后服务进程自身退出。
 
@@ -566,17 +594,7 @@ def api_shutdown(body):
     分不清是"退出成功"还是"请求失败"。
     """
     HUB.log("[退出] 关闭服务并退出: 停止 llama.cpp 与 DSH…")
-
-    def later():
-        for name, runner in (("llama.cpp", LLAMA), ("DSH", DSH)):
-            try:
-                runner.stop()
-            except Exception as ex:
-                HUB.log("[退出] 停止 %s 失败: %s" % (name, ex))
-        HUB.log("[退出] 服务进程退出")
-        os._exit(0)
-
-    threading.Timer(0.8, later).start()
+    threading.Timer(0.8, _stop_all_and_exit, ("退出",)).start()
     return {"ok": True}
 
 
@@ -855,7 +873,9 @@ def api_plugins_uninstall(body):
 def api_plugins_install_local(body):
     if not _dsh_running_guard():
         return {"error": "该操作需要先停止 DSH(会运行 pnpm 修改插件目录)。"}
-    ok, msg = compat.install_local_plugin("web", body.get("source") or "", HUB.log)
+    # dsh_dir 必传: 装成功后的自动激活要先过审计守卫, 而审计需要 DSH 版本
+    ok, msg = compat.install_local_plugin("web", body.get("source") or "", HUB.log,
+                                          _dsh_dir_of(current_profile()[1]))
     return {"ok": ok, "msg": msg}
 
 
@@ -1100,10 +1120,27 @@ def main():
         webbrowser.open(url)
     except Exception:
         pass
+    # SIGTERM/Ctrl+C 也要先停 llama.cpp 与 DSH: 以前直接进程了事, 两者变成孤儿进程,
+    # DSH 的 lock 文件还留着(stale lock), 下次启动会撞端口误报"启动失败"。
+    # 收尾放独立线程: 信号处理器运行在 serve_forever 所在的线程里, 那里 stop() 的
+    # 等待与日志不该阻塞解释器状态。
+    def _on_term(signum, _frame):
+        tag = "收到 SIGINT" if signum == signal.SIGINT else "收到 SIGTERM"
+        try:
+            HUB.log("[%s] 开始收尾" % tag)
+        except Exception:
+            pass
+        threading.Thread(target=_stop_all_and_exit, args=(tag,), daemon=True).start()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _on_term)
+        except (ValueError, OSError):
+            pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        _stop_all_and_exit("收到 Ctrl+C")
 
 
 def _health_loop():

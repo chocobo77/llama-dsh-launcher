@@ -81,7 +81,13 @@ def main():
     dlg.set_default_response(cancel_id)
 
     if respond is not None:
-        rid = next((k for k, v in ids.items() if v == respond), cancel_id)
+        # 标签找不到时**不能**静默按"取消"应答: 回归测试会以为测了某个按钮,
+        # 实际走的是取消分支, 断言全是假绿。
+        rid = next((k for k, v in ids.items() if v == respond), None)
+        if rid is None:
+            sys.stderr.write("没有这个按钮: %r (可选: %s)\n"
+                             % (respond, " / ".join(buttons)))
+            return 2
 
         def _auto():
             dlg.response(rid)

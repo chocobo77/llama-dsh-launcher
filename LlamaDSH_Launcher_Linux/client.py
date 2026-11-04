@@ -110,6 +110,23 @@ def open_dir_gtk(path):
     subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL)
 
+
+def hand_off_url(uri):
+    """把网页里的链接交系统浏览器, 只接 http/https, 返回是否交出去了。
+
+    与 main.py `_open_external` 同一道白名单: 页面(尤其 DSH 渲染的外部内容)里
+    可能出现 mailto:/file:/javascript: 之类的 scheme, 把任意串原样交给 xdg-open
+    等于让网页去驱动桌面程序。
+    """
+    if not uri or not uri.startswith(("http://", "https://")):
+        return False
+    try:
+        subprocess.Popen(["xdg-open", uri], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
 # ---------------------------------------------------------------- GTK 客户端 --
 
 def run_gtk(base_url):
@@ -194,6 +211,9 @@ def run_gtk(base_url):
         return win
 
     def _on_policy(_web, decision, dtype):
+        # uri 先绑定: 以前取 URI 失败时这里 NameError 被 except 吞掉, 却仍执行到末尾的
+        # decision.ignore() —— 内部导航被忽略, 表现是点页面后一片白屏。
+        uri = ""
         try:
             import warnings as _w
             with _w.catch_warnings():
@@ -201,24 +221,24 @@ def run_gtk(base_url):
                 # 但非导航决定仍需它取 URI —— 静音警告, 语义不变
                 _w.simplefilter("ignore", DeprecationWarning)
                 uri = decision.get_request().get_uri()
-            internal = uri == base_url or uri.startswith(base_url + "/")
-            if dtype == WebKit2.PolicyDecisionType.RESPONSE and not internal:
-                # 外部主资源响应交系统浏览器
-                decision.ignore()
-                subprocess.Popen(["xdg-open", uri], stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-                return
-            if internal:
-                decision.use()
-                return
         except Exception:
             pass
         try:
-            subprocess.Popen(["xdg-open", uri], stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+            if not uri or uri == base_url or uri.startswith(base_url + "/"):
+                decision.use()              # 本应用自己的页面: 照常渲染
+                return
+            # 外部链接一律交系统浏览器, 不在本窗口里跳转(与 Windows 版一致)
+            if hand_off_url(uri):
+                decision.ignore()
+            else:
+                # 交不出去(非 http/https、无 xdg-open)也别吞掉导航,
+                # 否则"点了链接毫无反应"又变成老症状
+                decision.use()
         except Exception:
-            pass
-        decision.ignore()
+            try:
+                decision.use()
+            except Exception:
+                pass
 
     def _on_create(_web, action):
         """window.open / target=_blank 触发的是 **create** 信号(不是 decide-policy)。
@@ -235,12 +255,7 @@ def run_gtk(base_url):
                 uri = action.get_request().get_uri()
             except Exception:
                 pass
-        if uri:
-            try:
-                subprocess.Popen(["xdg-open", uri], stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
+        hand_off_url(uri)                   # 非 http/https 一律不开(见 hand_off_url)
         return None
 
     def show_window():
@@ -262,9 +277,13 @@ def _acquire_window_lock():
     """窗口进程单例: 已有窗口时再点托盘直接退出(fcntl + sys.exit)。"""
     import fcntl
     path = os.path.join(os.path.expanduser("~"), ".llamadsh_launcher_window.lock")
-    fh = open(path, "w")
+    # "a" 而非 "w": "w" 会在**抢锁之前**就把文件截空, 于是第二个窗口(必然抢锁失败)
+    # 顺手抹掉了第一个窗口写进去的 PID, 排查时看不到是谁占着锁。拿到锁后才写。
+    fh = open(path, "a")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fh.seek(0)
+        fh.truncate(0)
         fh.write(str(os.getpid()))
         fh.flush()
         # fd 需要持有到进程结束: 挂到模块全局防止 GC 关闭释放锁

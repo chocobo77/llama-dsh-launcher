@@ -9,9 +9,11 @@ import os
 import re
 import glob
 import json
+import time
 import shutil
 import datetime
 import subprocess
+import tempfile
 
 import yaml
 
@@ -26,7 +28,10 @@ BUILTIN_BUNDLES = {"@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@deepse
 
 
 def dsh_home():
-    return os.environ.get("DSH_HOME") or os.path.join(os.path.expanduser("~"), ".dsh")
+    # abspath/expanduser: DSH_HOME 可能被写成相对路径或带 ~, 不展开时后续所有
+    # 拼接都跟着 cwd 走(同一份 profile 会从两个位置被读写)
+    raw = os.environ.get("DSH_HOME") or os.path.join(os.path.expanduser("~"), ".dsh")
+    return os.path.abspath(os.path.expanduser(raw))
 
 
 def profile_dir(profile="web"):
@@ -72,7 +77,9 @@ def write_file_atomic(path, content):
 
 def read_json(path, default=None):
     try:
-        with open(path, encoding="utf-8") as f:
+        # utf-8-sig: Windows/node 写的 package.json 可能带 BOM, 用 utf-8 读会
+        # 在首字符塞一个 \ufeff → json 解析失败, 于是整个插件被当成"没有 package.json"
+        with open(path, encoding="utf-8-sig") as f:
             return json.load(f)
     except Exception:
         return default if default is not None else {}
@@ -621,11 +628,11 @@ def set_bundle_active(profile, name, active):
                   else "已停用并锁定(DSH 重启后生效;被外部写回时启动器审计会自动移除)")
 
 
-def filter_bundle_activation(candidates, plugins):
+def filter_bundle_activation(candidates, plugins, profile="web"):
     """bundle 自动激活守卫(3af19b9): peer 错位/豁免仍不兼容/缺依赖/错误/被锁定的包
     不自动激活——激活会导致 client 模块加载失败(module table 漂移)。"""
     kept, demoted = [], []
-    pinned = set(read_pinned_inactive())
+    pinned = set(read_pinned_inactive(profile))
     for b in candidates:
         info = next((x for x in plugins if x.get("name") == b), None)
         bad, why = False, ""
@@ -911,8 +918,9 @@ def _pnpm_add(cwd, name, spec):
         return False, "非法包名: %r" % (name,)
     if not procman_which_pnpm():
         return False, "pnpm 不在 PATH(可先在 Node 环境面板一键安装)"
-    r = subprocess.run(["pnpm", "add", name + spec],
-                       cwd=cwd, capture_output=True, text=True, timeout=900, env=_pnpm_env())
+    r = subprocess.run(["pnpm", "add", name + spec], cwd=cwd, capture_output=True,
+                       text=True, encoding="utf-8", errors="replace",
+                       timeout=900, env=_pnpm_env())
     return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
 
 
@@ -925,7 +933,8 @@ def _pnpm_remove(cwd, name):
     if not _safe_pkg(name):
         return False, "非法包名: %r" % (name,)
     r = subprocess.run(["pnpm", "remove", name], cwd=cwd, capture_output=True,
-                       text=True, timeout=600, env=_pnpm_env())
+                       text=True, encoding="utf-8", errors="replace",
+                       timeout=600, env=_pnpm_env())
     return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
 
 
@@ -991,22 +1000,32 @@ def _package_identity(src_dir):
 def _tarball_identity(tgz):
     """从 tgz 里读 name/version —— 只认包根那一层的 package.json。
 
-    嵌套的 examples/**/package.json、test/**/package.json 不算(否则会把示例包名当成本体)。
+    两种打包布局都要认: npm 的 `package/package.json`, 以及裸根的 `package.json`。
+    取**最浅**的那一层, 且深度 >1 一律不算: 否则裸根包里的 examples/package.json
+    会被当成本体(它和 npm 布局的包根前缀在路径深度上长得一样)。
     """
     import tarfile
     try:
         with tarfile.open(tgz, "r:gz") as tf:
+            cands = []
             for m in tf.getmembers():
                 n = m.name.replace("\\", "/")
                 while n.startswith(("./", "/")):
                     n = n[2:] if n.startswith("./") else n[1:]
-                if n.count("/") != 1 or not n.endswith("/package.json"):
+                if not n.endswith("package.json"):
                     continue
-                fh = tf.extractfile(m)
-                if fh is None:
-                    continue
-                doc = json.loads(fh.read().decode("utf-8", "replace"))
-                return str(doc.get("name") or "").strip(), str(doc.get("version") or "").strip()
+                rel = n[: -len("package.json")].rstrip("/")
+                depth = 0 if not rel else rel.count("/") + 1
+                if depth <= 1:
+                    cands.append((depth, m))
+            if not cands:
+                return "", ""
+            cands.sort(key=lambda x: x[0])
+            fh = tf.extractfile(cands[0][1])
+            if fh is None:
+                return "", ""
+            doc = json.loads(fh.read().decode("utf-8-sig", "replace"))
+            return str(doc.get("name") or "").strip(), str(doc.get("version") or "").strip()
     except Exception:
         pass
     return "", ""
@@ -1022,9 +1041,85 @@ def _missing_build_entry(src_dir):
     return None if os.path.isfile(full) else main
 
 
-def _newest_tgz(directory):
-    found = glob.glob(os.path.join(directory, "*.tgz"))
-    return max(found, key=os.path.getmtime) if found else None
+def _newest_tgz(directory, not_before=None):
+    """目录里最新的 .tgz。
+
+    not_before: 只认这个时间戳之后产生的文件 —— 否则上一次失败留下的旧包会被当成
+    本次 pnpm pack 的产物装进 profile(内容还是上个版本的)。
+    """
+    best, best_mt = None, None
+    for path in glob.glob(os.path.join(directory, "*.tgz")):
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            continue                      # 列完就没了(并发清理), 跳过而不是让整次安装炸掉
+        if not_before is not None and mt < not_before:
+            continue
+        if best is None or mt > best_mt:
+            best, best_mt = path, mt
+    return best
+
+
+def _rel_path(value):
+    """package.json 里 files/bundle.patch 这类相对路径: 剥 ./ 前缀并拒绝越界。
+
+    不能用 lstrip("./"): 它按**字符集**剥, 会把 ".hidden/x" 削成 "hidden/x"。
+    """
+    v = str(value or "").strip().replace("\\", "/")
+    while v.startswith("./"):
+        v = v[2:]
+    v = v.strip("/")
+    if not v or v.startswith("/") or ".." in v.split("/") or v.startswith("!"):
+        return ""
+    return v
+
+
+def _pack_entries(src_dir, declared):
+    """package.json 的 files 数组 → 要复制的相对路径(npm 语义)。
+
+    带通配(* ? [)的条目要 glob 展开, 否则 "dist/*.js" 会被当成一个不存在的字面路径,
+    结果是暂存包里什么产物都没有; "!" 开头是排除项(npm), 不参与复制。
+    """
+    if not isinstance(declared, list):
+        return [leaf for leaf in sorted(os.listdir(src_dir)) if leaf not in _PACK_IGNORE]
+    out = []
+    for raw in declared:
+        entry = _rel_path(raw)
+        if not entry:
+            continue
+        if any(ch in entry for ch in "*?["):
+            for hit in glob.glob(os.path.join(src_dir, entry)):
+                rel = os.path.relpath(hit, src_dir)
+                if rel not in (".", "") and os.path.basename(rel) not in _PACK_IGNORE:
+                    out.append(rel)
+        else:
+            out.append(entry)
+    return list(dict.fromkeys(out))
+
+
+def _pkg_filename(name, version):
+    """packages/ 下的目标文件名。
+
+    name/version 都来自**包内** package.json(不可信输入): 不消毒的话 "@x/../../etc"
+    能把文件写到 <dshHome>/packages 之外。
+    """
+    leaf = re.sub(r"[^A-Za-z0-9._@~+-]", "-", str(name or "plugin")).replace("/", "-")
+    ver = re.sub(r"[^A-Za-z0-9._+-]", "-", str(version or "")) or "0.0.0"
+    # 点号串也压掉: 分隔符换成 "-" 后 ".." 仍会留在文件名里, 看着就像穿越路径,
+    # 而且某些工具会按 "." 分段处理它
+    leaf = re.sub(r"\.{2,}", ".", leaf).lstrip("-.") or "plugin"
+    ver = re.sub(r"\.{2,}", ".", ver).lstrip("-.") or "0.0.0"
+    return "%s-%s.tgz" % (leaf, ver)
+
+
+def _pnpm_error_tail(out, limit=600):
+    """pnpm 失败信息里最有用的尾巴: ERR_PNPM_* 行优先(末尾常被进度条/警告占满)。"""
+    text = str(out or "").strip()
+    if not text:
+        return "无输出"
+    hits = [ln.strip() for ln in text.splitlines()
+            if "ERR_PNPM" in ln or "ERR!" in ln or ln.lower().startswith("npm err")]
+    return ("\n".join(hits) if any(hits) else text)[-limit:]
 
 
 def _copy_entry(src, dst):
@@ -1043,7 +1138,6 @@ def _pack_staged(src_dir, out_dir, job_log=None):
     只复制运行所需文件到暂存目录, 去掉 prepack/prepare/postinstall 再 pack,
     保留 dist 等已构建产物, 得到可安装的稳定 tgz(C# TryPackStagedPackage 同语义)。
     """
-    import tempfile
     stage = tempfile.mkdtemp(prefix="llamadsh_packstage_")
     try:
         missing = _missing_build_entry(src_dir)
@@ -1056,20 +1150,14 @@ def _pack_staged(src_dir, out_dir, job_log=None):
         doc = read_json(src_pj, None)
         if not doc:
             return None
-        declared = doc.get("files")
-        if isinstance(declared, list):
-            entries = [str(x).strip().lstrip("./") for x in declared if str(x).strip()]
-        else:
-            entries = [leaf for leaf in os.listdir(src_dir) if leaf not in _PACK_IGNORE]
-        for entry in dict.fromkeys(entries):
+        for entry in _pack_entries(src_dir, doc.get("files")):
             _copy_entry(os.path.join(src_dir, entry), os.path.join(stage, entry))
         # package.json 与 bundle patch 必须在, 即使 files 没列
         _copy_entry(src_pj, os.path.join(stage, "package.json"))
         bundle = (doc.get("dsh") or {}).get("bundle")
-        patch = bundle.get("patch") if isinstance(bundle, dict) else None
+        patch = _rel_path(bundle.get("patch")) if isinstance(bundle, dict) else ""
         if patch:
-            _copy_entry(os.path.join(src_dir, str(patch).strip().lstrip("./")),
-                        os.path.join(stage, str(patch).strip().lstrip("./")))
+            _copy_entry(os.path.join(src_dir, patch), os.path.join(stage, patch))
         scripts = doc.get("scripts")
         if isinstance(scripts, dict):
             for name in ("prepack", "prepare", "postinstall"):
@@ -1080,37 +1168,62 @@ def _pack_staged(src_dir, out_dir, job_log=None):
                 doc.pop("scripts", None)
         with open(os.path.join(stage, "package.json"), "w", encoding="utf-8") as fh:
             json.dump(doc, fh, indent=2, ensure_ascii=False)
+        started = time.time()   # out_dir 里可能有上一轮 pnpm pack 失败留下的 tgz
         r = subprocess.run(["pnpm", "pack", "--pack-destination", out_dir], cwd=stage,
-                           capture_output=True, text=True, timeout=600, env=_pnpm_env())
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=600, env=_pnpm_env())
         if r.returncode != 0:
             if job_log:
-                job_log("[插件安装] 暂存打包仍失败: %s" % ((r.stderr or r.stdout or "")[-300:]))
+                job_log("[插件安装] 暂存打包仍失败: %s"
+                        % _pnpm_error_tail((r.stderr or "") + (r.stdout or ""), 300))
             return None
-        return _newest_tgz(out_dir)
+        return _newest_tgz(out_dir, not_before=started)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 
 
+_RANGE_RE = re.compile(r"^[A-Za-z0-9.*^~|>=<, ]*$")
+
+
+def _spec_ok(s):
+    """spec 形态: file:/link: 本地包, 或 name[@range]。返回 (ok, 原因)。
+
+    三条硬线: 不能以 '-' 开头(pnpm 会当命令行参数)、不能带换行/NUL(参数注入)、
+    非 file:/link: 时包名必须过 _PKG_RE(registry 名), 版本范围只允许 semver 元字符。
+    """
+    if not s or s.startswith("-") or "\n" in s or "\0" in s:
+        return False, "非法安装参数: %r" % (s[:100],)
+    if s.startswith(("file:", "link:")):
+        return True, ""
+    head, sep, tail = s.rpartition("@")
+    if sep and _safe_pkg(head):
+        if not _RANGE_RE.match(tail):
+            return False, "非法版本范围: %r" % (s,)
+        return True, ""
+    if _safe_pkg(s):
+        return True, ""
+    return False, "非法包名/版本范围: %r" % (s,)
+
+
 def _pnpm_add_spec(cwd, spec):
-    """pnpm add <完整 spec>(file:/link: 本地包, 或 name@range)。
+    """pnpm add <完整 spec>(file:/link: 本地包, 或 name[@range])。
 
     注意: 本地 tarball **不能**走 _pnpm_add(name=路径) —— 那里的包名白名单
     必然拒绝带 / 的路径, 用户侧就表现为"非法包名"(装 dsh-infinite-context-*.tgz 即此)。
-    这里改校 spec 本身: 以 '-' 开头会被 pnpm 当命令行参数, 必须挡掉。
+    这里改校 spec 本身(见 _spec_ok)。
     """
     if not procman_which_pnpm():
         return False, "pnpm 不在 PATH(可先在 Node 环境面板一键安装)"
     s = str(spec or "")
-    if not s or s.startswith("-") or "\n" in s or "\0" in s:
-        return False, "非法安装参数: %r" % (s[:100],)
-    if not s.startswith(("file:", "link:")) and not _safe_pkg(s):
-        return False, "非法包名: %r" % (s,)
+    ok, why = _spec_ok(s)
+    if not ok:
+        return False, why
     r = subprocess.run(["pnpm", "add", s], cwd=cwd, capture_output=True, text=True,
-                       timeout=900, env=_pnpm_env())
+                       encoding="utf-8", errors="replace", timeout=900, env=_pnpm_env())
     return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
 
 
-def install_local_plugin(profile, source, job_log=None):
+def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
     """本地安装插件: 目录或 .tgz 都可以(逐条对齐 C# InstallLocalPlugin)。
 
     几条都是"另一台电脑上"实测出来的坑:
@@ -1119,7 +1232,8 @@ def install_local_plugin(profile, source, job_log=None):
     - 同名旧依赖的 spec 与新 spec 不一致时先 pnpm remove, 否则 pnpm 会去解析旧 tarball。
     - pnpm add 失败要回滚 package.json 与 pnpm-lock.yaml, 不留半安装状态。
     - 目录形态先 pnpm pack 到临时目录(失败则用去掉构建脚本的暂存副本重试),
-      仍失败才退化直接 file:<目录>。
+      仍失败才退化直接 file:<目录>; 打包临时目录每次独立, 不共用固定名。
+    - 装成功后有 dsh.bundle 才自动激活, 且要先过激活守卫(见 filter_bundle_activation)。
     """
     source = (source or "").strip().strip('"')
     if not source:
@@ -1137,23 +1251,61 @@ def install_local_plugin(profile, source, job_log=None):
     packages_dir = os.path.join(dsh_home(), "packages")
     pack_temp = None
     spec, name, version = "", "", ""
+    manifest = os.path.join(base, "package.json")
+    lockfile = os.path.join(base, "pnpm-lock.yaml")
+    manifest_bak = lock_bak = None
+    lock_existed = os.path.isfile(lockfile)
+    removed_spec = ""
+
+    def _rollback():
+        """把 manifest/lock 恢复原状(失败与异常两条路都要走, 不留半安装状态)。"""
+        for path, bak in ((manifest, manifest_bak), (lockfile, lock_bak)):
+            if bak:
+                try:
+                    shutil.copy2(bak, path)
+                except OSError:
+                    pass
+        if not lock_existed and lock_bak is None and os.path.isfile(lockfile):
+            try:  # 原本没有 lock 文件: 回滚后也不该留下 pnpm 新建的那一份
+                os.remove(lockfile)
+            except OSError:
+                pass
+
+    def _snapshot(tgz_src, leaf):
+        """把安装包快照进 <dshHome>/packages/, 返回稳定路径(非法文件名回 None)。"""
+        os.makedirs(packages_dir, exist_ok=True)
+        dest = os.path.join(packages_dir, leaf)
+        root = os.path.realpath(packages_dir)
+        try:
+            if os.path.commonpath([os.path.realpath(dest), root]) != root:
+                return None
+        except ValueError:
+            return None
+        if os.path.realpath(tgz_src) != dest:
+            shutil.copy2(tgz_src, dest)
+        return dest
+
     try:
         if is_dir:
             name, version = _package_identity(src)
             if not name:
                 return False, "插件目录缺少可读的 package.json(name 为空): %s" % src
-            pack_temp = os.path.join(dsh_home(), "pack-temp")
-            os.makedirs(pack_temp, exist_ok=True)
+            # 临时目录每次独立: 固定名(<dshHome>/pack-temp)会被并发安装互删,
+            # 且上次失败留下的旧 tgz 会被 _newest_tgz 认成本次产物(装进 profile 的
+            # 就是上一个版本的包)。
+            pack_temp = tempfile.mkdtemp(prefix="llamadsh_packtemp_")
+            started = time.time()
             if job_log:
                 job_log("[插件安装] 打包 %s@%s …" % (name, version or "?"))
             r = subprocess.run(["pnpm", "pack", "--pack-destination", pack_temp],
-                               cwd=src, capture_output=True, text=True, timeout=600,
+                               cwd=src, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=600,
                                env=_pnpm_env())
-            tgz = _newest_tgz(pack_temp)
+            tgz = _newest_tgz(pack_temp, not_before=started)
             if r.returncode != 0 or not tgz:
                 if job_log:
                     job_log("[插件安装] pnpm pack 失败, 尝试无构建脚本打包: %s"
-                            % ((r.stderr or r.stdout or "")[-300:]))
+                            % _pnpm_error_tail((r.stderr or "") + (r.stdout or ""), 300))
                 tgz = _pack_staged(src, pack_temp, job_log)
             if not tgz:
                 missing = _missing_build_entry(src)
@@ -1164,49 +1316,48 @@ def install_local_plugin(profile, source, job_log=None):
                     job_log("[插件安装] 无构建脚本打包仍失败, 回退直接安装目录")
                 spec = "file:" + src
             else:
-                os.makedirs(packages_dir, exist_ok=True)
-                dest = os.path.join(packages_dir,
-                                    "%s-%s.tgz" % (name.replace("/", "-"), version or "0.0.0"))
-                shutil.copy2(tgz, dest)
+                dest = _snapshot(tgz, _pkg_filename(name, version))
+                if not dest:
+                    return False, "非法安装包名: %r" % (name,)
                 spec = "file:" + dest
                 if job_log:
                     job_log("[插件安装] 已生成稳定安装包: %s" % dest)
         else:
             name, version = _tarball_identity(src)
-            os.makedirs(packages_dir, exist_ok=True)
-            dest = os.path.join(packages_dir, os.path.basename(src))
-            if dest != src:
-                shutil.copy2(src, dest)
+            dest = _snapshot(src, os.path.basename(src))
+            if not dest:
+                return False, "非法安装包文件名: %r" % (os.path.basename(src),)
             spec = "file:" + dest
             if job_log:
                 job_log("[插件安装] 使用本地包: %s" % dest)
 
-        manifest = os.path.join(base, "package.json")
-        lockfile = os.path.join(base, "pnpm-lock.yaml")
         manifest_bak = _backup(manifest)
-        lock_bak = _backup(lockfile) if os.path.isfile(lockfile) else None
+        lock_bak = _backup(lockfile) if lock_existed else None
         before = _profile_deps(base)
         if name and name in before and before[name] != spec:
             if job_log:
                 job_log("[插件安装] 清理同名旧依赖 %s(原 %s)…" % (name, before[name]))
+            removed_spec = str(before[name] or "")
             ok_rm, out_rm = _pnpm_remove(base, name)
             if not ok_rm and job_log:
-                job_log("[插件安装] 清理旧依赖失败: %s" % (out_rm or "")[-300:])
+                job_log("[插件安装] 清理旧依赖失败: %s" % _pnpm_error_tail(out_rm, 300))
             before = _profile_deps(base)
 
         if job_log:
             job_log("[插件安装] pnpm add %s …" % spec)
         ok, out = _pnpm_add_spec(base, spec)
         if not ok:
-            # 回滚 manifest/lock, 否则 profile 会停在"声明了但没装"的半安装状态
-            for path, bak in ((manifest, manifest_bak), (lockfile, lock_bak)):
-                if bak:
-                    try:
-                        shutil.copy2(bak, path)
-                    except OSError:
-                        pass
-            tail = ((out or "").strip() or "")[-600:]
-            return False, "本地插件安装失败: %s(已回滚 package.json/lock)" % (tail or "无输出")
+            _rollback()
+            note = "(已回滚 package.json/lock)"
+            if removed_spec:
+                # 旧依赖已被 pnpm remove 掉而新装又失败: manifest 回滚了但 node_modules
+                # 里还是缺包, 尽力把旧 spec 装回去, 装不回去就把话说清楚
+                back_ok, _ = _pnpm_add(base, name, "@" + removed_spec)
+                note = ("已回滚 package.json/lock, 并已把原依赖 %s%s 装回"
+                        % (name, removed_spec)) if back_ok else (
+                        "已回滚 package.json/lock, 但同名旧依赖此前已被移除且未能装回: "
+                        "如插件不可用请在插件列表点\"修复\"")
+            return False, "本地插件安装失败: %s %s" % (_pnpm_error_tail(out), note)
 
         after = _profile_deps(base)
         installed = name
@@ -1221,15 +1372,36 @@ def install_local_plugin(profile, source, job_log=None):
         pj = os.path.join(base, "node_modules", installed.replace("/", os.sep), "package.json")
         doc = read_json(pj, None) or {}
         got = str(doc.get("version") or "")
-        has_bundle = bool((doc.get("dsh") or {}).get("bundle"))
-        if has_bundle:
-            _, bundle_msg = set_bundle_active(profile, installed, True)
-        else:
+        if not (doc.get("dsh") or {}).get("bundle"):
             bundle_msg = "已作为普通依赖安装, 但包内没有 dsh.bundle, 未加入 profile bundles"
+        else:
+            # C# 的 FilterBundleActivation: peer 错位/缺依赖/有错误/被用户锁定的包
+            # 不能自动激活 —— 激活后 DSH 启动时模块加载直接失败
+            plugins = []
+            try:
+                plugins = audit_plugins(profile, dsh_dir)
+            except Exception as ex:
+                if job_log:
+                    job_log("[插件安装] 激活前审计失败, 跳过激活守卫: %r" % (ex,))
+            kept, demoted = filter_bundle_activation([installed], plugins, profile)
+            if any(k == installed for k in kept):
+                act_ok, bundle_msg = set_bundle_active(profile, installed, True)
+                if not act_ok:
+                    bundle_msg = "已安装, 但写入 profile bundles 失败: %s" % bundle_msg
+            else:
+                why = (demoted[0].get("reason") if demoted else "审计未通过") or "审计未通过"
+                bundle_msg = "已安装但**未自动激活**(%s): 请在插件列表确认后手动激活" % why
         if job_log:
             job_log("[插件安装] %s 完成: %s" % (installed, bundle_msg))
         return True, ("已安装 %s%s(%s); %s。请重启 DSH 生效。"
                       % (installed, "@" + got if got else "", spec, bundle_msg))
+    except Exception as ex:
+        # pnpm 超时/OSError/package.json 坏 JSON 等: 不回滚就把 profile 停在半安装状态,
+        # 而且裸 traceback 会冒到 API 层变成"未知错误"
+        _rollback()
+        tail = "超时" if isinstance(ex, subprocess.TimeoutExpired) else repr(ex)
+        return False, ("本地插件安装异常(%s), %s已重试请查看日志"
+                       % (tail, "已回滚 package.json/lock; " if manifest_bak else ""))
     finally:
         if pack_temp:
             shutil.rmtree(pack_temp, ignore_errors=True)
