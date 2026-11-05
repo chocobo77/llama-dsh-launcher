@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(282 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(284 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -3037,22 +3037,33 @@ _orig_sleep23 = core.time.sleep
 core.time.sleep = lambda s: _orig_sleep23(0.02)
 _th23 = threading.Thread(target=_mon23.loop, daemon=True)
 _th23.start()
-_orig_sleep23(0.6)
+
+
+def _wait23(cond, secs):
+    """按条件等(休眠现在是 5s 一档, 不能按固定 0.6s 猜拍数)。"""
+    end = time.time() + secs
+    while time.time() < end:
+        if cond():
+            return True
+        _orig_sleep23(0.05)
+    return cond()
+
+
+_ok23a = _wait23(lambda: _mon23.llama.calls >= 3, 8.0)
 _alive23 = _th23.is_alive()
 _calls23 = _mon23.llama.calls
 _lines23 = list(_mon23.hub.lines)
 # 换一种异常时, 新行必须补上"上一条同类重复了多少次"
 _mon23.llama = _BoomLlama23(ValueError)
-_orig_sleep23(0.3)
+_ok23b = _wait23(lambda: len(_mon23.hub.lines) >= 2, 8.0)
 core.time.sleep = _orig_sleep23
-_th23.join(0.3)
-check("监控循环首拍抛异常后线程必须活着(interval 要有兜底值; HEAD 会 UnboundLocalError 退出)",
-      _alive23 and _calls23 >= 5 and len(_lines23) == 1,
+check("监控循环首拍抛异常后线程必须活着且继续复查(interval 有兜底值; HEAD 会 UnboundLocalError 退出)",
+      _alive23 and _ok23a and _calls23 >= 3 and len(_lines23) == 1,
       str((_alive23, _calls23, _lines23)))
 check("监控错误日志必须带异常类型名(很多异常 str 是空的)",
       any("RuntimeError:" in t for t in _lines23), str(_lines23))
 check("同一错误不得逐拍刷屏; 换错时新行要说明上一条重复了多少次",
-      len(_mon23.hub.lines) == 2 and "已重复" in _mon23.hub.lines[1]
+      _ok23b and len(_mon23.hub.lines) == 2 and "已重复" in _mon23.hub.lines[1]
       and "ValueError:" in _mon23.hub.lines[1], str(_mon23.hub.lines))
 
 # 23.2 轻量化不能把 monitor_visible 也省掉: 那是监控页每 3s 打点的"有人正看着"。
@@ -3088,6 +3099,23 @@ _m23.monitor_seen_at = time.time()
 check("对照: 打点新鲜时仍算\"有人在看\"(3s 全速)",
       _m23._cadence(False, False, False) == ("full", 3.0), str(_m23._cadence(False, False, False)))
 _m23.lightweight = False
+# 23.7 长休眠还要能被"有人刚打开页"打断: 空转/轻量化是 30~60s 一档, 打开面板不能等上一拍
+#      睡完才刷新(活体实测: 页已可见但 sampled_at 停了 34s, snapshot_age 一路涨到 31s)。
+_m23c = core.Monitor(_LogHub23(), None, None)
+_t023c = time.time()
+_th23c = threading.Thread(target=lambda: _m23c._sleep_until_next(60.0), daemon=True)
+_th23c.start()
+time.sleep(0.3)
+_m23c.monitor_visible, _m23c.monitor_seen_at = True, time.time()      # 用户打开监控页
+_th23c.join(6.0)
+_slept23c = time.time() - _t023c
+check("打点出现后必须在 ≤6s 内结束 60s 休眠(打开面板不能等上一拍睡完)",
+      not _th23c.is_alive() and _slept23c < 6.0, str(round(_slept23c, 2)))
+_m23c.monitor_visible = False
+_t023d = time.time()
+_m23c._sleep_until_next(1.2)
+check("对照: 没人看页时必须睡满间隔(不得为了响应把空转也变成高频醒)",
+      time.time() - _t023d >= 1.15, str(round(time.time() - _t023d, 2)))
 
 
 # 23.3 visible=True 时必须真的采样(整条链路), 且快照要带上帧龄与轻量化标记

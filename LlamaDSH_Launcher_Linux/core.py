@@ -1030,6 +1030,18 @@ class Monitor:
         就永远停在 True, 于是 30s 的空转档永远进不去, 轻量化也形同被废掉。"""
         return bool(self.monitor_visible) and (time.time() - self.monitor_seen_at <= 8.0)
 
+    def _sleep_until_next(self, interval):
+        """长休眠每 ≤5s 醒一次复查档位: 空转/轻量化那 30~60s 里用户打开监控页, 不能等上一拍
+        睡完才开始刷新(实测打开后 34s 仍不刷新)。醒来不采样, 只复查"有没有人开始看页"。"""
+        end = time.time() + interval
+        while True:
+            left = end - time.time()
+            if left <= 0:
+                return
+            time.sleep(min(left, 5.0))
+            if self._watched():
+                return
+
     def _cadence(self, llama_alive, api_online, dsh_alive):
         """本拍走哪条采样路("light"=轻量化驻留 / "full"=正常), 以及下一拍间隔。
 
@@ -1045,7 +1057,7 @@ class Monitor:
     def loop(self):
         while True:
             # interval 必须先给兜底值: 首拍在赋值**之前**抛异常(读 /proc、端口探测抖动),
-            # 末尾的 time.sleep(interval) 就会抛 UnboundLocalError, 整条监控线程从此退出 ——
+            # 末尾的 _sleep_until_next(interval) 就会抛 UnboundLocalError, 线程从此退出 ——
             # 监控页停在最后一帧、显存熔断(判定就跑在本循环里)静默失效, 且看不出来。
             interval = 3.0
             try:
@@ -1089,7 +1101,7 @@ class Monitor:
                         self.snapshot.update({"lightweight": True,
                                               "llama_status": self.llama.status,
                                               "dsh_status": self.dsh.status})
-                    time.sleep(interval)
+                    self._sleep_until_next(interval)
                     continue
                 if llama_alive or api_online or self._watched():
                     self.llama.api.poll_fast()
@@ -1143,7 +1155,7 @@ class Monitor:
                     self.hub.log("[Perf] Error: %s%s" % (
                         msg, "" if not self._perf_reps else "(上一条同类已重复 %d 次)" % self._perf_reps))
                     self._perf_last, self._perf_reps = msg, 0
-            time.sleep(interval)
+            self._sleep_until_next(interval)
 
     def _collect_speeds(self):
         return self.llama.api.speeds()
