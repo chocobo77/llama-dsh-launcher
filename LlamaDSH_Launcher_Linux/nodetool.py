@@ -44,8 +44,14 @@ def _node_candidates():
               "/snap/bin", os.path.join(LOCAL_BIN)):
         cands.append(os.path.join(p, "node"))
     home = os.path.expanduser("~")
-    cands += glob_dirs(os.path.join(home, ".nvm", "versions"), "node", "bin")
-    cands += glob_dirs(os.path.join(home, ".local", "share", "fnm", "node-versions"), "installation", "bin")
+    # 版本管理器实际布局是**三层**: ~/.nvm/versions/node/v24.10.3/bin/node、
+    # ~/.local/share/fnm/node-versions/v24.10.3/installation/bin/node。以前一处写成
+    # glob_dirs(~/.nvm/versions, "node", "bin")(找 ~/.nvm/versions/node/bin/node, 中间那层
+    # 版本号目录被跳掉), 一处把 prefix 落在 "installation" 上(版本目录在前, 永远不匹配)
+    # ⇒ 两路恒返回空: 用 nvm/fnm 的机器上面板永远显示"Node 未安装", 一键安装每次重下几十 MB。
+    cands += glob_dirs(os.path.join(home, ".nvm", "versions", "node"), "v", "bin")
+    cands += glob_dirs(os.path.join(home, ".local", "share", "fnm", "node-versions"),
+                       "v", "installation/bin")
     cands.append(os.path.join(home, ".volta", "bin", "node"))
     w = procman.which("node")
     if w:
@@ -67,6 +73,19 @@ def glob_dirs(root, prefix, sub):
     except OSError:
         pass
     return out
+
+
+def _vkey(v):
+    """v24.10.3 → (24, 10, 3): 版本比较必须按段做整数比。
+
+    用字符串比会出现 v24.10.0 < v24.9.9(按字符逐位比), 于是"已是最新"永远判不出来;
+    用 `!=` 判是否需要更新更糟: 本机是 v25(比上游最新 v24 还新)时一键安装会去**降级**。
+    解析不了返回 (0,) —— 宁可判"需要装", 也不要抛异常让整个任务红掉。
+    """
+    try:
+        return tuple(int(x) for x in str(v).lstrip("v").split("."))
+    except ValueError:
+        return (0,)
 
 
 def _exe_version(path, args=("--version",), timeout=8):
@@ -120,7 +139,11 @@ def detect(force=False):
             return int(v.lstrip("v").split(".")[0])
         except (ValueError, IndexError):
             return 0
-    n24 = next(((p, v) for p, v in nodes if major(v) >= 24), None)
+    # 24+ 里取**版本最高**的那个, 而不是候选表里排最前的: 候选表按目录/PATH 顺序排,
+    # 于是 ~/.local/bin 里上次一键装好的 v24.10 会被 /usr/bin 的 v24.9 挡在后面 ——
+    # 面板报 v24.9、一键安装于是每次都判"不是最新"再下一遍(不收敛)。
+    ok24 = [(p, v) for p, v in nodes if major(v) >= 24]
+    n24 = max(ok24, key=lambda x: _vkey(x[1])) if ok24 else None
     if n24 is None and nodes:
         n24 = max(nodes, key=lambda x: major(x[1]))
     unknown = bool(n24 is None and broken)
@@ -187,14 +210,47 @@ def install_node_env(job_log, timeout_secs=600):
     if version_unknown:
         job_log("⚠ Node %s 存在但版本探测失败(node -v 无输出)。跳过重装——"
                 "若确需更新请先手动确认 node 可运行。" % st["node24"]["path"])
-    need_node = (not cur_v and not version_unknown) or (cur_v and cur_v != latest_v and not version_unknown)
+    need_node = ((not cur_v and not version_unknown)
+                 or (cur_v and not version_unknown and _vkey(cur_v) < _vkey(latest_v)))
+    if not need_node and cur_v and _vkey(cur_v) > _vkey(latest_v):
+        # 本机比上游"最新 v24"还新(例如装了 v25): 明确说不降级, 否则用户看到
+        # "Node 已是最新(v25.1.0)"会以为上游就是 v25。
+        job_log("本机 Node %s 比上游最新 %s 更新, 不降级" % (cur_v, latest_v))
     if need_node:
         fname = "node-%s-linux-x64.tar.xz" % latest_v
         url = "%s/%s/%s" % (latest_base, latest_v, fname)
         dest = os.path.join(LOCAL_LIB, fname)
         os.makedirs(LOCAL_LIB, exist_ok=True)
+        # 期望哈希只由 (版本, 文件名) 决定, 与"从哪个镜像下载"无关 ⇒ 提到下载之前取一次。
+        # 旧写法把取校验表挂在每个镜像尝试的内部: nodejs.org 不可达(而这正是在用镜像的原因)
+        # 时, 每个源都要先下完 ~50MB 才发现校验表取不到 → 删掉 → 再下一遍, 最后回一句
+        # "Node 下载/校验失败(全部源)" —— 白下两遍流量, 而且失败原因看着像下载坏了。
+        sha_bases = ["https://nodejs.org/dist"]                   # 官方优先, 下载用的源兜底
+        if latest_base and latest_base not in sha_bases:
+            sha_bases.append(latest_base)
+        want, sha_src, sha_errs = None, "", []
+        for sha_base in sha_bases:
+            try:
+                shas = _http_get("%s/%s/SHASUMS256.txt" % (sha_base, latest_v), timeout=30).decode()
+            except Exception as ex:
+                sha_errs.append("%s: %s" % (sha_base, ex))
+                continue
+            for ln in shas.splitlines():
+                toks = ln.strip().split()
+                # 精确匹配 "<hash>  <fname>": endswith 可被前缀伪造
+                if len(toks) == 2 and toks[1] == fname:
+                    want, sha_src = toks[0], sha_base
+                    break
+            if want:
+                break
+        if not want:
+            return False, ("取不到 %s 的 SHA-256 校验表(nodejs.org 与镜像都不可达), 本次未下载 —— "
+                           "不做弱校验。%s" % (fname, "; ".join(sha_errs)[:200]))
+        if sha_src != "https://nodejs.org/dist":
+            # 与 tarball 同源的校验表强度低一档(镜像被控 = 两样一起换), 要说出来
+            job_log("⚠ SHA-256 期望值取自镜像(%s), 与 tarball 同源" % sha_src)
         job_log("下载: %s" % url)
-        # .part + SHA256 校验(校验表取不到 → 换源, 不做弱校验)
+        # .part + SHA256 校验(校验表已在下载前拿到; 坏文件 → 换源)
         ok_dl = False
         for attempt_base in DIST_MIRRORS:
             url_b = "%s/%s/%s" % (attempt_base, latest_v, fname)
@@ -209,24 +265,10 @@ def install_node_env(job_log, timeout_secs=600):
                         f.write(chunk)
                 os.replace(part, dest)
                 try:
-                    # SHASUMS 固定从 nodejs.org 官方源取: 与 tarball 同镜像取时,
-                    # 镜像被控 = tarball+校验表一起换, 校验形同虚设
-                    shas = _http_get("https://nodejs.org/dist/%s/SHASUMS256.txt" % latest_v,
-                                     timeout=30).decode()
-                    want = None
-                    for ln in shas.splitlines():
-                        toks = ln.strip().split()
-                        # 精确匹配 "<hash>  <fname>": endswith 可被前缀伪造
-                        if len(toks) == 2 and toks[1] == fname:
-                            want = toks[0]
-                            break
-                    if want:
-                        got = _sha256(dest)
-                        if got != want:
-                            raise IOError("SHA-256 不匹配(得 %s… 期望 %s…)" % (got[:12], want[:12]))
-                        job_log("SHA-256 校验通过")
-                    else:
-                        raise IOError("SHASUMS 中未找到 %s" % fname)
+                    got = _sha256(dest)
+                    if got != want:
+                        raise IOError("SHA-256 不匹配(得 %s… 期望 %s…)" % (got[:12], want[:12]))
+                    job_log("SHA-256 校验通过")
                 except Exception as sha_ex:
                     # 坏文件已 replace 进 dest, 不删会永久残留未校验 tarball
                     job_log("校验失败(%s),删除坏文件并换源重试" % sha_ex)
@@ -320,4 +362,12 @@ def install_node_env(job_log, timeout_secs=600):
         return False, ("pnpm 已就位(%s)但 `pnpm --version` 无输出 —— corepack 首次运行需要联网取包, "
                        "请手动执行一次 pnpm --version 看具体报错" % st2["pnpm"]["path"])
     job_log("pnpm %s 就绪(%s)" % (pv, st2["pnpm"]["path"]))
-    return True, "Node %s + pnpm %s 就绪" % (st2["node24"]["version"], pv)
+    node_v = st2["node24"]["version"]
+    # pnpm 一侧有"`pnpm --version` 无输出就不算就绪"的守卫, node 一侧以前没有: 版本探测
+    # 不到(exe 在但是个跑不动的空壳)时任务按 81cdb3b 跳过了重装, 结尾却报
+    # "Node None + pnpm 9.9.9 就绪" —— 面板一片绿, 而 DSH 安装/重建仍会挂在同一个 node 上。
+    if not node_v:
+        return False, ("Node 未能验证: %s 执行 --version 无输出(已按原策略跳过重装)。"
+                       "pnpm %s 已就绪, 但 DSH 安装/重建仍可能失败 —— 请先确认这个 node 能运行, "
+                       "或删掉它再点一键安装" % (st2["node24"]["path"] or "(无 node)", pv))
+    return True, "Node %s + pnpm %s 就绪" % (node_v, pv)

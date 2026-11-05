@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(284 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(352 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -9,7 +9,9 @@
       (约 0.2s 一闪), 否则那 4 项只能空转。
 每项断言都对应一个真实踩过的坑, 修 bug 前先跑它, 修完再跑它。
 注意: 源码级断言(比对字符串)挡不住运行时错误 —— 收尾/退出这一族另有行为级
-      测试(第 13 节): 进程内真调收尾函数 + 隔离 HOME 起真实例打 /api/shutdown。"""
+      测试(第 13 节): 进程内真调收尾函数 + 隔离 HOME 起真实例打 /api/shutdown。
+第 25 节是"修复动作"本身的行为级测试: 用临时 profile/dshHome 真跑审计、一键修复、
+      装插件回滚与一键安装 Node, 每条守卫都配反向对照(证据在→必须改, 证据缺→必须不动)。"""
 import io
 import json
 import os
@@ -3677,6 +3679,469 @@ check("对照: 首刷回来后必须真有行且 disks_pending 变 False(不得�
       len(_warm23["disks"]) >= 1 and _warm23["disks_pending"] is False,
       str((len(_warm23["disks"]), _warm23.get("disks_pending"))))
 
+
+
+# --------------------------------- 25. 兼容修复不毁配置 / Node 环境(第十六轮) --
+# 这一族最坏的失败不是"修不好", 而是"把有效配置改坏了、还报成功": dump-config 探针没查到
+# 东西时, 一键修复会把 cordis.patch.yml 里**每条有效**补丁注释掉。断言全部真文件真跑, 且
+# 每条守卫都配反向对照(证据在 → 必须改; 证据缺 → 必须一动不动), 免得守卫变成"一律不修"。
+import hashlib as _hashlib25        # noqa: E402
+import subprocess as _sp25          # noqa: E402
+import tarfile as _tf25             # noqa: E402
+
+_prof25 = os.path.join(_tmp, "prof25")
+_dshome25 = os.path.join(_tmp, "dshome25")
+_dshdir25 = os.path.join(_tmp, "dshdir25")
+os.makedirs(os.path.join(_prof25, ".dsh-market"))
+os.makedirs(os.path.join(_dshome25, "packages"))
+os.makedirs(os.path.join(_dshdir25, "apps", "cli", "lib"))
+io.open(os.path.join(_dshdir25, "apps", "cli", "lib", "bin.js"), "w", encoding="utf-8").write("// stub\n")
+_PATCH25 = os.path.join(_prof25, "cordis.patch.yml")
+_PATCH_SRC25 = "patch:\n  - id: keep-me\n    computeMs: 500\n  - id: second\n    enabled: true\n"
+io.open(_PATCH25, "w", encoding="utf-8").write(_PATCH_SRC25)
+_MANI25 = os.path.join(_prof25, "package.json")
+_real_pdir25, _real_dshome25 = _compat.profile_dir, _compat.dsh_home
+_compat.profile_dir = lambda p="web": _prof25
+_compat.dsh_home = lambda: _dshome25
+
+
+def _write_mani25(bundles, extra=None):
+    doc = {"dsh": {"profile": {"bundles": list(bundles)}}, "keepMe": {"x": 1}}
+    if extra:
+        doc.update(extra)
+    with io.open(_MANI25, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+
+
+def _mani25():
+    with io.open(_MANI25, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _patch25():
+    with io.open(_PATCH25, encoding="utf-8") as fh:
+        return fh.read()
+
+
+check("25 夹具: profile/dshHome 必须被改到临时区(否则整节会写用户真 profile)",
+      _compat.profile_dir("web") == _prof25 and _compat.pinned_plugins_path().startswith(_dshome25),
+      _compat.pinned_plugins_path())
+
+# 25.1 dump-config 退出码 0 但输出不是 JSON: 必须算"探针失败", 不能交出一个空 entry 集合
+_real_run_c25 = _compat.subprocess.run
+
+
+def _fake_run_stdout(payload):
+    _compat.subprocess.run = lambda *a, **k: types.SimpleNamespace(
+        returncode=0, stdout=payload, stderr="")
+
+
+_fake_run_stdout("DSH 0.9.1\nconfig written to /home/u/.dsh\n")
+_ids25, _err25 = _compat._dump_config_entries(_dshdir25)
+_compat.subprocess.run = _real_run_c25
+check("dump-config 退出码 0 但输出不是 JSON 必须判探针失败(不得交出空 entry 集合)",
+      _ids25 is None and "JSON" in (_err25 or ""), str((_ids25, (_err25 or "")[:70])))
+
+_fake_run_stdout('banner line\n{"config": {"patch": {"entries": [{"id": "keep-me"}, '
+                 '{"id": "other"}]}}}\ndone line\n')
+_ids25b, _err25b = _compat._dump_config_entries(_dshdir25)
+_compat.subprocess.run = _real_run_c25
+check("对照: JSON 前后夹 banner 时必须仍能解析出 entry(不得一律判失败)",
+      _ids25b == {"keep-me", "other"}, str((_ids25b, _err25b)))
+
+
+def _audit25(stdout_payload):
+    _fake_run_stdout(stdout_payload)
+    try:
+        return _compat.audit(_dshdir25, lambda _t: None)
+    finally:
+        _compat.subprocess.run = _real_run_c25
+
+
+# 25.2 转储查到 0 个 entry 而补丁文件有 N 条: 按"未能核对"处理, 绝不判失效条目
+_write_mani25(["core"])
+_rep25b = _audit25('{"config": {"patch": {"entries": []}}}')
+_kinds25b = [x["kind"] for x in _rep25b["fixables"]]
+check("转储 0 个 entry 而补丁文件有 N 条时不得判失效条目(修前: 每条补丁都成 orphan, 一键修复真去注释)",
+      "patch_orphan" not in _kinds25b and "patch_rename" not in _kinds25b, str(_kinds25b))
+check("同一情况必须明说\"本次不判定失效条目\"并计入未能核对(不得报成一切正常)",
+      any("不判定失效条目" in x["text"] for x in _rep25b["items"]),
+      str([x["text"][:40] for x in _rep25b["items"]][:6]))
+_rep25c = _audit25('{"config": {"patch": {"entries": [{"id": "unrelated-one"}, '
+                   '{"id": "unrelated-two"}]}}}')
+_orph25 = [x for x in _rep25c["fixables"] if x["kind"] == "patch_orphan"]
+check("对照: 转储确实查到 entry 而补丁不在其中时仍要判失效条目, 且带上 entry 数作证据",
+      len(_orph25) == 2 and all(x.get("dump_count") == 2 for x in _orph25), str(_orph25))
+
+# 25.3 repair 改写补丁条目的门槛: 没有 entry 证据 / 备份失败 → 一个字都不改
+_real_audit25 = _compat.audit
+
+
+def _repair25(fixables, log):
+    _compat.audit = lambda dsh_dir, logf: {"items": [], "fixables": fixables, "version": ""}
+    try:
+        return _compat.repair(_dshdir25, {}, log.append)
+    finally:
+        _compat.audit = _real_audit25
+
+
+_log25 = []
+_n25 = _repair25([{"kind": "patch_orphan", "old": "keep-me", "dump_count": 0}], _log25)
+check("没有 entry 证据时不得注释用户补丁(修前: 依据空转储把有效补丁关掉)",
+      _n25 == 0 and _patch25() == _PATCH_SRC25 and any("没有查到 entry" in t for t in _log25),
+      str((_n25, _patch25()[:50])))
+_log25b = []
+_n25b = _repair25([{"kind": "patch_orphan", "old": "keep-me", "dump_count": 2}], _log25b)
+_t25b = _patch25()
+check("对照: 有 entry 证据时失效条目仍要注释掉并留备份(守卫不得变成一律不修)",
+      _n25b == 1 and "# [compat] 已失效条目,自动注释:" in _t25b
+      and any(n.startswith("cordis.patch.yml.bak-compat-") for n in os.listdir(_prof25)),
+      str((_n25b, _t25b[:60])))
+io.open(_PATCH25, "w", encoding="utf-8").write(_PATCH_SRC25)
+_real_bak25 = _compat._backup
+_compat._backup = lambda p: None
+_log25c = []
+_n25c = _repair25([{"kind": "patch_orphan", "old": "keep-me", "dump_count": 2}], _log25c)
+check("备份失败时不得改写补丁文件(修前: 不查 _backup 返回值直接写)",
+      _n25c == 0 and _patch25() == _PATCH_SRC25 and any("备份失败" in t for t in _log25c),
+      str((_n25c, _patch25()[:50])))
+_compat._backup = _real_bak25
+
+# 25.4 market_disabled: 备份失败/读不动都不能算"已清空"
+_ST25 = os.path.join(_prof25, ".dsh-market", "state.json")
+
+
+def _state25(doc):
+    with io.open(_ST25, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+
+
+def _state25_read():
+    with io.open(_ST25, encoding="utf-8") as fh:
+        return fh.read()
+
+
+_state25({"disabled": ["a", "b"], "keepMe": {"x": 1}})
+_compat._backup = lambda p: None
+_log25d = []
+_n25d = _repair25([{"kind": "market_disabled", "path": _ST25, "count": 2}], _log25d)
+_compat._backup = _real_bak25
+check("备份失败不得清空 dsh-market disabled 还计成已修复",
+      _n25d == 0 and json.loads(_state25_read())["disabled"] == ["a", "b"]
+      and any("备份失败" in t for t in _log25d), str((_n25d, _state25_read()[:50])))
+io.open(_ST25, "w", encoding="utf-8").write("{ disabled broken json <<")
+_log25e = []
+_n25e = _repair25([{"kind": "market_disabled", "path": _ST25, "count": 1}], _log25e)
+check("读不动的 state.json 不得被重写成骨架(修前: json.load 抛错前已备份但照样 dump 出去)",
+      _n25e == 0 and _state25_read().startswith("{ disabled broken json")
+      and any("读不动" in t for t in _log25e), str((_n25e, _state25_read()[:40])))
+_state25({"disabled": ["a", "b"], "keepMe": {"x": 1}})
+_log25f = []
+_n25f = _repair25([{"kind": "market_disabled", "path": _ST25, "count": 2}], _log25f)
+_st25f = json.loads(_state25_read())
+check("对照: 正常时必须清空 disabled 并保留其它键(不得只写一个 disabled)",
+      _n25f == 1 and _st25f["disabled"] == [] and _st25f.get("keepMe") == {"x": 1}, str(_st25f))
+
+# 25.5 pinned_writeback: set_bundle_active 返回 (False, …) 时不算已修复
+_real_sba25 = _compat.set_bundle_active
+_compat.set_bundle_active = lambda p, n, a: (False, "已有插件操作正在进行中")
+_log25g = []
+_n25g = _repair25([{"kind": "pinned_writeback", "name": "dsh-x"}], _log25g)
+check("停用插件返回失败时不得计数为已修复(修前: 不看返回值就 fixed += 1, 复检才发现还在)",
+      _n25g == 0 and any("未能再次移除" in t for t in _log25g), str((_n25g, _log25g)))
+_compat.set_bundle_active = lambda p, n, a: (True, "")
+_log25h = []
+_n25h = _repair25([{"kind": "pinned_writeback", "name": "dsh-x"}], _log25h)
+_compat.set_bundle_active = _real_sba25
+check("对照: 停用成功时仍要计数(守卫不得变成一律不修)", _n25h == 1, str(_n25h))
+
+# 25.6 enforce_pinned 必须与装/卸/激活共用 profile 锁: 它改写的是同一份 package.json
+_imb25base = len(_compat.op_imbalance())     # 前面几节故意造过失衡, 只判本节新增的
+_write_mani25(["dsh-locked", "dsh-keep"])
+_compat.pin_inactive("web", "dsh-locked")
+_log25i = []
+_holder_done = [False]
+
+
+def _hold25():
+    if _compat.begin_profile_op("web", "安装插件 dsh-y"):
+        _holder_done[0] = True
+        time.sleep(0.8)
+        _compat.end_profile_op("web")
+
+
+_th25 = threading.Thread(target=_hold25)
+_th25.start()
+time.sleep(0.2)
+_wb25 = _compat.enforce_pinned("web", _log25i.append)
+_th25.join()
+check("有其它插件操作持锁时不得改写 package.json(修前: 写回本次读到的旧文档, 抹掉并发安装的依赖)",
+      _holder_done[0] and _wb25 == [] and "dsh-locked" in _mani25()["dsh"]["profile"]["bundles"]
+      and any("有其它插件操作" in t for t in _log25i), str((_wb25, _mani25())))
+_wb25b = _compat.enforce_pinned("web", _log25i.append)
+_mani25b = _mani25()
+check("对照: 无人持锁时锁定回写仍要执行, 且只动被锁定的那一个(其它声明必须保住)",
+      _wb25b == ["dsh-locked"] and _mani25b["dsh"]["profile"]["bundles"] == ["dsh-keep"]
+      and _mani25b.get("keepMe") == {"x": 1}, str((_wb25b, _mani25b)))
+_write_mani25(["dsh-locked", "dsh-keep"])
+_compat._backup = lambda p: None
+_wb25c = _compat.enforce_pinned("web", _log25i.append)
+_compat._backup = _real_bak25
+check("备份失败时不得移除锁定包(且不能报成已移除)",
+      _wb25c == [] and "dsh-locked" in _mani25()["dsh"]["profile"]["bundles"], str(_wb25c))
+check("begin/end 必须成对: enforce_pinned 跑完后不得新增在途登记或锁失衡",
+      _compat.inflight_ops() in ([], {}) and len(_compat.op_imbalance()) == _imb25base,
+      str((_compat.inflight_ops(), _compat.op_imbalance()[_imb25base:])))
+
+# 25.7 装插件失败的回滚: pnpm 新建的 lock 必须一起删掉(修前那段挂在 return 之后, 是死码)
+_tgz25 = os.path.join(_tmp, "dsh-demo-1.2.3.tgz")
+_pkgdir25 = os.path.join(_tmp, "pkg25")
+os.makedirs(_pkgdir25)
+with io.open(os.path.join(_pkgdir25, "package.json"), "w", encoding="utf-8") as fh:
+    json.dump({"name": "dsh-demo", "version": "1.2.3"}, fh)
+with _tf25.open(_tgz25, "w:gz") as _tfo25:
+    _tfo25.add(os.path.join(_pkgdir25, "package.json"), arcname="package/package.json")
+_real_pnpmwhich25 = _compat.procman_which_pnpm
+_compat.procman_which_pnpm = lambda: "/usr/bin/pnpm"
+_write_mani25(["core"], extra={"dependencies": {"old-dep": "1.0.0"}})
+_lock25 = os.path.join(_prof25, "pnpm-lock.yaml")
+
+
+def _add_fail25(base, spec):
+    with io.open(os.path.join(base, "pnpm-lock.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("lockName: new-from-pnpm\n")
+    return False, "模拟: pnpm add 失败(缺对等依赖)"
+
+
+_real_addspec25 = _compat._pnpm_add_spec
+_compat._pnpm_add_spec = _add_fail25
+_log25j = []
+_ok25j, _msg25j = _compat.install_local_plugin("web", _tgz25, _log25j.append, _dshdir25)
+check("装失败必须回滚 package.json 并删掉 pnpm 新建的 lock(修前: 留下一份孤儿 lock 还说\"已回滚\")",
+      _ok25j is False and not os.path.isfile(_lock25)
+      and _mani25()["dependencies"] == {"old-dep": "1.0.0"},
+      str([(_msg25j or "")[:120], os.path.isfile(_lock25)]))
+with io.open(_lock25, "w", encoding="utf-8") as fh:
+    fh.write("lockName: pre-existing\n")
+_log25k = []
+_ok25k, _msg25k = _compat.install_local_plugin("web", _tgz25, _log25k.append, _dshdir25)
+_lock_txt25 = io.open(_lock25, encoding="utf-8").read().strip() if os.path.isfile(_lock25) else "(没了)"
+check("原本就有 lock 时必须写回原内容而不是删掉(删掉等于抹掉用户的既有解析结果)",
+      _lock_txt25 == "lockName: pre-existing", str([(_msg25k or "")[:100], _lock_txt25]))
+if os.path.isfile(_lock25):
+    os.remove(_lock25)              # 本次要测的是"原本没有 lock, pnpm 现场新建了一份"
+_real_osremove25 = _compat.os.remove
+
+
+def _guard_remove25(path, *a, **k):
+    if str(path).endswith("pnpm-lock.yaml"):
+        raise OSError(13, "Permission denied")
+    return _real_osremove25(path, *a, **k)
+
+
+_compat.os.remove = _guard_remove25
+_log25l = []
+_ok25l, _msg25l = _compat.install_local_plugin("web", _tgz25, _log25l.append, _dshdir25)
+_compat.os.remove = _real_osremove25
+check("lock 删不掉时必须说出来(不能只报\"已回滚 package.json/lock\"就完事)",
+      _ok25l is False and os.path.isfile(_lock25) and "孤儿 lock" in (_msg25l or ""),
+      str((_msg25l or "")[:160]))
+os.remove(_lock25)
+_compat._pnpm_add_spec = _real_addspec25
+_compat.procman_which_pnpm = _real_pnpmwhich25
+
+# 25.7b 一次上游查询的预算必须在自己结束时关掉(线程局部, 留着就是下一段的"突然预算用尽")
+_rel25 = {"tag_name": "b12110", "assets": [
+    {"name": "llama-b12110-bin-ubuntu-vulkan-x64.tar.gz", "size": 100,
+     "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/"
+                             "llama-b12110-bin-ubuntu-vulkan-x64.tar.gz", "digest": "sha256:" + "a" * 64}]}
+_real_hg25 = toolchain.http_get
+toolchain.http_get = lambda url, timeout=10, binary=False: json.dumps(_rel25)
+try:
+    _rel25r = toolchain.fetch_latest_llama_release("ggml-org/llama.cpp", "vulkan", None)
+    _left25 = toolchain._deadline_for(25.0) - time.time()
+finally:
+    toolchain.http_get = _real_hg25
+check("查询结束必须关掉线程内预算: 下一段网络动作要能用自己完整的窗口(而不是继承旧截止)",
+      _rel25r["build"] == 12110 and _left25 > 24.0 and not toolchain._budget_out(),
+      str((_rel25r["build"], round(_left25, 2), toolchain._budget_out())))
+
+# 25.8 Node 环境: 版本管理器目录层级、版本比较、校验表次序、失败不许报成功
+_home25 = os.path.join(_tmp, "home25")
+_lbin25 = os.path.join(_home25, ".local", "bin")
+_llib25 = os.path.join(_home25, ".local", "lib")
+os.makedirs(_lbin25)
+_real_home_env25 = os.environ.get("HOME")
+_real_lbin25, _real_llib25 = nodetool.LOCAL_BIN, nodetool.LOCAL_LIB
+_real_pnpm_path25, _real_detect25 = nodetool._pnpm_path, nodetool.detect
+_real_v24_25, _real_up25 = nodetool.latest_v24, nodetool.urllib.request.urlopen
+_real_cands25 = nodetool._node_candidates
+_real_which25 = nodetool.procman.which
+nodetool.procman.which = lambda name: None   # 真机 PATH 里的 node/pnpm 不能混进本节候选
+nodetool.LOCAL_BIN, nodetool.LOCAL_LIB = _lbin25, _llib25
+os.environ["HOME"] = _home25
+
+
+def _mk_exe25(path, out):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with io.open(path, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\n" + (out.strip() and 'echo %s' % out.strip() or "exit 0") + "\n")
+    os.chmod(path, 0o755)
+
+
+_pnpm25 = os.path.join(_lbin25, "pnpm")
+_mk_exe25(_pnpm25, "9.9.9")
+nodetool._pnpm_path = lambda: _pnpm25
+_nvm_old25 = os.path.join(_home25, ".nvm", "versions", "node", "v24.9.9", "bin", "node")
+_nvm_new25 = os.path.join(_home25, ".nvm", "versions", "node", "v24.10.3", "bin", "node")
+_fnm25 = os.path.join(_home25, ".local", "share", "fnm", "node-versions", "v24.11.1",
+                      "installation", "bin", "node")
+for _p25, _v25 in ((_nvm_old25, "v24.9.9"), (_nvm_new25, "v24.10.3"), (_fnm25, "v24.11.1")):
+    _mk_exe25(_p25, _v25)
+_c25 = nodetool._node_candidates()
+check("nvm/fnm 的真实三层布局必须被认出来(修前层级错位: 用 nvm 的机器永远显示未装 Node)",
+      _nvm_old25 in _c25 and _nvm_new25 in _c25 and _fnm25 in _c25,
+      str([c for c in _c25 if "nvm" in c or "fnm" in c]))
+_st25d = nodetool.detect(force=True)
+check("多个 24+ 候选时必须取版本最高的(修前取候选表最前的: 面板报旧版本, 一键安装每次判\"不是最新\")",
+      _st25d["node24"]["version"] == "v24.11.1" and _st25d["meets"] is True, str(_st25d["node24"]))
+check("版本比较必须按段做整数比(修前字符串比会判 v24.10.0 < v24.9.9, 永远收敛不了)",
+      nodetool._vkey("v24.10.0") > nodetool._vkey("v24.9.9") and "v24.10.0" < "v24.9.9",
+      str((nodetool._vkey("v24.10.0"), nodetool._vkey("v24.9.9"))))
+
+
+class _Resp25:
+    def __init__(self, data):
+        self._d, self._pos = data, 0
+
+    def read(self, n=-1):
+        if self._pos >= len(self._d):
+            return b""
+        step = n if (n and n > 0) else len(self._d)
+        chunk = self._d[self._pos:self._pos + step]
+        self._pos += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+_opened25 = []
+
+
+def _net_fail25(req, timeout=30, *a, **k):
+    _opened25.append(getattr(req, "full_url", str(req)))
+    raise IOError("不该联网")
+
+
+def _st_stub25(node_v, node_path, unknown=False):
+    def _f(force=False):
+        return {"node24": {"path": node_path, "version": node_v},
+                "any_node": {"path": node_path, "version": node_v},
+                "pnpm": {"path": _pnpm25, "version": "9.9.9"},
+                "meets": bool(node_v), "version_unknown": unknown}
+    return _f
+
+
+# 本机比上游最新 v24 更新: 不得降级(修前用 cur_v != latest_v, 装了 v25 会被降级成 v24)
+nodetool.urllib.request.urlopen = _net_fail25
+nodetool.latest_v24 = lambda: ("https://registry.npmmirror.com/-/binary/node", "v24.9.9")
+nodetool.detect = _st_stub25("v25.1.0", _nvm_new25)
+_log25n = []
+_ok25n, _msg25n = nodetool.install_node_env(_log25n.append)
+check("本机比上游最新 v24 更新时不得降级重装, 且要说明为什么不装",
+      not _opened25 and _ok25n is True and any("不降级" in t for t in _log25n),
+      str((list(_opened25), _ok25n, _msg25n)))
+# 需要装但校验表取不到: 一个 tarball 都不许下(修前每个镜像各下 ~50MB 才发现取不到表)
+_opened25.clear()
+nodetool.latest_v24 = lambda: ("https://nodejs.org/dist", "v24.10.3")
+nodetool.detect = _st_stub25("v24.9.9", _nvm_old25)
+_log25s = []
+_ok25s, _msg25s = nodetool.install_node_env(_log25s.append)
+check("SHA-256 校验表取不到时必须直接失败且完全不下载(修前: 先下完再说, 两源各白下一遍)",
+      _ok25s is False and not any(".tar.xz" in u for u in _opened25)
+      and all("SHASUMS256.txt" in u for u in _opened25) and "取不到" in (_msg25s or ""),
+      str((list(_opened25), (_msg25s or "")[:80])))
+# 真下载真校验真解压: 校验表只取一次, 两个镜像共用同一个期望哈希
+shutil.rmtree(os.path.join(_home25, ".nvm"), ignore_errors=True)
+shutil.rmtree(os.path.join(_home25, ".local", "share", "fnm"), ignore_errors=True)
+_nodepkg25 = os.path.join(_tmp, "nodepkg25", "node-v24.10.3-linux-x64", "bin")
+os.makedirs(_nodepkg25)
+_mk_exe25(os.path.join(_nodepkg25, "node"), "v24.10.3")
+_targz25 = os.path.join(_tmp, "node-v24.10.3-linux-x64.tar.xz")
+with _tf25.open(_targz25, "w:xz") as _tfo25:
+    _tfo25.add(os.path.join(_nodepkg25, "node"),
+               arcname="node-v24.10.3-linux-x64/bin/node")
+_tbytes25 = open(_targz25, "rb").read()
+_sha_good25 = _hashlib25.sha256(_tbytes25).hexdigest()
+_table25 = ("%s  node-v24.10.3-linux-x64.tar.xz\n" % _sha_good25).encode()
+_after_dl25 = [False]
+
+
+def _net_ok25(req, timeout=30, *a, **k):
+    u = getattr(req, "full_url", str(req))
+    _opened25.append(u)
+    if "SHASUMS256.txt" in u:
+        return _Resp25(_table25)
+    if u.endswith("node-v24.10.3-linux-x64.tar.xz"):
+        _after_dl25[0] = True          # 装完之后要让 detect 走真检测
+        return _Resp25(_tbytes25)
+    raise IOError("不该请求 %s" % u)
+
+
+def _det25(force=False):
+    return _real_detect25(force=True) if _after_dl25[0] else _st_stub25("v24.9.9", None)(force)
+
+
+_opened25.clear()
+nodetool.urllib.request.urlopen = _net_ok25
+nodetool.latest_v24 = lambda: ("https://registry.npmmirror.com/-/binary/node", "v24.10.3")
+nodetool.detect = _det25
+_log25t = []
+_ok25t, _msg25t = nodetool.install_node_env(_log25t.append)
+check("一键安装必须真跑通: 校验通过后解压、软链进 ~/.local/bin, 结尾报的版本号是真检测出来的",
+      _ok25t is True and _msg25t == "Node v24.10.3 + pnpm 9.9.9 就绪"
+      and os.path.islink(os.path.join(_lbin25, "node")), str((_ok25t, _msg25t)))
+check("校验表只取一次且与下载源无关(修前挂在每个镜像尝试内部, 每源各取一遍)",
+      sum(1 for u in _opened25 if "SHASUMS" in u) == 1
+      and sum(1 for u in _opened25 if u.endswith(".tar.xz")) == 1, str(list(_opened25)))
+# node 在但跑不动(node -v 无输出): pnpm 一侧早有守卫, node 一侧修前会报 "Node None … 就绪"
+_silent25 = os.path.join(_lbin25, "node")
+if os.path.islink(_silent25) or os.path.exists(_silent25):
+    os.remove(_silent25)
+_mk_exe25(_silent25, "")
+_opened25.clear()
+nodetool.detect = lambda force=False: {"node24": {"path": _silent25, "version": None},
+                                       "any_node": {"path": _silent25, "version": None},
+                                       "pnpm": {"path": _pnpm25, "version": "9.9.9"},
+                                       "meets": False, "version_unknown": True}
+_log25u = []
+_ok25u, _msg25u = nodetool.install_node_env(_log25u.append)
+check("node 版本探测不到时不得报就绪(修前: 返回 True + \"Node None + pnpm 9.9.9 就绪\", 面板一片绿)",
+      _ok25u is False and "未能验证" in (_msg25u or "") and not _opened25, str((_ok25u, _msg25u)))
+_mk_exe25(_silent25, "v24.10.3")
+nodetool.detect = lambda force=False: {"node24": {"path": _silent25, "version": "v24.10.3"},
+                                       "any_node": {"path": _silent25, "version": "v24.10.3"},
+                                       "pnpm": {"path": _pnpm25, "version": "9.9.9"},
+                                       "meets": True, "version_unknown": False}
+_log25v = []
+_ok25v, _msg25v = nodetool.install_node_env(_log25v.append)
+check("对照: node 能报出版本时仍要判就绪(不得把新守卫变成一律失败)",
+      _ok25v is True and _msg25v == "Node v24.10.3 + pnpm 9.9.9 就绪", str((_ok25v, _msg25v)))
+nodetool.urllib.request.urlopen = _real_up25
+nodetool.detect, nodetool.latest_v24 = _real_detect25, _real_v24_25
+nodetool._pnpm_path, nodetool._node_candidates = _real_pnpm_path25, _real_cands25
+nodetool.LOCAL_BIN, nodetool.LOCAL_LIB = _real_lbin25, _real_llib25
+nodetool.procman.which = _real_which25
+os.environ["HOME"] = _real_home_env25
+_compat.profile_dir, _compat.dsh_home = _real_pdir25, _real_dshome25
+check("25 收尾: 被测模块的接缝必须全部换回真值(否则后面的节会被静默改变行为)",
+      _compat.profile_dir("web") != _prof25 and nodetool.LOCAL_BIN == _real_lbin25
+      and os.environ.get("HOME") == _real_home_env25 and nodetool.procman.which is _real_which25,
+      str((_compat.profile_dir("web"), nodetool.LOCAL_BIN)))
 
 shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)

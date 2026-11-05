@@ -164,24 +164,39 @@ def _dump_config_entries(dsh_dir, profile="web", timeout=180):
     if r.returncode != 0:
         tail = "\n".join((r.stderr or "").strip().splitlines()[-20:])
         return None, "退出码 %d:\n%s" % (r.returncode, tail)
-    ids = set()
-    for m in re.finditer(r'"id"\s*:\s*"([^"]+)"', r.stdout or ""):
-        ids.add(m.group(1))
+    raw = (r.stdout or "").strip()
+    # 退出码 0 **不等于** 拿到了一份完整的配置转储: cli 可能只打了 banner, 也可能在 JSON
+    # 前后夹日志行。以前 json.loads 失败被 `except: pass` 吞掉, 只留下正则扫到的零星 id
+    # (常常一个都没有), 审计于是把 cordis.patch.yml 里**每一条有效**补丁判成"在
+    # dump-config 中不存在(可修复: 注释失效条目)", 一键修复真去把它们注释掉 —— 探针
+    # "查不到"被翻译成了对用户补丁配置的破坏。
+    doc = None
     try:
-        doc = json.loads(r.stdout)
-        def walk(n):
-            if isinstance(n, dict):
-                i = n.get("id")
-                if isinstance(i, str):
-                    ids.add(i)
-                for v in n.values():
-                    walk(v)
-            elif isinstance(n, list):
-                for v in n:
-                    walk(v)
-        walk(doc)
+        doc = json.loads(raw)
     except Exception:
-        pass
+        lows = [i for i in (raw.find("{"), raw.find("[")) if i >= 0]
+        highs = [raw.rfind("}"), raw.rfind("]")]
+        if lows and max(highs) > min(lows):
+            try:
+                doc = json.loads(raw[min(lows):max(highs) + 1])
+            except Exception:
+                doc = None
+    if doc is None:
+        return None, ("退出码 0 但输出不是可解析 JSON(前 160 字符: %s)"
+                      % raw[:160].replace("\n", " / "))
+    ids = set()
+
+    def walk(n):
+        if isinstance(n, dict):
+            i = n.get("id")
+            if isinstance(i, str):
+                ids.add(i)
+            for v in n.values():
+                walk(v)
+        elif isinstance(n, list):
+            for v in n:
+                walk(v)
+    walk(doc)
     return ids, ""
 
 
@@ -269,17 +284,26 @@ def audit(dsh_dir, log, include_dump=True):
             it("error", "--dump-config 探针失败: %s" % err.splitlines()[0] if err else "--dump-config 探针失败")
             fixables.append({"kind": "dump_failed", "detail": err})
         else:
-            it("ok", "--dump-config 正常(%d 个 entry)" % len(ids))
-            for pid_ in patch_ids:
-                if pid_ in ids:
-                    continue
-                mapped = PATCH_ALIASES.get(pid_)
-                if mapped and mapped in ids:
-                    fixables.append({"kind": "patch_rename", "old": pid_, "new": mapped})
-                    it("warn", "补丁条目 '%s' 已被 '%s' 取代(可修复:改名迁移)" % (pid_, mapped))
-                else:
-                    fixables.append({"kind": "patch_orphan", "old": pid_})
-                    it("warn", "补丁条目 '%s' 在 dump-config 中不存在(可修复:注释失效条目)" % pid_)
+            if patch_ids and not ids:
+                # 补丁文件里有 N 条, 而转储里一个 entry 都没有: 这是探针**没查到东西**,
+                # 不是"补丁全部失效"。走下去会把每条补丁判成 orphan, 一键修复就把有效
+                # 配置整段注释掉。这一条按"未能核对"处理, 与读不动的文件同栏。
+                it("error", "--dump-config 返回 0 个 entry, 但 cordis.patch.yml 有 %d 条补丁 —— "
+                            "本次不判定失效条目(profile/DSH 版本不对或转储不完整)" % len(patch_ids))
+                unreadable.append("dump-config entry 列表")
+            else:
+                it("ok", "--dump-config 正常(%d 个 entry)" % len(ids))
+                for pid_ in patch_ids:
+                    if pid_ in ids:
+                        continue
+                    mapped = PATCH_ALIASES.get(pid_)
+                    if mapped and mapped in ids:
+                        fixables.append({"kind": "patch_rename", "old": pid_, "new": mapped,
+                                         "dump_count": len(ids)})
+                        it("warn", "补丁条目 '%s' 已被 '%s' 取代(可修复:改名迁移)" % (pid_, mapped))
+                    else:
+                        fixables.append({"kind": "patch_orphan", "old": pid_, "dump_count": len(ids)})
+                        it("warn", "补丁条目 '%s' 在 dump-config 中不存在(可修复:注释失效条目)" % pid_)
             # 入口注入审计(C# 4878-4945): dump 行 → 入口文件 → inject 服务名/运行时 ctx 访问
             ver = ver or get_dsh_version(dsh_dir)
             inject_fixes = audit_inject(dsh_dir, ver, it, fixables)
@@ -361,9 +385,21 @@ def repair(dsh_dir, report, log):
                 log("[兼容] 已删除残留锁: %s" % f["path"])
                 fixed += 1
             elif kind == "patch_rename" or kind == "patch_orphan":
+                # 改写补丁条目是本函数里唯一会**改变用户补丁语义**的动作(把有效条目注释掉
+                # 就等于把那个补丁关掉)。门槛因此最高: 判定必须来自一次"确实查到东西"的
+                # dump-config(审计会把当次的 entry 数带在 fixable 上), 且备份要成功。
+                if not f.get("dump_count"):
+                    log("[兼容] ⚠ 未改写补丁条目 '%s': 判定依据的 dump-config 没有查到 entry"
+                        "(%s) —— 查不到不等于失效" % (
+                            f.get("old"),
+                            "fixable 未带 entry 数" if f.get("dump_count") is None else "0 个"))
+                    continue
                 patch_path = os.path.join(profile_dir(), "cordis.patch.yml")
                 if os.path.isfile(patch_path):
                     bak = _backup(patch_path)
+                    if not bak:
+                        log("[兼容] ⚠ 备份失败, 未改写补丁文件: %s" % patch_path)
+                        continue
                     with open(patch_path, encoding="utf-8") as fh:
                         text = fh.read()
                     old = f["old"]
@@ -390,8 +426,7 @@ def repair(dsh_dir, report, log):
                             out.append(ln)
                         text = "".join(out)
                         log("[兼容] 已注释失效补丁 '%s'(备份 %s)" % (old, bak))
-                    with open(patch_path, "w", encoding="utf-8") as fh:
-                        fh.write(text)
+                    write_file_atomic(patch_path, text)   # 非原子写会在被杀时留下半份补丁文件
                     fixed += 1
             elif kind == "broken_links":
                 for p in f["paths"]:
@@ -402,7 +437,12 @@ def repair(dsh_dir, report, log):
                     except OSError:
                         pass
             elif kind == "pinned_writeback":
-                set_bundle_active("web", f["name"], False)  # 移除 + 保持锁定
+                ok_w, msg_w = set_bundle_active("web", f["name"], False)  # 移除 + 保持锁定
+                if not ok_w:
+                    # 返回 (False, ...) 时 bundles 没动过: 以前照样 fixed += 1, 于是
+                    # "修复完成 N 项"里含一项根本没发生的修改, 用户复检才发现还在。
+                    log("[兼容] ⚠ 未能再次移除锁定包 %s: %s" % (f["name"], msg_w))
+                    continue
                 log("[兼容] 已再次移除锁定包并保持锁定: %s" % f["name"])
                 fixed += 1
             elif kind == "dead_peer":
@@ -440,11 +480,24 @@ def repair(dsh_dir, report, log):
                     log("[兼容] 注入无可改写命中: %s(%s)" % (path, hint))
             elif kind == "market_disabled":
                 bak = _backup(f["path"])
-                with open(f["path"], encoding="utf-8") as fh:
-                    doc = json.load(fh)
+                if not bak:
+                    log("[兼容] ⚠ 备份失败, 未清空 dsh-market disabled: %s" % f["path"])
+                    continue
+                try:
+                    with open(f["path"], encoding="utf-8") as fh:
+                        doc = json.load(fh)
+                except (OSError, ValueError) as read_ex:
+                    # 备份已做成, 但读不动: 直接 json.dump 会把整个文件重写成"只有一个
+                    # disabled 键"的骨架, 把 state.json 里其它状态整段抹掉。
+                    log("[兼容] ⚠ %s 读不动(%s: %s), 未清空 disabled"
+                        % (f["path"], type(read_ex).__name__, read_ex))
+                    continue
+                if not isinstance(doc, dict):
+                    log("[兼容] ⚠ %s 顶层不是对象(实际 %s), 未清空 disabled"
+                        % (f["path"], type(doc).__name__))
+                    continue
                 doc["disabled"] = []
-                with open(f["path"], "w", encoding="utf-8") as fh:
-                    json.dump(doc, fh, indent=2, ensure_ascii=False)
+                write_file_atomic(f["path"], json.dumps(doc, indent=2, ensure_ascii=False))
                 log("[兼容] 已清空 dsh-market disabled(%d 条,备份 %s)" % (f.get("count", 0), bak))
                 fixed += 1
         except Exception as ex:
@@ -980,22 +1033,41 @@ def audit_plugins(profile="web", dsh_dir=""):
 
 def enforce_pinned(profile="web", log=None):
     """锁定回写强制(C# 1979): 审计时发现锁定包被写回 bundles → 报错并纳入修复。
-    这里直接执行移除(备份+原子写), 返回被移除的名字列表。"""
-    manifest_p = os.path.join(profile_dir(profile), "package.json")
-    doc = _profile_manifest(profile)
-    if doc is None:
-        return []
-    bundles = ((doc.get("dsh") or {}).get("profile") or {}).get("bundles") or []
-    pinned = read_pinned_inactive(profile)
-    write_back = [p for p in pinned if p in bundles]
-    if write_back:
-        bak = _backup(manifest_p)
-        for p in write_back:
-            bundles.remove(p)
-        write_json_atomic(manifest_p, doc, backup=False)  # 已备份
+    这里直接执行移除(备份+原子写), 返回被移除的名字列表。
+
+    它改写的是与装/卸/激活**同一份** package.json, 但入口是插件页面的审计请求
+    (main 的 /api/plugins、/api/plugins_audit) —— 那两个入口不拿 profile 锁。不拿锁时
+    这里写回的是"本次读到的整份文档", 于是并发的安装/激活刚写进去的依赖会被整段抹掉
+    (表现为"装完插件刷新一下又没了")。拿不到锁就**什么都不做**(下次审计还会再强制),
+    绝不排队等: 一条 HTTP 请求挂在锁上没有意义。备份失败同样不写。
+    """
+    if not begin_profile_op(profile, "锁定回写强制"):
         if log:
-            log("[插件] 锁定包被外部写回, 已自动移除: %s(备份 %s)" % (", ".join(write_back), bak))
-    return write_back
+            log("[插件] 有其它插件操作正在进行, 本次不做锁定回写(下次审计会再查)")
+        return []
+    try:
+        manifest_p = os.path.join(profile_dir(profile), "package.json")
+        doc = _profile_manifest(profile)
+        if doc is None:
+            return []
+        bundles = ((doc.get("dsh") or {}).get("profile") or {}).get("bundles") or []
+        pinned = read_pinned_inactive(profile)
+        write_back = [p for p in pinned if p in bundles]
+        if write_back:
+            bak = _backup(manifest_p)
+            if not bak:
+                if log:
+                    log("[插件] ⚠ 备份失败, 未移除被写回的锁定包: %s(请手工停用)"
+                        % ", ".join(write_back))
+                return []
+            for p in write_back:
+                bundles.remove(p)
+            write_json_atomic(manifest_p, doc, backup=False)  # 已备份
+            if log:
+                log("[插件] 锁定包被外部写回, 已自动移除: %s(备份 %s)" % (", ".join(write_back), bak))
+        return write_back
+    finally:
+        end_profile_op(profile)
 
 
 def _installed_version(base, dep):
@@ -1640,6 +1712,8 @@ def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
     lock_existed = os.path.isfile(lockfile)
     removed_spec = ""
 
+    _lock_left = [False]
+
     def _rollback():
         """把 manifest/lock 恢复原状(失败与异常两条路都要走, 不留半安装状态)。
 
@@ -1654,19 +1728,26 @@ def install_local_plugin(profile, source, job_log=None, dsh_dir=""):
                     shutil.copy2(bak, path)
                 except OSError:
                     restored = False
+        if not lock_existed and lock_bak is None and os.path.isfile(lockfile):
+            # 原本没有 lock 文件: pnpm add 现场新建的那一份也要删掉, 否则 profile 留下一份
+            # "package.json 里已经没有这个包, lock 里却还写着它"的孤儿 lock —— 下一次安装/
+            # 兼容性检查会把它当成既有状态, 报错位置离根因很远。
+            # (这段以前挂在 _rollback_note 的 return 之后, 是永远跑不到的死码。)
+            try:
+                os.remove(lockfile)
+            except OSError:
+                _lock_left[0] = True
         return restored
 
     def _rollback_note(ok_restored):
+        # 残留 lock 单独说: 它不是"写回失败"(manifest 可能确实完好), 但也不能一句"已回滚"
+        # 盖过去 —— 用户据此认为 profile 与安装前完全一致。
+        left = "⚠ 但 pnpm 新建的 lock 没能删除(profile 留下一份孤儿 lock); " if _lock_left[0] else ""
         if not manifest_bak and not lock_bak:
-            return "⚠ 备份失败未能回滚; "
+            return "⚠ 备份失败未能回滚; " + left
         if ok_restored:
-            return "已回滚 package.json/lock; "
+            return "已回滚 package.json/lock; " + left
         return "⚠ 备份在但写回失败, 未能回滚 package.json/lock(profile 可能停在半安装状态); "
-        if not lock_existed and lock_bak is None and os.path.isfile(lockfile):
-            try:  # 原本没有 lock 文件: 回滚后也不该留下 pnpm 新建的那一份
-                os.remove(lockfile)
-            except OSError:
-                pass
 
     def _snapshot(tgz_src, leaf):
         """把安装包快照进 <dshHome>/packages/, 返回稳定路径(非法文件名回 None)。"""

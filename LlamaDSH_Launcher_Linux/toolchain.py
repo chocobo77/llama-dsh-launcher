@@ -445,9 +445,20 @@ def _pick_cpu(cands):
 
 def fetch_latest_llama_release(repo=DEFAULT_REPO, backend=None, job_log=None):
     """返回 dict: tag/build/asset_name/asset_url/cudart_name/cudart_url/size/cudart_size/stable_version
-    失败抛异常(调用方提示网络)。"""
-    backend = backend or backend_preference()
+    失败抛异常(调用方提示网络)。
+
+    预算必须在线程内**关掉**: 截止时间是线程局部的, 查询结束还留着, 同线程随后的网络动作
+    (检查完接着走 apply_llama_update 那条链)就会继承一个快要到期的旧窗口 —— 表现成"查得到,
+    下一步突然说预算用尽"。今天每请求一个线程, 看不出来;换线程池或同线程连做两件事就必现。
+    """
     begin_net_budget()               # 这一次查询的所有请求共享同一截止时间
+    try:
+        return _fetch_release_in_budget(repo, backend or backend_preference(), job_log)
+    finally:
+        end_net_budget()
+
+
+def _fetch_release_in_budget(repo, backend, job_log):
     stable_version = ""
     try:
         latest = gh_api("/repos/%s/releases/latest" % repo)
