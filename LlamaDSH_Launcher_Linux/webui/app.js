@@ -38,11 +38,21 @@ function initState() {
 const GIB = 1073741824;
 
 async function api(path, body, timeoutMs = 12000) {
-  const r = await fetch("/api/" + path, {
-    method: "POST", headers: { "Content-Type": "application/json", "X-Auth": window.__DSH_TOKEN || "" },
-    body: JSON.stringify(body || {}),
-    signal: AbortSignal.timeout(timeoutMs)   // 服务卡顿时请求不无限挂起
-  });
+  let r;
+  try {
+    r = await fetch("/api/" + path, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Auth": window.__DSH_TOKEN || "" },
+      body: JSON.stringify(body || {}),
+      signal: AbortSignal.timeout(timeoutMs)   // 服务卡顿时请求不无限挂起
+    });
+  } catch (ex) {
+    // 浏览器中止的原文案是 "signal timed out": 直接显示等于没说明, 用户只会再点一次。
+    // 上游查询这类慢调用由调用方带更大的 timeoutMs(与服务端预算同量级), 这里只负责说清。
+    if (ex && ex.name === "TimeoutError") {
+      throw new Error(`请求 ${path} 超过 ${Math.round(timeoutMs / 1000)}s 未完成(网络候选都慢?), 可稍后重试`);
+    }
+    throw ex;
+  }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || r.status);
   return j;
@@ -1312,7 +1322,8 @@ async function saveConfigFile(notify = true) {
 /* ============================== 更新检查 ================================ */
 async function checkUpdateLlama() {
   showNotice("正在查询上游版本(GitHub API 直连+镜像, 通常几秒)…");
-  const r = await api("toolchains/check_update");
+  // 服务端一次上游查询的预算约 22s, 前端必须比它更耐心, 否则先被浏览器中止
+  const r = await api("toolchains/check_update", {}, 30000);
   if (r.error) {
     logLine("[更新] llama.cpp 检查失败: " + r.error);
     if (r.hint) {
@@ -1342,7 +1353,7 @@ async function checkUpdateLlama() {
 }
 async function checkUpdateDsh() {
   const dir = $("inDshDir").value.trim();
-  const r = await api("update/check", { target: "dsh", dir });
+  const r = await api("update/check", { target: "dsh", dir }, 30000);
   if (r.error) {
     // "查不到" 不等于 "网络坏了": cause=not_dir/not_repo/no_remote/detached 时给出出路
     // (含该仓库的构建基线 commit), 否则用户会反复点按钮, 看起来就是功能不稳定。

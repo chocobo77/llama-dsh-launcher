@@ -1640,7 +1640,7 @@ _rc5 = None
 _wait5 = -1.0
 _port5 = 0
 try:
-    for _ in range(120):
+    for _ in range(400):
         if _proc5.poll() is not None:
             break
         for _c5 in range(_api5, _api5 + 6):      # 端口被占时 main() 会往后挪
@@ -1656,10 +1656,16 @@ try:
         time.sleep(0.1)
     _tok5 = ""
     if _port5:
-        try:
-            _tok5 = open(os.path.join(_h5, ".dsh_launcher_token"), encoding="utf-8").read().strip()
-        except OSError:
-            _tok5 = ""
+        # 端口先就绪、token 文件后落盘是正常竞态(12s 启动上限 + 一次读 → 偶发拿不到 token,
+        # 于是下面四项端到端全 FAIL, 看着像收尾坏了。按条件等, 不等固定秒数。
+        for _ in range(100):
+            try:
+                _tok5 = open(os.path.join(_h5, ".dsh_launcher_token"), encoding="utf-8").read().strip()
+            except OSError:
+                _tok5 = ""
+            if _tok5:
+                break
+            time.sleep(0.1)
         if _tok5:
             _rq5 = _url5.Request("http://127.0.0.1:%d/api/shutdown" % _port5, data=b"{}",
                                  headers={"X-Auth": _tok5,
@@ -3609,6 +3615,18 @@ toolchain._GH_COOLDOWN.clear()
 _ok24f = toolchain.gh_api("/repos/a/b/releases/latest")
 check("对照: 预算窗口结束后同一候选链必须恢复正常(不得把一次失败变成永久)",
       _ok24f.get("tag_name") == "ok" and len(_api_calls24) == 2, str(_api_calls24))
+
+# 24.7 前端不得比服务端先放弃: api() 默认 12s 中止, 而一次上游查询的合法预算约 22s
+#      (活体实测点一次 llama 检查更新, 页面只留下 "signal timed out" 这四个字)。
+_app24 = io.open(os.path.join(APP, "webui", "app.js"), encoding="utf-8").read()
+check("检查更新两个入口的前端超时必须与服务端预算同量级(不是默认 12s)",
+      'api("toolchains/check_update", {}, 30000)' in _app24
+      and 'api("update/check", { target: "dsh", dir }, 30000)' in _app24,
+      str([l.strip() for l in _app24.splitlines() if "30000" in l][:2]))
+_sig24 = [l.strip() for l in _app24.splitlines() if "signal timed out" in l]
+check("浏览器中止必须翻译成人话(请求名 + 秒数), 原文案只允许出现在注释里",
+      "TimeoutError" in _app24 and "未完成" in _app24
+      and all(l.startswith("//") for l in _sig24), str(_sig24[:2]))
 
 # --- 17) 自检自身的边界: 不得污染用户真实的日志目录 ---------------------------
 # 17.1 以前 selftest 直接往 ~/.dsh_launcher_logs 写: 每跑一次就多出几条测试噪声
