@@ -3739,8 +3739,8 @@ def _fake_run_stdout(payload):
 _fake_run_stdout("DSH 0.9.1\nconfig written to /home/u/.dsh\n")
 _ids25, _err25 = _compat._dump_config_entries(_dshdir25)
 _compat.subprocess.run = _real_run_c25
-check("dump-config 退出码 0 但输出不是 JSON 必须判探针失败(不得交出空 entry 集合)",
-      _ids25 is None and "JSON" in (_err25 or ""), str((_ids25, (_err25 or "")[:70])))
+check("dump-config 退出码 0 但输出里没有任何条目必须判探针失败(不得交出空 entry 集合)",
+      _ids25 is None and "找不到任何条目" in (_err25 or ""), str((_ids25, (_err25 or "")[:70])))
 
 _fake_run_stdout('banner line\n{"config": {"patch": {"entries": [{"id": "keep-me"}, '
                  '{"id": "other"}]}}}\ndone line\n')
@@ -3758,20 +3758,46 @@ def _audit25(stdout_payload):
         _compat.subprocess.run = _real_run_c25
 
 
-# 25.2 转储查到 0 个 entry 而补丁文件有 N 条: 按"未能核对"处理, 绝不判失效条目
+# 25.2 转储里查不到任何条目: 必须是"探针失败"这条道, 绝不产出失效条目判定
 _write_mani25(["core"])
 _rep25b = _audit25('{"config": {"patch": {"entries": []}}}')
 _kinds25b = [x["kind"] for x in _rep25b["fixables"]]
-check("转储 0 个 entry 而补丁文件有 N 条时不得判失效条目(修前: 每条补丁都成 orphan, 一键修复真去注释)",
+check("转储查不到任何 entry 时不得判失效条目(修前: 每条补丁都成 orphan, 一键修复真去注释)",
       "patch_orphan" not in _kinds25b and "patch_rename" not in _kinds25b, str(_kinds25b))
-check("同一情况必须明说\"本次不判定失效条目\"并计入未能核对(不得报成一切正常)",
-      any("不判定失效条目" in x["text"] for x in _rep25b["items"]),
-      str([x["text"][:40] for x in _rep25b["items"]][:6]))
+check("同一情况必须给出 dump_failed + \"找不到任何条目\"的错误(不得报成一切正常)",
+      "dump_failed" in _kinds25b and any("找不到任何条目" in x["text"] for x in _rep25b["items"]),
+      str([x["text"][:44] for x in _rep25b["items"]][:8]))
 _rep25c = _audit25('{"config": {"patch": {"entries": [{"id": "unrelated-one"}, '
                    '{"id": "unrelated-two"}]}}}')
 _orph25 = [x for x in _rep25c["fixables"] if x["kind"] == "patch_orphan"]
 check("对照: 转储确实查到 entry 而补丁不在其中时仍要判失效条目, 且带上 entry 数作证据",
       len(_orph25) == 2 and all(x.get("dump_count") == 2 for x in _orph25), str(_orph25))
+
+#      本机实测形态: 输出是一段段 YAML 片段拼起来的(带 # == 分节与 !!js 标签), 不是 JSON
+_real_dump25 = ("# == @deepseek-ai/dsh-base\n"
+                "- id: tool-plugin-manager\n  name: '@x/tools'\n  disabled: true\n"
+                "- id: plugin-manager\n  disabled: !!js '!ctx.get(''profileContext'')'\n"
+                "# == @deepseek-ai/dsh-base, patched by ~/.dsh/profiles/web/cordis.patch.yml\n"
+                "- id: llm-pi-ai\n  config:\n    models:\n      - id: iq3_s\n"
+                "- id: ui-theme\n  name: '@x/theme'\n")
+_ids25y = _compat._dump_entry_ids(_real_dump25)
+check("转储输出必须按真实形态解析(YAML 片段 + !!js 标签, 本机 204 个条目): 修前一律判失败/交出空集合",
+      {"tool-plugin-manager", "plugin-manager", "llm-pi-ai", "ui-theme"} <= _ids25y, str(sorted(_ids25y)))
+_rep25y = _audit25(_real_dump25)
+check("真实形态转储下审计必须走通(不再报探针失败), 且补丁条目按转储里的 id 判定",
+      not any(x["kind"] == "dump_failed" for x in _rep25y["fixables"])
+      and [x["old"] for x in _rep25y["fixables"] if x["kind"] == "patch_orphan"] == ["keep-me", "second"],
+      str([x["kind"] for x in _rep25y["fixables"]]))
+
+_rep25i = _audit25(_real_dump25)
+check("转储里没有 entry/module 行时注入审计必须报未判定(修前打成 dump 行 0 个, 看着像查过了)",
+      any("注入审计未判定" in x["text"] for x in _rep25i["items"]),
+      str([x["text"][:50] for x in _rep25i["items"]][-4:]))
+_rep25i2 = _audit25("- id: keep-me\n  name: a\n- id: second\n  name: b\n")
+check("同一情况必须计入未能核对(结尾不能报 0 错误 / 0 可修复项)",
+      not any(x["kind"] in ("patch_orphan", "dump_failed") for x in _rep25i2["fixables"])
+      and any("未能核对" in x["text"] and "inject" in x["text"] for x in _rep25i2["items"]),
+      str([x["text"][:50] for x in _rep25i2["items"]][-3:]))
 
 # 25.3 repair 改写补丁条目的门槛: 没有 entry 证据 / 备份失败 → 一个字都不改
 _real_audit25 = _compat.audit

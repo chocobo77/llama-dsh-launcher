@@ -179,26 +179,43 @@ def _dump_config_entries(dsh_dir, profile="web", timeout=180):
         tail = "\n".join((r.stderr or "").strip().splitlines()[-20:])
         return None, "退出码 %d:\n%s" % (r.returncode, tail)
     raw = (r.stdout or "").strip()
-    # 退出码 0 **不等于** 拿到了一份完整的配置转储: cli 可能只打了 banner, 也可能在 JSON
-    # 前后夹日志行。以前 json.loads 失败被 `except: pass` 吞掉, 只留下正则扫到的零星 id
-    # (常常一个都没有), 审计于是把 cordis.patch.yml 里**每一条有效**补丁判成"在
-    # dump-config 中不存在(可修复: 注释失效条目)", 一键修复真去把它们注释掉 —— 探针
-    # "查不到"被翻译成了对用户补丁配置的破坏。
-    doc = None
-    try:
+    ids = _dump_entry_ids(raw)
+    if not ids:
+        # 退出码 0 **不等于** 拿到了一份完整的配置转储: cli 可能只打了 banner。以前解析
+        # 失败被 `except: pass` 吞掉并交出空集合, 审计于是把 cordis.patch.yml 里**每一条
+        # 有效**补丁判成"在 dump-config 中不存在(可修复: 注释失效条目)", 一键修复真去
+        # 把它们注释掉 —— 探针"查不到"被翻译成了对用户补丁配置的破坏。
+        return None, ("退出码 0 但输出里找不到任何条目 id(前 160 字符: %s)"
+                      % raw[:160].replace("\n", " / "))
+    return ids, ""
+
+
+def _dump_entry_ids(raw):
+    """从 --dump-config 的输出里取条目 id 集合。
+
+    本机实测(DSH 0.2.2-alpha.2, 2026-11-06): 输出**不是 JSON**, 而是一段段 YAML 片段拼起来
+    的东西 —— 每段前一行是 "# == <bundle>"(打过补丁的段还会标 "patched by …"), 段内是顶层
+    数组, 共 204 个顶层条目(去重 222 个 id)。片段里还有 `disabled: !!js '…'` 这种自定义
+    标签, yaml.safe_load 会当"未知 tag"直接拒, 所以整段 YAML 解析同样不可用。
+    ⇒ 按行取条目 id(短横 + id, 任意缩进都算: 少收一个 id 就会把有效补丁判成失效并被注释掉,
+    多收一个只会让判定更宽松, 两个方向里必须选破坏性小的那个), 顺带兼容 JSON 形态。
+    """
+    ids = set()
+    for m in re.finditer(r"(?m)^\s*-\s*id:\s*[\"']?([^\"'\s#]+)", raw):
+        ids.add(m.group(1))
+    for m in re.finditer(r'"id"\s*:\s*"([^"]+)"', raw):
+        ids.add(m.group(1))
+    try:                                   # 将来若改成 JSON, 整份解析仍能拿到全部 id
         doc = json.loads(raw)
     except Exception:
         lows = [i for i in (raw.find("{"), raw.find("[")) if i >= 0]
         highs = [raw.rfind("}"), raw.rfind("]")]
+        doc = None
         if lows and max(highs) > min(lows):
             try:
                 doc = json.loads(raw[min(lows):max(highs) + 1])
             except Exception:
                 doc = None
-    if doc is None:
-        return None, ("退出码 0 但输出不是可解析 JSON(前 160 字符: %s)"
-                      % raw[:160].replace("\n", " / "))
-    ids = set()
 
     def walk(n):
         if isinstance(n, dict):
@@ -210,8 +227,9 @@ def _dump_config_entries(dsh_dir, profile="web", timeout=180):
         elif isinstance(n, list):
             for v in n:
                 walk(v)
-    walk(doc)
-    return ids, ""
+    if doc is not None:
+        walk(doc)
+    return ids
 
 
 def _manifest_bundles(profile="web"):
@@ -298,29 +316,23 @@ def audit(dsh_dir, log, include_dump=True):
             it("error", "--dump-config 探针失败: %s" % err.splitlines()[0] if err else "--dump-config 探针失败")
             fixables.append({"kind": "dump_failed", "detail": err})
         else:
-            if patch_ids and not ids:
-                # 补丁文件里有 N 条, 而转储里一个 entry 都没有: 这是探针**没查到东西**,
-                # 不是"补丁全部失效"。走下去会把每条补丁判成 orphan, 一键修复就把有效
-                # 配置整段注释掉。这一条按"未能核对"处理, 与读不动的文件同栏。
-                it("error", "--dump-config 返回 0 个 entry, 但 cordis.patch.yml 有 %d 条补丁 —— "
-                            "本次不判定失效条目(profile/DSH 版本不对或转储不完整)" % len(patch_ids))
-                unreadable.append("dump-config entry 列表")
-            else:
-                it("ok", "--dump-config 正常(%d 个 entry)" % len(ids))
-                for pid_ in patch_ids:
-                    if pid_ in ids:
-                        continue
-                    mapped = PATCH_ALIASES.get(pid_)
-                    if mapped and mapped in ids:
-                        fixables.append({"kind": "patch_rename", "old": pid_, "new": mapped,
-                                         "dump_count": len(ids)})
-                        it("warn", "补丁条目 '%s' 已被 '%s' 取代(可修复:改名迁移)" % (pid_, mapped))
-                    else:
-                        fixables.append({"kind": "patch_orphan", "old": pid_, "dump_count": len(ids)})
-                        it("warn", "补丁条目 '%s' 在 dump-config 中不存在(可修复:注释失效条目)" % pid_)
+            # 走到这里 ids 一定非空: 空/解析不出来的转储在 _dump_config_entries 里就已经判
+            # 探针失败(上面那条 ✗ + dump_failed)。"查不到"因此不会变成"补丁全部失效"。
+            it("ok", "--dump-config 正常(%d 个 entry)" % len(ids))
+            for pid_ in patch_ids:
+                if pid_ in ids:
+                    continue
+                mapped = PATCH_ALIASES.get(pid_)
+                if mapped and mapped in ids:
+                    fixables.append({"kind": "patch_rename", "old": pid_, "new": mapped,
+                                     "dump_count": len(ids)})
+                    it("warn", "补丁条目 '%s' 已被 '%s' 取代(可修复:改名迁移)" % (pid_, mapped))
+                else:
+                    fixables.append({"kind": "patch_orphan", "old": pid_, "dump_count": len(ids)})
+                    it("warn", "补丁条目 '%s' 在 dump-config 中不存在(可修复:注释失效条目)" % pid_)
             # 入口注入审计(C# 4878-4945): dump 行 → 入口文件 → inject 服务名/运行时 ctx 访问
             ver = ver or get_dsh_version(dsh_dir)
-            inject_fixes = audit_inject(dsh_dir, ver, it, fixables)
+            inject_fixes = audit_inject(dsh_dir, ver, it, fixables, unreadable)
             if inject_fixes:
                 fixables.extend(inject_fixes)
 
@@ -2104,13 +2116,24 @@ def try_resolve_dead_service(service, dsh_version):
     return (False, "", "")
 
 
-def audit_inject(dsh_dir, dsh_version, it, fixables):
+def audit_inject(dsh_dir, dsh_version, it, fixables, unreadable=None):
     """入口注入审计(C# 4856-4950): dump 行定位入口 → inject 服务名/运行时 ctx 访问
     → 死服务解析(logger/webRuntime→webStartup/invariants)。返回 fixables。"""
     rows, err = dump_config_rows(dsh_dir)
     out = []
     if rows is None:
         it("warn", "注入审计跳过: %s" % (err or "dump 不可用"))
+        if unreadable is not None:
+            unreadable.append("inject 入口审计")
+        return out
+    if not rows:
+        # 转储跑成了, 但里面**没有一条带 entry/module 的记录**(本机 DSH 0.2.2-alpha.2 的
+        # --dump-config 就不带这两个字段)。以前打的是 "inject 检查: dump 行 0 个", 读起来
+        # 像"查过了, 没问题" —— 实际是一项都没判定。查不到 ≠ 知道。
+        it("warn", "注入审计未判定: --dump-config 没有给出带 entry/module 的行, "
+                   "无法定位入口文件(该 DSH 版本不提供这个字段)")
+        if unreadable is not None:
+            unreadable.append("inject 入口审计")
         return out
     seen_files = set()
     seen_keys = set()
