@@ -1311,8 +1311,21 @@ async function saveConfigFile(notify = true) {
 
 /* ============================== 更新检查 ================================ */
 async function checkUpdateLlama() {
+  showNotice("正在查询上游版本(GitHub API 直连+镜像, 通常几秒)…");
   const r = await api("toolchains/check_update");
-  if (r.error) { showNotice(r.error, true); return; }
+  if (r.error) {
+    logLine("[更新] llama.cpp 检查失败: " + r.error);
+    if (r.hint) {
+      await showModal({
+        title: "llama.cpp 无法检查更新",
+        body: mEsc(r.error + "\n\n" + r.hint),
+        buttons: [{ label: "知道了", cls: "primary", value: "ok" }]
+      });
+    } else {
+      showNotice(r.error, true);
+    }
+    return;
+  }
   if (r.up_to_date && !r.mismatch) { showNotice(`llama.cpp 已是最新(build ${r.local} ≥ ${r.latest})`); return; }
   let extra = "";
   if (r.mismatch) extra = `\n\n⚠ 本地 build ${r.local} 与上游 ${r.latest} 不一致(可能是分支/CI 构建)。若加载模型报 ggml type 错误,请删除该目录后重新安装。`;
@@ -1330,7 +1343,21 @@ async function checkUpdateLlama() {
 async function checkUpdateDsh() {
   const dir = $("inDshDir").value.trim();
   const r = await api("update/check", { target: "dsh", dir });
-  if (r.error) { showNotice("git 检查失败: " + r.error, true); return; }
+  if (r.error) {
+    // "查不到" 不等于 "网络坏了": cause=not_dir/not_repo/no_remote/detached 时给出出路
+    // (含该仓库的构建基线 commit), 否则用户会反复点按钮, 看起来就是功能不稳定。
+    logLine("[更新] DSH 检查失败(cause=" + (r.cause || "?") + "): " + r.error);
+    if (r.hint) {
+      await showModal({
+        title: "DSH 无法检查更新",
+        body: mEsc(r.error + "\n\n" + r.hint),
+        buttons: [{ label: "知道了", cls: "primary", value: "ok" }]
+      });
+    } else {
+      showNotice("git 检查失败: " + r.error, true);
+    }
+    return;
+  }
   if (r.behind === 0) { logLine("[更新] DSH 已是最新(branch " + r.branch + ")"); return; }
   if (r.ahead > 0) { showNotice(`本地有 ${r.ahead} 个未推送提交,不自动更新;请先处理本地改动。`, true); return; }
   const v = await showModal({

@@ -1866,6 +1866,19 @@ try:
           _st4 == 401 and _st5 == 401 and _st7 == 404, str((_st4, _st5, _st7)))
     check("带对 token 但 Host 不合法要 403: Host 与 token 两道各自独立生效",
           _st6 == 403, str(_st6))
+    # 字段类型错(自己的前端不会发, 但手改/旧客户端会): 旧版会 prof.get(...) →
+    # AttributeError → 500, 并把整段 traceback 写进 error.log, 排障时看着像服务坏了。
+    _st8, _bd8 = _req6("POST", "/api/dsh/plugins/audit", tok=_tok6, body={"profile": "web"})
+    _st9, _bd9 = _req6("POST", "/api/update/check", tok=_tok6, body={"target": "dsh", "dir": {"x": 1}})
+    _st10, _bd10 = _req6("POST", "/api/dsh/plugins/audit", tok=_tok6, body=[1, 2])
+    check("字段类型错要 400 并说清是哪个字段发成了什么(不是 500)",
+          _st8 == 400 and "profile 必须是对象" in _bd8
+          and _st9 == 400 and "dir 必须是字符串" in _bd9
+          and _st10 == 400 and "JSON 对象" in _bd10, str((_st8, _bd8[:70], _st9, _bd9[:70])))
+    _err6f = os.path.join(_h6, ".dsh_launcher_logs", "error.log")
+    _err6t = io.open(_err6f, encoding="utf-8", errors="replace").read() if os.path.isfile(_err6f) else ""
+    check("形状错的请求不得在服务错误日志里留下 traceback(真事故的密度不能被稀释)",
+          "Traceback" not in _err6t and "AttributeError" not in _err6t, _err6t[-160:])
 finally:
     if _pr6.poll() is None:
         _pr6.kill()
@@ -3259,6 +3272,344 @@ check("表头读写速率必须按全部盘求和(截的是显示行, 不是这�
       _sys23["io_total"] == [28.0, 56.0]
       and round(sum(d["read_mb"] for d in _sys23["disks"]), 1) == 15.0,
       str((_sys23["io_total"], [d["read_mb"] for d in _sys23["disks"]])))
+# --- 24) 检查更新(第十五轮): 上游只能有一条链, "查不到"必须说清真因 ----------------
+import updates
+# 24.1 llama 的上游版本以前有**两套实现**: 工具链那条(镜像 + 严格 tag 兜底)和 updates 里
+#      只走直连的副本。实测副本每次 32s 后返回 (None, ""), 面板上是"无法获取上游版本(网络?)",
+#      而真因是它自己把 nightly-tag 资产超时当成了整条失败。
+_flr_real24, _gh_real24 = toolchain.fetch_latest_llama_release, toolchain.gh_api
+_seen24 = {"flr": 0}
+
+
+def _flr_boom24(repo=None, backend=None, job_log=None):
+    _seen24["flr"] += 1
+    raise IOError("未在 %s 找到可用的 cuda 资产(网络或仓库无预编译包)" % repo)
+
+
+toolchain.fetch_latest_llama_release = _flr_boom24
+_p24 = updates.llama_update_probe()
+check("上游版本只能有一条链: 探针必须调工具链的 fetch_latest_llama_release",
+      _seen24["flr"] == 1 and _p24["build"] is None, str(_p24))
+check("上游查不到时必须把真因带回来, 不能只回 (None, '') 让上层猜网络",
+      "未在 ggml-org/llama.cpp 找到可用的 cuda 资产" in _p24["error"], _p24["error"])
+
+
+def _flr_ok24(repo=None, backend=None, job_log=None):
+    _seen24["flr"] += 1
+    return {"build": 12110, "tag": "b12110"}
+
+
+toolchain.fetch_latest_llama_release = _flr_ok24
+_p24b = updates.llama_update_probe()
+_lt24 = updates.llama_latest_version()
+check("成功路径必须回 build/tag 且 error 为空",
+      _p24b["build"] == 12110 and _p24b["tag"] == "b12110" and _p24b["error"] == "", str(_p24b))
+check("旧签名 llama_latest_version() 必须与探针同源(不得再自带网络路径)",
+      _lt24 == (12110, "b12110"), str(_lt24))
+# 判据用**模块表面**而不是源码文本: 说明性注释里提到旧名字是正常的, 但模块里再出现
+# 自己的 HTTP 副本(urllib/常量/下载函数)就意味着分叉又长回来了。
+check("updates 模块里不得再留第二套 GitHub 上游实现(分叉本身就是时好时坏的根因)",
+      not any(hasattr(updates, n) for n in ("_GH_API", "_MIRRORS", "_http_get", "llama_download_url", "urllib")),
+      str([n for n in dir(updates) if "GH" in n or "http" in n.lower() or "urllib" in n.lower()]))
+toolchain.fetch_latest_llama_release = _flr_real24
+
+# 24.2 资产端点(nightly-tag.txt 这类小文件)与 API 是**两族**, 候选/冷却要分开。
+#      2026-11-05 本机实测同一个 60 字节文件: 直连 17.5s 才通 / gh-proxy 1.2s / ghfast 恒 403
+#      / ghproxy.net 恒 502。旧代码把直连排第一、每候选 15s ⇒ 每次检查更新先白等 15~17s
+#      (整条实测 18.7s, 抖动时 32.3s)。现在: 镜像先试、成功的粘滞、失败的冷却、整条有预算。
+import urllib.error as _ue24
+_url24 = "https://github.com/ggml-org/llama.cpp/releases/download/v0.9.0/nightly-tag.txt"
+_c24c = toolchain._asset_candidates(_url24)
+check("资产候选默认必须镜像优先、直连垫底兜底",
+      _c24c[-1] == _url24 and "gh-proxy.com" in _c24c[0] and len(_c24c) == 4,
+      str([u.split('/')[2] for u in _c24c]))
+_hg_real24, _st_real24, _cd_real24 = toolchain.http_get, dict(toolchain._DL_STICKY), dict(toolchain._DL_COOLDOWN)
+_calls24 = []
+
+
+def _hg24(u, timeout=10, binary=False):
+    _calls24.append(u)
+    if "gh-proxy.com" in u:
+        return "b12110"
+    if "ghfast" in u:
+        raise _ue24.HTTPError(u, 403, "Forbidden", {}, None)
+    if "ghproxy.net" in u:
+        raise _ue24.HTTPError(u, 502, "Bad Gateway", {}, None)
+    return "b12110"          # 直连也能通, 只是要 17s
+
+
+toolchain.http_get = _hg24
+toolchain._DL_STICKY["prefix"] = None
+toolchain._DL_COOLDOWN.clear()
+_v24 = toolchain.http_get_asset(_url24, timeout=12)
+check("第一次取值必须直接命中最快候选(不再为直连白等 17s)",
+      _v24 == "b12110" and len(_calls24) == 1 and "gh-proxy" in _calls24[0], str(_calls24))
+check("成功的候选必须成为下次的优先候选(粘滞)",
+      toolchain._DL_STICKY["prefix"] == "https://gh-proxy.com/", str(toolchain._DL_STICKY))
+
+
+def _hg24b(u, timeout=10, binary=False):
+    _calls24.append(u)
+    if u.split("/")[2] == "github.com":
+        return "b12110"
+    raise _ue24.HTTPError(u, 403, "Forbidden", {}, None)
+
+
+toolchain.http_get = _hg24b
+toolchain._DL_STICKY["prefix"] = None
+toolchain._DL_COOLDOWN.clear()
+_calls24.clear()
+_v24b = toolchain.http_get_asset(_url24, timeout=12)
+check("三个镜像都明确失败时必须仍落到直连兜底(镜像先试不等于没有兜底)",
+      _v24b == "b12110" and len([u for u in _calls24
+                                 if any(u.startswith(m) for m in toolchain.MIRRORS)]) == 3,
+      str(_calls24))
+check("明确失败(403/502)的候选必须进冷却, 下次不再重试它",
+      len(toolchain._DL_COOLDOWN) == 3, str(sorted(toolchain._DL_COOLDOWN)))
+_calls24.clear()
+_v24c = toolchain.http_get_asset(_url24, timeout=12)
+check("冷却期内不得再对失败候选发请求(此例只剩直连可试)",
+      _v24c == "b12110" and len(_calls24) == 1
+      and not any(_calls24[0].startswith(m) for m in toolchain.MIRRORS), str(_calls24))
+for _h in ("github.com", "gh-proxy.com", "ghfast.top", "ghproxy.net"):
+    toolchain._DL_COOLDOWN[_h] = time.time() + 300.0
+_calls24.clear()
+_err24 = None
+try:
+    toolchain.http_get_asset(_url24, timeout=12)
+except Exception as _ex24:                                   # noqa: BLE001
+    _err24 = _ex24
+_calls24.clear()
+_v24d = toolchain.http_get_asset(_url24, timeout=12)
+check("候选全在冷却时也必须做一次探针(不能把用户挡到冷却到期), 且只发 1 个请求",
+      _v24d == "b12110" and len(_calls24) == 1, str(_calls24))
+_hg24all = toolchain.http_get
+
+
+def _hg24dead(u, timeout=10, binary=False):      # 连探针候选也失败
+    _calls24.append(u)
+    raise _ue24.HTTPError(u, 403, "Forbidden", {}, None)
+
+
+for _h in ("github.com", "gh-proxy.com", "ghfast.top", "ghproxy.net"):
+    toolchain._DL_COOLDOWN[_h] = time.time() + 300.0
+toolchain.http_get = _hg24dead
+_calls24.clear()
+_err24 = None
+try:
+    toolchain.http_get_asset(_url24, timeout=12)
+except Exception as _ex24e:                                  # noqa: BLE001
+    _err24 = _ex24e
+toolchain.http_get = _hg24all
+check("探针也失败要说'探针仍失败 + 会在 1~4 分钟自动恢复', 不能笼统推给网络",
+      _err24 is not None and "探针" in str(_err24) and "自动恢复" in str(_err24)
+      and len(_calls24) == 1, str(_err24))
+toolchain._DL_COOLDOWN.clear()
+_calls24.clear()
+_budget_real24 = toolchain._DL_BUDGET
+toolchain._DL_BUDGET = 0.0
+_err24b = None
+try:
+    toolchain.http_get_asset(_url24, timeout=12)
+except Exception as _ex24:                                   # noqa: BLE001
+    _err24b = _ex24
+check("总预算用尽要说是预算, 不能都推给'网络不好'",
+      _err24b is not None and "预算" in str(_err24b) and not _calls24, str(_err24b))
+toolchain._DL_BUDGET, toolchain.http_get = _budget_real24, _hg_real24
+toolchain._DL_STICKY, toolchain._DL_COOLDOWN = _st_real24, _cd_real24
+
+# 24.3 fetch_latest_llama_release 的 nightly-tag 一步: 以前它自己内联"直连先试 ×15s", 且资产
+#      失败会连带跳过同一 try 里的严格 tag 扫描。现在必须走 http_get_asset, 且资产失败仍能靠
+#      releases 严格扫描返回同一个 build。
+def _gh24(path, timeout=10):
+    if path.endswith("/releases/latest"):
+        return {"tag_name": "v0.9.0", "assets": [{"name": "nightly-tag.txt", "browser_download_url": _url24}]}
+    if "/releases/tags/b12110" in path:
+        return {"tag_name": "b12110", "assets": [{"name": "llama-b12110-bin-ubuntu-vulkan-x64.tar.gz",
+                                                  "browser_download_url": "https://x/z", "size": 10}]}
+    if "releases?per_page" in path:
+        return [{"tag_name": "b12110", "assets": [{"name": "llama-b12110-bin-ubuntu-vulkan-x64.tar.gz",
+                                                   "browser_download_url": "https://x/z", "size": 10}]}]
+    return []
+
+
+toolchain.gh_api = _gh24
+_gha_real24, _gha_calls24 = toolchain.http_get_asset, []
+
+
+def _gha_ok24(u, timeout=12, binary=False, budget=None):
+    _gha_calls24.append(u)
+    return "b12110"
+
+
+toolchain.http_get_asset = _gha_ok24
+_rel24 = toolchain.fetch_latest_llama_release("ggml-org/llama.cpp", "vulkan", None)
+check("nightly-tag 必须经 http_get_asset(镜像先试/粘滞/冷却), 不得再内联直连先试",
+      _gha_calls24 == [_url24] and _rel24["build"] == 12110, str((_gha_calls24, _rel24.get("build"))))
+
+
+def _gha_boom24(u, timeout=12, binary=False, budget=None):
+    raise IOError("资产候选近期全部失败过, 已跳过重试(稍后自动恢复)")
+
+
+toolchain.http_get_asset = _gha_boom24
+_rel24b = toolchain.fetch_latest_llama_release("ggml-org/llama.cpp", "vulkan", None)
+check("资产拉不动不得抹掉严格 tag 扫描兜底(仍能比出同一个 build)",
+      _rel24b["build"] == 12110 and _rel24b["tag"] == "b12110", str(_rel24b))
+toolchain.http_get_asset, toolchain.gh_api = _gha_real24, _gh_real24
+
+# 24.4 DSH 侧四态分开报。本机实测 ~/.local/share/deepseek-harness 一个 remote 都没配,
+#      旧代码却报"fetch 失败(直连与镜像均不可达)" ⇒ 用户反复点按钮, 看着就是功能不稳定。
+import subprocess as _sp24
+
+
+def _git24(cwd, *args):
+    return _sp24.run(["git", "-c", "user.email=t@example.com", "-c", "user.name=t",
+                      "-C", cwd] + list(args), capture_output=True, text=True)
+
+
+_d24_norem = os.path.join(_tmp, "dsh_no_remote24")
+_d24_det = os.path.join(_tmp, "dsh_detached24")
+_d24_plain = os.path.join(_tmp, "dsh_plain24")
+for _d24x in (_d24_norem, _d24_det, _d24_plain):
+    os.makedirs(_d24x, exist_ok=True)
+for _d24x in (_d24_norem, _d24_det):
+    _git24(_d24x, "init", "-q")
+    io.open(os.path.join(_d24x, "a.txt"), "w", encoding="utf-8").write("1\n")
+    _git24(_d24x, "add", "a.txt")
+    _git24(_d24x, "commit", "-q", "-m", "one")
+_git24(_d24_det, "remote", "add", "origin", "https://github.com/example/dsh.git")
+_git24(_d24_det, "checkout", "-q", "--detach")
+_c24a = updates.dsh_git_state("")[0]
+_c24b = updates.dsh_git_state(os.path.join(_tmp, "nope24"))[0]
+_c24c2 = updates.dsh_git_state(_d24_plain)[0]
+_c24d, _h24d = updates.dsh_git_state(_d24_norem)
+_c24e = updates.dsh_git_state(_d24_det)[0]
+check("DSH 目录未指定或不存在必须报 not_dir(不是网络问题)",
+      _c24a == "not_dir" and _c24b == "not_dir", str((_c24a, _c24b)))
+check("不是 git 检出必须报 not_repo", _c24c2 == "not_repo", str(_c24c2))
+check("没有 origin 必须报 no_remote(本机真实形态, 以前被报成网络不可达)",
+      _c24d == "no_remote", str((_c24d, _h24d[:80])))
+check("no_remote 的 hint 必须给出出路(git remote add origin), 不能只说失败",
+      "remote add origin" in _h24d and _d24_norem in _h24d, _h24d[:120])
+check("detached HEAD 必须报 detached", _c24e == "detached", str(_c24e))
+_r24 = updates.dsh_check_update(_d24_norem)
+check("dsh_check_update 对 no_remote 必须带 cause/hint 且不发任何网络请求",
+      _r24.get("cause") == "no_remote" and bool(_r24.get("hint")), str(_r24)[:160])
+_ok24, _msg24 = updates.dsh_pull(_d24_norem)
+check("点更新同样不能把'没配 origin'说成'直连与镜像拉取均失败'",
+      _ok24 is False and "没有配置 git 远端" in _msg24
+      and "直连与镜像拉取均失败" not in _msg24, _msg24[:160])
+
+# 24.5 GitHub API 的候选粘滞必须按**镜像前缀**跨 path 生效: 一次检查要发 2~3 个不同 path
+#      的请求, 按完整 URL 粘滞等于每条 path 各自重新从直连开始(实测第二次检查仍要 7.6s)。
+_ghs_real24, _ghc_real24 = dict(toolchain._GH_STICKY), dict(toolchain._GH_COOLDOWN)
+_api_calls24 = []
+_api_bad24 = {"all": False}
+
+
+def _hg24c(u, timeout=10, binary=False):
+    _api_calls24.append(u)
+    if _api_bad24["all"]:
+        raise _ue24.HTTPError(u, 403, "Forbidden", {}, None)
+    if u.startswith("https://api.github.com"):
+        raise _ue24.HTTPError(u, 404, "Not Found", {}, None)   # 本轮实测: 直连偶发 404/慢
+    if "gh-proxy.com" in u:
+        return json.dumps({"tag_name": "ok"})
+    raise _ue24.HTTPError(u, 403, "Forbidden", {}, None)
+
+
+toolchain.http_get = _hg24c
+toolchain._GH_STICKY["prefix"] = None
+toolchain._GH_COOLDOWN.clear()
+toolchain.gh_api("/repos/a/b/releases/latest")
+_api_calls24.clear()
+toolchain.gh_api("/repos/a/b/releases/tags/b12110")
+check("另一条 path 的请求必须优先用上一条成功的那个候选(粘滞按前缀不按完整 URL)",
+      len(_api_calls24) == 1 and _api_calls24[0].startswith("https://gh-proxy.com/"),
+      str(_api_calls24))
+_c24d = toolchain._prefixed_candidates("https://api.github.com/x", {"prefix": None}, True)
+check("API 族候选默认必须直连优先(镜像会缓存: 实测 gh-proxy 给 b12110 而直连已是 b12128, "
+      "同一按钮两个版本号也是不稳定)",
+      _c24d[0] == "https://api.github.com/x" and len(_c24d) == 4, str(_c24d[:2]))
+_c24e2 = toolchain._prefixed_candidates("https://github.com/a/b", {"prefix": None}, False)
+check("资产族候选默认必须镜像优先、直连垫底(直连要 17.5s, 镜像 1.2s)",
+      _c24e2[0].startswith("https://gh-proxy.com/") and _c24e2[-1] == "https://github.com/a/b",
+      str(_c24e2[:2]))
+toolchain._GH_STICKY["prefix"] = None
+toolchain._GH_COOLDOWN.clear()
+_api_calls24.clear()
+_api_bad24["all"] = True
+_err24c = None
+try:
+    toolchain.gh_api("/repos/a/b/releases/latest")
+except Exception as _ex24c:                                  # noqa: BLE001
+    _err24c = _ex24c
+check("全候选 403 时每个候选只发一次(4xx 不原地重试)且都进冷却",
+      _err24c is not None and len(_api_calls24) == 4 and len(toolchain._GH_COOLDOWN) == 4,
+      str((len(_api_calls24), sorted(toolchain._GH_COOLDOWN))))
+_api_calls24.clear()
+_err24d = None
+try:
+    toolchain.gh_api("/repos/a/b/releases/tags/b12110")
+except Exception as _ex24d:                                  # noqa: BLE001
+    _err24d = _ex24d
+check("候选全在冷却时也要探针一次而不是直接拒绝; 探针仍失败要说会自行恢复",
+      _err24d is not None and "探针" in str(_err24d) and len(_api_calls24) == 1,
+      str((_err24d, _api_calls24)))
+_now24 = time.time()
+check("端点级 4xx 不得把候选长冷却(实测 gh-proxy 有的 path 通、有的 path 给 404; "
+      "按 15 分钟挡会把 4 个候选全挡掉, 反而做成新的时好时坏)",
+      bool(toolchain._GH_COOLDOWN)
+      and all(v - _now24 <= 60.0 for v in toolchain._GH_COOLDOWN.values()),
+      str([round(v - _now24) for v in sorted(toolchain._GH_COOLDOWN.values())]))
+_api_bad24["all"] = False
+toolchain.http_get = _hg_real24
+toolchain._GH_STICKY, toolchain._GH_COOLDOWN = _ghs_real24, _ghc_real24
+# 24.6 整条上游查询必须共享一个网络截止时间: 每个请求各有一档预算时**总时长没人管**
+#      (实测同一个按钮 56.3s / 9.9s / 7.9s / 10.6s, 用户只会说"始终不稳定")。
+import socket as _so24
+_api_calls24.clear()
+_slow24 = {"n": 0}
+
+
+def _hg24slow(u, timeout=10, binary=False):
+    _slow24["n"] += 1
+    time.sleep(0.4)
+    raise _so24.timeout("每个候选都要 0.4s 以上")
+
+
+toolchain.http_get = _hg24slow
+_budget_real24b = toolchain.CHECK_NET_BUDGET
+toolchain.CHECK_NET_BUDGET = 1.2
+toolchain._GH_STICKY["prefix"] = None
+toolchain._GH_COOLDOWN.clear()
+toolchain.begin_net_budget()
+_err24e = None
+try:
+    toolchain.gh_api("/repos/a/b/releases/latest")
+except Exception as _ex24e2:                                 # noqa: BLE001
+    _err24e = _ex24e2
+_n1 = len(_api_calls24)
+_api_calls24.clear()
+_err24f = None
+try:
+    toolchain.gh_api("/repos/a/b/releases/tags/b12110")
+except Exception as _ex24f:                                  # noqa: BLE001
+    _err24f = _ex24f2 = _ex24f
+check("一次上游查询的总时长必须受共享预算约束(而不是每条 path 各排一轮候选)",
+      _err24e is not None and "预算" in str(_err24e) and _n1 <= 3, str((_n1, str(_err24e)[:70])))
+check("预算用尽后同一链的后续请求必须立刻失败并说明原因(不得重新排队候选)",
+      _err24f is not None and "预算" in str(_err24f) and not _api_calls24, str(_api_calls24))
+toolchain.CHECK_NET_BUDGET = _budget_real24b
+toolchain.end_net_budget()
+toolchain.http_get = _hg24c        # 对照仍走替身, 自检不得真发网络请求
+_api_calls24.clear()
+toolchain._GH_COOLDOWN.clear()
+_ok24f = toolchain.gh_api("/repos/a/b/releases/latest")
+check("对照: 预算窗口结束后同一候选链必须恢复正常(不得把一次失败变成永久)",
+      _ok24f.get("tag_name") == "ok" and len(_api_calls24) == 2, str(_api_calls24))
+
 # --- 17) 自检自身的边界: 不得污染用户真实的日志目录 ---------------------------
 # 17.1 以前 selftest 直接往 ~/.dsh_launcher_logs 写: 每跑一次就多出几条测试噪声
 #      ("资产名形态非法: ../evil.tar.gz"、"摘要与直连不一致"), 用户排障时会把它们当成

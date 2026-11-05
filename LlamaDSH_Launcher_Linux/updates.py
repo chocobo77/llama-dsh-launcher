@@ -16,7 +16,6 @@ import zipfile
 import shutil
 import subprocess
 
-import urllib.request
 
 import procman
 import applog
@@ -122,15 +121,6 @@ def find_dsh_project(known_only=False):
 
 # ============================================================ llama.cpp 更新
 
-_GH_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-_MIRRORS = ("https://ghproxy.net/", "https://ghfast.top/", "https://gh-proxy.com/")
-
-
-def _http_get(url, timeout=30):
-    req = urllib.request.Request(url, headers={"User-Agent": "LlamaDSH-Launcher-Linux"})
-    return urllib.request.urlopen(req, timeout=timeout).read()
-
-
 def llama_local_version(llama_dir):
     """运行 llama-server --version,提取 build 号。"""
     exe = os.path.join(llama_dir, "llama-server")
@@ -147,40 +137,30 @@ def llama_local_version(llama_dir):
         return None
 
 
+def llama_update_probe():
+    """上游版本探针, 返回 {"build","tag","error"}。
+
+    以前这里自己另写了一套(_GH_API 只直连 + 30s 超时): 本机实测每次都是 32s 后返回
+    (None, "") —— 因为直连 api.github.com 通, 但 nightly-tag.txt 的下载资产超时, 而异常
+    会跳过同一 try 里本来可用的"latest tag 解析"兜底。工具链那条(fetch_latest_llama_release)
+    早就有镜像 + 严格 tag 回退, 两条并存的**分叉本身**就是"检查更新时好时坏"的根因。
+    """
+    import toolchain as _tc
+    try:
+        rel = _tc.fetch_latest_llama_release(_tc.DEFAULT_REPO, None, None)
+    except Exception as ex:                                  # noqa: BLE001
+        return {"build": None, "tag": "", "error": "%s: %s" % (type(ex).__name__, ex)}
+    build = int(rel.get("build") or 0)
+    if build <= 0:
+        return {"build": None, "tag": rel.get("tag", ""),
+                "error": "上游 release 列表里没解析出 build 号(tag=%s)" % rel.get("tag", "")}
+    return {"build": build, "tag": rel.get("tag", ""), "error": ""}
+
+
 def llama_latest_version():
-    """上游最新 build 号(nightly-tag.txt 资产,失败回退近 20 个 release 的 bNNNNN)。"""
-    try:
-        data = json.loads(_http_get(_GH_API).decode("utf-8"))
-        for a in data.get("assets", []):
-            if a.get("name") == "nightly-tag.txt":
-                txt = _http_get(a["browser_download_url"]).decode().strip()
-                m = re.search(r"b?(\d+)", txt)
-                if m:
-                    return int(m.group(1)), data.get("tag_name", "")
-        tags = [data.get("tag_name", "")]
-        m = re.search(r"b?(\d+)", tags[0])
-        if m:
-            return int(m.group(1)), tags[0]
-    except Exception:
-        pass
-    return None, ""
-
-
-def llama_download_url(build):
-    """在 bNNNNN release 里挑 ubuntu-x64 zip:优先 vulkan,回退普通/avx2。"""
-    api = "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/b%d" % build
-    try:
-        data = json.loads(_http_get(api).decode("utf-8"))
-    except Exception:
-        return None
-    names = [a for a in data.get("assets", []) if "-bin-ubuntu-x64" in a.get("name", "") and a["name"].endswith(".zip")]
-    if not names:
-        names = [a for a in data.get("assets", []) if a.get("name", "").endswith(".zip") and "ubuntu" in a.get("name", "")]
-    for pref in ("vulkan", "avx2"):
-        for a in names:
-            if pref in a["name"]:
-                return a["browser_download_url"]
-    return names[0]["browser_download_url"] if names else None
+    """兼容旧调用: 只回 (build, tag)。失败原因请用 llama_update_probe()。"""
+    p = llama_update_probe()
+    return p["build"], p["tag"]
 
 
 def llama_update(llama_dir, log, job_log, repo=None, backend=None):
@@ -204,13 +184,66 @@ def llama_update(llama_dir, log, job_log, repo=None, backend=None):
 
 # ================================================================== DSH 更新
 
+def _git(cwd, *args, timeout=15):
+    r = subprocess.run(["git", "-C", cwd] + list(args), capture_output=True, text=True,
+                       timeout=timeout)
+    return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+
+
+def _build_head_short():
+    try:
+        import state
+        return (state.load_build_state().get("head") or "")[:8]
+    except Exception:
+        return ""
+
+
+def dsh_git_state(dsh_dir):
+    """能不能用 git 比对更新: 返回 (cause, hint)。
+
+    cause ∈ ""(可以) / not_dir / not_repo / no_remote / detached。这四类**都不是网络问题**:
+    本机实测 ~/.local/share/deepseek-harness 是一个"local source snapshot"提交, 仓库里
+    一个 remote 都没配, 旧代码却把它报成"fetch 失败(直连与镜像均不可达)" —— 用户于是反复
+    点"检查更新", 看起来就是功能不稳定。
+    """
+    if not dsh_dir or not os.path.isdir(dsh_dir):
+        return "not_dir", "没有指定(或不存在的)DSH 目录: 先在设置里填 DSH 源码目录"
+    rc, _, _ = _git(dsh_dir, "rev-parse", "--is-inside-work-tree")
+    head = _build_head_short()
+    if rc != 0:
+        return "not_repo", ("该 DSH 目录不是 git 检出%s, 无法用 git 比对更新。"
+                            "DSH 的更新走重装或「🔨 重建 DSH」" %
+                            ("(构建基线 commit %s)" % head if head else ""))
+    rc, remotes, _ = _git(dsh_dir, "remote")
+    if rc != 0 or not remotes:
+        return "no_remote", ("该 DSH 目录没有配置 git 远端(不是网络问题):它只是一个本地源码快照"
+                             "%s。要能检查更新, 先给它指上游, 例如:\n"
+                             "  git -C \"%s\" remote add origin <DSH 源码仓库地址>\n"
+                             "之后再点检查更新即可。" %
+                             ("(构建基线 commit %s)" % head if head else "", dsh_dir))
+    rc, br, _ = _git(dsh_dir, "rev-parse", "--abbrev-ref", "HEAD")
+    if br == "HEAD":
+        return "detached", "仓库处于 detached HEAD 状态,无法比对更新"
+    return "", ""
+
+
+_DSH_CAUSE_MSG = {"not_dir": "DSH 目录未指定",
+                  "not_repo": "DSH 目录不是 git 仓库",
+                  "no_remote": "DSH 目录没有配置 git 远端(origin)",
+                  "detached": "DSH 仓库处于 detached HEAD"}
+
+
 def dsh_check_update(dsh_dir):
-    """返回 dict:branch/ahead/behind/head。"""
+    """返回 dict:branch/ahead/behind/head;失败时 error + cause + hint。"""
+    cause, hint = dsh_git_state(dsh_dir)
+    if cause:
+        return {"error": _DSH_CAUSE_MSG.get(cause, "DSH 仓库状态无法比对更新"),
+                "cause": cause, "hint": hint}
     try:
         fr = subprocess.run(["git", "fetch", "origin", "--prune"], cwd=dsh_dir,
                             capture_output=True, text=True, timeout=120)
     except Exception as ex:
-        return {"error": str(ex)}
+        return {"error": str(ex), "cause": "network"}
     remote_ref = "origin/%s"
     if fr.returncode != 0:
         # 直连失败: 镜像 fetch 回退(比对对象改为 FETCH_HEAD)
@@ -220,7 +253,9 @@ def dsh_check_update(dsh_dir):
         except Exception:
             origin = ""
         fetched = False
+        tried = []
         for candidate in _mirror_urls(origin):
+            tried.append(candidate)
             mf = subprocess.run(["git", "-c", "http.version=HTTP/1.1", "fetch", "--no-tags",
                                  candidate, "+refs/heads/*:refs/mirrors/*"],
                                 cwd=dsh_dir, capture_output=True, text=True, timeout=120)
@@ -229,20 +264,24 @@ def dsh_check_update(dsh_dir):
                 remote_ref = "refs/mirrors/%s"
                 break
         if not fetched:
-            return {"error": "fetch 失败(直连与镜像均不可达): " + (fr.stderr or "").strip()[-400:]}
+            return {"error": "fetch 失败(直连与镜像均不可达): " + (fr.stderr or "").strip()[-400:],
+                    "cause": "network",
+                    "hint": "origin=%s; 试过镜像: %s" % (origin or "?", ", ".join(tried) or "(无镜像候选)")}
     try:
         branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=dsh_dir,
                                 capture_output=True, text=True, timeout=15).stdout.strip()
         if branch == "HEAD":
-            return {"error": "仓库处于 detached HEAD 状态,无法比对更新"}
+            return {"error": "仓库处于 detached HEAD 状态,无法比对更新", "cause": "detached"}
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=dsh_dir,
                               capture_output=True, text=True, timeout=15).stdout.strip()
         cnt = subprocess.run(["git", "rev-list", "--left-right", "--count", "HEAD...%s" % (remote_ref % branch)],
                              cwd=dsh_dir, capture_output=True, text=True, timeout=30).stdout.strip()
         ahead, behind = (cnt.split() + ["0", "0"])[:2]
-        return {"branch": branch, "head": head[:8], "ahead": int(ahead), "behind": int(behind)}
+        return {"branch": branch, "head": head[:8], "ahead": int(ahead), "behind": int(behind),
+                "build_baseline": _build_head_short(),
+                "compared_via": "mirror" if remote_ref != "origin/%s" else "origin"}
     except Exception as ex:
-        return {"error": str(ex)}
+        return {"error": str(ex), "cause": "compare"}
 
 
 def _cleanup_git_lock(repo_dir):
@@ -356,6 +395,11 @@ def dsh_pull(dsh_dir, log=None):
     直连失败时镜像 fetch + merge --ff-only 回退(不产生 merge 提交)。
     所有失败路径先 pop 还原工作区再报错,不留半套状态(42e897c 同语义)。"""
     log = log or (lambda t: None)
+    # 先把"根本不是 git 检出/没有远端"这类**结构性问题**分出来: 否则 git 的 stderr 会被
+    # 汇进"直连与镜像拉取均失败", 把一个"没配 origin"的本地快照说成网络问题(与检查更新同病灶)。
+    cause, hint = dsh_git_state(dsh_dir)
+    if cause:
+        return False, _DSH_CAUSE_MSG.get(cause, "DSH 仓库状态无法更新") + (("\n" + hint) if hint else "")
     rc, out = _run_git(dsh_dir, ["pull", "--ff-only"], 240)
     stashed = False
     if rc == 0:

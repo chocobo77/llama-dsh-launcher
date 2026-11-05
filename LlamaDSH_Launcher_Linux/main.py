@@ -408,15 +408,23 @@ def api_search(body):
 
 def api_check_update(body):
     which = body.get("target")
-    if which == "llama":
-        d = (body.get("dir") or "").strip().strip('"')
-        local = updates.llama_local_version(d)
-        latest, tag = updates.llama_latest_version()
-        if latest is None:
-            return {"error": "无法获取上游版本(网络?)"}
-        return {"local": local, "latest": latest, "tag": tag,
-                "up_to_date": local is not None and local >= latest}
     d = (body.get("dir") or "").strip().strip('"')
+    if which == "llama":
+        local = updates.llama_local_version(d)
+        probe = updates.llama_update_probe()
+        if probe["build"] is None:
+            # 以前只回"无法获取上游版本(网络?)", 而真因可能是镜像全挂/仓库无预编译包/解析不出
+            # build 号 —— 把"查不到"说成"网络问题"会让人白等、白重启。
+            return {"error": "无法获取上游版本: " + probe["error"], "cause": "upstream",
+                    "hint": "上游探针与工具链走同一条链(GitHub API 直连+镜像, 带候选粘滞与冷却); "
+                            "若显示候选近期全失败, 稍后自动恢复, 不必重启服务",
+                    "local": local, "local_unknown": local is None}
+        return {"local": local, "latest": probe["build"], "tag": probe["tag"],
+                "up_to_date": local is not None and local >= probe["build"],
+                "local_unknown": local is None,
+                "local_hint": "" if local is not None else
+                ("目录 %s 里跑不出 build 号(没装/不是 llama.cpp 目录?), 这次只能比出上游版本"
+                 % (d or "(未填)"))}
     return updates.dsh_check_update(d)
 
 
@@ -857,7 +865,11 @@ def api_toolchain_check_update(body):
     try:
         release = toolchain.fetch_latest_llama_release(repo, backend, None)
     except Exception as ex:
-        return {"error": "查询失败(%s): %s" % (repo, ex)}
+        return {"error": "查询失败(%s): %s" % (repo, ex), "cause": "upstream",
+                "hint": "上游查询走同一条链: 直连 + 三个镜像, 上次成功的候选优先, 明确失败过的候选"
+                        "先进冷却(镜像 15 分钟 / 直连 90 秒)后自动恢复, 不必重启服务。"
+                        "如果错误里写\u201c未找到可用的资产\u201d, 那是该仓库没有这个后端的预编译包,"
+                        "与网络无关, 换个后端(变体)即可。"}
     local = toolchain.local_build(dir_)
     latest = release.get("build", 0)
     mismatch = bool(local is not None and latest > 0 and local != latest and local > latest)
@@ -1017,6 +1029,25 @@ def api_health(_):
         HUB.log("--- DSH 进程已不在(非启动器停止), 状态已回落; 若不是您手动关掉的, "
                 "请看 DSH 日志确认崩溃原因 ---")
     return {"ok": True}
+
+
+_BODY_DICT_KEYS = ("profile", "config")
+_BODY_STR_KEYS = ("name", "dir", "target", "url", "repo", "path", "source", "version", "outtype")
+
+
+def _body_shape_error(body):
+    """POST 请求体里已知字段的类型校验; 返回错误文案或 None。"""
+    if not isinstance(body, dict):
+        return "请求体必须是 JSON 对象(当前是 %s)" % type(body).__name__
+    for k in _BODY_DICT_KEYS:
+        v = body.get(k)
+        if k in body and v is not None and not isinstance(v, dict):
+            return "%s 必须是对象(当前是 %s)" % (k, type(v).__name__)
+    for k in _BODY_STR_KEYS:
+        v = body.get(k)
+        if k in body and v is not None and not isinstance(v, str):
+            return "%s 必须是字符串(当前是 %s)" % (k, type(v).__name__)
+    return None
 
 
 ROUTES = {
@@ -1181,6 +1212,12 @@ class Handler(BaseHTTPRequestHandler):
         fn = ROUTES.get((path,))
         if fn is None:
             return self._send(404, {"error": "unknown api: " + path})
+        # 形状校验: 字段类型错在旧版会走到 prof.get(...)/.strip() → AttributeError → 500,
+        # 并把整段 traceback 写进 error.log(排障时看着像服务自己坏了)。类型错就当类型错
+        # 处理: 明确 400 说是哪个字段、发成了什么。
+        bad = _body_shape_error(body)
+        if bad:
+            return self._send(400, {"error": bad})
         try:
             result = fn(body)
         except Exception as ex:

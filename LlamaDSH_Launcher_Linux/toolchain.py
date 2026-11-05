@@ -63,19 +63,201 @@ def http_get(url, timeout=10, binary=False):
     return data if binary else data.decode("utf-8", "replace")
 
 
-def gh_api(path):
-    """GitHub API:直连 → 镜像前缀,每候选 2 次,共约 60s 上限(80d56de)。"""
+# 镜像能不能代理是**按端点**变的(2026-11-05 本机实测: gh-proxy.com 代理 /releases/latest 1.6s
+# 返回 200, 同一镜像对 /releases/tags/bNNNNN 却给 404; ghfast.top 恒 403; ghproxy.net 恒 502)。
+# 旧 gh_api 对每个候选固定 2 次 ×10s, 而一次"检查更新"要发 2~3 个 API 请求 ⇒ 直连一抖就是
+# 60~90s 没有回音, 面板上表现成"检查更新时好时坏"。现在的规则:
+#   1) 候选顺序: 上次成功的镜像**前缀** → 其余镜像 → 直连兜底。按前缀而不是完整 URL 粘滞,
+#      否则每条 path 各自从直连重新排队(实测第二次检查仍要 7.6s);
+#   2) 冷却按**失败种类**: 只有传输类(超时/连接重置)才长冷却, 端点级 403/404/451 只挡 45 秒。
+#      实测把"某镜像不代理某条 path"按 15 分钟冷却, 会把 4 个候选全部挡掉, 之后 15 分钟里
+#      每次点检查更新都被拒 —— 那本身就成了新的"时好时坏";
+#   3) 全部候选都在冷却时仍做一次探针(只发 1 个请求), 绝不把用户直接挡到冷却到期;
+#   4) 整条有总预算。
+# API 与资产是两族端点(实测直连 API 约 2s、直连资产 17.5s), 所以两套状态各自独立。
+MIRROR_4XX = (403, 404, 451)
+_GH_STICKY = {"prefix": None}   # 上次成功的镜像前缀(None=未知, ""=直连)
+_GH_COOLDOWN = {}              # host -> 冷却到的时刻
+_GH_COOLDOWN_MIRROR = 240.0    # 传输类失败: 镜像冷却 4 分钟
+_GH_COOLDOWN_DIRECT = 60.0
+_COOLDOWN_4XX = 45.0           # 端点级 4xx: 只挡 45 秒
+_GH_BUDGET = 30.0
+_DL_STICKY = {"prefix": None}  # None=还没成功过; ""=上次是直连
+_DL_COOLDOWN = {}
+_DL_COOLDOWN_MIRROR = 240.0
+_DL_COOLDOWN_DIRECT = 60.0
+_DL_BUDGET = 25.0
+# 一次"检查更新"要发 2~4 个网络请求, 每个请求各有一档预算 ⇒ **总时长没人管**
+# (实测同一个按钮 56.3s / 9.9s / 7.9s / 10.6s, 用户只会说"始终不稳定")。
+# 整条链共享一个线程内的截止时间: 期限内拿不到就带"预算用尽"的原因失败, 不让用户干等。
+CHECK_NET_BUDGET = 22.0
+_NET_LOCAL = threading.local()
+
+
+def begin_net_budget(seconds=None):
+    """开始一条链(一次检查更新/一次上游查询), 之后所有请求共享这个截止时间。"""
+    _NET_LOCAL.until = time.time() + (seconds if seconds is not None else CHECK_NET_BUDGET)
+    _NET_LOCAL.blown = False
+
+
+def end_net_budget():
+    _NET_LOCAL.until, _NET_LOCAL.blown = 0.0, False
+
+
+def _deadline_for(per_call_budget):
+    until = getattr(_NET_LOCAL, "until", 0.0)
+    if not until:
+        return time.time() + per_call_budget
+    if time.time() >= until:
+        _NET_LOCAL.blown = True            # 之后的请求一律直接失败, 不再续期
+        return time.time() - 1.0
+    return min(time.time() + per_call_budget, until)
+
+
+def _budget_out():
+    return bool(getattr(_NET_LOCAL, "blown", False))
+
+
+def _budget_msg(what):
+    return ("本次上游查询已用完 %.0fs 网络预算(候选: 直连 + %d 个镜像), 未取得 %s; "
+            "可稍后重试或换网络" % (CHECK_NET_BUDGET, len(MIRRORS), what))
+
+
+def _prefixed_candidates(url, sticky, direct_first):
+    """候选顺序: 上次成功的候选 → 其余候选(直连按端点族决定排前还是垫底)。
+
+    API 族 direct_first=True: 直连实测约 2s 且**权威** —— 镜像会缓存(实测 gh-proxy 返回
+    b12110 而直连已是 b12128), 同一个按钮两次给出不同版本号, 也是"时好时坏"。
+    资产族 direct_first=False: 直连要 17.5s 而镜像 1.2s, 坏镜像 1~2s 就明确失败。
+    """
+    pref = sticky["prefix"]
+    out = []
+    if pref is not None:
+        out.append(pref + url)
+    if direct_first and url not in out:
+        out.append(url)
+    out += [m + url for m in MIRRORS if m != pref and (m + url) not in out]
+    if not direct_first and url not in out:
+        out.append(url)
+    return out
+
+
+def _mark_ok(sticky, cooldown, cand, url):
+    sticky["prefix"] = cand[:len(cand) - len(url)]
+    cooldown.pop(urllib.parse.urlsplit(cand).netloc, None)
+
+
+def _mark_cool(cooldown, host, ex, mirror_long, direct_long, direct_host):
+    """冷却时长由失败种类决定: 端点级 4xx 只是"这个候选不代理这个端点"。"""
+    if getattr(ex, "code", 0) in MIRROR_4XX:
+        cooldown[host] = time.time() + _COOLDOWN_4XX
+    else:
+        cooldown[host] = time.time() + (direct_long if host == direct_host else mirror_long)
+
+
+def gh_api(path, timeout=10):
+    """GitHub API: 粘滞候选 + 按失败种类冷却 + 总预算 + 全冷却时的一次探针。"""
+    if _budget_out():
+        raise IOError(_budget_msg(path))
     url = GITHUB_API + path
-    candidates = [url] + [m + url for m in MIRRORS]
-    last = None
+    candidates = _prefixed_candidates(url, _GH_STICKY, True)
+    deadline = _deadline_for(_GH_BUDGET)
+    last, skipped, blown = None, 0, False
     for u in candidates:
-        for _ in range(2):
+        host = urllib.parse.urlsplit(u).netloc
+        if _GH_COOLDOWN.get(host, 0.0) > time.time():
+            skipped += 1
+            continue
+        if time.time() > deadline:
+            blown = True
+            break
+        failed = False
+        for _attempt in range(2):
+            if time.time() > deadline:
+                blown = True
+                break
             try:
-                return json.loads(http_get(u, timeout=10))
+                data = json.loads(http_get(u, timeout=timeout))
+                _mark_ok(_GH_STICKY, _GH_COOLDOWN, u, url)
+                return data
             except Exception as ex:
-                last = ex
+                last, failed = ex, True
+                # 4xx = "这个候选不代理这个端点"或"资源不存在", 原地重试不会变好;
+                # 只有传输类(超时/连接重置)才值得再试一次
+                if getattr(ex, "code", 0) in MIRROR_4XX:
+                    break
                 time.sleep(0.4)
+        if failed:
+            _mark_cool(_GH_COOLDOWN, host, last, _GH_COOLDOWN_MIRROR,
+                       _GH_COOLDOWN_DIRECT, "api.github.com")
+    if blown:
+        raise IOError(_budget_msg(path))
+    if skipped == len(candidates):
+        if _budget_out():
+            raise IOError(_budget_msg(path))
+        u = candidates[0]                      # 探针: 排序保证它是上次成功的那个
+        host = urllib.parse.urlsplit(u).netloc
+        _GH_COOLDOWN.pop(host, None)
+        try:
+            data = json.loads(http_get(u, timeout=timeout))
+            _mark_ok(_GH_STICKY, _GH_COOLDOWN, u, url)
+            return data
+        except Exception as ex:
+            _mark_cool(_GH_COOLDOWN, host, ex, _GH_COOLDOWN_MIRROR,
+                       _GH_COOLDOWN_DIRECT, "api.github.com")
+            raise IOError("GitHub API 候选近期失败过, 探针仍失败: %s "
+                          "(候选会在 1~4 分钟内自动恢复, 不必重启服务)" % ex)
     raise last if last else IOError("GitHub API 不可达")
+
+
+def _asset_candidates(url):
+    return _prefixed_candidates(url, _DL_STICKY, False)
+
+
+def http_get_asset(url, timeout=12, binary=False, budget=None):
+    """GET 一个 GitHub 资产(小文件用):同一套候选/冷却/探针规则, 状态与 API 那族独立。"""
+    deadline = _deadline_for(budget if budget is not None else _DL_BUDGET)
+    candidates = _prefixed_candidates(url, _DL_STICKY, False)
+    last, blown, skipped = None, False, 0
+    for u in candidates:
+        host = urllib.parse.urlsplit(u).netloc
+        if _DL_COOLDOWN.get(host, 0.0) > time.time():
+            skipped += 1
+            continue
+        if time.time() > deadline:
+            blown = True
+            break
+        try:
+            data = http_get(u, timeout=timeout, binary=binary)
+            _mark_ok(_DL_STICKY, _DL_COOLDOWN, u, url)
+            return data
+        except Exception as ex:
+            last = ex
+            _mark_cool(_DL_COOLDOWN, host, ex, _DL_COOLDOWN_MIRROR,
+                       _DL_COOLDOWN_DIRECT, "github.com")
+    if blown:
+        # 一次都没发完就被预算掐断: 说的是预算, 不能笼统推给"网络不好"
+        # (与 DSH 侧"没配 origin 被报成不可达"同族)。
+        raise IOError(_budget_msg("资产 " + url.rsplit("/", 1)[-1])
+                      if _budget_out() else
+                      "资产获取超出单条候选预算(%.0fs), 未再尝试后续候选" % _DL_BUDGET)
+    if skipped == len(candidates):
+        if _budget_out():
+            raise IOError(_budget_msg("资产 " + url.rsplit("/", 1)[-1]))
+        u = candidates[0]
+        host = urllib.parse.urlsplit(u).netloc
+        _DL_COOLDOWN.pop(host, None)
+        try:
+            data = http_get(u, timeout=timeout, binary=binary)
+            _mark_ok(_DL_STICKY, _DL_COOLDOWN, u, url)
+            return data
+        except Exception as ex:
+            _mark_cool(_DL_COOLDOWN, host, ex, _DL_COOLDOWN_MIRROR,
+                       _DL_COOLDOWN_DIRECT, "github.com")
+            raise IOError("资产候选近期失败过, 探针仍失败: %s (候选会在 1~4 分钟内自动恢复)" % ex)
+    if last is not None:
+        raise last
+    raise IOError("资产不可达")
 
 
 # ------------------------------------------------------- 仓库链接解析 ----
@@ -265,6 +447,7 @@ def fetch_latest_llama_release(repo=DEFAULT_REPO, backend=None, job_log=None):
     """返回 dict: tag/build/asset_name/asset_url/cudart_name/cudart_url/size/cudart_size/stable_version
     失败抛异常(调用方提示网络)。"""
     backend = backend or backend_preference()
+    begin_net_budget()               # 这一次查询的所有请求共享同一截止时间
     stable_version = ""
     try:
         latest = gh_api("/repos/%s/releases/latest" % repo)
@@ -273,12 +456,10 @@ def fetch_latest_llama_release(repo=DEFAULT_REPO, backend=None, job_log=None):
         nightly = next((a for a in assets if a.get("name") == "nightly-tag.txt"), None)
         if nightly:
             build_tag = ""
-            for m in ("",) + MIRRORS:
-                try:
-                    build_tag = http_get(m + nightly["browser_download_url"], timeout=15).strip()
-                    break
-                except Exception:
-                    continue
+            try:
+                build_tag = http_get_asset(nightly["browser_download_url"], timeout=12).strip()
+            except Exception:
+                build_tag = ""      # 资产拉不动不等于没更新: 下面还有严格 tag 扫描兜底
             build = parse_build_from_tag(build_tag)
             if build > 0:
                 rel = gh_api("/repos/%s/releases/tags/b%d" % (repo, build))
@@ -407,7 +588,9 @@ def download_asset(url, dest, expected_size=0, job_log=None, timeout_secs=1200, 
         raise IOError("该 release 资产无 sha256 摘要, 拒绝仅凭体积校验"
                       "(镜像链任一环都可能返回等长篡改内容); "
                       "应急可用环境变量 LLAMADSH_ALLOW_UNVERIFIED_UPDATE=1 覆盖(不建议)")
-    urls = [url] + [m + url for m in MIRRORS]
+    # 大文件下载同一条候选顺序(上次成功的先试), 但**不因为冷却就跳过候选**:
+    # 用户已经点了更新, 一次 403/502 只花 1~2s, 把可能唯一可用的候选挡掉才是风险。
+    urls = _asset_candidates(url)
     part = dest + ".part"
     last = None
     for u in urls:
@@ -433,6 +616,7 @@ def download_asset(url, dest, expected_size=0, job_log=None, timeout_secs=1200, 
                 if got_hash != want.lower():
                     raise IOError("SHA-256 不匹配(得 %s… 期望 %s…, 镜像内容被替换?)" % (got_hash[:16], want[:16]))
             os.replace(part, dest)
+            _mark_ok(_DL_STICKY, _DL_COOLDOWN, u, url)
             return dest
         except Exception as ex:
             last = ex
