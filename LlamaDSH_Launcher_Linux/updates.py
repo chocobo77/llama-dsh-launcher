@@ -122,10 +122,15 @@ def find_dsh_project(known_only=False):
 # ============================================================ llama.cpp 更新
 
 def llama_local_version(llama_dir):
-    """运行 llama-server --version,提取 build 号。"""
-    exe = os.path.join(llama_dir, "llama-server")
-    if not os.path.isfile(exe):
-        exe = procman.which("llama-server") or ""
+    """运行 llama-server --version,提取 build 号。
+
+    exe 查找复用 toolchain.find_llama_server_exe(会看 bin/、build/bin/ 等子目录):
+    以前只看 <dir>/llama-server 与 PATH, 于是源码树布局(build/bin)的安装被报成
+    "目录里跑不出 build 号(没装/不是 llama.cpp 目录?)" —— 与工具链页对同一目录
+    能报出 build 号自相矛盾。
+    """
+    import toolchain as _tc
+    exe = _tc.find_llama_server_exe(llama_dir) or procman.which("llama-server") or ""
     if not exe or not os.path.isfile(exe):
         return None
     try:

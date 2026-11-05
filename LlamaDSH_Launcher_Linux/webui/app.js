@@ -105,7 +105,7 @@ async function browsePicker(mode) {
   const pathIn = box.querySelector("#browserPath");
   const selInfo = box.querySelector("#browserSel");
   async function load(p) {
-    const r = await api("browse", { path: p });
+    const r = await api("browse", { path: p }, 30000);   // 大目录(网络盘)扫描可能要好几秒
     if (r.error) { selInfo.textContent = r.error; return; }
     cur = r.path; sel = null; selInfo.textContent = "";
     pathIn.value = cur;
@@ -1116,7 +1116,7 @@ function renderTrends(m) {
 /* --------------------------- Node 环境面板 --------------------------- */
 async function pollNodeEnv() {
   try {
-    const st = await api("node/status");
+    const st = await api("node/status", {}, 45000);   // latest_v24 首查要走网络(两个源各 20s)
     const n = st.node24 || {};
     setTxt("lblNodeStatus", `node: ${n.path ? (n.version || "版本未知") + " (" + n.path + ")" : "未安装"}${st.version_unknown ? " ⚠ 探测失败" : ""}`);
     const p = st.pnpm || {};
@@ -1143,7 +1143,7 @@ async function pollJobInto(id, logEl, seen) {
 /* --------------------------- 变体面板 --------------------------- */
 async function refreshVariants() {
   try {
-    const r = await api("toolchains/variants");
+    const r = await api("toolchains/variants", {}, 30000);   // 每个变体要跑一次 llama-server --version(各 8s 上限)
     const sel = $("comboVariant");
     sel.innerHTML = "";
     for (const v of r.variants || []) {
@@ -1273,7 +1273,7 @@ async function startDsh() {
 async function _startDshInner() {
   const prof = collectProfile();
   let r;
-  try { r = await api("dsh/start", { profile: prof }); }
+  try { r = await api("dsh/start", { profile: prof }, 45000); }   // 端口/git 探测最坏 25s
   catch (e) { showNotice("DSH 启动失败: " + e.message, true); return; }
   if (r.need_rebuild) {
     const v = await showModal({
@@ -1281,7 +1281,7 @@ async function _startDshInner() {
       body: mEsc(r.need_rebuild.message),
       buttons: [{ label: "否,跳过重建直接启动", value: "no" }, { label: "是,自动重建后启动", cls: "primary", value: "yes" }]
     });
-    const rr = await api(v === "yes" ? "dsh/rebuild_and_start" : "dsh/start_inner", { profile: prof });
+    const rr = await api(v === "yes" ? "dsh/rebuild_and_start" : "dsh/start_inner", { profile: prof }, 45000);
     if (rr.error) showNotice("DSH: " + rr.error, true);
     return;
   }
@@ -1377,7 +1377,8 @@ async function checkUpdateDsh() {
     buttons: [{ label: "取消", value: "no" }, { label: "拉取", cls: "primary", value: "yes" }]
   });
   if (v !== "yes") return;
-  const rr = await api("update/do", { target: "dsh", dir });
+  // 服务端是同步 git pull(--ff-only 240s + 镜像 fetch 回退), 12s 默认必然前端先弃单
+  const rr = await api("update/do", { target: "dsh", dir }, 900000);
   logLine("[更新] DSH pull: " + (rr.msg || rr.ok));
 }
 
@@ -1439,7 +1440,7 @@ async function pluginManager() {
       });
     }
     mk("升级", async () => {
-      const pv = await api("dsh/plugins/preview_update", { profile: prof, name: p.name });
+      const pv = await api("dsh/plugins/preview_update", { profile: prof, name: p.name }, 45000);   // registry 两个源各 15s
       if (pv.error) { showNotice(pv.error, true); return; }
       if (pv.up_to_date) { showNotice(`已是最新(${pv.installed})`); return; }
       let confirmMsg = `升级 ${p.name}: ${pv.installed} → ${pv.latest}?`;
@@ -1448,7 +1449,7 @@ async function pluginManager() {
       const vv = await showModal({ title: "升级插件", body: mEsc(confirmMsg),
         buttons: [{ label: "取消", value: null }, { label: "升级", cls: "primary", value: 1 }] });
       if (!vv) return;
-      const rr = await api("dsh/plugins/upgrade", { profile: prof, name: p.name });
+      const rr = await api("dsh/plugins/upgrade", { profile: prof, name: p.name }, 900000);   // pnpm add 上限 900s
       showNotice(rr.ok ? rr.msg : rr.error, !rr.ok);
     }, "primary", p.spec && !String(p.spec).startsWith("file:"));
     mk("豁免本版", async () => {
@@ -1457,7 +1458,7 @@ async function pluginManager() {
     }, null, p.compatible === false && !p.exempted);
     mk("卸载", async () => {
       if (!confirm(`卸载 ${p.name}?(需要 DSH 已停止)`)) return;
-      const rr = await api("dsh/plugins/uninstall", { profile: prof, name: p.name });
+      const rr = await api("dsh/plugins/uninstall", { profile: prof, name: p.name }, 620000);   // pnpm remove 上限 600s
       showNotice(rr.ok ? rr.msg : rr.error, !rr.ok);
     });
     mk("打开目录", async () => {
@@ -1477,7 +1478,7 @@ async function pluginManager() {
     try {
       const v2 = await browsePicker("plugin_src");
       if (!v2) return;
-      const rr = await api("dsh/plugins/install_local", { profile: prof, source: v2 });
+      const rr = await api("dsh/plugins/install_local", { profile: prof, source: v2 }, 1500000);   // pnpm pack 600s + add 900s
       showNotice(rr.ok ? (rr.msg || "已安装") : (rr.error || rr.msg || "安装失败"), !(rr.ok));
       pluginManager();
     } catch (e) { showNotice("安装失败: " + (e.message || e), true); pluginManager(); }
@@ -1620,9 +1621,9 @@ function wire() {
   };
   // 服务按钮
   $("btnLlamaStart").onclick = startLlama;
-  $("btnLlamaStop").onclick = () => api("llama/stop");
+  $("btnLlamaStop").onclick = () => api("llama/stop", {}, 30000);   // 停止链最坏 ≈13s(端口探针 10s + 杀树 3s)
   $("btnDshStart").onclick = startDsh;
-  $("btnDshStop").onclick = () => api("dsh/stop");
+  $("btnDshStop").onclick = () => api("dsh/stop", {}, 30000);   // 停止链最坏 ≈19s(杀树 + sudo kill 15s)
   $("btnOpenDsh").onclick = async () => {
     // 主窗口是 WebKit2 客户端, 弹窗会被吞掉 → 优先让服务端交系统默认浏览器;
     // 服务端交不出去(无桌面/无浏览器)时才回落到前端 window.open(浏览器模式下可用)。
@@ -1645,10 +1646,22 @@ function wire() {
   };
   // 维护工具
   $("btnCompat").onclick = async () => {
-    const r = await api("dsh/compat", { profile: collectProfile() });
+    const r = await api("dsh/compat", { profile: collectProfile() }, 240000);   // audit 里 --dump-config 上限 180s
     const html = r.report.items.map(i => `<div class="${i.level === "error" ? "evt-error" : i.level === "warn" ? "evt-warn" : i.level === "ok" ? "evt-ok" : ""}">${mEsc(i.text)}</div>`).join("");
-    await showModal({ title: "🔧 DSH 兼容性检查", body: html || "(无输出)", buttons: [{ label: "关闭", cls: "primary", value: 1 }] });
+    const nFix = (r.report.fixables || []).length;
+    const btns = [{ label: "关闭", cls: "primary", value: 1 }];
+    if (nFix) btns.unshift({ label: `🔧 一键修复(${nFix} 项)`, value: "fix" });
+    const act = await showModal({ title: "🔧 DSH 兼容性检查", body: html || "(无输出)", buttons: btns });
     for (const l of r.log) logLine(l);
+    if (act === "fix") {
+      // 修复入口此前压根没接到 UI(按钮写着"检查/修复"却只有检查); 服务端先重审再改写
+      const rr = await api("dsh/compat/repair", { profile: collectProfile() }, 480000);
+      if (rr.error) { showNotice(rr.error, true); return; }
+      for (const l of (rr.log || [])) logLine(l);
+      const html2 = (rr.report.items || []).map(i => `<div class="${i.level === "error" ? "evt-error" : i.level === "warn" ? "evt-warn" : i.level === "ok" ? "evt-ok" : ""}">${mEsc(i.text)}</div>`).join("");
+      await showModal({ title: `🔧 兼容性修复完成(${rr.fixed} 项)`, body: html2 || "(无输出)",
+                        buttons: [{ label: "关闭", cls: "primary", value: 1 }] });
+    }
   };
   $("btnPlugins").onclick = async () => {
     const r = await api("dsh/plugins", { profile: collectProfile() });
@@ -1661,13 +1674,13 @@ function wire() {
   // 检索/更新
   $("btnSearchLlama").onclick = async () => {
     logLine("[检索] 正在检索 llama-server(最长 45s)...");
-    const r = await api("search", { target: "llama" });
+    const r = await api("search", { target: "llama" }, 60000);   // 服务端 BFS 上限 45s
     if (r.result) { $("inLlamaDir").value = r.result; logLine("[检索] 找到: " + r.result); refreshPreview(); }
     else showNotice("未找到 llama-server", true);
   };
   $("btnSearchDsh").onclick = async () => {
     logLine("[检索] 正在检索 DSH 项目(最长 45s)...");
-    const r = await api("search", { target: "dsh" });
+    const r = await api("search", { target: "dsh" }, 60000);
     if (r.result) { $("inDshDir").value = r.result; logLine("[检索] 找到: " + r.result); refreshPreview(); }
     else showNotice("未找到 DSH 项目", true);
   };
@@ -1699,7 +1712,7 @@ function wire() {
   };
   $("btnRefreshNodeEnv").onclick = pollNodeEnv;
   $("btnCopyNodeDiag").onclick = async () => {
-    const st = await api("node/status");
+    const st = await api("node/status", {}, 45000);
     const txt = JSON.stringify(st, null, 2);
     try { await navigator.clipboard.writeText(txt); showNotice("诊断已复制"); }
     catch (e) { $("nodeLog").value += txt + "\n"; }

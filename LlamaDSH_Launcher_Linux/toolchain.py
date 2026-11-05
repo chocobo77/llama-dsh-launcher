@@ -400,17 +400,7 @@ def pick_assets(assets, backend):
                 if best_v is None or v > best_v:
                     best, best_v = n, v
         chosen = best or _pick(cands, "vulkan-x64") or _pick_cpu(cands)
-        cudart = None
-        if chosen:
-            cv = RE_CUDA.search(chosen)
-            if cv:
-                want = ("cudart-llama-" + PLATFORM_TOKEN.lstrip("-").replace("-bin-ubuntu-", "")
-                        if False else None)
-                # 精确同名匹配: cudart-llama-b{N}-bin-ubuntu-cuda-{V}-x64.tar.gz
-                tag_m = re.search(r"(llama-b\d+)", chosen)
-                if tag_m:
-                    want = "cudart-%s-bin-ubuntu-cuda-%s-x64%s" % (tag_m.group(1), cv.group(1), ARCHIVE_SUFFIX)
-                    cudart = want if want in cudarts else None
+        # cudart 配对在函数尾部统一算(那时 chosen 已定), 这里不再重复一份
     elif backend == "sycl":
         chosen = (_pick(cands, "sycl-fp16-x64") or _pick(cands, "sycl-fp32-x64")
                   or _pick(cands, "vulkan-x64") or _pick_cpu(cands))
@@ -804,7 +794,9 @@ def apply_llama_update(dir_, release, job_log=None):
     try:
         download_asset(release["asset_url"], main_path, release.get("size", 0), job_log,
                        expected_digest=release.get("digest", ""))
-        ex_dir = os.path.join(UPDATE_TMP_ROOT, "extract_%d" % release.get("build", 0))
+        # 目录名带 pid: 两个变体并发更新同一个 build 号时, 固定名会让一方的
+        # rmtree/解压踩进另一方的现场(最终清理有 _active_downloads 计数, 首次 rmtree 没有)
+        ex_dir = os.path.join(UPDATE_TMP_ROOT, "extract_%d_%d" % (release.get("build", 0), os.getpid()))
         shutil.rmtree(ex_dir, ignore_errors=True)
         os.makedirs(ex_dir)
         _extract_tar(main_path, ex_dir)
@@ -817,7 +809,8 @@ def apply_llama_update(dir_, release, job_log=None):
             try:
                 download_asset(release["cudart_url"], cudart_path, release.get("cudart_size", 0), job_log,
                                expected_digest=release.get("cudart_digest", ""))
-                cdir = os.path.join(UPDATE_TMP_ROOT, "extract_cudart_%d" % release.get("build", 0))
+                cdir = os.path.join(UPDATE_TMP_ROOT, "extract_cudart_%d_%d"
+                                    % (release.get("build", 0), os.getpid()))
                 shutil.rmtree(cdir, ignore_errors=True)
                 os.makedirs(cdir)
                 _extract_tar(cudart_path, cdir)

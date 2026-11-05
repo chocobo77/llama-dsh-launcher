@@ -718,8 +718,9 @@ def _sat_one(version, alt):
 
 # ======================================================= 插件审计与管理 ==
 
-PINNED_PATH = os.path.join(dsh_home(), "pinned_plugins.json")
 COMPAT_JSON = "compatibility.json"
+# (没有模块级 PINNED_PATH 常量: 它会在 import 期对 dsh_home() 求值, DSH_HOME 之后
+# 再改就永不更新 —— 一律走 pinned_plugins_path() 现取。)
 
 
 
@@ -803,13 +804,20 @@ def _set_bundle_active_locked(profile, name, active):
     if bundles is None:
         doc.setdefault("dsh", {}).setdefault("profile", {})["bundles"] = bundles = []
     changed = False
-    if active and name not in bundles:
-        bundles.append(name)
-        changed = True
+    # 激活=加进 bundles 并解锁; 停用=移出并**锁定**。锁定/解锁必须无条件做:
+    # 以前挂在"bundles 里确实有它"的分支里, 于是对一个本来就不在 bundles 的插件点
+    # "停用/卸载"时, 回话是"已停用并锁定"而 pinned_plugins.json 里**没有**它 ——
+    # 卸载流程的第一步(先停用并锁定)就这样静默落空, 市场网页端把它写回 bundles
+    # 时审计也不会再移除(它根本不在锁定名单里)。
+    if active:
+        if name not in bundles:
+            bundles.append(name)
+            changed = True
         unpin_inactive(profile, name)
-    elif not active and name in bundles:
-        bundles.remove(name)
-        changed = True
+    else:
+        if name in bundles:
+            bundles.remove(name)
+            changed = True
         pin_inactive(profile, name)
     if changed:
         write_json_atomic(p, doc, backup=True)

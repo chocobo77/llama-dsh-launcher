@@ -713,7 +713,7 @@ class DshRunner:
             # 提权启动要显式带环境与绝对路径: sudo 的 env_reset 会把 HOME 变成 /root
             # (DSH 会在 /root/.local/share 下另建一套数据), 而 secure_path 里没有
             # ~/.local/share/pnpm → `sudo pnpm` 直接 command not found。
-            binx = procman.which(inner[0]) or inner[0]
+            binx = _head          # 用上面 _abs_exe 的结果; which() 不认 ~/.local/bin 之外命中的那份
             argv = (["sudo", "-n", "env",
                      "HOME=" + os.path.expanduser("~"),
                      "PATH=" + (os.environ.get("PATH") or "")]
@@ -911,6 +911,30 @@ class DshRunner:
                          else "[DSH] ⚠ 停止未成功, 进程仍在(PID %d), 状态记为停止失败" % pid)
         state.clear_state_for("DshPid")
 
+    @staticmethod
+    def _rebuild_script(dsh_dir, pnpm_exe, node_exe):
+        """重建三步的脚本文本。
+
+        pnpm/node 必须用**绝对路径**: 这份脚本由启动器服务的 env 跑, 而 GNOME 自启/
+        systemd-user 拉起的服务 PATH 常常不含 ~/.local/bin —— 一键安装恰好把 pnpm 装在
+        那里, 于是"重建"永远以 "pnpm: command not found"(EXITCODE:1)收场, 看着像 DSH
+        构建坏了。
+        """
+        return "\n".join([
+            "#!/usr/bin/env bash",
+            "cd %s || exit 1" % shlex.quote(dsh_dir),
+            "echo \"=== 1/3 pnpm clean ===\"",
+            "%s clean" % shlex.quote(pnpm_exe),
+            "if [ $? -ne 0 ]; then echo EXITCODE:1; exit 1; fi",
+            "echo \"=== 2/3 pnpm build:lib ===\"",
+            "%s build:lib" % shlex.quote(pnpm_exe),
+            "if [ $? -ne 0 ]; then echo EXITCODE:1; exit 1; fi",
+            "echo \"=== 3/3 vite build ===\"",
+            "cd apps/web && %s node_modules/vite/bin/vite.js build" % shlex.quote(node_exe),
+            "if [ $? -ne 0 ]; then echo EXITCODE:1; exit 1; fi",
+            "echo EXITCODE:0",
+        ]) + "\n"
+
     def rebuild(self, profile, on_done=None):
         dsh_dir = (profile.get("DshDir") or "").strip().strip('"')
         if not dsh_dir or not os.path.isdir(os.path.join(dsh_dir, "apps", "cli")):
@@ -926,20 +950,13 @@ class DshRunner:
                 time.sleep(2)
             if self.running:
                 return False, "DSH 仍在运行,中止重建"
-        script = "\n".join([
-            "#!/usr/bin/env bash",
-            "cd %s || exit 1" % shlex.quote(dsh_dir),
-            "echo \"=== 1/3 pnpm clean ===\"",
-            "pnpm clean",
-            "if [ $? -ne 0 ]; then echo EXITCODE:1; exit 1; fi",
-            "echo \"=== 2/3 pnpm build:lib ===\"",
-            "pnpm build:lib",
-            "if [ $? -ne 0 ]; then echo EXITCODE:1; exit 1; fi",
-            "echo \"=== 3/3 vite build ===\"",
-            "cd apps/web && node node_modules/vite/bin/vite.js build",
-            "if [ $? -ne 0 ]; then echo EXITCODE:1; exit 1; fi",
-            "echo EXITCODE:0",
-        ]) + "\n"
+        pnpm_exe = _abs_exe("pnpm")
+        node_exe = _abs_exe("node")
+        if not pnpm_exe or not node_exe:
+            missing = "pnpm" if not pnpm_exe else "node"
+            return False, ("找不到可执行文件 %s(PATH 与 ~/.local/bin 都没有) —— 请先在"
+                           "「Node 环境」一键安装, 或手工执行重建三步" % missing)
+        script = _rebuild_script(dsh_dir, pnpm_exe, node_exe)
         with open(DSH_REBUILD_SCRIPT, "w", encoding="utf-8") as f:
             f.write(script)
         try:
@@ -957,6 +974,7 @@ class DshRunner:
 
     def _poll_rebuild(self, head, on_done):
         deadline = time.time() + 30 * 60
+        _logged = set()
         while time.time() < deadline and not self.rebuild_stop.is_set():
             time.sleep(2)
             try:
@@ -965,7 +983,10 @@ class DshRunner:
             except OSError:
                 continue
             for ln in txt.splitlines():
-                if ln.startswith("===") or ln.startswith("EXITCODE"):
+                if (ln.startswith("===") or ln.startswith("EXITCODE")) and ln not in _logged:
+                    # 每 2s 重读整份日志: 不去重的话 "=== 1/3 ===" 那三行每拍都重发一遍
+                    # (dedup 只挡相邻同文, 而 === 1/3 的上一行是 === 3/3), 全程刷屏两千条。
+                    _logged.add(ln)
                     self.hub.log("[dsh-rebuild] " + ln)
             if "EXITCODE:0" in txt:
                 state.save_build_state(head)
@@ -1251,16 +1272,30 @@ class Converter:
         return None
 
     def start(self, src_dir, outtype, on_done):
+        """返回 True=转换真的排上了; False=没排上(原因已写日志)。
+
+        返回值以前恒为 None 且调用方不区分 ⇒ api_llama_start 的"转换并启动"分支在
+        依赖装不上/目录不存在时也回 {"converting": true}, 前端等一个不会来的转换。
+        """
         # 白名单前置:outtype 直接来自请求体,后面会拼进产物文件名与命令行
         if outtype not in ("f16", "f32", "q8_0"):
             self.hub.log("[转换] 非法 outtype: %r(仅支持 f16/f32/q8_0),中止" % (outtype,))
             on_done(None)
-            return
+            return False
+        if self.running:
+            # 以前不设防: 连点两次"转换"会起两条 bash 流水线写**同一个** out_file 与
+            # 同一份日志, 产物互相截断, 哪条 EXITCODE 先到就用哪条 —— 结果不可预期。
+            self.hub.log("[转换] 已有转换在进行,忽略本次请求(等它结束再试)")
+            return False
+        if not src_dir or not os.path.isdir(src_dir):
+            self.hub.log("[转换] 目录不存在: %r,中止" % (src_dir,))
+            on_done(None)
+            return False
         script = self.find_convert_script()
         if not script:
             self.hub.log("[转换] 未找到 convert_hf_to_gguf.py(需要 llama.cpp 仓库或 ~/.dsh_launcher_tools)。")
             on_done(None)
-            return
+            return False
         src_bytes = sum(os.path.getsize(f) for f in glob.glob(os.path.join(src_dir, "*.safetensors")))
         dirname = src_dir.rstrip("/\\")
         out_file = os.path.join(src_dir, os.path.basename(dirname) + "-" + outtype + ".gguf")
@@ -1282,7 +1317,7 @@ class Converter:
         if free < need:
             self.hub.log("[转换] 磁盘空间不足(需要 %.1f GiB,可用 %.1f GiB),中止" % (need / cmdline.GIB, free / cmdline.GIB))
             on_done(None)
-            return
+            return False
         try:
             subprocess.run(["python3", "-c", "import gguf, torch, transformers"],
                            capture_output=True, timeout=60)
@@ -1302,7 +1337,7 @@ class Converter:
             if not deps_ok:
                 self.hub.log("[转换] 依赖安装失败,中止。可手动: python3 -m pip install gguf torch transformers sentencepiece")
                 on_done(None)
-                return
+                return False
         log_path = os.path.join(src_dir, CONVERT_LOG_NAME)
         open(log_path, "wb").close()
         self._log_pos = 0
@@ -1317,12 +1352,13 @@ class Converter:
         except Exception as ex:
             self.hub.error_ex(ex, "转换进程启动失败")
             on_done(None)
-            return
+            return False
         self.running = True
         self.hub.log("--- safetensors → GGUF(%s)转换已启动,目录: %s ---" % (outtype, src_dir))
         self.hub.log("[转换] 日志: %s" % log_path)
         threading.Thread(target=self._poll, args=(log_path, src_bytes, outtype, out_file, on_done),
                          daemon=True).start()
+        return True
 
     def _poll(self, log_path, src_bytes, outtype, out_file, on_done):
         factor = 0.9 if outtype == "f16" else 0.45

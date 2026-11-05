@@ -895,7 +895,8 @@ def estimate_vram_needed(profile, defs, query_gpu_fn):
         if meta_warn:
             detail = "\n".join(meta_warn) + "\n" + detail
         if kv_note:
-            detail = detail.replace("KV(%s/%s" % (ck, cv), "KV(%s/%s%s" % (ck, cv, kv_note.replace("(FA 关闭", "(FA 关闭")))
+            # 直接把 FA 回退说明插进 KV 那一行(旧写法里有一次自己替换自己的 no-op)
+            detail = detail.replace("KV(%s/%s" % (ck, cv), "KV(%s/%s%s" % (ck, cv, kv_note))
         return {"est_bytes": total, "model_bytes": file_bytes, "kv_bytes": kv_bytes,
                 "avail_bytes": avail, "detail": detail, "ok": True,
                 "warnings": meta_warn,

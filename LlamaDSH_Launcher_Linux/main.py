@@ -293,7 +293,11 @@ def api_llama_start(body):
                 ok, msg = LLAMA.start(saved, skip_vram_confirm=True)
                 if not ok:
                     HUB.log("[转换] 转换完成但启动失败: %s" % msg)
-        CONVERTER.start(convert_dir, outtype, after)
+        if not CONVERTER.start(convert_dir, outtype, after):
+            # start() 返回 False = 转换根本没排上(目录不存在/依赖装不上/已有转换在跑);
+            # 以前一律回 converting:true, 前端就永远等一个不会来的转换。
+            return {"started": False, "error": "转换未能启动(详见运行日志: 目录不存在、"
+                                               "依赖装不上或已有转换在进行)"}
         return {"started": True, "converting": True}
     ok, msg = LLAMA.start(prof, cmd_list, skip_vram_confirm=True)
     if not ok:
@@ -692,8 +696,8 @@ def api_convert_start(body):
     """独立触发 safetensors 转换(不自动启动)。"""
     d = (body.get("dir") or "").strip().strip('"')
     outtype = body.get("outtype") or "f16"
-    CONVERTER.start(d, outtype, lambda p: HUB.log("[转换] 结束: %s" % p))
-    return {"ok": True}
+    ok = CONVERTER.start(d, outtype, lambda p: HUB.log("[转换] 结束: %s" % p))
+    return {"ok": bool(ok), "error": None if ok else "转换未能启动(详见运行日志)"}
 
 
 def api_browse(body):
@@ -867,7 +871,8 @@ def api_toolchain_check_update(body):
     except Exception as ex:
         return {"error": "查询失败(%s): %s" % (repo, ex), "cause": "upstream",
                 "hint": "上游查询走同一条链: 直连 + 三个镜像, 上次成功的候选优先, 明确失败过的候选"
-                        "先进冷却(镜像 15 分钟 / 直连 90 秒)后自动恢复, 不必重启服务。"
+                        "先进冷却(传输类失败镜像 4 分钟 / 直连 60 秒, 端点级 4xx 只挡 45 秒)后自动恢复,"
+                        "不必重启服务。"
                         "如果错误里写\u201c未找到可用的资产\u201d, 那是该仓库没有这个后端的预编译包,"
                         "与网络无关, 换个后端(变体)即可。"}
     local = toolchain.local_build(dir_)
@@ -957,14 +962,25 @@ def api_plugins_audit(body):
             "dsh_running": not _dsh_running_guard()}
 
 
+def _profile_name(_body):
+    """这几个端点要的是 DSH 的 profile **名**, 而前端发上来的是整个 profile 对象。
+
+    Linux 复刻只管理 DSH 的 web profile(audit_plugins/enforce_pinned/install_local_plugin
+    也都写死 "web")。以前把 body["profile"](一个 dict)原样透传给 set_bundle_active/
+    exempt_plugin → profile_dir 对 dict 抛 ValueError("非法 profile 名") → 插件列表里的
+    激活/停用/豁免三个按钮全部 500, error.log 里留下整段栈。
+    """
+    return "web"
+
+
 def api_plugins_set_active(body):
-    ok, msg = compat.set_bundle_active(body.get("profile") or "web",
+    ok, msg = compat.set_bundle_active(_profile_name(body),
                                        body.get("name") or "", bool(body.get("active")))
     return {"ok": ok, "msg": msg}
 
 
 def api_plugins_exempt(body):
-    ok, msg = compat.exempt_plugin(body.get("profile") or "web",
+    ok, msg = compat.exempt_plugin(_profile_name(body),
                                    body.get("name") or "", body.get("version") or "")
     return {"ok": ok, "msg": msg}
 

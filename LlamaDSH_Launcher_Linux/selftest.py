@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Linux 版回归自检(352 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
+"""Linux 版回归自检(376 项): 同步批次 + 历轮真实 bug 的断言, 失败即非零退出。
 
 跑法: python3 selftest.py   (托盘/服务在跑时会额外做活体宿主侧协议探针,
      未运行则打印 SKIP 而不是失败)
@@ -4205,6 +4205,192 @@ check("25 收尾: 被测模块的接缝必须全部换回真值(否则后面的�
       and os.environ.get("HOME") == _real_home_env25 and nodetool.procman.which is _real_which25,
       str((_compat.profile_dir("web"), nodetool.LOCAL_BIN)))
 
+
+
+# --------------------------------- 26. 第十七轮(全量 review 回归) --
+# 本节断言对应第十七轮逐行 review 的实锤: ①插件激活/豁免被 profile 对象打穿成 500;
+# ②前端 12s 默认超时 vs 服务端分钟级操作(修前 DSH 更新/插件升级/检索点了必然"前端先弃单");
+# ③重建脚本裸 pnpm(GNOME 自启 PATH 不含 ~/.local/bin ⇒ 重建恒失败); ④转换器并发与目录校验;
+# ⑤updates 本地版本探测与工具链页自相矛盾。反向对照 = git show HEAD(修前)副本。
+import importlib.util as _isp26
+import re as _re26
+import subprocess as _sp26
+
+_old_dir26 = os.path.expanduser("~/probe_r17/old")
+os.makedirs(_old_dir26, exist_ok=True)
+for _mod26 in ("main.py", "core.py", "updates.py", "toolchain.py", "webui/app.js"):
+    _dst26 = os.path.join(_old_dir26, _mod26.replace("/", "_"))
+    if not os.path.exists(_dst26):
+        _sp26.run(["git", "show", "HEAD:./" + _mod26], stdout=open(_dst26, "w"),
+                  cwd=APP, check=True)
+
+
+def _load_old26(fname, as_name):
+    """把修前副本当独立模块加载(模块级副作用与真模块同构, 自检早已在隔离 HOME 里)。"""
+    spec = _isp26.spec_from_file_location(as_name, os.path.join(_old_dir26, fname))
+    mod = _isp26.module_from_spec(spec)
+    sys.modules[as_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# 26.1 插件激活/豁免: 前端发的是 profile **对象**, 端点必须归一成 profile 名
+_pdir26b = os.path.join(_tmp, "prof26")
+_dhome26 = os.path.join(_tmp, "dshome26")
+os.makedirs(os.path.join(_dhome26, "profiles", "web"), exist_ok=True)
+with io.open(os.path.join(_dhome26, "profiles", "web", "package.json"), "w", encoding="utf-8") as fh:
+    json.dump({"name": "profile-web", "dsh": {"profile": {"bundles": ["dsh-a", "dsh-b"]}},
+               "dependencies": {}}, fh)
+_real_pdir26, _real_dh26 = _compat.profile_dir, _compat.dsh_home
+_compat.profile_dir = lambda p="web": os.path.join(_dhome26, "profiles", "web")
+_compat.dsh_home = lambda: _dhome26
+try:
+    _r26a = main.api_plugins_set_active({"profile": {"DshDir": "/x"}, "name": "dsh-a", "active": False})
+    _mani26 = json.load(io.open(os.path.join(_dhome26, "profiles", "web", "package.json"), encoding="utf-8"))
+    _pinned26 = json.load(io.open(os.path.join(_dhome26, "pinned_plugins.json"), encoding="utf-8")) \
+        if os.path.isfile(os.path.join(_dhome26, "pinned_plugins.json")) else {}
+    check("激活/停用端点收到 profile 对象时必须归一成 web profile(修前透传 dict → profile_dir 抛 ValueError → 500)",
+          _r26a.get("ok") is True and _mani26["dsh"]["profile"]["bundles"] == ["dsh-b"]
+          and "dsh-a" in (_pinned26.get("web") or []),
+          str((_r26a, _mani26["dsh"]["profile"]["bundles"])))
+    _r26b = main.api_plugins_exempt({"profile": {"DshDir": "/x"}, "name": "dsh-a", "version": "1.2.3"})
+    _compat26 = json.load(io.open(os.path.join(_dhome26, "profiles", "web", "compatibility.json"),
+                                  encoding="utf-8")) if _r26b.get("ok") else {}
+    check("豁免端点同理(修前同型 500, 豁免从来写不进去)",
+          _r26b.get("ok") is True and _compat26.get("dsh-a") == ["1.2.3"], str((_r26b, _compat26)))
+    _r26c = main.api_plugins_set_active({"profile": {}, "name": "dsh-never-in-bundles", "active": False})
+    _pinned26c = json.load(io.open(os.path.join(_dhome26, "pinned_plugins.json"), encoding="utf-8")) \
+        if os.path.isfile(os.path.join(_dhome26, "pinned_plugins.json")) else {}
+    check("停用一个本就不在 bundles 的插件也必须落锁定(修前回\"已停用并锁定\"却不写锁定名单, 卸载流程的第一步静默落空)",
+          _r26c.get("ok") is True and "dsh-never-in-bundles" in (_pinned26c.get("web") or []),
+          str((_r26c, _pinned26c)))
+    _old_main26 = _load_old26("main.py", "old_main_r17")
+    _raised26 = None
+    try:
+        _old_main26.api_plugins_set_active({"profile": {"DshDir": "/x"}, "name": "dsh-a", "active": False})
+    except Exception as _ex26:
+        _raised26 = "%s: %s" % (type(_ex26).__name__, str(_ex26)[:40])
+    check("对照(修前副本): 同一请求必须抛异常(= 线上表现为 500; dict 透传在 profile_dir/pin 两处都会炸)",
+          bool(_raised26), "修前竟然没炸?")
+finally:
+    _compat.profile_dir, _compat.dsh_home = _real_pdir26, _real_dh26
+
+# 26.2 前端慢调用超时必须与服务端最坏路径同量级(12s 默认 = 前端先弃单)
+_js26 = io.open("webui/app.js", encoding="utf-8").read()
+_JS_MIN26 = {"update/do": 600000, "dsh/plugins/upgrade": 600000, "dsh/plugins/uninstall": 600000,
+             "dsh/plugins/install_local": 900000, "dsh/compat/repair": 240000, "dsh/compat": 180000,
+             "update/check": 30000, "toolchains/check_update": 30000, "search": 45000,
+             "node/status": 30000, "dsh/stop": 20000, "llama/stop": 20000}
+_bad26 = []
+for _path26, _min26 in _JS_MIN26.items():
+    for _stmt26 in _re26.findall(r'api\("%s"[^;]*;' % _re26.escape(_path26), _js26):
+        _tos26 = [int(x) for x in _re26.findall(r",\s*(\d{4,})\s*\)", _stmt26)]
+        if not _tos26 or max(_tos26) < _min26:
+            _bad26.append((_path26, _tos26))
+check("前端每个慢端点都必须带与服务端最坏路径同量级的 timeoutMs(修前 12s 默认在 git pull/pnpm 面前先弃单)",
+      not _bad26, str(_bad26))
+check("兼容性检查弹窗必须把修复端点接进 UI(按钮叫\"检查/修复\"但修复此前无入口)",
+      "dsh/compat/repair" in _js26, "app.js 里没有 compat/repair 调用")
+_old_js26 = io.open(os.path.join(_old_dir26, "webui_app.js"), encoding="utf-8").read()
+_old_bad26 = []
+for _path26, _min26 in _JS_MIN26.items():
+    for _stmt26 in _re26.findall(r'api\("%s"[^;]*;' % _re26.escape(_path26), _old_js26):
+        _tos26 = [int(x) for x in _re26.findall(r",\s*(\d{4,})\s*\)", _stmt26)]
+        if not _tos26 or max(_tos26) < _min26:
+            _old_bad26.append(_path26)
+check("对照(修前副本): 同一判定必须报出缺超时的调用(修前只有两个 check_update 带 30s)",
+      len(_old_bad26) >= 10, str(sorted(set(_old_bad26))))
+
+# 26.3 重建脚本必须用绝对路径的 pnpm/node, 缺失时显式失败(不 spawn)
+_scr26 = core.DshRunner._rebuild_script("/dsh/dir", "/x/pnpm", "/x/node")
+check("重建脚本必须引用绝对路径的 pnpm/node(修前裸 pnpm, GNOME 自启 PATH 不含 ~/.local/bin ⇒ 恒失败)",
+      "/x/pnpm clean" in _scr26 and "/x/pnpm build:lib" in _scr26
+      and "node_modules/vite/bin/vite.js" in _scr26 and "\npnpm " not in _scr26, str(_scr26[:120]))
+_dshdir26 = os.path.join(_tmp, "dshdir26")
+os.makedirs(os.path.join(_dshdir26, "apps", "cli"), exist_ok=True)
+_dr26 = core.DshRunner(core.LogHub(), {"defs": []})
+_real_head26 = core.DshRunner.git_head
+_real_abs26 = core._abs_exe
+core.DshRunner.git_head = staticmethod(lambda d: "a" * 40)
+core._abs_exe = lambda name: None
+try:
+    _ok26r, _msg26r = _dr26.rebuild({"DshDir": _dshdir26}, None)
+finally:
+    core.DshRunner.git_head = _real_head26
+    core._abs_exe = _real_abs26
+check("pnpm/node 都找不到时重建必须显式失败且不启动构建(修前直接 spawn 然后日志报 command not found)",
+      _ok26r is False and "pnpm" in (_msg26r or "") and _dr26.status != "rebuilding",
+      str((_ok26r, _msg26r)))
+_old_core26 = _load_old26("core.py", "old_core_r17")
+_old_core_src26 = io.open(os.path.join(_old_dir26, "core.py"), encoding="utf-8").read()
+check("对照(修前副本): 脚本模板是裸 pnpm 且没有可测的 _rebuild_script",
+      not hasattr(_old_core26.DshRunner, "_rebuild_script")
+      and '"pnpm clean"' in _old_core_src26 and "_rebuild_script" not in _old_core_src26,
+      "修前副本内容不符合预期")
+
+# 26.4 转换器: 并发拒绝 + 目录校验 + 真假启动可区分
+_cv26 = main.CONVERTER
+_cb26 = []
+_real_run26 = _cv26.running
+_cv26.running = True
+try:
+    _busy26 = _cv26.start("/tmp/whatever26", "f16", lambda p: _cb26.append(p))
+finally:
+    _cv26.running = _real_run26
+check("已有转换在跑时必须拒绝第二次(修前两条流水线写同一个 out_file 互相截断)",
+      _busy26 is False and not _cb26, str((_busy26, _cb26)))
+_bad_dir26 = os.path.join(_tmp, "no-such-dir-26")
+_ok26c = _cv26.start(_bad_dir26, "f16", lambda p: _cb26.append(p))
+check("目录不存在时必须显式失败并回调 None(修前 shutil.disk_usage 抛 FileNotFoundError → 500)",
+      _ok26c is False and _cb26 == [None], str((_ok26c, _cb26)))
+_old_conv26 = _old_core26.Converter(core.LogHub())
+_old_conv26.find_convert_script = lambda: "/x/convert_hf_to_gguf.py"   # 钉住探针, 让对照走到 disk_usage
+_old_raise26 = False
+try:
+    _old_conv26.start(_bad_dir26, "f16", lambda p: None)
+except Exception:
+    _old_raise26 = True
+check("对照(修前副本): 同一调用必须抛异常(= 线上 500)",
+      _old_raise26, "修前竟然没炸?")
+_real_start26 = main.CONVERTER.start
+
+
+class _StubConv26:
+    def __init__(self, ret):
+        self.ret = ret
+
+    def start(self, *a, **k):
+        return self.ret
+
+
+main.CONVERTER = _StubConv26(False)
+_r26s = main.api_llama_start({"profile": {"ModelPath": ""}, "confirm": {"convert_dir": "/x", "done": True}})
+main.CONVERTER = _StubConv26(True)
+_r26s2 = main.api_llama_start({"profile": {"ModelPath": ""}, "confirm": {"convert_dir": "/x", "done": True}})
+main.CONVERTER = _real_start26
+check("转换没排上时 llama/start 必须回 started:false(修前恒回 converting:true, 前端白等)",
+      _r26s.get("started") is False and _r26s.get("error")
+      and _r26s2.get("started") is True and _r26s2.get("converting") is True,
+      str((_r26s, _r26s2)))
+
+# 26.5 updates 本地版本探测认得 build/bin 布局(与工具链页同一口径)
+_bin26 = os.path.join(_tmp, "llama-dir26", "build", "bin")
+os.makedirs(_bin26)
+with io.open(os.path.join(_bin26, "llama-server"), "w", encoding="utf-8") as fh:
+    fh.write("#!/bin/sh\necho 'version: 0.1 (build 1234)'\n")
+os.chmod(os.path.join(_bin26, "llama-server"), 0o755)
+_lv26 = updates.llama_local_version(os.path.join(_tmp, "llama-dir26"))
+_old_upd26 = _load_old26("updates.py", "old_updates_r17")
+_lv26o = _old_upd26.llama_local_version(os.path.join(_tmp, "llama-dir26"))
+check("build/bin 布局的安装必须能报出本地 build(修前只看 <dir>/llama-server, 报\"跑不出 build 号\")",
+      _lv26 == 1234 and _lv26o is None, str((_lv26, _lv26o)))
+
+# 26.6 并发更新的解压目录名带 pid(同 build 号的两个变体不再互删现场)
+_tc_src26 = io.open("toolchain.py", encoding="utf-8").read()
+_tc_old26 = io.open(os.path.join(_old_dir26, "toolchain.py"), encoding="utf-8").read()
+check("解压目录名必须含 pid(修前 extract_<build> 固定名, 两个变体并发更新同一 build 会互删现场)",
+      "extract_%d_%d" in _tc_src26 and 'extract_%d"' in _tc_old26,
+      "toolchain.py 解压目录名形态不对")
 shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)
 
