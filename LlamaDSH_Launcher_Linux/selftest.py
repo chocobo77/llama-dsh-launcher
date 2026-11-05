@@ -3807,6 +3807,42 @@ check("备份失败时不得改写补丁文件(修前: 不查 _backup 返回值�
       str((_n25c, _patch25()[:50])))
 _compat._backup = _real_bak25
 
+# 25.3b 本机真实形态: cordis.patch.yml 顶层是数组(文件头注释原文如此), 条目里还嵌着别的 id
+_REAL_PATCH25 = (
+    "# a top-level YAML array of loader patch entries\n"
+    "- id: ui-settings-general\n  name: \"@x/ui\"\n  config:\n    welcomeNoticeVersion: 2026-09-28.1\n"
+    "- id: llm-pi-ai\n  config:\n    models:\n      - id: iq3_s\n        contextWindow: 128000\n"
+    "  name: \"@x/llm\"\n")
+io.open(_PATCH25, "w", encoding="utf-8").write(_REAL_PATCH25)
+_ids25p, _why25p = _compat._parse_patch_entries(_PATCH25)
+check("顶层数组形态必须被认出来(修前对真实文件报\"读不动(顶层不是映射)\", 补丁审计整段没跑)",
+      _why25p == "" and _ids25p == ["ui-settings-general", "llm-pi-ai"], str((_ids25p, _why25p[:40])))
+check("条目内嵌的 id(config.models 里的 iq3_s)不得当成补丁条目(否则用户模型条目被判失效并注释掉)",
+      "iq3_s" not in _ids25p, str(_ids25p))
+_rep25r = _audit25('{"config": {"patch": {"entries": [{"id": "ui-settings-general"}, '
+                   '{"id": "other-live"}]}}}')
+_orph_r25 = [x for x in _rep25r["fixables"] if x["kind"] == "patch_orphan"]
+check("数组形态下的失效判定仍只看条目层: 恰好 llm-pi-ai 一条",
+      len(_orph_r25) == 1 and _orph_r25[0]["old"] == "llm-pi-ai" and _orph_r25[0]["dump_count"] == 2,
+      str(_orph_r25))
+_log25r = []
+_n25r = _repair25(_orph_r25, _log25r)
+_after25r = _patch25()
+import yaml as _yaml25
+try:
+    _doc25r = _yaml25.safe_load(_after25r)
+except Exception as _ex25r:
+    _doc25r = "EXC:%s" % _ex25r
+_ids_left25 = [e.get("id") for e in _doc25r if isinstance(e, dict)] if isinstance(_doc25r, list) else _doc25r
+_uncmt25 = [ln for ln in _after25r.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+_kept25 = _doc25r[0] if isinstance(_doc25r, list) and _doc25r else {}
+check("注释失效条目必须连它的续行一起注释(修前只注释 - id 一行, 续行留在原地被上一条目吸收 = 配置搬家)",
+      _n25r == 1 and _ids_left25 == ["ui-settings-general"]
+      and _kept25.get("config") == {"welcomeNoticeVersion": "2026-09-28.1"}
+      and not any(("llm" in ln) or ("iq3_s" in ln) for ln in _uncmt25),
+      str((_ids_left25, _kept25.get("config"), [ln[:30] for ln in _uncmt25])))
+io.open(_PATCH25, "w", encoding="utf-8").write(_PATCH_SRC25)
+
 # 25.4 market_disabled: 备份失败/读不动都不能算"已清空"
 _ST25 = os.path.join(_prof25, ".dsh-market", "state.json")
 

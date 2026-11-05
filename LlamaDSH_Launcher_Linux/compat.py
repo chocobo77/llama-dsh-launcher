@@ -116,11 +116,15 @@ def write_json_atomic(path, doc, backup=False):
 
 
 def _parse_patch_entries(path):
-    """粗解析 cordis.patch.yml:返回 ([{index, id, raw_block}], 失败原因)。
+    """粗解析 cordis.patch.yml:返回 (补丁条目 id 列表, 失败原因)。
 
-    原因非空表示**读不动**(编码错/YAML 语法错/顶层不是映射)。以前这种情况返回空列表,
-    审计于是打印"cordis.patch.yml: 0 条补丁"并在结尾给出"0 错误 / 0 可修复项"——
+    原因非空表示**读不动**(编码错/YAML 语法错/顶层既不是映射也不是数组)。以前这种情况
+    返回空列表, 审计于是打印"cordis.patch.yml: 0 条补丁"并在结尾给出"0 错误 / 0 可修复项"——
     一个坏掉的文件被报成"一切正常", patch_orphan/rename 检查也整段跳过(假绿)。
+
+    顶层**数组**是 DSH 的真实形态(本机 ~/.dsh/profiles/web/cordis.patch.yml 的文件头注释
+    原文: "a top-level YAML array of loader patch entries")。以前只认映射, 于是每次打开
+    插件页都对一个完全正常的文件报"✗ 读不动(顶层不是映射)", 补丁条目审计整段没跑。
     """
     entries = []
     try:
@@ -128,24 +132,34 @@ def _parse_patch_entries(path):
             doc = yaml.safe_load(f)
     except Exception as ex:
         return entries, "%s: %s" % (type(ex).__name__, ex)
-    if not isinstance(doc, dict):
-        return entries, "顶层不是映射(实际是 %s)" % type(doc).__name__
-    return _walk_patch_entries(doc), ""
+    if isinstance(doc, dict):
+        return _walk_patch_entries(doc), ""
+    if isinstance(doc, list):
+        return _walk_patch_entries(doc, root_is_list=True), ""
+    return entries, "顶层不是映射或数组(实际是 %s)" % type(doc).__name__
 
 
-def _walk_patch_entries(doc):
+def _walk_patch_entries(doc, root_is_list=False):
+    """只数**条目层**的 id/path。
+
+    条目内部还会有一堆 id(config 里的 models: - id: iq3_s 等), 它们不是补丁条目: 把它们
+    当成条目, dump-config 里必然找不到, 于是有效条目被判失效并被一键修复注释掉(改的是用户
+    的模型列表)。root_is_list 时顶层数组的每一项就是一个条目(DSH 真实形态)。
+    """
     entries = []
+
     def walk(node, in_patch=False):
         if isinstance(node, dict):
             this_id = node.get("id") or node.get("path")
-            if in_patch and isinstance(this_id, str):
+            if in_patch and isinstance(this_id, str) and this_id:
                 entries.append(this_id)
+                in_patch = False           # 条目内部(config/…)的 id 不再是补丁条目
             for k, v in node.items():
                 walk(v, in_patch or k in ("patch", "patches"))
         elif isinstance(node, list):
             for v in node:
                 walk(v, in_patch)
-    walk(doc)
+    walk(doc, root_is_list)
     return entries
 
 
@@ -412,14 +426,21 @@ def repair(dsh_dir, report, log):
                         log("[兼容] 补丁改名 %s → %s(备份 %s)" % (old, new, bak))
                     else:
                         lines = text.splitlines(keepends=True)
-                        out, skip = [], False
+                        # 注释范围按**条目自身的缩进**算, 不写死 4 空格: 本机真实文件是顶层
+                        # 数组(条目在 0 缩进, 续行只有 2 空格), 写死 \s{4,} 只注释掉
+                        # "- id: xxx" 那一行, 把 name/config 几行留在原地 —— 结果是 YAML
+                        # 直接解析失败, "修一个失效条目"变成"整个补丁层坏掉"。
+                        ent_re = re.compile(r"(\s*)-\s*(?:id|path)\s*:\s*[\"']?%s\b" % re.escape(old))
+                        out, skip, ind0 = [], False, 0
                         for ln in lines:
-                            if re.match(r"\s*-\s*(?:id|path)\s*:\s*[\"']?%s\b" % re.escape(old), ln):
+                            m = ent_re.match(ln)
+                            if m:
                                 out.append("# [compat] 已失效条目,自动注释: " + ln)
-                                skip = True
+                                skip, ind0 = True, len(m.group(1))
                                 continue
                             if skip:
-                                if re.match(r"\s{4,}\S", ln):
+                                body = len(ln) - len(ln.lstrip())
+                                if ln.strip() and body > ind0:
                                     out.append("# [compat] " + ln)
                                     continue
                                 skip = False
