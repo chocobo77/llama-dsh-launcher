@@ -83,6 +83,20 @@ input.wrap, .wrap { text-wrap: wrap; }
 #nodeLog { width: 100%; min-height: 60px; max-height: 130px; resize: vertical;
   font-size: 11px; margin-top: 6px; color: #e6edf3; }
 
+/* ---------- 插件管理表格(第十九轮: 告别 flex 乱流) ---------- */
+.pmTable { width: 100%; border-collapse: collapse; font-size: 12px; }
+.pmTable th { position: sticky; top: 0; background: var(--panel); text-align: left;
+  font-weight: 600; color: var(--muted); padding: 5px 8px; border-bottom: 1px solid var(--border);
+  white-space: nowrap; z-index: 1; }
+.pmTable td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.pmTable tbody tr:hover { background: #1a2029; }
+.pmTable td.pmName { min-width: 150px; max-width: 240px; word-break: break-all; }
+.pmTable td.pmSpec { word-break: break-all; color: var(--muted); font-size: 11px; }
+.pmTable td.pmOps { white-space: nowrap; }
+.pmTable td.pmOps .pmbtn { margin: 1px 2px 1px 0; }
+.pmTable td.pmNote { min-width: 120px; max-width: 260px; word-break: break-all; color: var(--muted); }
+.pmBadges { display: flex; flex-wrap: wrap; gap: 3px; }
+
 /* ---------- 参数配置页 ---------- */
 .filterRow { display: flex; align-items: center; gap: 6px; padding-bottom: 8px; flex: none; }
 .paramShell { flex: 1; min-height: 0; background: var(--box); border: 1px solid var(--border);

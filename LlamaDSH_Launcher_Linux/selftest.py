@@ -4467,6 +4467,13 @@ check("一键修复必须真做: 失效链接被重连到 DSH 安装实体, 陈�
       str((_n27f, _ln27_after, sorted(_compat27))))
 _compat.profile_dir, _compat.dsh_home = _real_pdir27, _real_dh27
 
+# 27.5 插件管理器表格化(用户反馈"乱糟糟"): 表格结构 + 五个动作按钮语义保留
+check("插件管理器必须是表格(插件/版本/状态/说明/操作, 吸顶表头), 动作按钮语义不丢",
+      'class="pmTable"' in _js27 and "<th>插件</th>" in _js27 and "<th>操作</th>" in _js27
+      and all(x in _js27 for x in ('mk("激活"', 'mk("停用并锁定"', 'mk("启用并解锁"',
+                                   'mk("升级"', 'mk("豁免本版"', 'mk("卸载"', 'mk("打开目录"')),
+      "app.js 插件管理表格/按钮缺失")
+
 shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)
 

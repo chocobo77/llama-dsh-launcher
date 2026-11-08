@@ -1421,40 +1421,60 @@ async function pluginManager() {
   if (r.error) { showNotice(r.error, true); return; }
   const items = r.plugins || [];
   const box = document.createElement("div");
-  box.innerHTML = `<div class="tiny" style="margin-bottom:6px">${mEsc(r.summary || "")}${r.dsh_running ? " · ⚠ DSH 运行中(升级/卸载/安装被拒)" : ""}</div>
-    <div id="pmlist" style="max-height:320px;overflow:auto"></div>`;
-  const list = box.querySelector("#pmlist");
+  const runningHint = r.dsh_running
+    ? '<span class="mbadge warnBadge">⚠ DSH 运行中(升级/卸载/安装被拒)</span>' : "";
+  // 表格化(用户反馈"乱糟糟"): 插件 | 版本 | 状态 | 说明 | 操作, thead 吸顶
+  const rows = [];
   for (const p of items) {
-    const row = document.createElement("div");
-    row.style.cssText = "display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border);flex-wrap:wrap";
     const peers = (p.peer_issues || []).slice(0, 2)
       .map(x => `${x.dep} ${x.range}(装 ${x.installed})`).join("; ");
-    const deadPeers = (p.dead_peers || []).length ? ` <span class="mbadge warnBadge">死依赖 ${p.dead_peers.length}</span>` : "";
-    const specLocal = String(p.spec || "").startsWith("file:") ? ` <span class="mbadge">本地</span>` : "";
-    row.innerHTML = `<b>${mEsc(p.name)}</b> <span class="tiny">${mEsc(p.version)}</span>
-      <span class="mbadge">${mEsc(p.state_label)}</span>
-      <span class="tiny mono">${mEsc(p.spec || "(bundle)")}</span>${specLocal}${deadPeers}
-      ${p.compatible ? "" : '<span class="mbadge warnBadge">peer 不兼容</span>'}
-      ${p.exempted ? '<span class="mbadge">已豁免</span>' : ""}
-      ${peers ? `<span class="tiny">${mEsc(peers)}</span>` : ""}
-      ${(p.errors || []).length ? `<span class="tiny evt-error">${mEsc(p.errors.join("; "))}</span>` : ""}`;
-    const btns = document.createElement("div");
-    btns.style.cssText = "margin-left:auto;display:flex;gap:4px;flex-wrap:wrap";
+    const notes = [];
+    if (peers) notes.push("peer 不兼容: " + peers);
+    if ((p.dead_peers || []).length) notes.push("死依赖: " + p.dead_peers.join(", "));
+    if ((p.peer_unknown || []).length) notes.push("未判定(需 DSH 源码树): " + p.peer_unknown.join(", "));
+    if ((p.missing_specs || []).length) notes.push("缺依赖: " + p.missing_specs.join(", "));
+    if ((p.errors || []).length) notes.push(p.errors.join("; "));
+    const stateCls = p.state_label === "已启用" ? ""
+      : p.state_label === "被外部重新激活" ? "warnBadge" : "";
+    rows.push(`<tr>
+      <td class="pmName"><b>${mEsc(p.name)}</b>
+        <div class="pmSpec" title="${mEsc(p.spec || "")}">${mEsc(p.spec || "(bundle)")}</div></td>
+      <td>${mEsc(p.version || "?")}${String(p.spec || "").startsWith("file:") ? ' <span class="mbadge">本地</span>' : ""}</td>
+      <td><div class="pmBadges">
+        <span class="mbadge ${stateCls}">${mEsc(p.state_label)}</span>
+        ${p.compatible ? "" : '<span class="mbadge warnBadge">peer 不兼容</span>'}
+        ${p.exempted ? '<span class="mbadge">已豁免</span>' : ""}
+        ${(p.dead_peers || []).length ? `<span class="mbadge warnBadge">死依赖 ${p.dead_peers.length}</span>` : ""}
+      </div></td>
+      <td class="pmNote">${notes.length ? mEsc(notes.join("\n")) : "—"}</td>
+      <td class="pmOps"></td>
+    </tr>`);
+  }
+  box.innerHTML = `<div class="tiny" style="margin-bottom:6px;display:flex;flex-wrap:wrap;gap:4px">
+      <span class="mbadge">插件 ${items.length} 个</span>${runningHint}</div>
+    <div style="max-height:360px;overflow:auto;border:1px solid var(--border);border-radius:6px">
+    <table class="pmTable"><thead><tr>
+      <th>插件</th><th>版本</th><th>状态</th><th>说明</th><th>操作</th>
+    </tr></thead><tbody>${rows.join("")}</tbody></table></div>`;
+  const list = box.querySelector("tbody");
+  const trs = list.querySelectorAll("tr");
+  items.forEach((p, i) => {
+    const ops = trs[i].querySelector(".pmOps");
     const mk = (label, fn, cls, cond = true) => {
       if (!cond) return;
       const b = document.createElement("button");
       b.textContent = label; b.style.padding = "2px 8px"; b.style.fontSize = "11px";
-      if (cls) b.className = cls;
+      if (cls) b.className = "pmbtn " + cls;
       b.onclick = async () => {
         try { await fn(); } catch (e) { showNotice(e.message, true); }
         pluginManager();
       };
-      btns.appendChild(b);
+      ops.appendChild(b);
     };
     mk("激活", async () => {
       const rr = await api("dsh/plugins/set_active", { profile: prof, name: p.name, active: true });
       showNotice(rr.msg || "已激活");
-    }, "primary", !p.in_bundles);
+    }, "primary", !p.in_bundles && !p.locked);
     if (p.locked) {
       mk("启用并解锁", async () => {
         const rr = await api("dsh/plugins/set_active", { profile: prof, name: p.name, active: true });
@@ -1497,28 +1517,25 @@ async function pluginManager() {
       const rr = await api("dsh/plugins/open_dir", { dir: p.dir });
       if (rr.error) showNotice(rr.error, true);
     });
-    row.appendChild(btns);
-    list.appendChild(row);
-  }
-  const box2 = document.createElement("div");
-  box2.innerHTML = `<div class="btnrow" style="margin-top:8px">
-    <button id="pmRefresh">🔄 刷新</button>
-    <button id="pmInstallLocal">📥 安装本地插件(.tgz / 目录,需 DSH 已停止)</button>
-    <button id="pmClose">关闭</button></div>`;
-  box2.querySelector("#pmRefresh").onclick = () => pluginManager();
-  box2.querySelector("#pmInstallLocal").onclick = async () => {
-    try {
-      const v2 = await browsePicker("plugin_src");
-      if (!v2) return;
-      const rr = await api("dsh/plugins/install_local", { profile: prof, source: v2 }, 1500000);   // pnpm pack 600s + add 900s
-      showNotice(rr.ok ? (rr.msg || "已安装") : (rr.error || rr.msg || "安装失败"), !(rr.ok));
-      pluginManager();
-    } catch (e) { showNotice("安装失败: " + (e.message || e), true); pluginManager(); }
-  };
-  box.appendChild(box2);
+  });
   await showModal({
-    title: `🗂 插件管理(${items.length} 个)`, body: "", extra: box,
-    buttons: [{ label: "关闭", cls: "primary", value: 1 }]
+    title: "🗂 插件管理", body: "", extra: box,
+    buttons: [
+      { label: "📥 安装本地插件", value: "install" },
+      { label: "🔄 刷新", value: "refresh" },
+      { label: "关闭", cls: "primary", value: 1 }
+    ]
+  }).then(async v => {
+    if (v === "refresh") { pluginManager(); return; }
+    if (v === "install") {
+      try {
+        const v2 = await browsePicker("plugin_src");
+        if (!v2) { pluginManager(); return; }
+        const rr = await api("dsh/plugins/install_local", { profile: prof, source: v2 }, 1500000);   // pnpm pack 600s + add 900s
+        showNotice(rr.ok ? (rr.msg || "已安装") : (rr.error || rr.msg || "安装失败"), !(rr.ok));
+        pluginManager();
+      } catch (e) { showNotice("安装失败: " + (e.message || e), true); pluginManager(); }
+    }
   });
 }
 
