@@ -4979,15 +4979,22 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			// 端口上有进程 ≠ 那是 DSH：无身份校验就接管，用户自己跑在 3080 的进程会被标成
 			// "接管运行中"，点"停止"即被 KillProcessTree 杀掉整棵树。
-			if (!ProcessHelper.LooksLikeDshProcess(existing.Value, EffectiveDshDir()))
+			// 判定带 HTTP 指纹兜底(最多 1.2 秒)：提权运行的 DSH 读不到命令行，只按命令行匹配
+			// 会把真 DSH 当成外来进程拒绝接管。
+			DshIdentity.Verdict id = ProcessHelper.DshIdentityProbe(existing.Value, EffectiveDshDir());
+			if (!id.Ok)
 			{
-				ShowNotice($"端口 3080 已被 PID {existing.Value} 占用，但它不是可识别的 DSH 进程（进程名/命令行不匹配）。\n不会接管、也不会停止它：请自行结束该进程，或改用其它 DSH 端口。", isError: true);
+				string hint = id.CommandLineReadable
+					? "不会接管、也不会停止它：请自行结束该进程，或改用其它 DSH 端口。"
+					: "读不到命令行通常说明 DSH 是以管理员权限启动的：请以管理员身份重新运行启动器再接管；"
+					  + "如果那确实是个无关进程，请自行结束它或改用其它 DSH 端口。";
+				ShowNotice($"端口 3080 已被 PID {existing.Value} 占用，但未确认它是 DSH（{id.Reason}）。\n{hint}", isError: true);
 				return;
 			}
 			_dshRetriesLeft = 0;
 			_dshProc = null;
 			_dshTracker = null;
-			AttachDsh(existing.Value, "检测到端口 3080 已有 DSH 在运行，直接接管", saveState: true);
+			AttachDsh(existing.Value, "检测到端口 3080 已有 DSH 在运行，直接接管", saveState: true, id);
 			return;
 		}
 		_dshRetriesLeft = 2;
@@ -8711,9 +8718,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				int? pp = ProcessHelper.FindProcessByPort(3080);
 				if (pp.HasValue)
 				{
+					// 身份判定含 HTTP 指纹兜底(最多 1.2 秒)，在这条后台线程上做完再把结论送回 UI
+					DshIdentity.Verdict id = ProcessHelper.DshIdentityProbe(pp.Value, dd);
 					((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
 					{
-						AttachDsh(pp.Value, "Resumed DSH", saveState: true);
+						AttachDsh(pp.Value, "Resumed DSH", saveState: true, id);
 					}, Array.Empty<object>());
 				}
 				else
@@ -8778,13 +8787,20 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		});
 	}
 
-	private void AttachDsh(int pid, string logPrefix, bool saveState)
+	private void AttachDsh(int pid, string logPrefix, bool saveState, DshIdentity.Verdict? verdict = null)
 	{
 		// 接管前先证明"那是 DSH"：端口探测只说明 3080 有人占着，不构成身份证据。
 		// 无校验接管后点"停止"会对它执行 KillProcessTree，用户的无关进程树直接被杀。
-		if (!ProcessHelper.LooksLikeDshProcess(pid, EffectiveDshDir()))
+		// 判定分三层(进程名/命令行/DSH 的 HTTP 指纹)，因为提权运行的 DSH 的命令行对未提权
+		// 的启动器不可读——只按命令行会把真 DSH 拒绝在门外。
+		DshIdentity.Verdict v = verdict ?? ProcessHelper.DshIdentityProbe(pid, EffectiveDshDir());
+		if (!v.Ok)
 		{
-			Log($"[DSH] PID {pid} 的进程名/命令行不像 DSH，拒绝接管（避免误停无关进程）");
+			Log($"[DSH] 拒绝接管 PID {pid}: {v.Reason}");
+			if (!v.CommandLineReadable)
+			{
+				Log("[DSH] 提示: DSH 若以管理员权限运行，未提权的启动器读不到它的命令行——以管理员身份重新运行启动器即可正常接管。");
+			}
 			return;
 		}
 		_dshTracker = new ProcessTracker(pid);
@@ -8793,7 +8809,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		BtnOpenDsh.IsEnabled = true;
 		LblDshStatus.Text = "● 接管运行中";
 		LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
-		Log($"{logPrefix}:{pid}");
+		Log($"{logPrefix}:{pid}" + (v.CommandLineReadable ? "" : " (按 " + v.Reason + ")"));
 		if (saveState)
 		{
 			SaveState();

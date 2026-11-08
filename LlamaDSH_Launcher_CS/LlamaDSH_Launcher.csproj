@@ -19,9 +19,9 @@
     <UseWindowsForms>true</UseWindowsForms>
     <!-- 版本单一来源是 installer.iss 的 MyAppVersion；一键封包.cmd 会把同一个 x.y.z 同步到这里。
          缺了这几行，exe 文件属性和 `cli status` 报的版本会永远停在 1.0.0.0，排障时对不上安装包。 -->
-    <Version>1.1.0</Version>
-    <AssemblyVersion>1.1.0.0</AssemblyVersion>
-    <FileVersion>1.1.0.0</FileVersion>
+    <Version>1.1.1</Version>
+    <AssemblyVersion>1.1.1.0</AssemblyVersion>
+    <FileVersion>1.1.1.0</FileVersion>
     <Product>DeepSeek Harness &amp; Llama 启动器</Product>
     <Company>LlamaDSH</Company>
   </PropertyGroup>

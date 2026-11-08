@@ -607,7 +607,17 @@ class DshRunner:
             pass
         existing = procman.find_process_by_port(DSH_PORT)
         if existing:
-            self.attach(existing, "检测到端口 %d 已有 DSH 在运行,直接接管" % DSH_PORT)
+            # 端口上有进程 ≠ 那是 DSH: 无身份校验就接管, 用户自己跑在 3080 的服务会被标成
+            # "接管运行中", 点"停止"即被 kill_process_tree 杀掉整棵树(Windows 侧同一族缺陷)。
+            ok, why = procman.dsh_identity(existing, self.dsh_dir_of(profile), DSH_PORT)
+            if not ok:
+                hint = ("不会接管、也不会停止它: 请自行结束该进程, 或改用其它 DSH 端口。"
+                        if procman.read_cmdline(existing) else
+                        "读不到 cmdline 通常说明该 DSH 由别的用户(或 root)启动: 请用同一用户运行启动器; "
+                        "如果那确实是个无关进程, 请自行结束它或改用其它 DSH 端口。")
+                return False, ("端口 %d 已被 PID %d 占用, 但未确认它是 DSH(%s)。\n%s"
+                               % (DSH_PORT, existing, why, hint))
+            self.attach(existing, "检测到端口 %d 已有 DSH 在运行,直接接管(%s)" % (DSH_PORT, why))
             return True, None
         self.retries_left = 2
         return self._prepare_then_start(profile)

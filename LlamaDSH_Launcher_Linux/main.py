@@ -164,15 +164,6 @@ def run_job(name, fn):
 
 
 
-def _pid_is_dsh(pid):
-    """PID 复用防护(4bf9416 同语义): 只认 cmdline 带 DSH 强特征的 node 进程,
-    否则"停止"会误杀复用了该 PID 的无关进程。"""
-    import procman as _pm
-    cl = _pm.read_cmdline(int(pid)).lower()
-    return bool(cl) and any(h.lower() in cl
-                            for h in (_pm._DSH_NAME_HINTS + ("@deepseek-ai",)))
-
-
 def takeover_on_boot():
     """LoadState 等价:Llama 按 PID 接管;DSH 按端口→state→孤儿扫描。"""
     st = state.load_state()
@@ -186,19 +177,33 @@ def takeover_on_boot():
             HUB.log("[接管] 状态文件中的 Llama PID %s 已失效(进程退出或 PID 被复用),跳过接管" % st["LlamaPid"])
         state.clear_state_for("LlamaPid")
     pid = procman_find_port()
+    dsh_dir_st = st.get("DshDir", "")
     if pid:
-        DSH.attach(pid, "[接管] 端口 %d 已有 DSH 在运行,直接接管" % DSH_PORT)
-    elif st.get("DshPid") and procman_alive(st["DshPid"]) and _pid_is_dsh(st["DshPid"]):
-        DSH.attach(st["DshPid"], "[接管] 恢复 DSH 进程", save_state=True)
-    elif st.get("DshPid"):
-        HUB.log("[接管] 状态文件中的 DSH PID %s 已失效(进程退出或 PID 被复用),跳过接管" % st["DshPid"])
-        state.clear_state_for("DshPid")
-    else:
-        dsh_dir = st.get("DshDir", "")
-        orphans = procman_find_orphans(dsh_dir)
+        # 端口上有进程 ≠ 那是 DSH: 无身份校验就接管, 用户自己跑在 3080 的服务会被标成
+        # "接管运行中", 点"停止"即被 kill_process_tree 杀掉整棵树(Windows 侧同一族缺陷)。
+        ok, why = _pm.dsh_identity(pid, dsh_dir_st, DSH_PORT)
+        if ok:
+            DSH.attach(pid, "[接管] 端口 %d 已有 DSH 在运行,直接接管(%s)" % (DSH_PORT, why))
+        else:
+            HUB.log("[接管] 端口 %d 上的 PID %d 拒绝接管: %s" % (DSH_PORT, pid, why))
+    if not DSH.running:
+        if st.get("DshPid") and procman_alive(st["DshPid"]):
+            ok, why = _pm.dsh_identity(st["DshPid"], dsh_dir_st, DSH_PORT)
+            if ok:
+                DSH.attach(st["DshPid"], "[接管] 恢复 DSH 进程(%s)" % why, save_state=True)
+            else:
+                HUB.log("[接管] 状态文件中的 DSH PID %s 判定失败: %s" % (st["DshPid"], why))
+        if not DSH.running and st.get("DshPid") and not procman_alive(st["DshPid"]):
+            HUB.log("[接管] 状态文件中的 DSH PID %s 已失效(进程退出或 PID 被复用),跳过接管" % st["DshPid"])
+            state.clear_state_for("DshPid")
+        if not DSH.running and st.get("DshPid") and procman_alive(st["DshPid"]):
+            # 判定不成立但进程还活着: 保留状态, 下次启动(或提权后)还能认出来
+            HUB.log("[接管] 保留了状态里的 DSH PID %s(判定不确定时不清状态)" % st["DshPid"])
+    if not DSH.running and not procman_find_port():
+        orphans = procman_find_orphans(st.get("DshDir", ""))
         if orphans:
             DSH.attach(orphans[0], "[接管] 发现孤儿 DSH 进程")
-        else:
+        elif not st.get("DshPid"):
             state.clear_state()
     # 载入配置
     global CONFIG

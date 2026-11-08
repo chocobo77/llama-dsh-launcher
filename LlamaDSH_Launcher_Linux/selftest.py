@@ -4474,6 +4474,34 @@ check("插件管理器必须是表格(插件/版本/状态/说明/操作, 吸顶
                                    'mk("升级"', 'mk("豁免本版"', 'mk("卸载"', 'mk("打开目录"')),
       "app.js 插件管理表格/按钮缺失")
 
+# 28.1 DSH 接管身份判定(与 C# 侧 DshIdentity 同三层): 端口被占不是身份证据, 而 cmdline
+#      不是总能读到 —— /proc/<pid>/cmdline 只对同 uid 可读, 别的用户(或 root)起的 DSH 在
+#      Windows 侧就因 WMI 读不到提权进程命令行而被判成"不像 DSH", 真 DSH 接管不到。
+_rn28, _rc28, _hf28 = procman.process_name, procman.read_cmdline, procman.http_fingerprint
+procman.process_name = lambda pid: "node"
+procman.read_cmdline = lambda pid: ""            # 跨 uid/提权: cmdline 读不到
+procman.http_fingerprint = lambda port, timeout=1.2: True
+_ok28, _why28 = procman.dsh_identity(4242, "/opt/deepseek-harness", 3080)
+check("cmdline 读不到但端口应答 DSH 的 HTTP 指纹 → 必须接管(否则提权启动过一次就永久接管不到)",
+      _ok28 and "HTTP 指纹" in _why28, _why28)
+procman.http_fingerprint = lambda port, timeout=1.2: None
+_ok28b, _why28b = procman.dsh_identity(4242, "/opt/deepseek-harness", 3080)
+check("cmdline 读不到且指纹未知 → 保守拒绝, 但理由要说清可能是权限问题",
+      (not _ok28b) and "读不到" in _why28b, _why28b)
+procman.read_cmdline = lambda pid: "python3 -m http.server 3080"
+procman.http_fingerprint = lambda port, timeout=1.2: False
+_ok28c, _why28c = procman.dsh_identity(4242, "/opt/deepseek-harness", 3080)
+check("无关进程占着 3080 → 既不接管也不许停止它(无校验接管后点停止会杀用户进程树)",
+      not _ok28c, _why28c)
+procman.read_cmdline = lambda pid: "node apps/cli/lib/bin.js web"
+_ok28d, _why28d = procman.dsh_identity(4242, "/opt/deepseek-harness", 3080)
+check("cmdline 含 apps/cli → 判定为 DSH(真 DSH 的命令行里根本没有 dsh 字样)", _ok28d, _why28d)
+procman.process_name, procman.read_cmdline, procman.http_fingerprint = _rn28, _rc28, _hf28
+_pm28 = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "procman.py"),
+                encoding="utf-8").read()
+check("进程扫描要含 Node 24 的 comm(MainThread): 只按 node 过滤会永远查不到 DSH",
+      '"MainThread"' in _pm28, "procman 未放宽 MainThread")
+
 shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)
 

@@ -313,42 +313,40 @@ public static class ProcessHelper
 	/// 端口探测不构成身份证据——用户自己跑在 3080 的任意进程若不校验，会被标成"接管运行中"，
 	/// 点"停止"就把它的整棵进程树杀掉（llama 侧已有同样的 ProcessName 闸门，这里补齐对称）。
 	/// </summary>
-	public static bool LooksLikeDshProcess(int pid, string? dshDir = null)
+	public static bool LooksLikeDshProcess(int pid, string? dshDir = null, int port = DshIdentity.DshPort)
 	{
-		HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "node", "node.exe", "electron", "electron.exe" };
+		return DshIdentityProbe(pid, dshDir, port).Ok;
+	}
+
+	/// <summary>
+	/// 分层身份判定：进程名 → 命令行 → DSH 的 HTTP 指纹（见 DshIdentity）。
+	/// port 传 0 表示不做 HTTP 兜底（只用于"绝不能阻塞"的调用点）。
+	/// </summary>
+	public static DshIdentity.Verdict DshIdentityProbe(int pid, string? dshDir = null, int port = DshIdentity.DshPort)
+	{
 		try
 		{
 			using Process process = Process.GetProcessById(pid);
-			if (!names.Contains(process.ProcessName))
-			{
-				return false;
-			}
-			string text = GetCommandLine(process.Id).ToLowerInvariant();
+			string cmd = GetCommandLine(process.Id);
 			string image = "";
 			try
 			{
-				image = process.MainModule?.FileName?.ToLowerInvariant().Replace('/', '\\') ?? "";
+				image = process.MainModule?.FileName ?? "";
 			}
 			catch
 			{
-				// 32/64 位或权限差异读不到 MainModule：只按命令行判定
+				// 跨完整性级别/32-64 位读不到 MainModule：命令行与 HTTP 指纹两层还在
 			}
-			if (text.Contains("cli/src/bin") || text.Contains("apps/cli") || text.Contains("@deepseek-ai")
-				|| text.Contains("deepseek-harness") || image.Contains("deepseek-harness"))
-			{
-				return true;
-			}
-			if (text.Contains("dsh") && (text.Contains("web") || text.Contains("dist") || text.Contains("cli") || text.Contains("server") || text.Contains("start")))
-			{
-				return true;
-			}
-			string key = (dshDir ?? "").ToLowerInvariant().Replace('/', '\\');
-			return key.Length > 0 && (text.Contains(key) || image.Contains(key));
+			// 命令行已经证明是 DSH 就不必再发 HTTP 探测（最多 1.2 秒），只有需要兜底时才探测
+			bool? fp = (port > 0 && !DshIdentity.CommandLineMatches(cmd, image, dshDir)) ? DshIdentity.HttpFingerprint(port) : null;
+			return DshIdentity.Judge(process.ProcessName, cmd, image, dshDir, fp);
 		}
-		catch
+		catch (Exception ex)
 		{
 			// 进程已退出或 PID 被复用：一律不接管
-			return false;
+			DshIdentity.Verdict v = new DshIdentity.Verdict { Reason = "进程已退出或 PID 已被复用" };
+			AppLog.WriteError("DSH 身份判定失败(pid=" + pid + "): " + ex.Message);
+			return v;
 		}
 	}
 
@@ -415,8 +413,10 @@ public static class ProcessHelper
 		long tickCount = Environment.TickCount64;
 		lock (_cmdCacheLock)
 		{
-			if (_cmdLineCache.TryGetValue(pid, out (string, long) value) && tickCount - value.Item2 < 10000)
+			if (_cmdLineCache.TryGetValue(pid, out (string, long) value) && tickCount - value.Item2 < (string.IsNullOrEmpty(value.Item1) ? 2000 : 10000))
 			{
+				// 空结果只缓存 2 秒: WMI 偶发失败(或跨完整性级别读不到)若按 10 秒缓存,
+				// 会把"读不到"固化成一段时间内的判定依据
 				return value.Item1;
 			}
 		}

@@ -174,6 +174,7 @@ curl -s -H "X-Auth: $TOK" http://127.0.0.1:8788/api/job?id=1   # 任务模型轮
 | Authenticode 验签 | 不适用(略) |
 | 编辑命令为就地编辑 | 模态编辑自定义参数(仅追加语义不变) |
 | WMI 分离启动 | setsid 会话分离 + 日志尾随 |
+| 身份判定读命令行(WMI 读不到提权进程的命令行) | 身份判定读 `/proc/<pid>/cmdline`(只对同 uid 可读) |
 | 提权 runas 读游戏内存 | sudo -n 选项(默认关) |
 | 内置 `cli` 子命令(`llamadsh-cli.exe`) | 无内置 cli:端点名/字段与 Windows 一致,用 curl/脚本直连,`ping` 的 `cli` 字段留空 |
 | Agent 接口可禁用(`LLAMADSH_AGENT_DISABLE=1`) | 不可禁用:这个 HTTP 服务就是主窗口本身(`agent.json` 里 `enabled` 恒为 true) |

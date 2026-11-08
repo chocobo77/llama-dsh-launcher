@@ -49,6 +49,7 @@ internal static class Program
         TestDiagnostics();
         TestAgentCliParse();
         TestAgentApiHttp();
+        TestDshIdentityJudge();
 
         Console.WriteLine();
         Console.WriteLine($"总计: {_passed + _failed}  通过: {_passed}  失败: {_failed}");
@@ -267,6 +268,32 @@ internal static class Program
         Check("未知命令失败", !ok);
         ok = AgentCli.TryParse(new[] { "cli", "quit", "--no-stop" }, out m, out p, out b, out e);
         Check("cli quit --no-stop → stop_services=false", ok && b.Contains("false"));
+    }
+
+    /// <summary>
+    /// 接管身份判定(DshIdentity.Judge 决策表)。端口被占不是身份证据(无校验接管后点「停止」
+    /// 会 KillProcessTree 用户的无关进程)；而提权运行的 DSH 的命令行对未提权的启动器不可读，
+    /// 只按命令行匹配就会把真 DSH 判成"不像 DSH"而拒绝接管 —— 本机实测丢接管就是这么来的。
+    /// </summary>
+    private static void TestDshIdentityJudge()
+    {
+        string nodeImg = @"C:\Program Files\nodejs\node.exe";
+        string dshDir = @"D:\Program files\deepseek-harness";
+        DshIdentity.Verdict a = DshIdentity.Judge("node", "\"C:\\Program Files\\nodejs\\node.exe\"  apps/cli/lib/bin.js web ", nodeImg, dshDir, null);
+        Check("命令行含 apps/cli → 判定为 DSH", a.Ok && a.CommandLineReadable, a.Reason);
+        DshIdentity.Verdict b = DshIdentity.Judge("node", "", "", dshDir, true);
+        Check("命令行不可读 + HTTP 指纹确认 → 接管", b.Ok && !b.CommandLineReadable, b.Reason);
+        DshIdentity.Verdict c = DshIdentity.Judge("node", "", "", dshDir, null);
+        Check("命令行不可读 + 指纹未知 → 拒绝并提示权限", !c.Ok && c.Reason.Contains("管理员"), c.Reason);
+        DshIdentity.Verdict d = DshIdentity.Judge("python3", "python3 -m http.server 3080", "/usr/bin/python3", dshDir, false);
+        Check("非 node/electron 占端口 → 拒绝(不接管也不停止)", !d.Ok, d.Reason);
+        DshIdentity.Verdict e = DshIdentity.Judge("node", "node server.js", nodeImg, dshDir, false);
+        Check("node 但命令行与指纹都不是 DSH → 拒绝", !e.Ok, e.Reason);
+        DshIdentity.Verdict f = DshIdentity.Judge("node", "node ./dist/whatever.js web", nodeImg, "", true);
+        Check("命令行不含标志但端口是 DSH 指纹 → 接管", f.Ok, f.Reason);
+        Check("命令行判定: 真 DSH 入口 apps/cli 命中", DshIdentity.CommandLineMatches("node apps/cli/lib/bin.js web", nodeImg, null));
+        Check("命令行判定: 无关 node 服务不命中", !DshIdentity.CommandLineMatches("node server.js", nodeImg, null));
+        Check("端口无人监听 → 指纹为未知而非否定", DshIdentity.HttpFingerprint(1) == null);
     }
 
     private static void TestAgentApiHttp()

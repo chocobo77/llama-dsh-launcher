@@ -206,7 +206,10 @@ def _all_cmdlines():
             pid = int(os.path.basename(pdir))
         except ValueError:
             continue
-        if process_name(pid) in ("node", "electron"):
+        if process_name(pid) in ("node", "electron", "MainThread"):
+            # Node 24 把主线程 comm 改成了 "MainThread"(见 find_process_by_port 的注释):
+            # 只按 "node" 过滤会让 node_host_running/孤儿扫描在 Node 24 上永远查不到 DSH,
+            # 该接管的接管不到。放宽后仍由 cmdline 特征把关, 不会把别的 Node 应用算进来。
             res[pid] = read_cmdline(pid)
     _cmdline_cache["t"] = now
     _cmdline_cache["v"] = res
@@ -276,6 +279,69 @@ def dsh_activity(port):
     if node_host_running():
         return True
     return False
+
+
+def cmdline_matches_dsh(cmdline, dsh_dir=None):
+    """cmdline/镜像是否含 DSH 强特征(与 find_orphaned_dsh_processes 的打分口径一致)。"""
+    low = (cmdline or "").lower()
+    if not low:
+        return False
+    if re.search(r"cli/src/bin|apps/cli|@deepseek-ai", low):
+        return True
+    if "deepseek-harness" in low:
+        return True
+    if "dsh" in low and re.search(r"web|dist|cli|server|start", low):
+        return True
+    dd = (dsh_dir or "").strip().strip('"').lower()
+    return bool(dd) and dd in low
+
+
+def http_fingerprint(port, timeout=1.2):
+    """DSH 自己的 HTTP 指纹: 不带 token 时 GET / 回 401 + 正文 "dsh web authentication required"。
+
+    True=确认是 DSH; False=有 HTTP 应答但不是 DSH 的口径; None=连不上/超时(未知, 不能据此
+    判定"不是")。与 Windows 侧 DshIdentity.HttpFingerprint 同语义: cmdline 不是总能读到
+    (/proc/<pid>/cmdline 只对同 uid 可读), 只按 cmdline 匹配会把真 DSH 判成外来进程。
+    """
+    try:
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request("http://127.0.0.1:%d/" % int(port), method="GET")
+        body = ""
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read(4096).decode("utf-8", "replace").lower()
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read(4096).decode("utf-8", "replace").lower()
+            except Exception:
+                body = ""
+        return any(h in body for h in ("dsh web authentication required", "dsh", "cordis"))
+    except Exception:
+        return None
+
+
+def dsh_identity(pid, dsh_dir=None, port=None):
+    """(ok, reason): 进程名 → cmdline → DSH 的 HTTP 指纹, 与 Windows 侧 DshIdentity 同三层。
+
+    两个方向都会出错: 端口上有进程就接管, 用户自己跑在 3080 的服务会被标成"接管运行中"
+    并在点"停止"时被杀树; 反过来, 别的用户(root)起的 DSH 读不到 cmdline, 只按 cmdline
+    判就把真 DSH 拒在门外(随后状态被清, 再起实例撞 EADDRINUSE 报启动失败)。
+    """
+    name = process_name(pid)
+    if name not in ("node", "node.exe", "electron", "electron.exe", "MainThread"):
+        return (False, '进程名 "%s" 不是 node/electron' % (name or "?"))
+    cl = read_cmdline(pid)
+    if cmdline_matches_dsh(cl, dsh_dir):
+        return (True, "cmdline 含 DSH 标志")
+    fp = http_fingerprint(port) if port else None
+    if fp is True:
+        return (True, "%s 端口应答的是 DSH 自己的 HTTP 指纹(cmdline %s)"
+                % (port, "读不到, 该进程属于其它用户" if not cl else "不含 DSH 标志"))
+    if not cl:
+        return (False, "cmdline 读不到(该进程可能属于其它用户/需要更高权限), 且 %s 的 HTTP 应答也没能确认是 DSH"
+                % (port or "DSH"))
+    return (False, "进程名是 %s, 但 cmdline 与端口 HTTP 指纹都不含 DSH 标志" % name)
 
 
 def which(exe):
