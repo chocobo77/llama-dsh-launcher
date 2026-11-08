@@ -177,7 +177,11 @@ public sealed class AgentApi
 				["enabled"] = true
 			});
 			File.WriteAllText(ConfigFile, json);
-			TightenAcl();
+			// cli 项目(llamadsh-cli.csproj)是无平台限定的 net8.0, ACL API 只在 Windows 存在
+			if (OperatingSystem.IsWindows())
+			{
+				TightenAcl();
+			}
 			try { File.SetAttributes(ConfigFile, FileAttributes.Hidden); } catch { }
 		}
 		catch
@@ -190,6 +194,7 @@ public sealed class AgentApi
 	/// agent.json 里的 token 等于"本机任意进程可启停服务/改写用户配置/退出启动器"，
 	/// Hidden 属性不提供任何保护。这里把 DACL 收成 SYSTEM + 管理员 + 当前用户。
 	/// </summary>
+	[System.Runtime.Versioning.SupportedOSPlatform("windows")]
 	private void TightenAcl()
 	{
 		try

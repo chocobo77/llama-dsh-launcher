@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks; // cli 项目(llamadsh-cli.csproj)未开 ImplicitUsings, 这里必须显式引
 
 namespace LlamaDSH_Launcher.Services;
 
