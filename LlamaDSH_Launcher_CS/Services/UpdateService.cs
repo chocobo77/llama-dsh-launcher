@@ -929,6 +929,7 @@ public static class UpdateService
 			}
 			(int ExitCode, string Output) pull = RunGit(dir, "pull --ff-only", 240);
 			bool stashed = false;
+			string stashSha = "";
 			// 本地未提交改动会挡住合并——而且直连 pull 因网络失败时, 输出里根本没有
 			// "local changes"字样, 后续镜像 merge 才会被改动挡住(曾在 merge 处误诊为
 			// "历史分叉")。所以只要 pull 失败就预检工作区脏状态, 统一先 stash,
@@ -936,22 +937,26 @@ public static class UpdateService
 			// 绝不丢弃; pop 冲突时保留在 stash 供手动处理)。
 			if (pull.ExitCode != 0 && (LocalChangesBlocked(pull.Output) || HasLocalChanges(dir)))
 			{
-				(bool ok, string err) = TryStash(dir, log);
+				(bool ok, string err, string sha) = TryStash(dir, log);
 				if (!ok)
 				{
 					return (false, "本地有未提交改动且自动 stash 失败：\n" + err);
 				}
-				stashed = true;
+				// 只有真的产生了条目才算"我们 stash 过": push 在无可存内容时也返回 0
+				// ("No local changes to save", 典型场景是 untracked 文件挡合并),
+				// 此时若照样 pop, 弹出的就是用户与本次无关的 stash@{0} 并把它删掉。
+				stashSha = sha;
+				stashed = sha.Length >= 40;
 				pull = RunGit(dir, "pull --ff-only", 240);
 				if (pull.ExitCode == 0)
 				{
 					string head = RunGit(dir, "rev-parse HEAD", 15).Output.Trim();
 					if (head.Length != 40)
 					{
-						StashPopSafe(dir, log);
+						StashPopSafe(dir, stashSha, log);
 						return (false, "pull 成功但无法读取新 HEAD");
 					}
-					StashPopSafe(dir, log);
+					StashPopSafe(dir, stashSha, log);
 					return (true, head);
 				}
 			}
@@ -977,26 +982,26 @@ public static class UpdateService
 						{
 							if (stashed)
 							{
-								StashPopSafe(dir, log);
+								StashPopSafe(dir, stashSha, log);
 							}
 							return (true, head);
 						}
 						if (stashed)
 						{
-							StashPopSafe(dir, log);
+							StashPopSafe(dir, stashSha, log);
 						}
 						return (false, "镜像拉取成功但无法读取新 HEAD");
 					}
 					if (stashed)
 					{
-						StashPopSafe(dir, log); // 合并仍失败: 先把工作区还原再说
+						StashPopSafe(dir, stashSha, log); // 合并仍失败: 先把工作区还原再说
 					}
-					return (false, "镜像已获取上游，但本地无法快进合并（" + (LocalChangesBlocked(merge.Output) ? "stash 后仍被本地改动挡住" : "可能有本地提交/历史分叉") + "）：\n" + Tail(merge.Output, 800));
+					return (false, "镜像已获取上游，但本地无法快进合并（" + (LocalChangesBlocked(merge.Output) ? (stashed ? "stash 后仍被本地改动挡住" : "被本地未跟踪文件挡住：stash 不含未跟踪文件，请先提交或移走这些文件") : "可能有本地提交/历史分叉") + "）：\n" + Tail(merge.Output, 800));
 				}
 			}
 			if (stashed)
 			{
-				StashPopSafe(dir, log);
+				StashPopSafe(dir, stashSha, log);
 			}
 			return (false, ExplainGitFailure(pull.Output, "pull"));
 		}
@@ -1015,27 +1020,59 @@ public static class UpdateService
 			|| t.Contains("local changes", StringComparison.OrdinalIgnoreCase);
 	}
 
-	/// <summary>工作区是否有未提交的已跟踪改动(untracked 不算: stash push 默认不 stash 它们, 也不挡快进合并)。</summary>
+	/// <summary>工作区是否有未提交的已跟踪改动(untracked 不算: stash push 默认不 stash 它们)。
+	/// untracked 仍可能挡快进合并("would be overwritten")，那种情况下 stash 会是空弹，由 TryStash 识别。</summary>
 	private static bool HasLocalChanges(string dir)
 	{
 		(int ExitCode, string Output) st = RunGit(dir, "status --porcelain -uno", 15);
 		return st.ExitCode == 0 && !string.IsNullOrWhiteSpace(st.Output);
 	}
 
-	private static (bool ok, string err) TryStash(string dir, Action<string>? log)
+	/// <summary>refs/stash 栈顶条目的 SHA；仓库没有 stash 条目时返回空串。</summary>
+	private static string StashHead(string dir)
 	{
+		return RunGit(dir, "rev-parse -q --verify refs/stash", 15).Output.Trim();
+	}
+
+	/// <summary>
+	/// 返回 (是否成功, 错误, 本次产生的 stash 条目 SHA)。
+	/// "无可存内容"时 `git stash push` 同样返回 0 且不产生条目("No local changes to save")，
+	/// 所以只能以 refs/stash 前后是否变化判定；sha 为空表示本次没有可恢复条目，调用方必须据此跳过 pop。
+	/// </summary>
+	private static (bool ok, string err, string sha) TryStash(string dir, Action<string>? log)
+	{
+		string before = StashHead(dir);
 		(int ExitCode, string Output) st = RunGit(dir, "stash push -m \"LlamaDSH auto-stash before update\"", 60);
 		if (st.ExitCode != 0)
 		{
-			return (false, Tail(st.Output, 400));
+			return (false, Tail(st.Output, 400), "");
+		}
+		string created = StashHead(dir);
+		if (created.Length < 40 || string.Equals(created, before, StringComparison.Ordinal))
+		{
+			log?.Invoke("[更新] 已跟踪文件没有改动，本次未产生 stash 条目（不会执行 stash pop，用户既有 stash 不受影响）");
+			return (true, "", "");
 		}
 		log?.Invoke("[更新] 检测到本地未提交改动，已自动 stash（更新完成后自动恢复）");
-		return (true, "");
+		return (true, "", created);
 	}
 
-	/// <summary>恢复 stash；pop 冲突时保留 stash 条目并提示手动处理（git pop 冲突时本就不丢弃）。</summary>
-	private static void StashPopSafe(string dir, Action<string>? log)
+	/// <summary>
+	/// 只恢复本次创建的那一条：栈顶不是它（空弹、或中途 stash 栈被别的会话动过）就直接返回，
+	/// 否则弹出的就是用户与本次无关的 stash@{0} 并在成功后把它删掉。
+	/// pop 冲突时 git 本身保留条目，这里只提示手动处理。
+	/// </summary>
+	private static void StashPopSafe(string dir, string sha, Action<string>? log)
 	{
+		if (sha.Length < 40)
+		{
+			return;
+		}
+		if (!string.Equals(StashHead(dir), sha, StringComparison.Ordinal))
+		{
+			log?.Invoke("[更新] ⚠ stash 栈顶不是本次自动 stash 的条目，已跳过 pop（用户 stash 未改动，本次改动仍在 " + sha[..12] + "）");
+			return;
+		}
 		(int ExitCode, string Output) pop = RunGit(dir, "stash pop", 60);
 		if (pop.ExitCode == 0)
 		{
@@ -1277,6 +1314,20 @@ public static class UpdateService
 			Path.Combine(tmp, "llamadsh_convert.cmd"),
 			Path.Combine(tmp, "conversion_kit.zip")
 		})
+		{
+			if (OlderThan(f, ageCut))
+			{
+				TryDelete(f);
+			}
+		}
+		foreach (string f in Directory.GetFiles(tmp, "LlamaDSH_dsh_rebuild_*.cmd"))
+		{
+			if (OlderThan(f, ageCut))
+			{
+				TryDelete(f);
+			}
+		}
+		foreach (string f in Directory.GetFiles(tmp, "LlamaDSH_dsh_rebuild_*.log"))
 		{
 			if (OlderThan(f, ageCut))
 			{

@@ -16,7 +16,7 @@ namespace LlamaDSH_Launcher.Services;
 /// 线程模型: PollFast/PollSlowIfNeeded 由性能采集线程按拍调用; FeedLogLine 由
 /// stdout 泵线程调用; 所有可变状态统一用 _lock 保护, UI 侧一律走 *Snapshot()。
 /// </summary>
-public sealed class LlamaApiMonitor
+public sealed class LlamaApiMonitor : IDisposable
 {
 	// ============ 对外数据契约(语义 = llama.cpp 公开 API 字段) ============
 
@@ -149,6 +149,19 @@ public sealed class LlamaApiMonitor
 	private readonly LinkedList<WatchEvent> _events = new();
 
 	private int _failStreak;
+
+	/// <summary>释放内部 HttpClient（连接池与非托管句柄）。调用方须先停掉 perf 轮询线程。</summary>
+	public void Dispose()
+	{
+		try
+		{
+			_http.Dispose();
+		}
+		catch (Exception ex)
+		{
+			AppLog.WriteError("释放 llama API HttpClient 失败: " + ex.Message);
+		}
+	}
 	private double _nextSlowPollAt;
 	private double _nextRescanAt;
 	private bool _slowInFlight;

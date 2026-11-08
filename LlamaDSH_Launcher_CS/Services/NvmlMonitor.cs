@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -69,6 +69,21 @@ public static partial class NvmlMonitor
 
 	private static double _lastTry;
 
+	// 非 NVIDIA 机器上"找不到 nvml.dll"是正常状态, 但 EnsureInit 每 60s 重试一次,
+	// 每次失败都按 error 落盘会把真错误埋掉(实测 AMD 机器 error.log 已 1.3 MB / 9000+ 行)。
+	// 同一子系统只报第一条, 之后的静默重试照旧。
+	private static bool _failureLogged;
+
+	private static void LogFailureOnce(string what)
+	{
+		if (_failureLogged)
+		{
+			return;
+		}
+		_failureLogged = true;
+		AppLog.WriteError(what);
+	}
+
 	private static void EnsureInit()
 	{
 		if (_ok)
@@ -100,7 +115,7 @@ public static partial class NvmlMonitor
 			}
 			if (_lib == IntPtr.Zero)
 			{
-				AppLog.WriteError("NVML 加载失败: 未找到 nvml.dll(PCIe 吞吐/功率将回退 nvidia-smi)");
+				LogFailureOnce("NVML 加载失败: 未找到 nvml.dll(PCIe 吞吐/功率将回退 nvidia-smi)");
 				return;
 			}
 			var init = GetFn<IntFn>("nvmlInit_v2");
@@ -110,7 +125,7 @@ public static partial class NvmlMonitor
 				// 不释放会随进程存活持续泄漏 nvml.dll 引用计数
 				FreeLibrary(_lib);
 				_lib = IntPtr.Zero;
-				AppLog.WriteError("NVML 初始化失败: nvmlInit 非零返回");
+				LogFailureOnce("NVML 初始化失败: nvmlInit 非零返回");
 				return;
 			}
 			_ok = true;
@@ -119,7 +134,7 @@ public static partial class NvmlMonitor
 		{
 			_ok = false;
 			_lib = IntPtr.Zero;
-			AppLog.WriteError("NVML 初始化异常: " + ex.Message);
+			LogFailureOnce("NVML 初始化异常: " + ex.Message);
 		}
 	}
 

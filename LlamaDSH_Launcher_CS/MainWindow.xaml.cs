@@ -66,6 +66,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private CancellationTokenSource? _dshTailCts;
 
+	// python/pip/转换这条环境自动化链的取消源: 退出时取消, 免得 pip 挂起把启动流程永久钉住
+	private CancellationTokenSource? _envChainCts;
+
 	// 最近一次 AutoFill 提示集合（用于去重，避免击键刷屏）
 	private string? _lastAutoFillHints;
 
@@ -108,6 +111,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private int _runLogCount;
 
+	// 运行日志的单调行序号(agent logs 游标基准), 与 _runLogCount 不同: 后者折叠时会回退
+	private long _runLogSeq;
+
 	private const int RunLogMaxLines = 5000;
 
 	private string _configDir;
@@ -149,6 +155,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	/// <summary>本次点击"启动"后是否已经尝试过"重连 node_modules 链接"自愈，避免反复触发。</summary>
 	private bool _dshModuleHealTried;
+
+	// 启动前检查(残留锁/升级检测)进行中标记: 检查已移出 UI 线程, 期间再点按钮会并发两次
+	private bool _dshPrepareBusy;
 
 	/// <summary>测试启动时临时打开了 --log-verbose，停止后需要还原。</summary>
 	private bool _vramTestVerboseRestore;
@@ -1037,22 +1046,72 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			flag3 = messageBoxResult == MessageBoxResult.Yes;
 		}
-		if (flag3)
+		_exiting = true;
+		ExitCore(flag3);
+		System.Windows.Application.Current.Shutdown();
+	}
+
+	/// <summary>退出收尾：托盘「退出程序」与窗口关闭共用同一份逻辑。
+	/// Stop 里的杀树是 fire-and-forget，而 Shutdown 不等后台线程池——托盘这条路径此前先删状态文件
+	/// 再退出，结果是孤儿 llama-server/DSH 常驻（显存不释放），下次启动既接管不到（状态文件已删）
+	/// 又停不下来，只能报「端口已被占用」。</summary>
+	private void ExitCore(bool stopServices)
+	{
+		if (stopServices)
 		{
+			int? llamaPid = _llamaProc?.Id;
+			int? dshPid = _dshTracker?.Pid ?? _dshProc?.Id;
 			StopLlama();
 			StopDsh();
+			try
+			{
+				if (llamaPid.HasValue)
+				{
+					ProcessHelper.KillProcessTree(llamaPid.Value);
+				}
+			}
+			catch (Exception ex)
+			{
+				LogError(ex, "退出时补杀 llama 进程树失败");
+			}
+			try
+			{
+				if (dshPid.HasValue)
+				{
+					ProcessHelper.KillProcessTree(dshPid.Value);
+				}
+			}
+			catch (Exception ex)
+			{
+				LogError(ex, "退出时补杀 DSH 进程树失败");
+			}
 			ClearStateFile();
 		}
 		else
 		{
 			SaveState();
 		}
+		SaveWindowSize();
+		try
+		{
+			_envChainCts?.Cancel();
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "取消环境自动化链失败");
+		}
 		StopPerf();
-		_exiting = true;
 		FlushRunLog();
+		try
+		{
+			_agentApi?.Stop();
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "停止 Agent 接口失败");
+		}
 		_trayIcon?.Dispose();
-		_trayIcon = null;
-		System.Windows.Application.Current.Shutdown();
+		_trayIcon = null; // 重入的托盘分支会对已 Dispose 的 NotifyIcon 调方法
 	}
 
 	private void BrowseModel_Click(object s, RoutedEventArgs e)
@@ -4150,8 +4209,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		return null;
 	}
 
-	// 启动进程并实时把输出泵进日志，返回退出码
-	private System.Threading.Tasks.Task<int> RunProcessWithLog(string exe, string args, string cwd, string tag)
+	// 启动进程并实时把输出泵进日志，返回退出码。
+	// 默认 30 分钟超时：python/pip 卡死时（网络异常能挂十几分钟）没有 deadline 会让整条
+	// async void 链永久挂起 —— 启动按钮长灰、无取消入口，退出启动器后进程还在后台跑。
+	private System.Threading.Tasks.Task<int> RunProcessWithLog(string exe, string args, string cwd, string tag, int timeoutMs = 1800000, CancellationToken ct = default)
 	{
 		System.Threading.Tasks.TaskCompletionSource<int> tcs = new System.Threading.Tasks.TaskCompletionSource<int>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
 		try
@@ -4176,6 +4237,46 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				return tcs.Task;
 			}
 			Process? p = proc;
+			CancellationTokenRegistration reg = default(CancellationTokenRegistration);
+			bool hasReg = false;
+			if (ct.CanBeCanceled)
+			{
+				reg = ct.Register(delegate
+				{
+					try
+					{
+						if (p != null && !p.HasExited)
+						{
+							p.Kill(true);
+							Log("[" + tag + "] 收到取消指令，已结束进程");
+						}
+					}
+					catch (Exception ex)
+					{
+						LogError(ex, tag + " 取消时结束进程失败");
+					}
+				});
+				hasReg = true;
+			}
+			System.Threading.Timer? timer = null;
+			if (timeoutMs > 0)
+			{
+				timer = new System.Threading.Timer(delegate
+				{
+					try
+					{
+						if (p != null && !p.HasExited)
+						{
+							p.Kill(true);
+							Log("[" + tag + "] 超过 " + (timeoutMs / 60000) + " 分钟未完成，已强制结束");
+						}
+					}
+					catch (Exception ex)
+					{
+						LogError(ex, tag + " 超时强制结束失败");
+					}
+				}, null, timeoutMs, Timeout.Infinite);
+			}
 			PumpProcessStreams(p, tag + " ", delegate
 			{
 				int code = 0;
@@ -4187,6 +4288,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 				}
 				DisposeProc(ref p);
+				timer?.Dispose();
+				if (hasReg)
+				{
+					reg.Dispose();
+				}
 				tcs.TrySetResult(code);
 			});
 		}
@@ -4201,6 +4307,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	// 环境自动化总入口：python 检测 → 下载转换脚本 → 安装 pip 依赖 → 转换 → 继续启动
 	private async void EnsureConvertAndLaunchAsync(string dir, string outtype)
 	{
+		// 退出时取消整条链: pip 挂起会让启动按钮永久灰, 而进程会在启动器退出后继续跑
+		_envChainCts?.Dispose();
+		_envChainCts = new CancellationTokenSource();
+		CancellationToken envCt = _envChainCts.Token;
 		try
 		{
 			string? py = null;
@@ -4228,7 +4338,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			Log("[环境] 检查/安装 python 依赖: gguf torch transformers sentencepiece (首次可能需下载数 GB，请耐心等待)");
 			string mirror = " -i https://pypi.tuna.tsinghua.edu.cn/simple";
 			string pipArgs = ((pyPre.Length > 0) ? (pyPre + " ") : "") + "-m pip install --disable-pip-version-check --progress-bar off gguf torch transformers sentencepiece";
-			int rc = await RunProcessWithLog(py, pipArgs + mirror, null, "[pip]");
+			int rc = await RunProcessWithLog(py, pipArgs + mirror, null, "[pip]", 1800000, envCt);
 			if (rc != 0)
 			{
 				Log("[环境] 清华镜像安装失败，改用官方 PyPI 重试 ...");
@@ -4800,7 +4910,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			int killPid = pid.Value;
 			Task.Run(() => ProcessHelper.KillProcessTree(killPid));
 		}
-		DisposeProc(ref _llamaProc);
+		DetachProc(ref _llamaProc);
 		ClearStateFor("llama");
 		_ = FinishStopLlamaAsync(pid);
 	}
@@ -4867,6 +4977,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		int? existing = ProcessHelper.FindProcessByPort(3080);
 		if (existing.HasValue)
 		{
+			// 端口上有进程 ≠ 那是 DSH：无身份校验就接管，用户自己跑在 3080 的进程会被标成
+			// "接管运行中"，点"停止"即被 KillProcessTree 杀掉整棵树。
+			if (!ProcessHelper.LooksLikeDshProcess(existing.Value, EffectiveDshDir()))
+			{
+				ShowNotice($"端口 3080 已被 PID {existing.Value} 占用，但它不是可识别的 DSH 进程（进程名/命令行不匹配）。\n不会接管、也不会停止它：请自行结束该进程，或改用其它 DSH 端口。", isError: true);
+				return;
+			}
 			_dshRetriesLeft = 0;
 			_dshProc = null;
 			_dshTracker = null;
@@ -4942,55 +5059,107 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// DSH 启动前的维护步骤（依据 DSH_启动操作记录_20260830.md 遗留建议）:
 	/// 1) 无 host 运行时自动清理 task-board 残留锁; 2) git HEAD 变化时提示自动重建编译产物。
 	/// </summary>
-	private void PrepareDshThenStart()
+	private async void PrepareDshThenStart()
 	{
-		// 1) 残留锁: 锁存在 + 端口无监听 + 无 DSH node 进程 → 判定为未干净关闭的残留
+		if (_dshPrepareBusy)
+		{
+			Log("[DSH] 启动前检查已在进行，忽略重复点击");
+			return;
+		}
+		_dshPrepareBusy = true;
+		bool started = false;
 		try
 		{
-			if (DshMaintenance.IsStaleLockPresent(3080))
+			string dshDir = EffectiveDshDir();
+			bool localMode = ComboDshMode.SelectedIndex == 0;
+			bool staleLock = false;
+			string? head = null;
+			string? builtHead = null;
+			string? builtAt = null;
+			// 残留锁判定要扫端口/进程(WMI), 升级检测要跑 git: 合起来最坏好几秒,
+			// 留在 UI 线程上就是"点启动整窗冻住"的直接原因。
+			await Task.Run(delegate
 			{
-				File.Delete(DshMaintenance.LockPath);
-				Log("[DSH] 已自动清理残留锁: " + DshMaintenance.LockPath);
-			}
-		}
-		catch (Exception lockEx)
-		{
-			Log("[DSH] 清理残留锁失败(不影响启动): " + lockEx.Message);
-		}
-		// 2) 升级检测: 仅本地目录模式(npx 安装模式无仓库可检测)
-		if (ComboDshMode.SelectedIndex == 0)
-		{
-			try
-			{
-				string dshDir = EffectiveDshDir();
-				string? head = DshMaintenance.GetGitHead(dshDir);
-				(string? builtHead, string? builtAt) = DshMaintenance.LoadBuildState();
-				if (head != null && builtHead != null && builtHead != head)
+				try
 				{
-					string msg = "检测到 DSH 仓库已升级 (基线 " + builtHead.Substring(0, 7) + " → 当前 " + head.Substring(0, 7) + ")。\n\n"
-						+ "旧编译产物会导致启动失败(大面积 MISSING_EXPORT)，需要全量重建:\n"
-						+ "  1/3 pnpm clean\n  2/3 pnpm build:lib\n  3/3 build:web (vite)\n\n"
-						+ "是 = 现在自动重建 (后台运行，约几分钟，断开远程不中断)\n"
-						+ "否 = 跳过重建直接启动 (大概率报旧产物错误)";
-					if (System.Windows.MessageBox.Show(msg, "DSH 升级重建", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
-					{
-						StartDshRebuild(dshDir, head, PrepareDshThenStart);
-						return;
-					}
-					Log("[DSH] 跳过重建直接启动 (上次重建基线 " + builtAt + ")，旧产物可能报错");
+					staleLock = DshMaintenance.IsStaleLockPresent(3080);
 				}
-				else if (head != null && builtHead == null)
+				catch (Exception lockEx)
 				{
-					DshMaintenance.SaveBuildState(head);
-					Log("[DSH] 已记录 DSH 构建基线 HEAD " + head.Substring(0, 7) + " (之后仓库升级将提示自动重建)");
+					Log("[DSH] 检测残留锁失败(不影响启动): " + lockEx.Message);
+				}
+				if (!localMode)
+				{
+					return;
+				}
+				try
+				{
+					head = DshMaintenance.GetGitHead(dshDir);
+					(string? bh, string? ba) = DshMaintenance.LoadBuildState();
+					builtHead = bh;
+					builtAt = ba;
+				}
+				catch (Exception upEx)
+				{
+					Log("[DSH] 升级检测失败(不影响启动): " + upEx.Message);
+				}
+			});
+			// 1) 残留锁: 锁存在 + 端口无监听 + 无 DSH node 进程 → 判定为未干净关闭的残留
+			if (staleLock)
+			{
+				try
+				{
+					File.Delete(DshMaintenance.LockPath);
+					Log("[DSH] 已自动清理残留锁: " + DshMaintenance.LockPath);
+				}
+				catch (Exception lockEx2)
+				{
+					Log("[DSH] 清理残留锁失败(不影响启动): " + lockEx2.Message);
 				}
 			}
-			catch (Exception upEx)
+			// 2) 升级检测: 仅本地目录模式(npx 安装模式无仓库可检测)
+			if (localMode && head != null && builtHead != null && builtHead != head)
 			{
-				Log("[DSH] 升级检测失败(不影响启动): " + upEx.Message);
+				string msg = "检测到 DSH 仓库已升级 (基线 " + builtHead.Substring(0, 7) + " → 当前 " + head.Substring(0, 7) + ")。\n\n"
+					+ "旧编译产物会导致启动失败(大面积 MISSING_EXPORT)，需要全量重建:\n"
+					+ "  1/3 pnpm clean\n  2/3 pnpm build:lib\n  3/3 build:web (vite)\n\n"
+					+ "是 = 现在自动重建 (后台运行，约几分钟，断开远程不中断)\n"
+					+ "否 = 跳过重建直接启动 (大概率报旧产物错误)";
+				if (System.Windows.MessageBox.Show(msg, "DSH 升级重建", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+				{
+					StartDshRebuild(dshDir, head, PrepareDshThenStart);
+					return;
+				}
+				Log("[DSH] 跳过重建直接启动 (上次重建基线 " + builtAt + ")，旧产物可能报错");
+			}
+			else if (localMode && head != null && builtHead == null)
+			{
+				DshMaintenance.SaveBuildState(head);
+				Log("[DSH] 已记录 DSH 构建基线 HEAD " + head.Substring(0, 7) + " (之后仓库升级将提示自动重建)");
+			}
+			StartDsh();
+			started = true;
+		}
+		catch (Exception ex)
+		{
+			// async void 里没接住的异常会直接掀掉进程; 兜底: 检查阶段失败仍按原流程启动一次
+			LogError(ex, "DSH 启动前检查异常(继续按原流程启动)");
+			if (!started)
+			{
+				try
+				{
+					StartDsh();
+				}
+				catch (Exception ex2)
+				{
+					LogError(ex2, "DSH 启动兜底也失败");
+				}
 			}
 		}
-		StartDsh();
+		finally
+		{
+			_dshPrepareBusy = false;
+		}
 	}
 
 	/// <summary>
@@ -5018,8 +5187,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				BtnRebuildDsh.IsEnabled = true;
 				return;
 			}
-			string logPath = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_rebuild.log");
-			string cmdPath = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_rebuild.cmd");
+			// 每次重建用带 PID+时间的独立日志/引导文件名: 上一次重建的 cmd 还持着固定名字的
+			// 文件句柄时, File.WriteAllText 会抛 IOException 让整次重建被跳过(error.log 里
+			// "DSH 重建启动失败: IOException …LlamaDSH_dsh_rebuild.log" 就是这个), 结果仓库
+			// 升级了却没重建。旧文件由 UpdateService.CleanupOldTemp 按通配清理。
+			string stamp = Environment.ProcessId + "-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+			string logPath = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_rebuild_" + stamp + ".log");
+			string cmdPath = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_rebuild_" + stamp + ".cmd");
 			string nodeDir = Path.GetDirectoryName(nodeExe) ?? "";
 			string pnpmDir = Path.GetDirectoryName(pnpmExe) ?? "";
 			string pathPrefix = string.Join(";", new[] { nodeDir, pnpmDir }.Where(delegate (string x) { return !string.IsNullOrEmpty(x); }));
@@ -5142,6 +5316,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		try
 		{
+			string? exitCode = null;
 			if (File.Exists(_dshRebuildLogPath))
 			{
 				using (FileStream fs = new FileStream(_dshRebuildLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
@@ -5162,24 +5337,19 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 							foreach (string line in array)
 							{
 								string t = line.TrimEnd();
-								if (t.Length > 0)
+								if (t.Length <= 0)
 								{
-									Log("[DSH重建] " + ((t.Length > 300) ? (t.Substring(0, 300) + "…") : t));
+									continue;
 								}
+								if (t.StartsWith("EXITCODE:", StringComparison.Ordinal))
+								{
+									// 结束标记在增量块里顺手取走: 以前每 2 秒还要把整份构建日志
+									// 重读一遍找它, 几 MB 的 vite 输出足以把 UI 线程卡住
+									exitCode = t.Substring(9).Trim();
+									continue;
+								}
+								Log("[DSH重建] " + ((t.Length > 300) ? (t.Substring(0, 300) + "…") : t));
 							}
-						}
-					}
-				}
-				string? exitCode = null;
-				using (FileStream ef = new FileStream(_dshRebuildLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-				using (StreamReader er = new StreamReader(ef))
-				{
-					string line2;
-					while ((line2 = er.ReadLine()) != null)
-					{
-						if (line2.StartsWith("EXITCODE:"))
-						{
-							exitCode = line2.Substring(9).Trim();
 						}
 					}
 				}
@@ -5846,37 +6016,83 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void OnDshDone()
 	{
-		if (HasDsh())
+		// 收尾守卫方向不能反：这里被调用的前提正是"进程已退出"。原先写成 if (HasDsh())，
+		// 而 HasDsh() 在进程死后返回 false，于是 DSH 崩溃/被外部结束时的整段收尾
+		// （状态标签、按钮复位、状态文件）全被跳过 —— 界面永远停在"● 运行中"、
+		// 启动按钮永久禁用，只能重启启动器（托盘 tooltip 却写"DSH:已停止"，自相矛盾）。
+		if (_dshProc == null && _dshTracker == null)
 		{
-			int num = _dshProc?.Id ?? _dshTracker?.Pid ?? 0;
-			string dd = EffectiveDshDir();
-			int? num2 = ResolveDshPid(num, dd);
-			if (num2.HasValue && num2.Value != num)
+			return;
+		}
+		bool stillAlive = (_dshProc != null && !_dshProc.HasExited) || (_dshTracker != null && !_dshTracker.Poll().HasValue);
+		if (stillAlive)
+		{
+			// 输出流提前结束（子孙继承了管道句柄）但进程还在：不改状态，HealthCheck 会继续对账
+			return;
+		}
+		int exitCode = 0;
+		try
+		{
+			if (_dshProc != null && _dshProc.HasExited)
 			{
-				_dshTracker = new ProcessTracker(num2.Value);
-				DisposeProc(ref _dshProc);
-				SaveState();
-				BtnOpenDsh.IsEnabled = true;
-				Log($"DSH wrapper {num}->{num2.Value}");
+				exitCode = _dshProc.ExitCode;
+			}
+		}
+		catch (Exception ex)
+		{
+			Log("[DSH] 读取退出码失败: " + ex.Message);
+		}
+		int num = _dshProc?.Id ?? _dshTracker?.Pid ?? 0;
+		string dd = EffectiveDshDir();
+		int? num2 = ResolveDshPid(num, dd);
+		if (num2.HasValue && num2.Value != num && !ProcessHelper.LooksLikeDshProcess(num2.Value, dd))
+		{
+			// 端口上找到的"新 pid"其实不是 DSH：不能把它当接管对象记账
+			Log($"[DSH] 端口 3080 上的 PID {num2.Value} 不像 DSH，不作为接管目标");
+			num2 = null;
+		}
+		if (num2.HasValue && num2.Value != num)
+		{
+			_dshTracker = new ProcessTracker(num2.Value);
+			DisposeProc(ref _dshProc);
+			SaveState();
+			BtnOpenDsh.IsEnabled = true;
+			Log($"DSH wrapper {num}->{num2.Value}");
+		}
+		else
+		{
+			StopDshLogTailer();
+			DisposeProc(ref _dshProc);
+			_dshTracker = null;
+			BtnDshStart.IsEnabled = true;
+			BtnDshStop.IsEnabled = false;
+			BtnOpenDsh.IsEnabled = false;
+			if (exitCode != 0)
+			{
+				// 崩溃与主动停止必须可区分：否则用户只看到"已停止"，排障只能翻日志猜
+				LblDshStatus.Text = "● 异常退出(码 " + exitCode + ")";
+				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
+				LogError(new Exception("DSH 退出码 " + exitCode), "--- DSH 异常退出 (pid=" + num + ") ---");
 			}
 			else
 			{
-				DisposeProc(ref _dshProc);
-				_dshTracker = null;
-				BtnDshStart.IsEnabled = true;
-				BtnDshStop.IsEnabled = false;
-				BtnOpenDsh.IsEnabled = false;
 				LblDshStatus.Text = "● 已停止";
 				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
 				Log("--- DSH 已退出 ---");
-				ClearStateFor("dsh");
 			}
+			ClearStateFor("dsh");
 		}
 	}
 
 	private void StopDsh()
 	{
-		if (!HasDsh() && !ProcessHelper.FindProcessByPort(3080).HasValue)
+		int? portOwner = ProcessHelper.FindProcessByPort(3080);
+		if (portOwner.HasValue && !ProcessHelper.LooksLikeDshProcess(portOwner.Value, EffectiveDshDir()))
+		{
+			// 3080 上的进程不是 DSH：既不该被停止，也不该成为提权 taskkill 的目标
+			portOwner = null;
+		}
+		if (!HasDsh() && !portOwner.HasValue)
 		{
 			return;
 		}
@@ -5887,17 +6103,33 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		LblDshStatus.Text = "● 停止中...";
 		LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(240, 136, 62));
 		// 提权模式下 _dshProc 恒为 null，被托管的 pid 在 _dshTracker 里；先记下来供 UIPI 回退使用
-		int? adminKillPid = (_dshTracker?.Pid ?? _dshProc?.Id ?? ProcessHelper.FindProcessByPort(3080)); // 接管来的提权/外部进程同样需要 UIPI 回退
+		int? adminKillPid = (_dshTracker?.Pid ?? _dshProc?.Id ?? portOwner); // 接管来的提权/外部进程同样需要 UIPI 回退
+		// 记下进程启动时刻: PID 会被复用, 没有身份校验的 /F /T 提权 taskkill 可能杀掉无关进程树
+		DateTime? adminKillStart = null;
+		if (adminKillPid.HasValue)
+		{
+			try
+			{
+				using Process probe = Process.GetProcessById(adminKillPid.Value);
+				adminKillStart = probe.StartTime;
+			}
+			catch (Exception ex)
+			{
+				Log("[DSH] 停止前探测进程身份失败: " + ex.Message);
+				adminKillPid = null;
+			}
+		}
+		Task? killTask = null;
 		if (_dshProc != null)
 		{
 			Log("--- 正在停止 DSH ---");
 			int killPid1 = _dshProc.Id;
-			Task.Run(() => ProcessHelper.KillProcessTree(killPid1));
+			killTask = Task.Run(() => ProcessHelper.KillProcessTree(killPid1));
 		}
 		if (_dshTracker != null)
 		{
 			int killPid2 = _dshTracker.Pid;
-			Task.Run(() =>
+			killTask = Task.Run(() =>
 			{
 				try
 				{
@@ -5911,6 +6143,16 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		if (adminKillPid.HasValue)
 		{
+			// 杀树只是排队: 同一毫秒查 stillAlive 几乎必然为 true, 于是每次停止都白弹一次 UAC,
+			// 而授权落地时原 PID 常已释放。先等杀树落定(最多 1.5s)再决定要不要提权补杀。
+			try
+			{
+				killTask?.Wait(1500);
+			}
+			catch (AggregateException aex)
+			{
+				LogError(aex, "DSH 杀树任务异常(继续判断是否需要提权补杀)");
+			}
 			// UIPI：中完整性的启动器无法 TerminateProcess 高完整性（提权）子进程，普通停止会失败；
 			// 此时用同样的 runas 静默提权起一个 taskkill 收尾。
 			bool stillAlive = false;
@@ -5918,7 +6160,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				using (Process process = Process.GetProcessById(adminKillPid.Value))
 				{
-					stillAlive = !process.HasExited;
+					// 同一个 PID 但启动时刻不同 = 已被复用, 绝不能对它 /T
+					stillAlive = !process.HasExited && (!adminKillStart.HasValue || process.StartTime == adminKillStart.Value);
 				}
 			}
 			catch
@@ -5945,7 +6188,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 		}
 		_dshAdminMode = false;
-		DisposeProc(ref _dshProc);
+		DetachProc(ref _dshProc); // 不提前 Dispose: 让读线程把管道尾巴塞完
 		_dshTracker = null;
 		BtnOpenDsh.IsEnabled = false;
 		Log("--- 已下发停止 DSH 指令，等待进程彻底退出 ---");
@@ -6124,7 +6367,29 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			pump(proc.StandardError);
 		});
-		Task.WhenAll(task, task2).ContinueWith((Task _) => ((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)onExited, Array.Empty<object>()));
+		Task.WhenAll(task, task2).ContinueWith(delegate (Task _)
+		{
+			// 释放权归泵本身: Stop 里提前 Dispose(Process) 会连带 Dispose 它的 StandardOutput/
+			// StandardError 读取器, 读线程随即抛 ObjectDisposedException 被吞掉, 尾部日志永久丢失,
+			// onExited 也会在进程还没退出时就触发。管道 EOF 之后再释放才不丢东西。
+			try
+			{
+				proc.Dispose();
+			}
+			catch (Exception ex)
+			{
+				LogError(ex, "释放子进程对象失败(" + tag + ")");
+			}
+			((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)onExited, Array.Empty<object>());
+		});
+	}
+
+	/// <summary>只摘走 Process 引用而不 Dispose：对象由 PumpProcessStreams 在管道 EOF 后释放。</summary>
+	private static Process? DetachProc(ref Process? p)
+	{
+		Process? old = p;
+		p = null;
+		return old;
 	}
 
 	private void FlushLogs()
@@ -6299,6 +6564,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		lock (_runLogLock)
 		{
 			_runLog.AppendLine(line);
+			// 单调递增的行序号: agent `logs?after=` 游标要用它。折叠只裁缓冲, 序号不回退,
+			// 于是"缓冲里最后一行的序号"就能反推每一行的序号。
+			_runLogSeq++;
 			if (++_runLogCount > 5000)
 			{
 				string text = _runLog.ToString();
@@ -6831,15 +7099,47 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		_perfCts = null;
 		_perfThread = null;
 		_gpuMonitor.StopGpuTempLoop();
+		DisposePerfCounters();
 		try
 		{
-			_cpuCounter?.Dispose();
+			_llamaApi?.Dispose();
 		}
 		catch (Exception ex)
 		{
-			LogError(ex, "释放 CPU 计数器失败");
+			LogError(ex, "释放 llama API 监视器失败");
 		}
+		_llamaApi = null;
+	}
+
+	/// <summary>PDH 计数器是非托管句柄(每块网卡还是一对), 之前只释放了 CPU 那一个。
+	/// perf 线程一旦支持重启(托盘轻量档), 泄漏就会按轮次累积。</summary>
+	private void DisposePerfCounters()
+	{
+		try { _cpuCounter?.Dispose(); } catch (Exception ex) { LogError(ex, "释放 CPU 计数器失败"); }
 		_cpuCounter = null;
+		try { _diskReadCounter?.Dispose(); } catch (Exception ex) { LogError(ex, "释放磁盘读计数器失败"); }
+		_diskReadCounter = null;
+		try { _diskWriteCounter?.Dispose(); } catch (Exception ex) { LogError(ex, "释放磁盘写计数器失败"); }
+		_diskWriteCounter = null;
+		try { _ramAvailCounter?.Dispose(); } catch (Exception ex) { LogError(ex, "释放可用内存计数器失败"); }
+		_ramAvailCounter = null;
+		if (_coreCounters != null)
+		{
+			foreach (PerformanceCounter pc in _coreCounters)
+			{
+				try { pc.Dispose(); } catch (Exception ex) { LogError(ex, "释放核心计数器失败"); }
+			}
+			_coreCounters = null;
+		}
+		if (_netCounters != null)
+		{
+			foreach ((string _, PerformanceCounter rx, PerformanceCounter tx) in _netCounters)
+			{
+				try { rx.Dispose(); } catch (Exception ex) { LogError(ex, "释放网卡接收计数器失败"); }
+				try { tx.Dispose(); } catch (Exception ex) { LogError(ex, "释放网卡发送计数器失败"); }
+			}
+			_netCounters = new List<(string name, PerformanceCounter rx, PerformanceCounter tx)>();
+		}
 	}
 
 	/// <summary>
@@ -8346,6 +8646,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			catch (Exception ex)
 			{
 				LogError(ex, "状态保存失败");
+				// 状态文件写不进去 = 下次启动接管不到正在运行的 llama/DSH，必须让用户看见
+				ShowNotice("接管状态保存失败（下次启动可能无法接管正在运行的服务）：" + ex.Message, isError: true);
 				return;
 			}
 		}
@@ -8478,6 +8780,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void AttachDsh(int pid, string logPrefix, bool saveState)
 	{
+		// 接管前先证明"那是 DSH"：端口探测只说明 3080 有人占着，不构成身份证据。
+		// 无校验接管后点"停止"会对它执行 KillProcessTree，用户的无关进程树直接被杀。
+		if (!ProcessHelper.LooksLikeDshProcess(pid, EffectiveDshDir()))
+		{
+			Log($"[DSH] PID {pid} 的进程名/命令行不像 DSH，拒绝接管（避免误停无关进程）");
+			return;
+		}
 		_dshTracker = new ProcessTracker(pid);
 		BtnDshStart.IsEnabled = false;
 		BtnDshStop.IsEnabled = true;
@@ -8548,15 +8857,33 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	// 状态文件半写入(杀进程/断电)会导致重启后无法接管 llama/DSH, 代价高。
 	private static void WriteTextAtomic(string path, string text)
 	{
-		string tmpPath = path + ".tmp";
+		// 临时名必须唯一：状态文件/配置文件有多个写者（UI 保存、agent config/save、OOM 落盘、
+		// LoadState 收尾），共用固定 .tmp 时后一个写者的 File.Replace 会因为 tmp 已被前一个
+		// 写者换走而抛 FileNotFoundException，那一次保存就无声丢失。
+		string tmpPath = path + "." + Environment.ProcessId + "." + Guid.NewGuid().ToString("N") + ".tmp";
 		File.WriteAllText(tmpPath, text);
-		if (File.Exists(path))
+		try
 		{
-			File.Replace(tmpPath, path, null);
+			if (File.Exists(path))
+			{
+				File.Replace(tmpPath, path, path + ".bak"); // 顺手留一份上一版，半写入历史可回滚
+			}
+			else
+			{
+				File.Move(tmpPath, path);
+			}
 		}
-		else
+		catch (Exception)
 		{
-			File.Move(tmpPath, path);
+			try
+			{
+				File.Delete(tmpPath);
+			}
+			catch
+			{
+				// 清理失败只留一个 .tmp 残file，不影响主异常上抛
+			}
+			throw;
 		}
 	}
 
@@ -8673,6 +9000,39 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		_customArgs = c.CustomArgs != null ? new List<string>(c.CustomArgs) : new List<string>();
 		// llama.cpp 参数改名后，旧 profile 里旧 flag 键的值自动迁移到新 flag
 		ParamSchemaService.MigrateProfileFlags(c, _paramDefs);
+		// 先按 schema 默认值全量复位控件：下面只会覆盖 profile 里出现的键，
+		// 不复位的话上一个方案的勾选/文本会残留进来，再点保存就把 A 的值静默写进 B。
+		foreach (ParamDefinition d in _paramDefs)
+		{
+			if (d.Type == ParamType.Bool)
+			{
+				if (_pbw.TryGetValue(d.Flag, out System.Windows.Controls.CheckBox boolBox))
+				{
+					boolBox.IsChecked = string.Equals(d.DefaultValue, "true", StringComparison.OrdinalIgnoreCase);
+				}
+				continue;
+			}
+			if (_pw.TryGetValue(d.Flag, out (System.Windows.Controls.CheckBox Cb, System.Windows.Controls.Control Ed) row))
+			{
+				row.Cb.IsChecked = d.Enabled;
+				if (row.Ed is System.Windows.Controls.ComboBox combo)
+				{
+					combo.Text = d.DefaultValue ?? "";
+				}
+				else if (row.Ed is System.Windows.Controls.TextBox box)
+				{
+					box.Text = d.DefaultValue ?? "";
+				}
+			}
+		}
+		foreach (KeyValuePair<string, ValueParamData> kv in c.ValueParams)
+		{
+			if (!_pw.ContainsKey(kv.Key))
+			{
+				// 参数改名/删除后 profile 里的孤儿键：静默丢弃会让人以为设置还在
+				Log("[方案] " + _currentProfile + " 里的参数 \"" + kv.Key + "\" 在当前参数表里不存在，已忽略");
+			}
+		}
 		InputModelPath.Text = c.ModelPath;
 		InputMtpPath.Text = c.MtpPath;
 		InputMmprojPath.Text = c.MmprojPath;
@@ -8730,9 +9090,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				Directory.CreateDirectory(_configDir);
 			}
-			// 原子写: 半写入(进程被杀/断电)不再产生截断的配置文件
-			string tmpPath = path + ".tmp";
-			File.WriteAllText(tmpPath, JsonSerializer.Serialize(new ConfigFile
+			// 原子写: 半写入(进程被杀/断电)不再产生截断的配置文件(临时名唯一, 见 WriteTextAtomic)
+			WriteTextAtomic(path, JsonSerializer.Serialize(new ConfigFile
 			{
 				Profiles = _profiles,
 				CurrentProfile = _currentProfile,
@@ -8743,14 +9102,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				WriteIndented = true,
 				Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
 			}));
-			if (File.Exists(path))
-			{
-				File.Replace(tmpPath, path, null);
-			}
-			else
-			{
-				File.Move(tmpPath, path);
-			}
 		}
 		catch (Exception ex)
 		{
@@ -9516,35 +9867,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			flag3 = messageBoxResult == MessageBoxResult.Yes;
 		}
 		_exiting = true; // Shutdown 会再次触发 Closing, 入口守卫放行(此处先置位防重入二次弹窗)
-		if (flag3)
-		{
-			// 记录退出前 pid, Stop 的异步杀树若未及完成, Shutdown 前同步补杀
-			// (Shutdown 不等后台线程池, fire-and-forget 会让"停止并退出"落空)
-			int? llamaPid = _llamaProc?.Id;
-			int? dshPid = _dshTracker?.Pid ?? _dshProc?.Id;
-			StopLlama();
-			StopDsh();
-			try
-			{
-				if (llamaPid.HasValue) ProcessHelper.KillProcessTree(llamaPid.Value);
-			}
-			catch { }
-			try
-			{
-				if (dshPid.HasValue) ProcessHelper.KillProcessTree(dshPid.Value);
-			}
-			catch { }
-			ClearStateFile();
-		}
-		else
-		{
-			SaveState();
-		}
-		StopPerf();
-		FlushRunLog();
-		try { _agentApi?.Stop(); } catch { }
-		_trayIcon?.Dispose();
-		_trayIcon = null; // 重入的托盘分支会对已 Dispose 的 NotifyIcon 调方法
+		ExitCore(flag3);
 		System.Windows.Application.Current.Shutdown();
 	}
 
@@ -9566,13 +9889,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			api.RegisterGet("status", delegate { return AgentStatusJson(); });
 			api.RegisterGet("monitor", delegate { return AgentMonitorJson(); });
 			api.RegisterGet("logs", AgentLogsTail);
+			// Linux 侧 logs 是 POST(游标式)，Windows 原本只有 GET：两种方法都受理
+			api.RegisterPost("logs", AgentLogsTail);
 			api.RegisterGet("profiles", delegate { return AgentProfilesJson(); });
 			api.RegisterGet("breaker", delegate { return AgentBreakerGet(); });
 			api.RegisterGet("llama/raw", AgentLlamaRaw);
-			api.RegisterPost("llama/start", delegate { return AgentLlamaStart(); });
-			api.RegisterPost("llama/stop", delegate { return AgentLlamaStop(); });
-			api.RegisterPost("dsh/start", delegate { return AgentDshStart(); });
-			api.RegisterPost("dsh/stop", delegate { return AgentDshStop(); });
+			api.RegisterPost("llama/start", delegate (string body) { return AgentLlamaStart(body); });
+			api.RegisterPost("llama/stop", delegate (string body) { return AgentLlamaStop(body); });
+			api.RegisterPost("dsh/start", delegate (string body) { return AgentDshStart(body); });
+			api.RegisterPost("dsh/stop", delegate (string body) { return AgentDshStop(body); });
 			api.RegisterPost("lightweight", AgentLightweight);
 			api.RegisterPost("window", AgentWindowOp);
 			api.RegisterPost("profiles/use", AgentProfileUse);
@@ -9586,8 +9911,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}
 				return AgentOk("运行日志缓冲已清空(LogArea 界面内容不动)");
 			});
-			api.RegisterPost("config/save", delegate
+			api.RegisterPost("config/save", delegate (string body)
 			{
+				// Linux 侧 config/save 接收完整 config 对象并落盘；Windows 侧写的是界面当前状态。
+				// 带 config 字段时必须明确拒绝，否则会"报告成功但一个字都没写"。
+				if (AgentBodyHasProp(body, "config"))
+				{
+					return AgentErr("Windows 侧 config/save 只把界面当前状态写回配置文件，不接受请求体里的 config 对象。改配置请用 profiles/use + 界面，或 /api/breaker 等专用端点");
+				}
 				return AgentOp(delegate
 				{
 					_profiles[_currentProfile] = BuildConfig();
@@ -9596,6 +9927,19 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				});
 			});
 			api.RegisterPost("quit", AgentQuitOp);
+			// 分钟级操作一律走任务模型（对齐 Linux 侧 run_job/api_job）：立即返回 {"job":"<id>"}，
+			// 由调用方轮询 GET /api/job?id=。同步返回会撞 AgentOp 的 30s 上限——客户端先放弃、
+			// 这边还在跑，同一操作被重复执行（webui 已修过同一族问题）。
+			api.RegisterGet("job", delegate (string q) { return AgentJobJson(AgentQueryStr(q, "id")); });
+			api.RegisterPost("job", delegate (string body) { return AgentJobJson(AgentBodyStr(body, "id")); });
+			api.RegisterPost("update/check", AgentUpdateCheckOp);
+			api.RegisterPost("update/do", AgentUpdateDoOp);
+			api.RegisterPost("dsh/compat", AgentCompatOp);
+			api.RegisterPost("dsh/compat/repair", AgentCompatRepairOp);
+			api.RegisterGet("preview", delegate { return AgentPreviewJson(); });
+			api.RegisterPost("preview", delegate { return AgentPreviewJson(); });
+			api.RegisterGet("node/status", delegate { return AgentNodeStatusJson(); });
+			api.RegisterPost("node/status", delegate { return AgentNodeStatusJson(); });
 			string? fail;
 			if (api.Start(out fail))
 			{
@@ -9610,6 +9954,393 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		catch (Exception ex)
 		{
 			LogError(ex, "Agent 接口启动失败");
+		}
+	}
+
+	// ---------- Agent 异步任务模型（与 Linux 侧 main.py run_job / api_job 同一契约） ----------
+	// Linux 有 JOBS + GET/POST /api/job，Windows 此前只有同步 marshal：任何分钟级操作
+	// （更新、兼容修复、pnpm）在 HTTP 上必然撞 AgentOp 的 30s 上限，客户端先放弃而这边还在跑。
+	private sealed class AgentJob
+	{
+		public string Name = "";
+
+		public string Status = "running";
+
+		public readonly List<string> Log = new List<string>();
+
+		public string Result = "";
+
+		public DateTime StartedUtc;
+	}
+
+	private readonly Dictionary<string, AgentJob> _agentJobs = new Dictionary<string, AgentJob>();
+
+	private readonly object _agentJobsLock = new object();
+
+	private int _agentJobSeq;
+
+	/// <summary>把长操作放到后台线程并登记：立即返回 {"ok":true,"job":"&lt;id&gt;"}，调用方轮询 /api/job。</summary>
+	private string AgentRunJob(string name, Func<Action<string>, string> work)
+	{
+		string jid;
+		AgentJob job;
+		lock (_agentJobsLock)
+		{
+			_agentJobSeq += 1;
+			jid = _agentJobSeq.ToString(CultureInfo.InvariantCulture);
+			job = new AgentJob { Name = name, StartedUtc = DateTime.UtcNow };
+			_agentJobs[jid] = job;
+			// 长驻进程防护: 已结束的任务只保留最近 20 个
+			List<KeyValuePair<string, AgentJob>> finished = new List<KeyValuePair<string, AgentJob>>();
+			foreach (KeyValuePair<string, AgentJob> kv in _agentJobs)
+			{
+				if (kv.Value.Status != "running")
+				{
+					finished.Add(kv);
+				}
+			}
+			if (finished.Count > 20)
+			{
+				finished.Sort(delegate (KeyValuePair<string, AgentJob> a, KeyValuePair<string, AgentJob> b)
+				{
+					return a.Value.StartedUtc.CompareTo(b.Value.StartedUtc);
+				});
+				for (int i = 0; i < finished.Count - 20; i++)
+				{
+					_agentJobs.Remove(finished[i].Key);
+				}
+			}
+		}
+		Task.Run(delegate
+		{
+			try
+			{
+				string res = work(delegate (string line)
+				{
+					lock (job.Log)
+					{
+						if (job.Log.Count < 5000)
+						{
+							job.Log.Add(line ?? "");
+						}
+					}
+					Log(line ?? "");
+				});
+				job.Result = res;
+				job.Status = "done";
+			}
+			catch (Exception ex)
+			{
+				job.Result = ex.Message;
+				job.Status = "error";
+				LogError(ex, "Agent 后台任务 " + name);
+			}
+		});
+		return JsonSerializer.Serialize(new Dictionary<string, object>
+		{
+			["ok"] = true,
+			["job"] = jid
+		}, AgentApi.JsonOpts);
+	}
+
+	private string AgentJobJson(string? id)
+	{
+		AgentJob? job;
+		lock (_agentJobsLock)
+		{
+			_agentJobs.TryGetValue(id ?? "", out job);
+		}
+		if (job == null)
+		{
+			return JsonSerializer.Serialize(new Dictionary<string, object>
+			{
+				["ok"] = false,
+				["status"] = "unknown",
+				["error"] = "未知任务 id: " + (id ?? "") + "; 长操作先 POST 对应端点取 job id"
+			}, AgentApi.JsonOpts);
+		}
+		List<string> tail;
+		lock (job.Log)
+		{
+			int from = (job.Log.Count > 200) ? (job.Log.Count - 200) : 0;
+			tail = job.Log.GetRange(from, job.Log.Count - from);
+		}
+		return JsonSerializer.Serialize(new Dictionary<string, object>
+		{
+			["ok"] = job.Status != "error",
+			["id"] = id,
+			["name"] = job.Name,
+			["status"] = job.Status,
+			["started_at_utc"] = job.StartedUtc.ToString("o"),
+			["log"] = tail,
+			["result"] = job.Result
+		}, AgentApi.JsonOpts);
+	}
+
+	/// <summary>从 GET query 里取一个参数（AgentBodyStr 的 GET 对应物）。</summary>
+	private string AgentQueryStr(string query, string prop)
+	{
+		string[] parts = (query ?? "").Split('&');
+		foreach (string part in parts)
+		{
+			int eq = part.IndexOf('=');
+			if (eq <= 0 || !string.Equals(part.Substring(0, eq), prop, StringComparison.Ordinal))
+			{
+				continue;
+			}
+			string v = part.Substring(eq + 1);
+			try
+			{
+				return Uri.UnescapeDataString(v);
+			}
+			catch (Exception ex)
+			{
+				LogError(ex, "Agent query 参数解码失败: " + v);
+				return v;
+			}
+		}
+		return "";
+	}
+
+	/// <summary>POST /api/update/check {"target":"llama"|"dsh","dir"?} → {"job":id}。</summary>
+	private string AgentUpdateCheckOp(string body)
+	{
+		string target = AgentBodyStr(body, "target") ?? "llama";
+		string dirArg = AgentBodyStr(body, "dir") ?? "";
+		string llamaDir = "";
+		string dshDir = "";
+		string backend = "vulkan";
+		AgentUi<int>(delegate
+		{
+			llamaDir = Toolchain.NormalizeDir(InputLlamaDir.Text);
+			dshDir = EffectiveDshDir();
+			backend = LlamaBackendPreference();
+			return 0;
+		}, 5000);
+		string dir = (!string.IsNullOrWhiteSpace(dirArg)) ? Toolchain.NormalizeDir(dirArg) : ((target == "llama") ? llamaDir : dshDir);
+		if (string.IsNullOrWhiteSpace(dir))
+		{
+			return AgentErr("未确定目录: 传 {\"dir\":\"...\"}，或先在界面上填好 " + target + " 目录");
+		}
+		return AgentRunJob("update/check " + target, delegate (Action<string> jl)
+		{
+			if (target == "llama")
+			{
+				int? local = UpdateService.GetLocalLlamaBuild(dir);
+				UpdateService.LlamaReleaseInfo? latest = UpdateService.FetchLatestLlamaRelease("ggml-org/llama.cpp", backend);
+				return JsonSerializer.Serialize(new Dictionary<string, object>
+				{
+					["ok"] = latest != null,
+					["target"] = "llama",
+					["dir"] = dir,
+					["local"] = local,
+					["latest"] = latest?.Build ?? 0,
+					["tag"] = latest?.Tag ?? "",
+					["up_to_date"] = local.HasValue && latest != null && local.Value >= latest.Build,
+					["error"] = (latest == null) ? "上游版本探测失败（GitHub 直连与镜像链都不可用）" : ""
+				}, AgentApi.JsonOpts);
+			}
+			string err = "";
+			UpdateService.DshUpdateInfo? info = UpdateService.CheckDshUpdate(dir, out err);
+			return JsonSerializer.Serialize(new Dictionary<string, object>
+			{
+				["ok"] = info != null,
+				["target"] = "dsh",
+				["dir"] = dir,
+				["branch"] = info?.Branch ?? "",
+				["local_head"] = info?.LocalHead ?? "",
+				["remote_head"] = info?.RemoteHead ?? "",
+				["ahead"] = info?.Ahead ?? 0,
+				["behind"] = info?.Behind ?? 0,
+				["compared_via"] = info?.Mirror ?? "origin",
+				["up_to_date"] = info != null && info.Behind == 0,
+				["error"] = err
+			}, AgentApi.JsonOpts);
+		});
+	}
+
+	/// <summary>POST /api/update/do {"target":"llama"|"dsh","dir"?} → {"job":id}。运行中直接拒绝，避免占用文件失败半更新。</summary>
+	private string AgentUpdateDoOp(string body)
+	{
+		string target = AgentBodyStr(body, "target") ?? "dsh";
+		string dirArg = AgentBodyStr(body, "dir") ?? "";
+		string llamaDir = "";
+		string dshDir = "";
+		string backend = "vulkan";
+		bool llamaRunning = false;
+		bool dshRunning = false;
+		AgentUi<int>(delegate
+		{
+			llamaDir = Toolchain.NormalizeDir(InputLlamaDir.Text);
+			dshDir = EffectiveDshDir();
+			backend = LlamaBackendPreference();
+			llamaRunning = _llamaProc != null && !_llamaProc.HasExited;
+			dshRunning = HasDsh();
+			return 0;
+		}, 5000);
+		string dir = (!string.IsNullOrWhiteSpace(dirArg)) ? Toolchain.NormalizeDir(dirArg) : ((target == "llama") ? llamaDir : dshDir);
+		if (string.IsNullOrWhiteSpace(dir))
+		{
+			return AgentErr("未确定目录: 传 {\"dir\":\"...\"}，或先在界面上填好 " + target + " 目录");
+		}
+		if (target == "llama")
+		{
+			if (llamaRunning)
+			{
+				return AgentErr("llama-server 正在运行: 先 POST /api/llama/stop 再更新（exe 被占用会导致半更新）");
+			}
+			return AgentRunJob("update/do llama", delegate (Action<string> jl)
+			{
+				UpdateService.LlamaReleaseInfo? latest = UpdateService.FetchLatestLlamaRelease("ggml-org/llama.cpp", backend);
+				if (latest == null)
+				{
+					return AgentErr("上游版本探测失败，未做任何改动");
+				}
+				(bool ok, string m) = UpdateService.ApplyLlamaUpdateAsync(dir, latest).GetAwaiter().GetResult();
+				UpdateService.CleanupLauncherTemp();
+				return JsonSerializer.Serialize(new Dictionary<string, object>
+				{
+					["ok"] = ok,
+					["msg"] = m,
+					["latest"] = latest.Build
+				}, AgentApi.JsonOpts);
+			});
+		}
+		if (dshRunning)
+		{
+			return AgentErr("DSH 正在运行: 先 POST /api/dsh/stop 再更新（工作区被占用会导致拉取失败）");
+		}
+		return AgentRunJob("update/do dsh", delegate (Action<string> jl)
+		{
+			(bool ok, string m) = UpdateService.PullDsh(dir, jl);
+			UpdateService.CleanupLauncherTemp();
+			return JsonSerializer.Serialize(new Dictionary<string, object>
+			{
+				["ok"] = ok,
+				["msg"] = m
+			}, AgentApi.JsonOpts);
+		});
+	}
+
+	/// <summary>POST /api/dsh/compat {"dir"?} → {"job":id}；结果 JSON 里是审计结论摘要。</summary>
+	private string AgentCompatOp(string body)
+	{
+		string dirArg = AgentBodyStr(body, "dir") ?? "";
+		string dshDir = "";
+		string profile = _currentProfile ?? "";
+		AgentUi<int>(delegate
+		{
+			dshDir = EffectiveDshDir();
+			return 0;
+		}, 5000);
+		string dir = (!string.IsNullOrWhiteSpace(dirArg)) ? Toolchain.NormalizeDir(dirArg) : dshDir;
+		if (string.IsNullOrWhiteSpace(dir))
+		{
+			return AgentErr("未确定 DSH 目录: 传 {\"dir\":\"...\"} 或先在界面上填好");
+		}
+		return AgentRunJob("dsh/compat", delegate (Action<string> jl)
+		{
+			var r = DshCompatService.Audit(dir, profile, jl, true);
+			List<Dictionary<string, object>> items = new List<Dictionary<string, object>>();
+			foreach (DshCompatItem it in r.Items)
+			{
+				if (items.Count >= 120)
+				{
+					break;
+				}
+				items.Add(new Dictionary<string, object>
+				{
+					["category"] = it.Category,
+					["level"] = it.Level.ToString(),
+					["title"] = it.Title,
+					["detail"] = it.Detail,
+					["repairable"] = it.Repairable,
+					["repair"] = it.Repair
+				});
+			}
+			return JsonSerializer.Serialize(new Dictionary<string, object>
+			{
+				["ok"] = true,
+				["dir"] = dir,
+				["profile"] = profile,
+				["dsh_version"] = r.DshVersion,
+				["errors"] = r.ErrorCount,
+				["warnings"] = r.WarningCount,
+				["repairable"] = r.RepairableCount,
+				["items"] = items
+			}, AgentApi.JsonOpts);
+		});
+	}
+
+	/// <summary>POST /api/dsh/compat/repair {"dir"?} → {"job":id}。审计→修复→复检各步独立兜底。</summary>
+	private string AgentCompatRepairOp(string body)
+	{
+		string dirArg = AgentBodyStr(body, "dir") ?? "";
+		string dshDir = "";
+		string profile = _currentProfile ?? "";
+		AgentUi<int>(delegate
+		{
+			dshDir = EffectiveDshDir();
+			return 0;
+		}, 5000);
+		string dir = (!string.IsNullOrWhiteSpace(dirArg)) ? Toolchain.NormalizeDir(dirArg) : dshDir;
+		if (string.IsNullOrWhiteSpace(dir))
+		{
+			return AgentErr("未确定 DSH 目录: 传 {\"dir\":\"...\"} 或先在界面上填好");
+		}
+		return AgentRunJob("dsh/compat/repair", delegate (Action<string> jl)
+		{
+			DshCompatReport report = DshCompatService.Audit(dir, profile, jl, false);
+			DshCompatRepairResult res = DshCompatService.Repair(dir, profile, report, jl);
+			return JsonSerializer.Serialize(new Dictionary<string, object>
+			{
+				["ok"] = true,
+				["dir"] = dir,
+				["profile"] = profile,
+				["messages"] = res.Messages,
+				["remaining_errors"] = res.RemainingErrors,
+				["remaining_repairable"] = res.RemainingRepairable
+			}, AgentApi.JsonOpts);
+		});
+	}
+
+	/// <summary>GET/POST /api/preview：当前命令预览（UI 上那条 llama-server 命令行），不启动任何东西。</summary>
+	private string AgentPreviewJson()
+	{
+		Dictionary<string, object>? d = AgentUi<Dictionary<string, object>>(delegate
+		{
+			return new Dictionary<string, object>
+			{
+				["ok"] = true,
+				["cmd"] = _lastCmd ?? "",
+				["llama_running"] = _llamaProc != null && !_llamaProc.HasExited,
+				["dsh_running"] = HasDsh()
+			};
+		}, 5000);
+		return (d == null) ? AgentErr("UI 线程 5s 内未响应") : JsonSerializer.Serialize(d, AgentApi.JsonOpts);
+	}
+
+	/// <summary>GET/POST /api/node/status：node v24+/pnpm 探测结果（DSH 重建的前置条件）。</summary>
+	private string AgentNodeStatusJson()
+	{
+		try
+		{
+			NodeSetup.NodeStatus st = NodeSetup.Detect(true);
+			return JsonSerializer.Serialize(new Dictionary<string, object>
+			{
+				["ok"] = st.MeetsRequirement,
+				["node24_exe"] = st.Node24Exe ?? "",
+				["node24_version"] = st.Node24Version,
+				["any_node_exe"] = st.AnyNodeExe ?? "",
+				["any_node_version"] = st.AnyNodeVersion,
+				["pnpm_exe"] = st.PnpmExe ?? "",
+				["pnpm_version"] = st.PnpmVersion
+			}, AgentApi.JsonOpts);
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "Agent node/status 探测失败");
+			return AgentErr("node 探测失败: " + ex.Message);
 		}
 	}
 
@@ -9644,6 +10375,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			["llama"] = new Dictionary<string, object>
 			{
 				["running"] = llamaAlive || (_llamaApi != null && _llamaApi.Online),
+				// Linux 侧 status 用字符串状态；两个口径并存，跨端脚本不必按平台分支
+				["status"] = (llamaAlive || (_llamaApi != null && _llamaApi.Online)) ? "running" : "stopped",
 				["pid"] = llamaPid,
 				["api_online"] = _llamaApi != null && _llamaApi.Online,
 				["api_port"] = _llamaApi?.ActivePort ?? 0,
@@ -9660,6 +10393,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			["dsh"] = new Dictionary<string, object>
 			{
 				["running"] = HasDsh(),
+				["status"] = HasDsh() ? "running" : "stopped",
 				["pid"] = dshPid,
 				["dir"] = (InputDshDir?.Text ?? "").Trim()
 			},
@@ -9680,9 +10414,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				["active_variant"] = pc.ActiveLlamaVariant,
 				["variants"] = pc.LlamaVariants
 			},
+			// Linux 侧 status 里 profile 只是一个名字字符串；两个口径并存
+			["profile_name"] = _currentProfile,
 			["gpus"] = _lastPerfGpus ?? new List<GpuDevInfo>(),
 			["system"] = _lastPerfDict ?? new Dictionary<string, string>(),
 			["sampled_at_utc"] = _perfSampledAtUtc == default ? "" : _perfSampledAtUtc.ToString("O"),
+			// 同一时刻的 epoch 秒：Linux 侧 monitor/status 用的是 epoch float
+			["sampled_at"] = (_perfSampledAtUtc == default) ? 0.0 : Math.Round(new DateTimeOffset(DateTime.SpecifyKind(_perfSampledAtUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds() / 1000.0, 1),
 			["paths"] = new Dictionary<string, object>
 			{
 				["config_dir"] = _configDir,
@@ -9735,7 +10473,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					["cpu"] = _hCpu.Values,
 					["ram"] = _hRam.Values,
 					["net"] = _hNet.Values,
-					["net_tx"] = _hNetTx.Values
+					["net_tx"] = _hNetTx.Values,
+					// Linux 侧 monitor.hist 用的是 gpu_temp/gpu_power/net_rx；旧键保留兼容
+					["gpu_temp"] = _hTemp.Values,
+					["gpu_power"] = _hPower.Values,
+					["net_rx"] = _hNet.Values
 				},
 				["hist_ticks"] = _hTps.Ticks
 			};
@@ -9743,30 +10485,121 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		return d == null ? AgentErr("UI 线程 10s 内未响应") : JsonSerializer.Serialize(d, AgentApi.JsonOpts);
 	}
 
-	private string AgentLogsTail(string query)
+	private string AgentLogsTail(string input)
 	{
 		int n = 200;
-		Match m = Regex.Match(query ?? "", "n=(\\d+)");
-		if (m.Success && int.TryParse(m.Groups[1].Value, out int mn) && mn >= 1 && mn <= 2000)
+		long after = -1L;
+		string q = input ?? "";
+		if (q.TrimStart().StartsWith("{", StringComparison.Ordinal))
 		{
-			n = mn;
+			// POST 请求体是 JSON(Linux 侧 logs 的主用法): 正则找 "after=" 在 {"after":0} 里
+			// 永远取不到值, 会静默退回"尾部 200 行"并把游标语义丢掉。
+			try
+			{
+				using JsonDocument doc = JsonDocument.Parse(q);
+				JsonElement root = doc.RootElement;
+				if (root.TryGetProperty("n", out JsonElement ne))
+				{
+					if (ne.ValueKind == JsonValueKind.Number && ne.TryGetInt32(out int nn) && nn >= 1 && nn <= 2000)
+					{
+						n = nn;
+					}
+					else if (ne.ValueKind == JsonValueKind.String && int.TryParse(ne.GetString(), out int nstr) && nstr >= 1 && nstr <= 2000)
+					{
+						n = nstr;
+					}
+				}
+				if (root.TryGetProperty("after", out JsonElement ae))
+				{
+					if (ae.ValueKind == JsonValueKind.Number && ae.TryGetInt64(out long aa))
+					{
+						after = aa;
+					}
+					else if (ae.ValueKind == JsonValueKind.String && long.TryParse(ae.GetString(), out long aestr))
+					{
+						after = aestr;
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				return AgentErr("logs 请求体不是合法 JSON: " + ex.Message);
+			}
+		}
+		else
+		{
+			Match m = Regex.Match(q, "n=(\\d+)");
+			if (m.Success && int.TryParse(m.Groups[1].Value, out int mn) && mn >= 1 && mn <= 2000)
+			{
+				n = mn;
+			}
+			// after=<seq> 是 Linux 侧 logs 的游标语义: 只回比 seq 更新的行
+			Match m2 = Regex.Match(q, "after=(\\d+)");
+			if (m2.Success && long.TryParse(m2.Groups[1].Value, out long af))
+			{
+				after = af;
+			}
 		}
 		string joined;
+		long seqLast;
 		lock (_runLogLock)
 		{
 			joined = _runLog.ToString();
+			seqLast = _runLogSeq;
 		}
 		string[] all = joined.Split('\n');
-		List<string> tail = new List<string>();
-		for (int i = Math.Max(0, all.Length - n); i < all.Length; i++)
+		List<string> lines = new List<string>();
+		foreach (string raw in all)
 		{
-			string ln = all[i].TrimEnd('\r');
+			string ln = raw.TrimEnd('\r');
 			if (ln.Length > 0)
 			{
-				tail.Add(ln);
+				lines.Add(ln);
 			}
 		}
-		return JsonSerializer.Serialize(new Dictionary<string, object> { ["ok"] = true, ["count"] = tail.Count, ["lines"] = tail }, AgentApi.JsonOpts);
+		// 缓冲里保存的是尾部若干行: 最后一行的序号就是 _runLogSeq
+		long firstSeq = seqLast - lines.Count + 1;
+		if (after >= 0)
+		{
+			List<Dictionary<string, object>> picked = new List<Dictionary<string, object>>();
+			for (int i = 0; i < lines.Count; i++)
+			{
+				long seq = firstSeq + i;
+				if (seq <= after)
+				{
+					continue;
+				}
+				picked.Add(new Dictionary<string, object>
+				{
+					["seq"] = seq,
+					["text"] = lines[i]
+				});
+			}
+			if (picked.Count > n)
+			{
+				picked = picked.GetRange(picked.Count - n, n);
+			}
+			return JsonSerializer.Serialize(new Dictionary<string, object>
+			{
+				["ok"] = true,
+				["count"] = picked.Count,
+				["after"] = ((picked.Count > 0) ? (long)picked[picked.Count - 1]["seq"] : after),
+				["lines"] = picked
+			}, AgentApi.JsonOpts);
+		}
+		List<string> tail = new List<string>();
+		for (int i = Math.Max(0, lines.Count - n); i < lines.Count; i++)
+		{
+			tail.Add(lines[i]);
+		}
+		return JsonSerializer.Serialize(new Dictionary<string, object>
+		{
+			["ok"] = true,
+			["count"] = tail.Count,
+			["lines"] = tail,
+			["seq_first"] = firstSeq,
+			["seq_last"] = seqLast
+		}, AgentApi.JsonOpts);
 	}
 
 	private string AgentProfilesJson()
@@ -9898,10 +10731,16 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 	}
 
-	private string AgentLlamaStart()
+	private string AgentLlamaStart(string body)
 	{
 		return AgentOp(delegate
 		{
+			// 与 Linux 侧一致: 请求体里带 profile 就先把方案切过去再启动
+			string? sw = AgentApplyProfileArg(body);
+			if (sw != null)
+			{
+				return sw;
+			}
 			if (IsAlive(_llamaProc))
 			{
 				return AgentErr("Llama 已在运行");
@@ -9923,23 +10762,40 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}, 60000);
 	}
 
-	private string AgentLlamaStop()
+	private string AgentLlamaStop(string body)
 	{
 		return AgentOp(delegate
 		{
-			if (!IsAlive(_llamaProc))
+			bool was = IsAlive(_llamaProc) || (_llamaApi != null && _llamaApi.Online);
+			if (!was)
 			{
-				return AgentErr("Llama 未在运行");
+				// 停止是幂等操作(Linux 侧一致): 已经停了就报成功, 别让脚本把"重复停止"当失败
+				return JsonSerializer.Serialize(new Dictionary<string, object>
+				{
+					["ok"] = true,
+					["was_running"] = false,
+					["msg"] = "本来就未在运行"
+				}, AgentApi.JsonOpts);
 			}
 			StopLlama();
-			return AgentOk("已停止");
+			return JsonSerializer.Serialize(new Dictionary<string, object>
+			{
+				["ok"] = true,
+				["was_running"] = true,
+				["msg"] = "已停止"
+			}, AgentApi.JsonOpts);
 		}, 60000);
 	}
 
-	private string AgentDshStart()
+	private string AgentDshStart(string body)
 	{
 		return AgentOp(delegate
 		{
+			string? sw = AgentApplyProfileArg(body);
+			if (sw != null)
+			{
+				return sw;
+			}
 			if (HasDsh())
 			{
 				return AgentErr("DSH 已在运行");
@@ -9949,16 +10805,27 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}, 60000);
 	}
 
-	private string AgentDshStop()
+	private string AgentDshStop(string body)
 	{
 		return AgentOp(delegate
 		{
-			if (!HasDsh())
+			bool was = HasDsh();
+			if (!was)
 			{
-				return AgentErr("DSH 未在运行");
+				return JsonSerializer.Serialize(new Dictionary<string, object>
+				{
+					["ok"] = true,
+					["was_running"] = false,
+					["msg"] = "本来就未在运行"
+				}, AgentApi.JsonOpts);
 			}
 			StopDsh();
-			return AgentOk("已停止");
+			return JsonSerializer.Serialize(new Dictionary<string, object>
+			{
+				["ok"] = true,
+				["was_running"] = true,
+				["msg"] = "已停止"
+			}, AgentApi.JsonOpts);
 		}, 60000);
 	}
 
@@ -9986,7 +10853,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				["ok"] = true,
 				["lightweight"] = _lightOn,
-				["tray_mode"] = _trayMode
+				// Linux 侧 lightweight 只认显式 on；Windows 不带字段是 toggle。两个键都回，
+				// 跨端脚本读同一个字段名即可
+				["on"] = _lightOn,
+				["tray_mode"] = _trayMode,
+				["llama_status"] = (IsAlive(_llamaProc) || (_llamaApi != null && _llamaApi.Online)) ? "running" : "stopped",
+				["dsh_status"] = HasDsh() ? "running" : "stopped"
 			}, AgentApi.JsonOpts);
 		});
 	}
@@ -10061,9 +10933,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		// Background 优先级: 先让本次 HTTP 响应发出去, 再在 UI 线程收尾退出
 		Dispatcher.BeginInvoke((Delegate)(Action)delegate
 		{
-			try { if (stop && IsAlive(_llamaProc)) { StopLlama(); } } catch { }
-			try { if (stop && HasDsh()) { StopDsh(); } } catch { }
 			_exiting = true;
+			ExitCore(stop);
 			System.Windows.Application.Current?.Shutdown();
 		}, System.Windows.Threading.DispatcherPriority.Background);
 		return AgentOk("正在退出(stop_services=" + (stop ? "true" : "false") + ")");
@@ -10077,16 +10948,20 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			System.Windows.Threading.DispatcherOperation<string> dop = Dispatcher.InvokeAsync<string>(op);
 			if (!dop.Task.Wait(timeoutMs))
 			{
+				// 只回 HTTP 不留日志 = 事后无从判断"这次调用到底执行了没有"
+				LogError(new TimeoutException("Agent UI 操作 " + timeoutMs + "ms 未返回"), "Agent 操作超时（操作可能仍在 UI 线程上继续）");
 				return AgentErr("UI 操作 " + (timeoutMs / 1000) + "s 未返回(可能在等弹窗确认; 操作可能仍在进行)");
 			}
 			return dop.Result ?? AgentErr("操作返回空");
 		}
 		catch (AggregateException aex)
 		{
+			LogError(aex, "Agent 操作异常");
 			return AgentErr(aex.GetBaseException().Message);
 		}
 		catch (Exception ex)
 		{
+			LogError(ex, "Agent 操作异常");
 			return AgentErr(ex.Message);
 		}
 	}
@@ -10107,6 +10982,45 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			LogError(ex, "Agent UI 快照失败");
 			return default;
+		}
+	}
+
+	/// <summary>请求体里带 profile 就把界面方案先切过去（Linux 侧 llama/start 支持 profile 覆盖）。
+	/// 必须在 UI 线程调用。返回 null 表示无需切换或已切换成功；否则返回可直接回给调用方的错误 JSON。</summary>
+	private string? AgentApplyProfileArg(string body)
+	{
+		string? name = AgentBodyStr(body, "profile");
+		if (string.IsNullOrWhiteSpace(name))
+		{
+			return null;
+		}
+		if (!_profiles.ContainsKey(name))
+		{
+			return AgentErr("未知方案: " + name);
+		}
+		if (!string.Equals(_currentProfile, name, StringComparison.Ordinal))
+		{
+			ComboProfile.SelectedItem = name; // 走 ComboBox = ProfileChanged 完整流程(先写回旧方案面板)
+			if (!string.Equals(_currentProfile, name, StringComparison.Ordinal))
+			{
+				return AgentErr("方案切换失败: " + name);
+			}
+		}
+		return null;
+	}
+
+	/// <summary>请求体(JSON 对象)里是否存在某个键。</summary>
+	private static bool AgentBodyHasProp(string body, string prop)
+	{
+		try
+		{
+			using JsonDocument doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(body) ? "{}" : body);
+			return doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty(prop, out JsonElement _);
+		}
+		catch (Exception)
+		{
+			// 非法 JSON 由具体处理器自己的解析分支报错，这里只回答"没有这个键"
+			return false;
 		}
 	}
 

@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import time
+import datetime
 import fcntl
 import signal
 import secrets
@@ -18,6 +19,7 @@ import traceback
 import subprocess
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 
 import applog
 import compat
@@ -42,6 +44,11 @@ DEFAULT_PORT = 8788
 # 浏览器经 index.html 注入获得; client.py/tray.py 经 token 文件(0600)获得。
 API_TOKEN = secrets.token_urlsafe(24)
 TOKEN_FILE = os.path.join(os.path.expanduser("~"), ".dsh_launcher_token")
+# 机器可读的发现文件: 与 Windows 侧 Services/AgentApi.cs 同名同字段(port/token/enabled,
+# 见 docs/API-CONTRACT.md)。~/.dsh_launcher_token 保留作向后兼容(client.py/tray.py 仍读它),
+# 新调用方应优先读 agent.json —— 那里连**实际监听端口**都有: 默认 8788 被占时端口会顺延
+# (port + i), 只按默认端口去连会连到别的进程或连不上。
+AGENT_FILE = os.path.join(applog.LOG_DIR, "agent.json")
 
 
 def _write_token_file():
@@ -56,6 +63,37 @@ def _write_token_file():
         applog.error("[鉴权] token 文件写入失败(%s: %s), 路径 %s —— 托盘与网页端会持续 401"
                      % (type(ex).__name__, ex, TOKEN_FILE))
         print("⚠ token 文件写入失败(%s): 托盘与网页端会持续 401, 路径 %s" % (ex, TOKEN_FILE))
+
+
+def _write_agent_file(port):
+    """写端口 + token 的发现文件(Windows 侧同路径同字段, 见 docs/API-CONTRACT.md)。
+
+    enabled 在 Linux 侧恒为 true: Windows 的 agent 接口是可关掉的旁路(LLAMADSH_AGENT_DISABLE=1
+    或 agent.json 里 enabled=false 就干脆不监听), Linux 的这个 HTTP 服务本身就是主窗口,
+    没有"监听但不服务"的形态 —— 字段照样要写, 否则调用方得按平台分支。
+
+    必须在**绑定成功之后**调用: 端口被占会顺延(port + i), 写默认端口等于骗调用方。
+    """
+    try:
+        # 不依赖 applog 顺带建目录这个副作用: 目录不在就直接写会 FileNotFoundError。
+        os.makedirs(os.path.dirname(AGENT_FILE), exist_ok=True)
+        fd = os.open(AGENT_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"port": int(port), "token": API_TOKEN, "enabled": True}, f)
+        try:
+            # 文件已存在时 O_CREAT 的 mode 不起作用(权限由前任写入者 + umask 决定),
+            # 补一次 chmod: 这文件里躺着"本机任意进程可启停服务/退出启动器"的 token。
+            os.chmod(AGENT_FILE, 0o600)
+        except OSError as ex:
+            applog.error("[鉴权] agent.json 权限收紧失败(%s: %s), 路径 %s"
+                         % (type(ex).__name__, ex, AGENT_FILE))
+    except OSError as ex:
+        # 与 token 文件同口径: 写不出来时外部 cli/curl 只能瞎猜端口, 现场却看不到原因。
+        applog.error("[鉴权] agent.json 写入失败(%s: %s), 路径 %s —— 外部调用方(cli/curl)"
+                     "无法发现端口与 token" % (type(ex).__name__, ex, AGENT_FILE))
+        print("⚠ agent.json 写入失败(%s): 外部调用方(cli/curl)无法发现端口与 token, 路径 %s"
+              % (ex, AGENT_FILE))
+
 
 applog.info("========== LlamaDSH Launcher (Linux) 启动 ==========")
 
@@ -457,9 +495,22 @@ def api_do_update(body):
 
 
 def api_job(body):
+    """任务模型查询: {"id":"<id>"} → {"ok","id","name","status","log","result"}。
+
+    字段与 Windows 侧 AgentJobJson 对齐(docs/API-CONTRACT.md「任务模型」): 分钟级操作只回
+    `{"job":"<id>"}`, 由调用方轮询这里。id 不存在时按 ok:false + error 说清楚, 而不是回一个
+    看似正常的 `status:"unknown"` —— 服务重启后旧 id 必然查不到, 含糊的形状会让人以为任务还在跑。
+    """
     jid = str(body.get("id"))
-    j = JOBS.get(jid) or {"status": "unknown"}
-    return {"status": j.get("status"), "log": j.get("log", [])[-200:], "result": j.get("result")}
+    j = JOBS.get(jid)
+    if j is None:
+        return {"ok": False, "id": jid, "status": "unknown",
+                "error": "未知任务 id: %s; 长操作先 POST 对应端点取 job id" % jid}
+    return {"ok": j.get("status") != "error", "id": jid, "name": j.get("name"),
+            "status": j.get("status"),
+            "started_at": j.get("started"),
+            "started_at_utc": _utc_iso(j.get("started")),
+            "log": j.get("log", [])[-200:], "result": j.get("result")}
 
 
 def api_save_config(body):
@@ -523,8 +574,12 @@ def api_status(_):
     # status 与 monitor 双路轮询: status 只回状态摘要(前端 pollStatus 只用这几个
     # 字段), 完整快照(12 条历史/事件流/slots)只走 /api/monitor
     return {
-        "llama": {"status": LLAMA.status, "pid": LLAMA.proc.pid if LLAMA.proc else None},
-        "dsh": {"status": DSH.status, "pid": dsh_pid,
+        "llama": {"status": LLAMA.status,
+                  # running(bool) 与 status(字符串) 并存: Windows 侧 status 就是这个形状,
+                  # 跨端脚本不必按平台分支(见 docs/API-CONTRACT.md「字段别名口径」)
+                  "running": bool(LLAMA.running),
+                  "pid": LLAMA.proc.pid if LLAMA.proc else None},
+        "dsh": {"status": DSH.status, "running": bool(DSH.running), "pid": dsh_pid,
                 "url": "http://127.0.0.1:%d" % DSH_PORT,
                 "rebuilding": DSH.rebuild_running(),
                 "converting": CONVERTER.running},
@@ -535,10 +590,14 @@ def api_status(_):
                     # 这帧显存/熔断数字的年龄: 轻量化休眠分支不重新采样, 不给出年龄就等于
                     # 把几小时前的显存当成"现在" (与"查不到 ≠ 知道"同一族)
                     "sampled_at": MON.snapshot.get("sampled_at"),
+                    "sampled_at_utc": _utc_iso(MON.snapshot.get("sampled_at")),
                     "snapshot_age": (round(time.time() - MON.snapshot["sampled_at"], 1)
                                      if MON.snapshot.get("sampled_at") else None),
                     "vram": MON.snapshot.get("vram", {"used": 0, "total": 0, "pct": 0})},
+        # profile 历来是"当前方案名"字符串(网页端依赖它, 不能改类型);
+        # profile_name 是契约里的正式名, Windows 侧 profile 是对象 + profile_name 是字符串
         "profile": name,
+        "profile_name": name,
         "lightweight": MON.lightweight,
         "dsh_stale_lock": DSH.stale_lock_present(),
     }
@@ -547,11 +606,27 @@ def api_status(_):
 
 
 def api_logs(body):
+    """运行日志读取: 游标(after)与尾部(n)两种口径同用一个端点。
+
+    Windows 侧是 GET /api/logs?n=200(纯尾部), Linux 侧历来是 POST {"after":N}(增量游标)。
+    调用方(双端互查的脚本、cli)不该为同一个端点写两套分支, 所以两个参数都收:
+    给了 n 就按"尾部 N 条"取(仍走同一个 seq 计数器, 返回结构不变: lines 带 seq/text),
+    这样 n 与 after 也能叠用 = "游标之后的尾部 N 条"(与 Windows 的 after 分支同口径)。
+    """
     try:
         after = int(body.get("after") or 0)
     except (TypeError, ValueError):
         after = 0
-    items, new_after = HUB.since(after, 400)
+    n = body.get("n")
+    if n is None:
+        limit = 400
+    else:
+        try:
+            # 上限 2000 与 Windows 同口径(环形缓冲本身也只有 2000 条)
+            limit = max(1, min(int(n), 2000))
+        except (TypeError, ValueError):
+            limit = 200
+    items, new_after = HUB.since(after, limit)
     return {"lines": [{"seq": s, "text": t} for s, t in items], "after": new_after}
 
 
@@ -608,11 +683,15 @@ _SHUTTING_DOWN = False
 _EXIT_WATCHDOG_S = 45
 
 
-def _stop_all_and_exit(tag):
+def _stop_all_and_exit(tag, stop_services=True):
     """停 llama.cpp 与 DSH、交代在途任务, 然后结束服务进程。
 
     **所有**退出路径都必须走这里: 以前 Ctrl+C 与 SIGTERM 直接杀进程, llama.cpp 与 DSH
     就成了没人管的孤儿, DSH 还留下 stale lock, 下次启动表现为撞端口"启动失败"。
+
+    stop_services=False(只来自 /api/quit {"stop_services":false})时**不碰** llama.cpp 与
+    DSH, 只结束服务自己 —— 与 Windows 侧 quit 同一口径。这时看门狗也不再预备补杀那些
+    PID, 否则"不停服务退出"会变成"照样把它们杀掉"。
 
     幂等 + 看门狗(两条都是 review 找出来的):
     · 连按两次 Ctrl+C、托盘 45s 后补发的 SIGTERM、前端重复点"关闭服务并退出"都会二次
@@ -630,16 +709,18 @@ def _stop_all_and_exit(tag):
     # (C# Window_Closing 9237-9246 同语义: "Shutdown 不等后台线程池", 退出前按记录
     #  的 PID 同步补杀; 只 _exit 等于把 stop() 打断在途的那一半留下当孤儿。)
     svc_pids = []
-    for runner in (LLAMA, DSH):
-        for handle in (getattr(runner, "proc", None), getattr(runner, "tracker", None)):
-            pid = getattr(handle, "pid", None)
-            if pid:
-                svc_pids.append(int(pid))
+    if stop_services:
+        for runner in (LLAMA, DSH):
+            for handle in (getattr(runner, "proc", None), getattr(runner, "tracker", None)):
+                pid = getattr(handle, "pid", None)
+                if pid:
+                    svc_pids.append(int(pid))
 
     def _watchdog_fire():
         try:
             HUB.log("[退出] ⚠ 收尾超过 %d 秒仍未完成, 补发 SIGKILL 并强制退出: %s"
-                    % (_EXIT_WATCHDOG_S, svc_pids or "未记录 PID"))
+                    % (_EXIT_WATCHDOG_S,
+                       svc_pids or ("未记录 PID" if stop_services else "本次不停服务")))
             for pid in svc_pids:
                 try:
                     victims = procman.child_pids(pid)
@@ -664,11 +745,14 @@ def _stop_all_and_exit(tag):
     watchdog = threading.Timer(_EXIT_WATCHDOG_S, _watchdog_fire)
     watchdog.daemon = True
     watchdog.start()
-    for name, runner in (("llama.cpp", LLAMA), ("DSH", DSH)):
-        try:
-            runner.stop()
-        except Exception as ex:
-            HUB.log("[%s] 停止 %s 失败: %s" % (tag, name, ex))
+    if stop_services:
+        for name, runner in (("llama.cpp", LLAMA), ("DSH", DSH)):
+            try:
+                runner.stop()
+            except Exception as ex:
+                HUB.log("[%s] 停止 %s 失败: %s" % (tag, name, ex))
+    else:
+        HUB.log("[%s] 按要求**不**停止 llama.cpp 与 DSH: 它们继续运行, 由后续实例接管" % tag)
     try:
         with JOB_LOCK:                 # 直接迭代 JOBS 会和 run_job 的插入/pop 竞态
             snapshot = dict(JOBS)     # (RuntimeError 被下面吞掉 → 警告静默消失)
@@ -695,15 +779,31 @@ def _stop_all_and_exit(tag):
     os._exit(0)
 
 
+def _quit_stop_services(body):
+    """`stop_services` 的取值口径: **只有 JSON true 算 true**, 缺省也是 true。
+
+    与 Windows 侧 AgentQuitOp 同一判定(`v.ValueKind == JsonValueKind.True`): 传 false 只结束
+    服务进程, llama.cpp 与 DSH 继续跑(下次启动按 PID/端口接管)。之所以不收 `1`/`"true"`,
+    是因为那样两端会得出相反结论(Windows 一律按 false)。
+    """
+    if isinstance(body, dict) and "stop_services" in body:
+        return body["stop_services"] is True
+    return True
+
+
 def api_shutdown(body):
-    """托盘"关闭服务并退出": 停 llama.cpp 与 DSH, 然后服务进程自身退出。
+    """退出端点: 契约名是 `quit`, `shutdown` 是保留别名(旧托盘/脚本在用)。
 
     先把响应送达再动手(0.8s): 否则调用方只看到连接断开,
     分不清是"退出成功"还是"请求失败"。
     """
-    HUB.log("[退出] 关闭服务并退出: 停止 llama.cpp 与 DSH…")
-    threading.Timer(0.8, _stop_all_and_exit, ("退出",)).start()
-    return {"ok": True}
+    stop = _quit_stop_services(body)
+    HUB.log("[退出] 关闭服务并退出(stop_services=%s): %s"
+            % ("true" if stop else "false",
+               "停止 llama.cpp 与 DSH…" if stop else "两个服务保持运行…"))
+    threading.Timer(0.8, _stop_all_and_exit, ("退出", stop)).start()
+    return {"ok": True, "stopping": True, "stop_services": stop,
+            "msg": "正在退出(stop_services=%s)" % ("true" if stop else "false")}
 
 
 def api_convert_start(body):
@@ -772,7 +872,16 @@ def api_monitor(body):
     """
     MON.monitor_visible = bool(body.get("visible", True))
     MON.monitor_seen_at = time.time() if MON.monitor_visible else 0.0
-    return MON.snapshot
+    # 契约别名(不改 Linux 原有键, 只补): Windows 侧历史序列字典叫 hist、时间戳给 ISO-8601 UTC,
+    # Linux 侧历来叫 hists、只给 epoch。跨端脚本要的是"同一个名字都能取到", 所以两个都发。
+    # 浅拷贝: MON.snapshot 是监控线程反复替换的活动对象, 就地加键会与之竞态。
+    out = dict(MON.snapshot)
+    if "hists" in out and "hist" not in out:
+        out["hist"] = out["hists"]
+    ts = out.get("sampled_at")
+    if ts and "sampled_at_utc" not in out:
+        out["sampled_at_utc"] = _utc_iso(ts)
+    return out
 
 
 def api_args_map(body):
@@ -1080,6 +1189,57 @@ def _body_shape_error(body):
     return None
 
 
+def _utc_iso(ts):
+    """epoch 秒 → ISO-8601 UTC(毫秒精度, 末尾 Z), 与 Windows 侧 sampled_at_utc 同一族写法。
+
+    时间戳两个口径都给: 只有 epoch 时人肉看响应要做换算, 只有 ISO 时脚本要解析字符串。
+    ts 缺失/非法一律回空串而不是 None —— 前端直接把它拼进文本, None 会显示成 "null"。
+    """
+    if not ts:
+        return ""
+    try:
+        dt = datetime.datetime.fromtimestamp(float(ts), datetime.timezone.utc)
+        return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _with_ok(result):
+    """响应出口收口: 发出去的 JSON 一律带 `ok`, 业务失败也是 HTTP 200 + ok:false。
+
+    以前失败只带 {"error": ...}, 调用方分不清"没有这个字段"与"没有出错"; 现在跨端调用
+    (cli / Windows↔Linux 互查 / webui)只看 ok 一个字段。这里只**增**字段, 不删也不改名,
+    所以现存的 `if (r.error)` 判断(webui 里几十处)照旧成立。
+
+    处理器自己写了 ok 就尊重它(例如 dsh/rebuild 明确回 ok:false + error); 否则按 error 的
+    **值**推断: api_load_config 那种 {"error": null} 是"成功, 顺带说明一句", 应得 ok:true,
+    所以不能按"有没有 error 这个键"判。
+    不动原对象: MON.snapshot / CONFIG 这类是被其它线程反复读写的活动对象。
+    """
+    if isinstance(result, dict) and "ok" not in result:
+        out = dict(result)
+        out["ok"] = not result.get("error")
+        return out
+    return result
+
+
+def _query_body(query):
+    """GET 的 ?k=v&k2=v2 → 处理器要看的 dict(值一律是字符串)。
+
+    Windows 侧 GET 处理器收到的就是去掉 '?' 的 query 串, Linux 侧处理器历来吃 POST 的 JSON
+    对象。桥接时不做类型猜测: logs/job 这两个只读处理器自己会把 after/n/id 转 int/str。
+    """
+    out = {}
+    for part in (query or "").split("&"):
+        if not part:
+            continue
+        k, _, v = part.partition("=")
+        if not k:
+            continue
+        out[k] = unquote(v)
+    return out
+
+
 ROUTES = {
     ("bootstrap",): api_bootstrap,
     ("preview",): api_preview,
@@ -1106,6 +1266,9 @@ ROUTES = {
     ("logs/clear",): api_logs_clear,
     ("open/logs",): api_open_logs,
     ("open/dsh",): api_open_dsh,
+    # quit 是契约里的正式端点名(与 Windows 侧同名同参数); shutdown 保留为别名,
+    # 旧托盘/脚本还在 POST /api/shutdown, 删掉等于把它们打挂。
+    ("quit",): api_shutdown,
     ("shutdown",): api_shutdown,
     ("convert/start",): api_convert_start,
     ("browse",): api_browse,
@@ -1151,6 +1314,10 @@ class Handler(BaseHTTPRequestHandler):
         BaseHTTPRequestHandler.handle_error(self, request, client_address)
 
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        if not isinstance(body, bytes):
+            # 出口处统一收口: 无论处理器写没写, 发出去的 JSON 一定有 ok(见 _with_ok)。
+            # 业务失败一律 HTTP 200 + ok:false, 处理器抛异常才是 500 + ok:false。
+            body = _with_ok(body)
         data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -1172,20 +1339,44 @@ class Handler(BaseHTTPRequestHandler):
             h = h.split(":")[0]             # 127.0.0.1:8788 / localhost:8788
         return h in self._ALLOWED_HOSTS
 
+    # GET 侧受理的 API 端点。Windows 端 logs 是 GET ?n=200、job 是 GET ?id=3, Linux 端历来
+    # 只有 POST; 两种写法都受理, 跨端脚本才不必按平台分支(POST 那半边一直是主力, webui 只用 POST)。
+    # 除 ping/status 外一律要 token: GET 不鉴权等于把运行日志与任务输出降级成"本机任意页面可读"
+    # —— POST 面当初就是因为同样的问题才加上 X-Auth 的。
+    _GET_API = ("logs", "job")
+
+    def _api_get(self, key):
+        if key == "ping":
+            # 探活/端口发现, 免 token(与 Windows 侧 ping 同口径)。Linux 端没有内置 cli,
+            # cli 字段照样给但留空, 调用方可以无条件读这个键。
+            return self._send(200, {"ok": True, "app": "llamadsh-launcher-linux", "cli": ""})
+        if key == "status":
+            # GET /api/status: 供客户端自举探测与轻量轮询使用(客户端 _probe 走 GET, 不带 token)
+            try:
+                return self._send(200, api_status({}))
+            except Exception as ex:
+                return self._send(500, {"ok": False, "error": str(ex)})
+        if key not in self._GET_API:
+            return self._send(404, {"ok": False, "error": "unknown api: " + key})
+        if (self.headers.get("X-Auth") or "") != API_TOKEN:
+            return self._send(401, {"ok": False, "error": "unauthorized"})
+        try:
+            result = ROUTES[(key,)](_query_body(self.path.partition("?")[2]))
+        except Exception as ex:
+            HUB.error_ex(ex, "API GET %s" % key)
+            return self._send(500, {"ok": False, "error": str(ex)})
+        return self._send(200, result)
+
     def do_GET(self):
         if not self._host_ok():
-            return self._send(403, {"error": "forbidden host"})
+            return self._send(403, {"ok": False, "error": "forbidden host"})
         path = self.path.split("?")[0]
         if path in ("/", "/index.html"):
             return self._static_index()
         if path == "/favicon.ico":
             return self._send(204, b"", "image/x-icon")
-        # GET /api/status: 供客户端自举探测与轻量轮询使用(客户端 _probe 走 GET)
-        if path == "/api/status":
-            try:
-                return self._send(200, api_status({}))
-            except Exception as ex:
-                return self._send(500, {"error": str(ex)})
+        if path.startswith("/api/"):
+            return self._api_get(path[len("/api/"):].strip("/"))
         safe = os.path.normpath(path.lstrip("/"))
         base = os.path.realpath(WEBUI_DIR)
         full = os.path.realpath(os.path.join(base, safe))
@@ -1195,7 +1386,7 @@ class Handler(BaseHTTPRequestHandler):
         # 被投下的符号链接(指向树外)一并挡掉。
         if full != base and full.startswith(base + os.sep) and os.path.isfile(full):
             return self._static(full)
-        self._send(404, {"error": "not found"})
+        self._send(404, {"ok": False, "error": "not found"})
 
     def _static(self, full):
         ext = os.path.splitext(full)[1]
@@ -1203,7 +1394,7 @@ class Handler(BaseHTTPRequestHandler):
             with open(full, "rb") as f:
                 self._send(200, f.read(), MIME.get(ext, "application/octet-stream"))
         except OSError:
-            self._send(404, {"error": "not found"})
+            self._send(404, {"ok": False, "error": "not found"})
 
     def _static_index(self):
         """index.html + 注入本次启动的 API token(app.js 统一带 X-Auth 头)。"""
@@ -1211,7 +1402,7 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.path.join(WEBUI_DIR, "index.html"), encoding="utf-8") as f:
                 html = f.read()
         except OSError:
-            return self._send(404, {"error": "not found"})
+            return self._send(404, {"ok": False, "error": "not found"})
         inject = "<script>window.__DSH_TOKEN=%s;</script>" % json.dumps(API_TOKEN)
         if "</head>" in html:
             html = html.replace("</head>", inject + "</head>", 1)
@@ -1226,33 +1417,33 @@ class Handler(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length") or 0)
             if n > 10_000_000:
-                return self._send(413, {"error": "payload too large"})
+                return self._send(413, {"ok": False, "error": "payload too large"})
             raw = self.rfile.read(n) if n else b""
             body = json.loads(raw.decode("utf-8")) if raw else {}
         except Exception:
-            return self._send(400, {"error": "bad request"})
+            return self._send(400, {"ok": False, "error": "bad request"})
         # CSRF: 浏览器可跨站提交 text/plain 表单拼合法 JSON 驱动全部 POST API;
         # 校验 Host 白名单(DNS rebinding 同时被挡)。与 GET 用同一个 _host_ok,
         # 免得两半白名单各自漂移(IPv6 字面量 [::1]:8788 以前在 POST 侧会被误拒)。
         if not self._host_ok():
-            return self._send(403, {"error": "forbidden host"})
+            return self._send(403, {"ok": False, "error": "forbidden host"})
         # 鉴权: 本机任意进程此前可无凭证驱动全部 POST(启停进程/装插件/浏览全盘)
         if (self.headers.get("X-Auth") or "") != API_TOKEN:
-            return self._send(401, {"error": "unauthorized"})
+            return self._send(401, {"ok": False, "error": "unauthorized"})
         fn = ROUTES.get((path,))
         if fn is None:
-            return self._send(404, {"error": "unknown api: " + path})
+            return self._send(404, {"ok": False, "error": "unknown api: " + path})
         # 形状校验: 字段类型错在旧版会走到 prof.get(...)/.strip() → AttributeError → 500,
         # 并把整段 traceback 写进 error.log(排障时看着像服务自己坏了)。类型错就当类型错
         # 处理: 明确 400 说是哪个字段、发成了什么。
         bad = _body_shape_error(body)
         if bad:
-            return self._send(400, {"error": bad})
+            return self._send(400, {"ok": False, "error": bad})
         try:
             result = fn(body)
         except Exception as ex:
             HUB.error_ex(ex, "API %s" % path)
-            code, result = 500, {"error": str(ex)}
+            code, result = 500, {"ok": False, "error": str(ex)}
         else:
             code = 200
         try:
@@ -1320,6 +1511,8 @@ def main():
     if server is None:
         print("无法绑定端口 %d~%d" % (args.port, args.port + 19))
         sys.exit(1)
+    # 绑定成功之后才写发现文件: 端口被占会顺延(port + i), 写默认端口等于骗调用方。
+    _write_agent_file(port)
     url = "http://127.0.0.1:%d" % port
     print("LlamaDSH Launcher(Linux 复刻版)已启动")
     print("主窗口: %s" % url)

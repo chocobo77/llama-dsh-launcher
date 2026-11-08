@@ -922,9 +922,36 @@ public class GpuMonitor
 		catch
 		{
 		}
-		if (_gpuTempThread != null && _gpuTempThread.IsAlive)
+		if (_gpuTempThread != null && _gpuTempThread.IsAlive && _gpuTempThread != Thread.CurrentThread)
 		{
-			_gpuTempThread.Join(2000);
+			Thread dying = _gpuTempThread;
+			if (System.Windows.Application.Current?.Dispatcher.CheckAccess() == true)
+			{
+				// UI 线程上不能 Join: 温度循环的一拍可能是 nvidia-smi 的秒级子进程,
+				// 每次托盘显隐都会 Stop/Start, 于是窗口会整窗冻住最多 2 秒
+				Task.Run(delegate
+				{
+					try
+					{
+						dying.Join(3000);
+					}
+					catch (Exception ex)
+					{
+						AppLog.WriteError("等待 GPU 温度线程退出失败: " + ex.Message);
+					}
+				});
+			}
+			else
+			{
+				try
+				{
+					dying.Join(2000);
+				}
+				catch (Exception ex)
+				{
+					AppLog.WriteError("等待 GPU 温度线程退出失败: " + ex.Message);
+				}
+			}
 		}
 		// 进程对象是非托管句柄包装: 每次托盘显隐都会 Stop/Start, 不 Dispose 会累积泄漏
 		try

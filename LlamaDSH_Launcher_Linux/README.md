@@ -42,6 +42,32 @@ python3 main.py            # 默认端口 8788,被占用自动 +1
 浏览器打开打印的地址即主窗口;服务端进程常驻,关闭标签页不影响已启动的服务。
 依赖:Python 3.10+、`pyyaml`。
 
+## 本机 HTTP 接口(Agent 调用 / 排障)
+
+端点命名与 Windows 版启动器的 Agent 接口对齐,**完整口径见 `../docs/API-CONTRACT.md`**
+(端点表、字段别名、发现文件、任务模型都在那里)。要点:
+
+- 只绑 `127.0.0.1:8788`(被占用自动 +1,最多试 20 个),GET/POST 都要过 Host 白名单
+  (`127.0.0.1` / `localhost` / `::1`,含 `[::1]:8788` 写法)。
+- 鉴权头 `X-Auth: <token>`(POST 全部、以及 `GET /api/logs`、`GET /api/job`)。
+  免鉴权只有 `GET /api/ping`(探活/端口发现)与 `GET /api/status`(客户端自举探测)。
+- 发现文件两份,都在 `~/.dsh_launcher_logs/`:
+  - `agent.json`(0600) = `{"port":…,"token":"…","enabled":true}` —— 与 Windows 同路径同字段,
+    端口是**本次实际绑定成功**的端口(顺延后不是 8788)。只写不读。
+  - `~/.dsh_launcher_token`(0600 纯文本)保留作向后兼容,`client.py`/`tray.py` 仍读它。
+  两份都是"最后一次启动"的记录,进程退出不会清理,所以先 `ping` 再当它在跑。
+- 所有 JSON 响应(含 4xx/5xx 与业务失败)都带 `ok`:业务失败 = HTTP 200 + `ok:false + error`,
+  处理器抛异常 = 500 + `ok:false`。退出端点是 `quit`(`{"stop_services":true|false}`,默认停服务),
+  `shutdown` 作为历史别名保留。
+
+```bash
+curl -s http://127.0.0.1:8788/api/ping                    # 免 token 探活
+TOK=$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.dsh_launcher_logs/agent.json")))["token"])')
+curl -s -H "X-Auth: $TOK" -H 'Content-Type: application/json' \
+     -d '{"after":0,"n":200}' http://127.0.0.1:8788/api/logs   # 游标 + 尾部,两种参数都收
+curl -s -H "X-Auth: $TOK" http://127.0.0.1:8788/api/job?id=1   # 任务模型轮询
+```
+
 ## 本轮同步内容(相对 2026-09-29 功能基线)
 
 ### 监测子系统
@@ -149,6 +175,8 @@ python3 main.py            # 默认端口 8788,被占用自动 +1
 | 编辑命令为就地编辑 | 模态编辑自定义参数(仅追加语义不变) |
 | WMI 分离启动 | setsid 会话分离 + 日志尾随 |
 | 提权 runas 读游戏内存 | sudo -n 选项(默认关) |
+| 内置 `cli` 子命令(`llamadsh-cli.exe`) | 无内置 cli:端点名/字段与 Windows 一致,用 curl/脚本直连,`ping` 的 `cli` 字段留空 |
+| Agent 接口可禁用(`LLAMADSH_AGENT_DISABLE=1`) | 不可禁用:这个 HTTP 服务就是主窗口本身(`agent.json` 里 `enabled` 恒为 true) |
 
 DSH 兼容服务中的入口注入改写(词法机)、死依赖全量扫描为精简实现;semver peer
 判定/激活守卫/锁定/豁免/升级链为完整移植。
@@ -160,7 +188,8 @@ DSH 兼容服务中的入口注入改写(词法机)、死依赖全量扫描为�
 - `~/.llamadsh_config_path.json`、`~/.dsh_launcher_state.json`、`~/.llamadsh_dsh_build.json`
 - `~/.llamadsh/params_override.yml`(override 层支持 subgroup/offValue/offFlag/wide)
 - `~/.dsh/pinned_plugins.json`、`~/.dsh/profiles/web/{package.json,compatibility.json,…}`
-- `~/.dsh_launcher_logs/{info,run,error,crash}.log`
+- `~/.dsh_launcher_logs/{info,run,error,crash}.log`;`agent.json`(0600,端口+token+enabled,
+  与 Windows 同字段)、`~/.dsh_launcher_token`(0600,旧版纯文本 token,向后兼容)
 - llama.cpp 变体建议目录:`~/llama.cpp-<owner>`(与现有目录并排);更新临时:
   `~/.cache/llamadsh/updates`
 

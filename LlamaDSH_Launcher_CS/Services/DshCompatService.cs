@@ -690,7 +690,7 @@ public static class DshCompatService
                 {
                     return "package.json 中没有 dsh.profile.bundles";
                 }
-                List<string> names = bundles.Where(n => n?.GetValue<string>() is string s).Select(n => n!.GetValue<string>()).ToList();
+                List<string> names = bundles.Select(NodeString).Where((string? s) => !string.IsNullOrEmpty(s)).Select((string? s) => s!).ToList();
                 bool changed = false;
                 if (active && !names.Contains(name, StringComparer.Ordinal))
                 {
@@ -1782,7 +1782,7 @@ public static class DshCompatService
                 }
                 List<string> files = new List<string>();
                 JsonNode? manifest = TryReadManifest(Path.Combine(packageDir, "package.json"));
-                string? declared = manifest?["dsh"]?["bundle"]?["patch"]?.GetValue<string>();
+                string? declared = NodeString(manifest?["dsh"]?["bundle"]?["patch"]);
                 if (!string.IsNullOrWhiteSpace(declared))
                 {
                         files.Add(Path.Combine(packageDir, declared!));
@@ -1919,7 +1919,7 @@ public static class DshCompatService
                 {
                         foreach (JsonNode? n in bundlesNode)
                         {
-                                string? s = n?.GetValue<string>();
+                                string? s = NodeString(n); // 脏数据(对象/数字)时 GetValue<string>() 会抛, 一次就毁掉整轮审计
                                 if (!string.IsNullOrWhiteSpace(s))
                                 {
                                         bundleNames.Add(s!);
@@ -3265,6 +3265,20 @@ process.stdout.write(JSON.stringify(out));
                 DshCompatRepairResult res = new DshCompatRepairResult();
                 string dir = string.IsNullOrWhiteSpace(dshDir) ? report.DshDir : dshDir.Trim().Trim('"');
                 string prof = string.IsNullOrWhiteSpace(profile) ? report.Profile : profile.Trim();
+                // 每个修复步骤独立兜底: 一步抛穿会让"备份已建、后续补丁/链接/插件全不修"，
+                // 用户只看到一行"修复异常"。步骤之间没有依赖顺序上的强耦合，失败只记账继续走。
+                void Step(string name, Action step)
+                {
+                        try
+                        {
+                                step();
+                        }
+                        catch (Exception ex)
+                        {
+                                res.Messages.Add(name + "失败: " + ex.Message);
+                                log?.Invoke("[兼容修复] " + name + "异常: " + ex.Message);
+                        }
+                }
                 try
                 {
                         // 0) 统一先重审: 传入的 report 是用户看确认框之前的快照,
@@ -3275,119 +3289,169 @@ process.stdout.write(JSON.stringify(out));
                         // 1) bundle 激活表
                         if (fresh.ManifestRepairNeeded)
                         {
-                                string msg = RepairManifest(fresh, log);
-                                res.ManifestChanged = true;
-                                res.Messages.Add(msg);
-                                log?.Invoke("[兼容修复] " + msg);
+                                try
+                                {
+                                        string msg = RepairManifest(fresh, log);
+                                        res.ManifestChanged = true;
+                                        res.Messages.Add(msg);
+                                        log?.Invoke("[兼容修复] " + msg);
+                                }
+                                catch (Exception ex)
+                                {
+                                        // 单步异常不撤销其余步骤: 否则备份已建而补丁/链接/插件全不修
+                                        res.Messages.Add("bundle 激活表修复失败: " + ex.Message);
+                                        log?.Invoke("[兼容修复] bundle 修复异常: " + ex.Message);
+                                }
                         }
 
                         // 3) cordis.patch.yml：改名迁移 + 注释失效 + 删除误停用行（重新启用插件）
                         HashSet<string> removeIds = new HashSet<string>(fresh.OrphanDisableIds, StringComparer.Ordinal);
                         if (fresh.PatchIssues.Any((DshPatchIssue x) => x.Repairable) || removeIds.Count > 0)
                         {
-                                (int commented, int migrated, int removedBlocks, bool changed) = RepairPatchFile(fresh.PatchFilePath, fresh.PatchIssues, removeIds, log);
-                                res.CommentedPatchBlocks = commented;
-                                res.MigratedPatchAliases = migrated;
-                                res.RemovedDisableBlocks = removedBlocks;
-                                if (changed)
+                                Step("补丁文件", () =>
                                 {
-                                        string msg = "补丁修复: 迁移 " + migrated + " 条改名，注释 " + commented + " 条失效条目，重新启用删除 " + removedBlocks + " 条禁用行（已备份 cordis.patch.yml）";
-                                        res.Messages.Add(msg);
-                                        log?.Invoke("[兼容修复] " + msg);
-                                }
+                                        (int commented, int migrated, int removedBlocks, bool changed) = RepairPatchFile(fresh.PatchFilePath, fresh.PatchIssues, removeIds, log);
+                                        res.CommentedPatchBlocks = commented;
+                                        res.MigratedPatchAliases = migrated;
+                                        res.RemovedDisableBlocks = removedBlocks;
+                                        if (changed)
+                                        {
+                                                string msg = "补丁修复: 迁移 " + migrated + " 条改名，注释 " + commented + " 条失效条目，重新启用删除 " + removedBlocks + " 条禁用行（已备份 cordis.patch.yml）";
+                                                res.Messages.Add(msg);
+                                                log?.Invoke("[兼容修复] " + msg);
+                                        }
+                                });
                         }
 
                         // 3b) 清理 .dsh-market/state.json 中对应的停用记录
                         if (fresh.MarketStateRepairNeeded && fresh.ReenabledPlugins.Count > 0)
                         {
-                                string mmsg = RepairMarketState(fresh, log);
-                                res.MarketStateChanged = true;
-                                res.Messages.Add(mmsg);
-                                log?.Invoke("[兼容修复] " + mmsg);
+                                Step("市场 state 清理", () =>
+                                {
+                                        string mmsg = RepairMarketState(fresh, log);
+                                        res.MarketStateChanged = true;
+                                        res.Messages.Add(mmsg);
+                                        log?.Invoke("[兼容修复] " + mmsg);
+                                });
                         }
 
                         // 3c) 入口文件里永不解析的 inject 服务名
                         if (fresh.InjectFixes.Count > 0)
                         {
-                                string imsg = RepairInjectFixes(fresh, log);
-                                res.Messages.Add(imsg);
-                                log?.Invoke("[兼容修复] " + imsg);
+                                Step("inject 改写", () =>
+                                {
+                                        string imsg = RepairInjectFixes(fresh, log);
+                                        res.Messages.Add(imsg);
+                                        log?.Invoke("[兼容修复] " + imsg);
+                                });
                         }
                         // 3d) 死依赖声明：peer/devDep 引用已被 DSH 上游删除的包
                         if (fresh.DeadPeerFixes.Count > 0)
                         {
-                                int dremoved = RepairDeadPeerFixes(fresh, log);
-                                res.DeadPeersRemoved += dremoved;
-                                string msg = "死依赖清理: 移除 " + dremoved + " 条死声明（涉及 "
-                                        + fresh.DeadPeerFixes.Select((DshDeadPeerFix f) => f.PluginName).Distinct().Count() + " 个插件，改前已备份）";
-                                res.Messages.Add(msg);
-                                log?.Invoke("[兼容修复] " + msg);
+                                Step("死依赖清理", () =>
+                                {
+                                        int dremoved = RepairDeadPeerFixes(fresh, log);
+                                        res.DeadPeersRemoved += dremoved;
+                                        string msg = "死依赖清理: 移除 " + dremoved + " 条死声明（涉及 "
+                                                + fresh.DeadPeerFixes.Select((DshDeadPeerFix f) => f.PluginName).Distinct().Count() + " 个插件，改前已备份）";
+                                        res.Messages.Add(msg);
+                                        log?.Invoke("[兼容修复] " + msg);
+                                });
                         }
 
                         // 3e) compatibility.json 陈旧豁免条目
                         if (fresh.StaleExemptions.Count > 0)
                         {
-                                int sremoved = RepairStaleExemptions(fresh, log);
-                                res.StaleExemptionsRemoved += sremoved;
-                                string msg = "豁免清理: 移除 compatibility.json 中 " + sremoved + " 条陈旧条目（改前已备份）";
-                                res.Messages.Add(msg);
-                                log?.Invoke("[兼容修复] " + msg);
+                                Step("豁免清理", () =>
+                                {
+                                        int sremoved = RepairStaleExemptions(fresh, log);
+                                        res.StaleExemptionsRemoved += sremoved;
+                                        string msg = "豁免清理: 移除 compatibility.json 中 " + sremoved + " 条陈旧条目（改前已备份）";
+                                        res.Messages.Add(msg);
+                                        log?.Invoke("[兼容修复] " + msg);
+                                });
                         }
 
                         // 4) node_modules 失效链接
-                        (int relinked, int removed, int failed) = RepairLinks(fresh, log);
-                        res.RelinkedLinks = relinked;
-                        res.RemovedLinks = removed;
-                        if (relinked > 0 || removed > 0 || failed > 0)
+                        Step("链接修复", () =>
                         {
-                                string msg = "链接修复: 重连 " + relinked + " 条，清理 " + removed + " 条" + (failed > 0 ? "，失败 " + failed + " 条" : "");
-                                res.Messages.Add(msg);
-                                log?.Invoke("[兼容修复] " + msg);
-                        }
+                                (int relinked, int removed, int failed) = RepairLinks(fresh, log);
+                                res.RelinkedLinks = relinked;
+                                res.RemovedLinks = removed;
+                                if (relinked > 0 || removed > 0 || failed > 0)
+                                {
+                                        string msg = "链接修复: 重连 " + relinked + " 条，清理 " + removed + " 条" + (failed > 0 ? "，失败 " + failed + " 条" : "");
+                                        res.Messages.Add(msg);
+                                        log?.Invoke("[兼容修复] " + msg);
+                                }
+                        });
 
                         // 4b) peer 与 DSH 版本不兼容 → pnpm 升级到最新（registry 依赖）
                         if (fresh.PluginsToUpgrade.Count > 0)
                         {
-                                string msg = RepairUpgradePlugins(fresh, log);
-                                res.Messages.Add(msg);
-                                log?.Invoke("[兼容修复] " + msg);
+                                Step("插件升级", () =>
+                                {
+                                        string msg = RepairUpgradePlugins(fresh, log);
+                                        res.Messages.Add(msg);
+                                        log?.Invoke("[兼容修复] " + msg);
+                                });
                         }
 
                         // 升级后重审一次：下面的 4b.2（死依赖）与 4c（缺失 peer junction）都基于这份新状态
-                        DshCompatReport afterUpgrade = fresh.PluginsToUpgrade.Count > 0
-                                ? Audit(dir, prof, log, includeDumpConfig: false)
-                                : fresh;
+                        DshCompatReport afterUpgrade = fresh;
+                        if (fresh.PluginsToUpgrade.Count > 0)
+                        {
+                                Step("升级后重审", () =>
+                                {
+                                        afterUpgrade = Audit(dir, prof, log, includeDumpConfig: false);
+                                });
+                        }
                         // 4b.2) 升级后的新版可能又带来死依赖声明（如最新版仍声明 dsh-invariants）：
                         // 3d 清的是升级前那份清单，这里基于升级后重审再清一次，避免要等到下一次修复。
                         if (fresh.PluginsToUpgrade.Count > 0 && afterUpgrade.DeadPeerFixes.Count > 0)
                         {
-                                int dremoved2 = RepairDeadPeerFixes(afterUpgrade, log);
-                                if (dremoved2 > 0)
+                                Step("升级后死依赖清理", () =>
                                 {
-                                        res.DeadPeersRemoved += dremoved2;
-                                        string msg = "升级后死依赖清理: 移除 " + dremoved2 + " 条声明";
-                                        res.Messages.Add(msg);
-                                        log?.Invoke("[兼容修复] " + msg);
-                                }
+                                        int dremoved2 = RepairDeadPeerFixes(afterUpgrade, log);
+                                        if (dremoved2 > 0)
+                                        {
+                                                res.DeadPeersRemoved += dremoved2;
+                                                string msg = "升级后死依赖清理: 移除 " + dremoved2 + " 条声明";
+                                                res.Messages.Add(msg);
+                                                log?.Invoke("[兼容修复] " + msg);
+                                        }
+                                });
                         }
                         // 4c) 缺失 peer → 在共享 node_modules 建 junction（覆盖新装插件的缺失项）
                         if (afterUpgrade.PeerJunctionFixes.Count > 0)
                         {
-                                (int linked, int jfailed) = RepairPeerJunctions(afterUpgrade, log);
-                                if (linked > 0 || jfailed > 0)
+                                Step("peer junction 补齐", () =>
                                 {
-                                        string msg = "peer 补齐: junction " + linked + " 条" + (jfailed > 0 ? "，失败 " + jfailed + " 条" : "");
-                                        res.Messages.Add(msg);
-                                        log?.Invoke("[兼容修复] " + msg);
-                                }
+                                        (int linked, int jfailed) = RepairPeerJunctions(afterUpgrade, log);
+                                        if (linked > 0 || jfailed > 0)
+                                        {
+                                                string msg = "peer 补齐: junction " + linked + " 条" + (jfailed > 0 ? "，失败 " + jfailed + " 条" : "");
+                                                res.Messages.Add(msg);
+                                                log?.Invoke("[兼容修复] " + msg);
+                                        }
+                                });
                         }
 
-                        // 5) 复检
+                        // 5) 复检：复检本身出错也不能把报告丢掉，退回修复前那份给调用方
                         log?.Invoke("[兼容修复] 修复完成，重新检查 ...");
-                        res.Report = Audit(dir, prof, log, includeDumpConfig: true);
-                        res.Messages.Add("复检：错误 " + res.Report.ErrorCount + " · 警告 " + res.Report.WarningCount + " · 可修复 " + res.Report.RepairableCount);
-                        res.RemainingErrors = res.Report.ErrorCount;
-                        res.RemainingRepairable = res.Report.RepairableCount;
+                        try
+                        {
+                                res.Report = Audit(dir, prof, log, includeDumpConfig: true);
+                                res.Messages.Add("复检：错误 " + res.Report.ErrorCount + " · 警告 " + res.Report.WarningCount + " · 可修复 " + res.Report.RepairableCount);
+                                res.RemainingErrors = res.Report.ErrorCount;
+                                res.RemainingRepairable = res.Report.RepairableCount;
+                        }
+                        catch (Exception ex)
+                        {
+                                res.Report = fresh;
+                                res.Messages.Add("复检失败: " + ex.Message);
+                                log?.Invoke("[兼容修复] 复检异常（结论取自修复前那份报告）: " + ex.Message);
+                        }
                 }
                 catch (Exception ex)
                 {
@@ -3429,10 +3493,11 @@ process.stdout.write(JSON.stringify(out));
                 List<string> names = new List<string>();
                 foreach (JsonNode? n in bundles)
                 {
-                        string? s = n?.GetValue<string>();
-                        if (!string.IsNullOrWhiteSpace(s))
+                        // 只用 TryGetValue 取值：GetValue<string>() 遇到对象/数字/null 会抛
+                        // InvalidOperationException，整次 Repair 会在第 1 步中断（备份已建、后续全不执行）。
+                        if (n is JsonValue jv && jv.TryGetValue<string>(out string? s) && !string.IsNullOrWhiteSpace(s))
                         {
-                                names.Add(s!);
+                                names.Add(s);
                         }
                 }
                 int removed = names.RemoveAll((string x) => report.BundlesToRemove.Contains(x, StringComparer.Ordinal));

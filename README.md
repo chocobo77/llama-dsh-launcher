@@ -100,11 +100,11 @@ llamadsh-cli api GET /api/status 任意端点逃生舱
 llamadsh-cli quit              退出（默认先停服务）
 ```
 
-退出码 `0` 成功 / `1` 业务失败 / `2` 接口不可达，stdout 永远是一行可直接解析的 JSON。同样的能力也能经 `LlamaDSH_Launcher.exe cli <命令>` 使用。
+退出码 `0` 成功 / `1` 业务失败或 HTTP 4xx-5xx / `2` 接口不可达或已禁用 / `3` 超时(结果未知，**勿直接重试**，先用 `status`/`logs` 确认)，stdout 永远是一行可直接解析的 JSON。同样的能力也能经 `LlamaDSH_Launcher.exe cli <命令>` 使用。等待秒数用 `LLAMADSH_AGENT_TIMEOUT`(5–3600，默认 600)放宽。
 
-配置在 `%USERPROFILE%\.dsh_launcher_logs\agent.json`（端口 + token；`cli token` 直接读）。curl 用：`curl -H "X-Auth: <token>" http://127.0.0.1:17325/api/status`。禁用接口：`agent.json` 里 `"enabled": false` 或环境变量 `LLAMADSH_AGENT_DISABLE=1`；改端口用 `LLAMADSH_AGENT_PORT`。
+发现文件 `~/.dsh_launcher_logs/agent.json`（Windows 下即 `%USERPROFILE%\.dsh_launcher_logs\agent.json`）= `{"port":…,"token":"…","enabled":true}`，**两个启动器都写**这一份（Linux 端默认端口 8788，端口被占会顺延，所以文件里的 port 是本次真正绑上的端口；Linux 另留 `~/.dsh_launcher_token` 纯文本 token 作向后兼容）。它是“最后一次启动”的记录，进程退出不会清理——先 `GET /api/ping` 再当服务在跑。curl 用：`curl -H "X-Auth: <token>" http://127.0.0.1:17325/api/status`（也接受 `Authorization: Bearer <token>`）。禁用接口：`agent.json` 里 `"enabled": false` 或环境变量 `LLAMADSH_AGENT_DISABLE=1`；改端口用 `LLAMADSH_AGENT_PORT`；临时换 token 用 `LLAMADSH_AGENT_TOKEN`（env 里的 token **不会**被写进 `agent.json`，`cli` 也按同一优先级读 env）。
 
-端点命名与 **Linux 侧启动器自带的 Web 控制面对齐**（`/api/llama/start`、`/api/lightweight` 等同名，见 `LlamaDSH_Launcher_Linux/main.py` ROUTES），跨平台脚本可共用词汇表。
+端点命名、字段别名口径（`llama.running`/`llama.status`、`profile_name`、`gpu_temp`/`gpu_power`/`net_rx`、`sampled_at`/`sampled_at_utc`、`logs` 的 `n`/`after`）、任务模型（`{"job":id}` → `/api/job`）与两端差异清单见 **`docs/API-CONTRACT.md`**；Linux 侧实现见 `LlamaDSH_Launcher_Linux/main.py` 的 `ROUTES`。
 
 ## 环境要求
 

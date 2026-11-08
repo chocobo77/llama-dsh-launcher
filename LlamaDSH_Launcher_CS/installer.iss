@@ -15,7 +15,8 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\LlamaDSH_Launcher
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-LicenseFile=
+; MIT 许可随安装向导展示(此前 LicenseFile= 是空值, 用户装完都不知道授权条款)
+LicenseFile=..\LICENSE
 OutputDir={#SourcePath}installer_output
 OutputBaseFilename=LlamaDSH_Launcher_Setup
 SetupIconFile=installer_staging\{#MyAppIcon}
@@ -27,6 +28,9 @@ PrivilegesRequired=admin
 ; 与 App.xaml.cs 单实例 Mutex 同名: 安装/卸载前要求关闭运行中的启动器,
 ; 也防止手工跑 ISCC 时把 installer_staging 里正在被占用的旧 exe 打进包
 AppMutex=LlamaDSH_Launcher_SingleInstance_Mutex
+; 覆盖安装时 exe 正在运行会留下半新半旧的文件树: 让安装向导主动要求关闭
+CloseApplications=yes
+RestartApplications=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
@@ -48,7 +52,6 @@ chinesesimplified.FinishedLabel=安装已完成。您现在可以启动程序了
 chinesesimplified.ClickFinish=单击"完成"退出安装向导。
 chinesesimplified.StatusRunProgram=正在完成安装...
 chinesesimplified.ConfirmUninstall=确定要完全删除 %1 及其所有组件吗？
-chinesesimplified.UninstallSuccessLabel=%1 已成功从您的计算机中删除。
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加选项:"
@@ -64,7 +67,7 @@ Source: "installer_staging\{#MyAppIcon}"; DestDir: "{app}\Resources"; Flags: ign
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\Resources\{#MyAppIcon}"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\Resources\{#MyAppIcon}"; Tasks: desktopicon
-Name: "{userstartmenu}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\Resources\{#MyAppIcon}"; Tasks: startmenuicon
+Name: "{autostartmenu}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\Resources\{#MyAppIcon}"; Tasks: startmenuicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动程序"; Flags: nowait postinstall skipifsilent

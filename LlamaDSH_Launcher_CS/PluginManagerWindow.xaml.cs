@@ -92,7 +92,7 @@ public partial class PluginManagerWindow : Window
 		}
 		finally
 		{
-			_busy = false;
+			SetBusy(false);
 			BtnRefresh.IsEnabled = true;
 			UpdateButtons();
 		}
@@ -117,6 +117,35 @@ public partial class PluginManagerWindow : Window
 	{
 		Log(msg);
 		TxtHeader.Text = msg;
+	}
+
+	/// <summary>操作期间的可见状态 + 按钮禁用。此前审计/升级（分钟级）进行中点任何按钮都静默无反馈，
+	/// 与已经修掉的「点了没反应」是同一族体感问题。</summary>
+	private void SetBusy(bool on, string? doing = null)
+	{
+		_busy = on;
+		BtnRefresh.IsEnabled = !on;
+		BtnActivate.IsEnabled = !on;
+		BtnToggle.IsEnabled = !on;
+		BtnUpgrade.IsEnabled = !on;
+		BtnExempt.IsEnabled = !on;
+		BtnUninstall.IsEnabled = !on;
+		BtnOpenDir.IsEnabled = !on;
+		if (on && !string.IsNullOrEmpty(doing))
+		{
+			TxtHeader.Text = "正在" + doing + " …（其它操作已暂时禁用）";
+		}
+	}
+
+	/// <summary>各操作入口的统一守卫：被挡住时说明原因，不再静默 return。</summary>
+	private bool BusyBlocked()
+	{
+		if (!_busy)
+		{
+			return false;
+		}
+		ShowStatus("上一个操作还在进行，请等它完成后再点");
+		return true;
 	}
 
 	private DshPluginInfo? Selected()
@@ -188,11 +217,11 @@ public partial class PluginManagerWindow : Window
 	private async void Activate_Click(object sender, RoutedEventArgs e)
 	{
 		DshPluginInfo? p = Selected();
-		if (p == null || _busy)
+		if (p == null || BusyBlocked())
 		{
 			return;
 		}
-		_busy = true;
+		SetBusy(true, "激活插件 " + p.Name);
 		try
 		{
 			string msg = await Task.Run(delegate { return DshCompatService.SetBundleActive(_profile, p.Name, true, delegate (string m) { Log(m); }); });
@@ -206,7 +235,7 @@ public partial class PluginManagerWindow : Window
 		}
 		finally
 		{
-			_busy = false;
+			SetBusy(false);
 		}
 		await RefreshAsync();
 	}
@@ -214,7 +243,7 @@ public partial class PluginManagerWindow : Window
 	private async void Toggle_Click(object sender, RoutedEventArgs e)
 	{
 		DshPluginInfo? p = Selected();
-		if (p == null || _busy)
+		if (p == null || BusyBlocked())
 		{
 			return;
 		}
@@ -230,9 +259,9 @@ public partial class PluginManagerWindow : Window
 				return;
 			}
 		}
-		// 用 try/finally 保证任何异常（含 Task.Run 内抛出）都会复位 _busy，
+		// 用 try/finally 保证任何异常（含 Task.Run 内抛出）都会复位忙碌状态，
 		// 否则窗口会被永久锁死在“忙碌”状态而静默忽略后续点击。
-		_busy = true;
+		SetBusy(true, (activating ? "启用并解锁插件 " : "停用并锁定插件 ") + p.Name);
 		try
 		{
 			string msg = await Task.Run(delegate { return DshCompatService.SetBundleActive(_profile, p.Name, activating, delegate (string m) { Log(m); }); });
@@ -245,7 +274,7 @@ public partial class PluginManagerWindow : Window
 		}
 		finally
 		{
-			_busy = false;
+			SetBusy(false);
 		}
 		await RefreshAsync();
 	}
@@ -296,7 +325,7 @@ public partial class PluginManagerWindow : Window
 				return;
 			}
 		}
-		_busy = true;
+		SetBusy(true, "升级插件 " + p.Name + "（pnpm，可能要几分钟）");
 		try
 		{
 			string msg = await Task.Run(delegate { return DshCompatService.UpgradePlugin(_profile, p.Name, delegate (string m) { Log(m); }); });
@@ -309,7 +338,7 @@ public partial class PluginManagerWindow : Window
 		}
 		finally
 		{
-			_busy = false;
+			SetBusy(false);
 		}
 		await RefreshAsync();
 	}
@@ -348,7 +377,7 @@ public partial class PluginManagerWindow : Window
 		{
 			return;
 		}
-		_busy = true;
+		SetBusy(true, "卸载插件 " + p.Name);
 		try
 		{
 			string msg = await Task.Run(delegate { return DshCompatService.UninstallPlugin(_profile, p.Name, delegate (string m) { Log(m); }); });
@@ -361,7 +390,7 @@ public partial class PluginManagerWindow : Window
 		}
 		finally
 		{
-			_busy = false;
+			SetBusy(false);
 		}
 		await RefreshAsync();
 	}
@@ -447,7 +476,7 @@ public partial class PluginManagerWindow : Window
 		}
 		finally
 		{
-			_busy = false;
+			SetBusy(false);
 		}
 		await RefreshAsync();
 	}

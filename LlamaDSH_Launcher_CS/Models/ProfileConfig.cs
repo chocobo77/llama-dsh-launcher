@@ -1,10 +1,19 @@
 using System.Collections.Generic;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace LlamaDSH_Launcher.Models;
 
 public class ProfileConfig
 {
+	/// <summary>
+	/// 未识别字段原样收下、保存时原样写回。Windows 保存 profile 是"反序列化 → 再序列化"，
+	/// 没有这一段的话 Linux 侧写的字段（如 OomRetryEnabled、LlamaBackend）会在 Windows
+	/// 点一次保存后被静默抹掉。
+	/// </summary>
+	[JsonExtensionData]
+	public Dictionary<string, JsonElement> Extra { get; set; } = new Dictionary<string, JsonElement>();
+
 	public string ModelPath { get; set; } = "";
 
 	public string MtpPath { get; set; } = "";

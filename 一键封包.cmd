@@ -51,6 +51,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
  "$p='%ISS%'; $b=[IO.File]::ReadAllBytes($p); $bom=($b.Length -ge 3 -and $b[0] -eq 239 -and $b[1] -eq 187 -and $b[2] -eq 191); $q=[char]34; $t=[IO.File]::ReadAllText($p); $t=[regex]::Replace($t,'(?m)^#define\s+MyAppVersion\s+[^\r\n]*','#define MyAppVersion '+$q+'%VERARG%'+$q); [IO.File]::WriteAllText($p,$t,(New-Object System.Text.UTF8Encoding($bom)))"
 if errorlevel 1 goto :fail
 findstr /C:"#define MyAppVersion" "%ISS%"
+rem 同一版本号写进 csproj: exe 文件属性与 `cli status` 报告的版本必须和安装包一致
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+ "$p='%CSProj%'; $b=[IO.File]::ReadAllBytes($p); $bom=($b.Length -ge 3 -and $b[0] -eq 239 -and $b[1] -eq 187 -and $b[2] -eq 191); $t=[IO.File]::ReadAllText($p); $v='%VERARG%'; $t=[regex]::Replace($t,'(?m)^\s*<Version>[^\u003c]*</Version>','    <Version>'+$v+'</Version>'); $t=[regex]::Replace($t,'(?m)^\s*<AssemblyVersion>[^\u003c]*</AssemblyVersion>','    <AssemblyVersion>'+$v+'.0</AssemblyVersion>'); $t=[regex]::Replace($t,'(?m)^\s*<FileVersion>[^\u003c]*</FileVersion>','    <FileVersion>'+$v+'.0</FileVersion>'); [IO.File]::WriteAllText($p,$t,(New-Object System.Text.UTF8Encoding($bom)))"
+if errorlevel 1 goto :fail
+findstr /C:"<Version>" "%CSProj%"
 
 :envcheck
 echo [2/7] 检查构建环境...

@@ -73,7 +73,29 @@ public partial class App : System.Windows.Application
         bool createdNew = false;
         for (int attempt = 1; attempt <= 3; attempt++)
         {
-            mutex = new Mutex(true, mutexName, out createdNew);
+            try
+            {
+                mutex = new Mutex(true, mutexName, out createdNew);
+            }
+            catch (AbandonedMutexException)
+            {
+                // 上一实例被强杀/崩溃而未 ReleaseMutex：内核把遗弃 mutex 的所有权直接交给
+                // 本次调用方并抛这里。旧进程已不存在，接管是安全的；不接住会让启动器
+                // 在崩溃后一次都打不开（窗口不出，异常发生在下面的全局兜底注册之前）。
+                createdNew = true;
+                mutex = new Mutex(false, mutexName, out _); // 重新拿一个句柄，所有权仍在本线程
+                AppLog.WriteInfo($"单实例 mutex 从已退出的旧实例接管（第 {attempt} 次尝试）");
+                break;
+            }
+            catch (Exception ex)
+            {
+                // mutex 本身建不起来（安全描述符/权限异常）时不该阻止启动：
+                // 放弃单实例保护并留痕，比双击没反应且无痕要好。
+                AppLog.WriteInfo($"单实例 mutex 创建失败，跳过单实例检查: {ex.Message}");
+                mutex = null;
+                createdNew = true;
+                break;
+            }
             if (createdNew)
             {
                 if (attempt > 1)

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -305,6 +305,50 @@ public static class ProcessHelper
 		{
 			_orphanCache[key] = (DateTime.Now.AddSeconds(15.0), list);
 			return list;
+		}
+	}
+
+	/// <summary>
+	/// 判定 pid 是否像本程序要接管的 DSH：进程名必须是 node/electron，且命令行或镜像路径含 DSH 特征。
+	/// 端口探测不构成身份证据——用户自己跑在 3080 的任意进程若不校验，会被标成"接管运行中"，
+	/// 点"停止"就把它的整棵进程树杀掉（llama 侧已有同样的 ProcessName 闸门，这里补齐对称）。
+	/// </summary>
+	public static bool LooksLikeDshProcess(int pid, string? dshDir = null)
+	{
+		HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "node", "node.exe", "electron", "electron.exe" };
+		try
+		{
+			using Process process = Process.GetProcessById(pid);
+			if (!names.Contains(process.ProcessName))
+			{
+				return false;
+			}
+			string text = GetCommandLine(process.Id).ToLowerInvariant();
+			string image = "";
+			try
+			{
+				image = process.MainModule?.FileName?.ToLowerInvariant().Replace('/', '\\') ?? "";
+			}
+			catch
+			{
+				// 32/64 位或权限差异读不到 MainModule：只按命令行判定
+			}
+			if (text.Contains("cli/src/bin") || text.Contains("apps/cli") || text.Contains("@deepseek-ai")
+				|| text.Contains("deepseek-harness") || image.Contains("deepseek-harness"))
+			{
+				return true;
+			}
+			if (text.Contains("dsh") && (text.Contains("web") || text.Contains("dist") || text.Contains("cli") || text.Contains("server") || text.Contains("start")))
+			{
+				return true;
+			}
+			string key = (dshDir ?? "").ToLowerInvariant().Replace('/', '\\');
+			return key.Length > 0 && (text.Contains(key) || image.Contains(key));
+		}
+		catch
+		{
+			// 进程已退出或 PID 被复用：一律不接管
+			return false;
 		}
 	}
 

@@ -299,23 +299,23 @@ public static class AgentCli
 
 	private static int Call(string method, string url, string body, string token)
 	{
+		// 服务端 AgentOp 对 UI 操作只等 30s，但更新/重建/pnpm 这类操作在后台还会继续跑；
+		// 客户端 120s 固定超时等于"前端比服务端先放弃"（同一族问题已在 webui 修过一次）。
+		int timeoutSec = 600;
+		if (int.TryParse(Environment.GetEnvironmentVariable("LLAMADSH_AGENT_TIMEOUT"), out int ts) && ts > 0)
+		{
+			timeoutSec = Math.Clamp(ts, 5, 3600);
+		}
 		try
 		{
-			using HttpClient hc = new HttpClient { Timeout = TimeSpan.FromSeconds(120) };
+			using HttpClient hc = new HttpClient { Timeout = TimeSpan.FromSeconds(timeoutSec) };
 			if (!string.IsNullOrEmpty(token))
 			{
 				hc.DefaultRequestHeaders.TryAddWithoutValidation("X-Auth", token);
 			}
-			HttpResponseMessage resp;
-			if (method == "GET")
-			{
-				resp = hc.GetAsync(url).GetAwaiter().GetResult();
-			}
-			else
-			{
-				StringContent content = new StringContent(string.IsNullOrEmpty(body) ? "{}" : body, Encoding.UTF8, "application/json");
-				resp = hc.PostAsync(url, content).GetAwaiter().GetResult();
-			}
+			using HttpResponseMessage resp = method == "GET"
+				? hc.GetAsync(url).GetAwaiter().GetResult()
+				: hc.PostAsync(url, new StringContent(string.IsNullOrEmpty(body) ? "{}" : body, Encoding.UTF8, "application/json")).GetAwaiter().GetResult();
 			string text = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
 			Console.WriteLine(text);
 			bool ok = false;
@@ -326,8 +326,27 @@ public static class AgentCli
 			}
 			catch
 			{
+				// 响应不是 JSON: 按业务失败处理, 输出已原样打印
 			}
-			return ok ? 0 : (resp.IsSuccessStatusCode ? 1 : resp.StatusCode == System.Net.HttpStatusCode.Unauthorized ? 1 : 2);
+			// 4xx/5xx 是"接口答了但失败"，与"连不上"必须分开：2 只留给不可达
+			if (!resp.IsSuccessStatusCode)
+			{
+				return 1;
+			}
+			return ok ? 0 : 1;
+		}
+		catch (TaskCanceledException)
+		{
+			// 超时 ≠ 失败：服务端很可能仍在执行，直接重试会把同一变更做两遍
+			Console.WriteLine(JsonSerializer.Serialize(new Dictionary<string, object>
+			{
+				["ok"] = false,
+				["timeout"] = true,
+				["error"] = "等待超过 " + timeoutSec + "s；服务端可能仍在执行，勿直接重试，先用 status/logs 确认",
+				["url"] = url,
+				["hint"] = "可设 LLAMADSH_AGENT_TIMEOUT=<秒> 放宽等待"
+			}, AgentApi.JsonOpts));
+			return 3;
 		}
 		catch (HttpRequestException ex)
 		{
@@ -354,7 +373,7 @@ public static class AgentCli
 	private static void PrintHelp()
 	{
 		Console.WriteLine(@"llamadsh-cli <命令>  (或 LlamaDSH_Launcher.exe cli <命令>) —— Agent 调用正在运行的启动器, stdout 输出 JSON
-退出码: 0=成功  1=业务失败  2=接口不可达/未启用
+退出码: 0=成功  1=业务失败/HTTP 4xx-5xx  2=接口不可达/未启用  3=超时(结果未知, 勿直接重试)
 
   status                 全量状态快照(llama/dsh/GPU/熔断/轻量档/方案/路径)
   monitor                监控页同款数据(采样字典+GPU+slots+速度历史)

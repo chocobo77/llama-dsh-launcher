@@ -323,6 +323,24 @@ internal static class Program
                 HttpResponseMessage nf = hc.GetAsync("http://127.0.0.1:" + port + "/api/nope").GetAwaiter().GetResult();
                 string nfBody = nf.Content.ReadAsStringAsync().GetAwaiter().GetResult();
                 Check("未知端点 404 带端点清单", (int)nf.StatusCode == 404 && nfBody.Contains("endpoints"));
+                // 以前是"超过 262144 就截断后继续解析"：大 config 会被静默改成残缺内容
+                HttpResponseMessage big = hc.PostAsync("http://127.0.0.1:" + port + "/api/echo",
+                    new StringContent(new string('x', 300000), Encoding.UTF8, "text/plain")).GetAwaiter().GetResult();
+                Check("超大请求体 → 413(不截断解析)", (int)big.StatusCode == 413, ((int)big.StatusCode).ToString());
+                // DNS 重绑定防护: 连接进得来但 Host 不是环回 → 必须被拒(400)
+                using (System.Net.Sockets.TcpClient tc = new System.Net.Sockets.TcpClient())
+                {
+                    tc.Connect("127.0.0.1", port);
+                    using (Stream sk = tc.GetStream())
+                    {
+                        byte[] req = Encoding.ASCII.GetBytes("GET /api/ping HTTP/1.1\r\nHost: evil.example:" + port + "\r\nConnection: close\r\n\r\n");
+                        sk.Write(req, 0, req.Length);
+                        sk.Flush();
+                        using StreamReader sr = new StreamReader(sk);
+                        string? statusLine = sr.ReadLine();
+                        Check("Host 非环回被拒", statusLine != null && statusLine.Contains("400"), statusLine ?? "(无响应)");
+                    }
+                }
             }
             finally
             {

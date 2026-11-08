@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -42,6 +43,9 @@ public sealed class AgentApi
 	private readonly ConcurrentDictionary<string, Func<string, string>> _post = new ConcurrentDictionary<string, Func<string, string>>();
 	private HttpListener? _listener;
 
+	/// <summary>请求体上限：超过直接 413，绝不"截断后继续解析"（那会静默损坏大 config）。</summary>
+	private const int MaxBodyChars = 262144;
+
 	public void RegisterGet(string path, Func<string, string> handler)
 	{
 		_get[path] = handler;
@@ -62,6 +66,7 @@ public sealed class AgentApi
 		}
 		int port = DefaultPort;
 		string token = "";
+		string diskToken = "";
 		bool enabled = true;
 		try
 		{
@@ -74,7 +79,8 @@ public sealed class AgentApi
 				}
 				if (doc.RootElement.TryGetProperty("token", out JsonElement te))
 				{
-					token = te.GetString() ?? "";
+					diskToken = te.GetString() ?? "";
+					token = diskToken;
 				}
 				if (doc.RootElement.TryGetProperty("enabled", out JsonElement ee) && ee.ValueKind == JsonValueKind.False)
 				{
@@ -92,9 +98,11 @@ public sealed class AgentApi
 			port = ep;
 		}
 		string? envToken = Environment.GetEnvironmentVariable("LLAMADSH_AGENT_TOKEN");
+		bool tokenFromEnv = false;
 		if (!string.IsNullOrWhiteSpace(envToken))
 		{
 			token = envToken.Trim();
+			tokenFromEnv = true;
 		}
 		if (Environment.GetEnvironmentVariable("LLAMADSH_AGENT_DISABLE") == "1")
 		{
@@ -124,7 +132,7 @@ public sealed class AgentApi
 		_listener = listener;
 		Port = port;
 		Token = token;
-		PersistConfig(port, token);
+		PersistConfig(port, tokenFromEnv ? diskToken : token);
 		failReason = null;
 		new Thread((ThreadStart)delegate { Loop(listener); })
 		{
@@ -139,11 +147,16 @@ public sealed class AgentApi
 		try
 		{
 			_listener?.Stop();
+			_listener?.Close();
 		}
 		catch
 		{
+			// 已在关闭中：忽略
 		}
 		_listener = null;
+		// handler 捕获着 MainWindow，清空后窗口才能随本次退出一起回收
+		_get.Clear();
+		_post.Clear();
 	}
 
 	private static string NewToken()
@@ -164,11 +177,36 @@ public sealed class AgentApi
 				["enabled"] = true
 			});
 			File.WriteAllText(ConfigFile, json);
+			TightenAcl();
 			try { File.SetAttributes(ConfigFile, FileAttributes.Hidden); } catch { }
 		}
 		catch
 		{
 			// 写不进去不影响本次监听(token 只存在于进程内)
+		}
+	}
+
+	/// <summary>
+	/// agent.json 里的 token 等于"本机任意进程可启停服务/改写用户配置/退出启动器"，
+	/// Hidden 属性不提供任何保护。这里把 DACL 收成 SYSTEM + 管理员 + 当前用户。
+	/// </summary>
+	private void TightenAcl()
+	{
+		try
+		{
+			string? sid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value;
+			if (string.IsNullOrEmpty(sid))
+			{
+				return;
+			}
+			FileSecurity fs = new FileSecurity();
+			fs.SetSecurityDescriptorSddlForm("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;" + sid + ")", AccessControlSections.Access);
+			FileInfo fi = new FileInfo(ConfigFile);
+			fi.SetAccessControl(fs);
+		}
+		catch (Exception ex)
+		{
+			AppLog.WriteError("收紧 agent.json 权限失败(token 仍按默认 ACL 存放): " + ex.Message);
 		}
 	}
 
@@ -196,6 +234,13 @@ public sealed class AgentApi
 		string key = path.StartsWith("/api/", StringComparison.Ordinal) ? path.Substring(5).Trim('/') : "?" + path;
 		try
 		{
+			// 绑定 127.0.0.1 只挡住外部机器，不挡 DNS 重绑定：浏览器把 evil.com 解析到
+			// 127.0.0.1 后，请求的 Host 是 evil.com 而连接仍然进得来。核对 Host 才补上这一环。
+			if (!HostIsLoopback(ctx.Request.Headers["Host"]))
+			{
+				Send(ctx, 400, "{\"ok\":false,\"error\":\"Host 不是环回地址(疑似 DNS 重绑定)，已拒绝\"}");
+				return;
+			}
 			bool isGet = string.Equals(ctx.Request.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase);
 			ConcurrentDictionary<string, Func<string, string>> table = isGet ? _get : _post;
 			if (!table.TryGetValue(key, out Func<string, string>? fn))
@@ -220,7 +265,7 @@ public sealed class AgentApi
 						auth = auth.Substring(7);
 					}
 				}
-				if (!string.Equals((auth ?? "").Trim(), Token, StringComparison.Ordinal))
+				if (!TokenMatches((auth ?? "").Trim(), Token))
 				{
 					Send(ctx, 401, "{\"ok\":false,\"error\":\"token 缺失或不匹配\",\"hint\":\"请求头 X-Auth <token>; token 见 " + JsonSerializer.Serialize(ConfigFile, JsonOpts) + "\",\"cli\":\"llamadsh-cli token\"}");
 					return;
@@ -229,9 +274,20 @@ public sealed class AgentApi
 			string input = "";
 			if (!isGet)
 			{
+				if (ctx.Request.ContentLength64 > MaxBodyChars)
+				{
+					Send(ctx, 413, "{\"ok\":false,\"error\":\"请求体超过 " + MaxBodyChars + " 字节，已拒绝\"}");
+					return;
+				}
 				using StreamReader sr = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
 				string raw = sr.ReadToEnd();
-				input = raw.Length > 262144 ? raw.Substring(0, 262144) : raw;
+				if (raw.Length > MaxBodyChars)
+				{
+					// 以前是"截断后照样解析"：大 config 会被静默改成残缺内容
+					Send(ctx, 413, "{\"ok\":false,\"error\":\"请求体超过 " + MaxBodyChars + " 字符，已拒绝(未解析)\"}");
+					return;
+				}
+				input = raw;
 			}
 			else if (ctx.Request.Url != null && !string.IsNullOrEmpty(ctx.Request.Url.Query))
 			{
@@ -242,6 +298,8 @@ public sealed class AgentApi
 		}
 		catch (Exception ex)
 		{
+			// 只回 HTTP 不留日志会让"接口报错"变成无从查证的现场
+			AppLog.WriteError("Agent 端点异常 " + ctx.Request.HttpMethod + " " + path + ": " + ex);
 			try
 			{
 				Send(ctx, 500, JsonSerializer.Serialize(new Dictionary<string, object>
@@ -252,8 +310,36 @@ public sealed class AgentApi
 			}
 			catch
 			{
+				// 响应已经发不出去(连接被对端关闭): 无进一步动作
 			}
 		}
+	}
+
+	/// <summary>Host 头是否只可能是本机环回（允许 127.x、localhost、[::1]，可带端口）。</summary>
+	private static bool HostIsLoopback(string? hostHeader)
+	{
+		string h = (hostHeader ?? "").Trim();
+		if (h.Length == 0)
+		{
+			return false;
+		}
+		int colon = h.LastIndexOf(':');
+		if (colon > 0 && h.IndexOf(']') < colon)
+		{
+			h = h.Substring(0, colon); // 去掉 :port，保留 [::1] 的方括号
+		}
+		h = h.Trim('[', ']');
+		return h.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+			|| h.Equals("::1", StringComparison.Ordinal)
+			|| (h.StartsWith("127.", StringComparison.Ordinal) && h.Length <= 15);
+	}
+
+	/// <summary>token 比较走固定时间，避免按字符数差异做时序探测。</summary>
+	private static bool TokenMatches(string given, string expected)
+	{
+		byte[] a = Encoding.UTF8.GetBytes(given);
+		byte[] b = Encoding.UTF8.GetBytes(expected);
+		return a.Length == b.Length && CryptographicOperations.FixedTimeEquals(a, b);
 	}
 
 	private List<string> EndpointList()
