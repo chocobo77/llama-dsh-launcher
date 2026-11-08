@@ -382,6 +382,18 @@ def api_plugins(body):
     plugins = compat.audit_plugins("web", dsh_dir)
     lines = []
     compat.enforce_pinned("web", lines.append)
+    # 对齐 C# BuildPluginSummary 的头部口径: 异常/市场停用/失效链接分开计数
+    _abn = sum(1 for p in plugins if p["errors"] or p["missing_specs"] or p["dead_peers"]
+               or (p["peer_issues"] and not p["exempted"]))
+    _links = compat._link_issues(dsh_dir=dsh_dir)
+    _mkt = 0
+    try:
+        _mp = os.path.join(compat.profile_dir("web"), ".dsh-market", "state.json")
+        if os.path.isfile(_mp):
+            with open(_mp, encoding="utf-8") as _fh:
+                _mkt = len((json.load(_fh) or {}).get("disabled") or [])
+    except Exception:
+        _mkt = -1
     items = []
     for p in plugins:
         notes = []
@@ -400,7 +412,9 @@ def api_plugins(body):
         items.append({"name": p["name"], "note": "; ".join(notes) or p["state_label"],
                       "level": "error" if (p["errors"] or p["dead_peers"]) else
                                ("warn" if notes else "ok")})
-    return {"report": {"items": items, "count": len(plugins)}, "log": lines}
+    return {"report": {"items": items, "count": len(plugins)},
+            "counts": {"abnormal": _abn, "market": _mkt, "links": len(_links)},
+            "log": lines}
 
 
 def api_search(body):

@@ -3793,6 +3793,7 @@ _rep25i = _audit25(_real_dump25)
 check("转储里没有 entry/module 行时注入审计必须报未判定(修前打成 dump 行 0 个, 看着像查过了)",
       any("注入审计未判定" in x["text"] for x in _rep25i["items"]),
       str([x["text"][:50] for x in _rep25i["items"]][-4:]))
+_write_mani25([])      # bundles 置空: 免得新加的"bundle 已失效"节造出 fixable, 盖过本条要测的摘要
 _rep25i2 = _audit25("- id: keep-me\n  name: a\n- id: second\n  name: b\n")
 check("同一情况必须计入未能核对(结尾不能报 0 错误 / 0 可修复项)",
       not any(x["kind"] in ("patch_orphan", "dump_failed") for x in _rep25i2["fixables"])
@@ -4422,6 +4423,49 @@ check("参数导航的组/子组标题必须有层级样式(13px accent 组标�
 check("面包屑必须按层级输出结构化 span(组名/分隔/子组/计数)",
       'class="bcGrp"' in _js27 and 'class="bcSep"' in _js27
       and 'class="bcSub"' in _js27 and 'class="bcCnt"' in _js27, "app.js 面包屑未分层")
+
+# 27.4 维护工具审计项对齐(第十九轮): 报告带 cat/probes/counts, 豁免/链接可判可修。
+# 接缝必须**本节自管**(patch profile_dir + dsh_home 两个属性, 用完恢复): 借用第 5 节
+# 泄漏的 lambda 会把审计/修复打到别人夹具甚至真实 profile 上(本轮实测: 27.4 第一次
+# 跑就借泄漏接缝在真实 profile 上产出 stale_lock/bundle_remove 误报)。
+_write_mani25(["dsh-base"])                      # 声明一个装不上的 bundle → bundle 已失效
+os.makedirs(os.path.join(_dshdir25, "node_modules", "@x", "pkg27"), exist_ok=True)
+with io.open(os.path.join(_dshdir25, "node_modules", "@x", "pkg27", "package.json"), "w", encoding="utf-8") as fh:
+    json.dump({"name": "@x/pkg27", "version": "1.0.0"}, fh)
+_real_pdir27, _real_dh27 = _compat.profile_dir, _compat.dsh_home
+_compat.profile_dir = lambda p="web": _prof25
+_compat.dsh_home = lambda: _dshome25
+os.makedirs(os.path.join(_dshome25, "node_modules", "@x", "pkg27"), exist_ok=True)
+with io.open(os.path.join(_dshome25, "node_modules", "@x", "pkg27", "package.json"), "w", encoding="utf-8") as fh:
+    json.dump({"name": "@x/pkg27", "version": "1.0.0"}, fh)
+_nm27 = os.path.join(_prof25, "node_modules")
+os.makedirs(os.path.join(_nm27, "@x"), exist_ok=True)
+_ln27 = os.path.join(_nm27, "@x", "pkg27")
+if not os.path.islink(_ln27):
+    os.symlink(os.path.join(_tmp, "no-such-target-27"), _ln27)   # 失效链接: 目标在 DSH 安装 farm 里找得到
+_log27m = []
+with io.open(os.path.join(_prof25, "compatibility.json"), "w", encoding="utf-8") as fh:
+    json.dump({"ghost@1.0.0": ["0.1.0"]}, fh)
+_rep27m = _compat.audit(_dshdir25, lambda _t: None, include_dump=False)
+_cats27 = {x.get("cat") for x in _rep27m["items"]}
+check("审计报告必须带分类/探针/计数(供维护工具弹窗分组渲染)",
+      _rep27m.get("probes") is not None and _rep27m.get("counts") is not None
+      and {"环境", "配置", "插件", "链接", "豁免"} <= _cats27, str(sorted(c for c in _cats27 if c)))
+_kinds27 = [x["kind"] for x in _rep27m["fixables"]]
+check("对齐 C#: bundle 失效可修 / 失效链接带 relink 目标 / 陈旧豁免可清理",
+      "bundle_remove" in _kinds27 and "stale_exempt" in _kinds27
+      and any(x["kind"] == "link_issues" and any(l["action"] == "relink" and l["target"]
+              for l in x["links"]) for x in _rep27m["fixables"] if x["kind"] == "link_issues"),
+      str(_kinds27))
+_n27f = _compat.repair(_dshdir25, {}, _log27m.append)
+_ln27_after = os.path.realpath(_ln27)
+_compat27 = json.load(io.open(os.path.join(_prof25, "compatibility.json"), encoding="utf-8")) \
+    if os.path.isfile(os.path.join(_prof25, "compatibility.json")) else {}
+check("一键修复必须真做: 失效链接被重连到 DSH 安装实体, 陈旧豁免被清掉",
+      _n27f >= 3 and os.path.isfile(os.path.join(_ln27, "package.json"))
+      and "ghost@1.0.0" not in _compat27,
+      str((_n27f, _ln27_after, sorted(_compat27))))
+_compat.profile_dir, _compat.dsh_home = _real_pdir27, _real_dh27
 
 shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)

@@ -242,41 +242,116 @@ def _manifest_bundles(profile="web"):
         return []
 
 
-def _broken_symlinks(profile="web"):
+def _find_pkg_in_farms(pkg, dsh_dir, profile_dir_):
+    """在 DSH 的各 node_modules farm 里找已安装的包目录(供失效链接重连/缺依赖补链)。"""
+    rel = pkg.replace("/", os.sep)
+    parent = os.path.dirname(os.path.abspath(profile_dir_))
+    farms = [os.path.join(parent, "node_modules"),
+             os.path.join(profile_dir_ or "", "node_modules"),
+             os.path.join(dsh_dir or "", "node_modules"),
+             os.path.join(dsh_dir or "", "apps", "cli", "node_modules"),
+             os.path.join(dsh_dir or "", "apps", "web", "node_modules")]
+    for farm in farms:
+        if not farm or farm == os.sep:
+            continue
+        cand = os.path.join(farm, rel)
+        if os.path.isdir(cand) and os.path.isfile(os.path.join(cand, "package.json")):
+            return cand
+    return None
+
+
+def _link_issues(profile="web", dsh_dir=""):
+    """失效 node_modules 链接清单 + 逐条处置: 能在当前 DSH 安装里找到同名包 → relink,
+    profile 本地已有实体目录 → remove(直接清掉即可), 否则 remove(无重连目标)。"""
     out = []
     base = os.path.join(profile_dir(profile), "node_modules")
-    patterns = [os.path.join(base, "*"), os.path.join(base, "@*", "*")]
-    for pat in patterns:
+    for pat in (os.path.join(base, "*"), os.path.join(base, "@*", "*")):
         for p in glob.glob(pat):
-            if os.path.islink(p) and not os.path.exists(p):
-                out.append(p)
+            if not (os.path.islink(p) and not os.path.exists(p)):
+                continue
+            rel = os.path.relpath(p, base)
+            pkg = rel.replace(os.sep, "/")
+            repl = _find_pkg_in_farms(pkg, dsh_dir, profile_dir(profile))
+            # 链接自身已失效, 重连目标必须不是它自己(防自环)
+            if repl and os.path.realpath(repl) == os.path.realpath(p):
+                repl = None
+            out.append({"path": p, "pkg": pkg, "action": "relink" if repl else "remove",
+                        "target": repl or ""})
     return out
 
 
 def audit(dsh_dir, log, include_dump=True):
-    """返回报告 dict:items=[{level,text}], fixables=[{kind,detail,...}], version。"""
+    """返回报告 dict:items=[{level,text,cat}], fixables=[{kind,...}], version, probes。
+
+    items 带分类(环境/配置/插件/补丁/链接/豁免/注入), 供维护工具弹窗分组渲染;
+    probes 是环境探针结论(git/编译产物/node24/pnpm/dump), 供头部徽章。"""
     items, fixables = [], []
     # 检查项本身没跑成(文件读不动)与"检查过且没问题"是两回事, 分开计数免得假绿
     unreadable = []
     dsh_dir = (dsh_dir or "").strip().strip('"')
+    _sec = {"v": "环境"}
+    probes = {"git": False, "bin": False, "node24": None, "pnpm": None, "dump": None}
 
     def it(level, text):
-        items.append({"level": level, "text": text})
+        items.append({"level": level, "text": text, "cat": _sec["v"]})
         log("[兼容] %s%s" % ({"info": "·", "warn": "⚠", "error": "✗", "ok": "✓"}[level], text))
 
     if not dsh_dir or not os.path.isdir(dsh_dir):
         it("error", "DSH 目录不存在: %s" % dsh_dir)
-        return {"items": items, "fixables": fixables, "version": ""}
+        return {"items": items, "fixables": fixables, "version": "", "probes": probes}
     it("ok", "目录: %s" % dsh_dir)
-    if not os.path.isdir(os.path.join(dsh_dir, ".git")):
+    probes["git"] = os.path.isdir(os.path.join(dsh_dir, ".git"))
+    if not probes["git"]:
         it("warn", "不是 git 仓库(无法做升级基线检测)")
     ver = get_dsh_version(dsh_dir)
     it("ok" if ver else "warn", "版本: %s" % (ver or "未知"))
-    for exe, name in (("node", "node"), ("pnpm", "pnpm")):
-        it("ok" if procman.which(exe) else "error", "%s: %s" % (name, procman.which(exe) or "未找到"))
     binjs = os.path.join(dsh_dir, "apps", "cli", "lib", "bin.js")
-    it("ok" if os.path.isfile(binjs) else "error",
-       "编译产物 apps/cli/lib/bin.js: %s" % ("存在" if os.path.isfile(binjs) else "缺失(需要全量重建)"))
+    probes["bin"] = os.path.isfile(binjs)
+    it("ok" if probes["bin"] else "error",
+       "编译产物 apps/cli/lib/bin.js: %s" % ("存在" if probes["bin"] else "缺失(需要全量重建)"))
+    # node24/pnpm 不只看"文件在", 要按 C# Node24Ok/PnpmOk 的口径**跑一次 --version**:
+    # 文件在但跑不动(corepack shim 未取到包等)时, "存在"是假绿
+    import nodetool as _nd
+    _node_exe = procman.which("node")
+    if not _node_exe:
+        for _d in (os.path.join(os.path.expanduser("~"), ".local", "bin"), "/usr/local/bin"):
+            _cand = os.path.join(_d, "node")
+            if os.path.isfile(_cand):
+                _node_exe = _cand
+                break
+    _node_v = _nd._exe_version(_node_exe) if _node_exe else None
+    _node_major = 0
+    try:
+        _node_major = int(str(_node_v).lstrip("v").split(".")[0])
+    except (ValueError, IndexError, AttributeError):
+        _node_major = 0
+    probes["node24"] = _node_v
+    it("ok" if _node_major >= 24 else "error",
+       "node24: %s%s" % (_node_v or "无输出",
+                         "" if _node_major >= 24 else "(需要 ≥ v24; 文件在但跑不动也算未就绪)"))
+    _pnpm_exe = procman.which("pnpm") or (
+        os.path.join(os.path.expanduser("~"), ".local", "bin", "pnpm")
+        if os.path.isfile(os.path.join(os.path.expanduser("~"), ".local", "bin", "pnpm")) else None)
+    _pnpm_v = _nd._exe_version(_pnpm_exe) if _pnpm_exe else None
+    probes["pnpm"] = _pnpm_v
+    it("ok" if _pnpm_v else "warn", "pnpm: %s" % (_pnpm_v or "不可用(存在但 --version 无输出也算不可用)"))
+
+    _sec["v"] = "配置"
+    pdir = profile_dir()
+    if not os.path.isdir(pdir):
+        it("error", "profile 目录不存在: %s" % pdir)
+        unreadable.append("profile 目录")
+    else:
+        _mani_p = os.path.join(pdir, "package.json")
+        if not os.path.isfile(_mani_p):
+            it("error", "profile package.json 不存在: %s" % _mani_p)
+            unreadable.append("package.json")
+        else:
+            _mani_doc = read_json_or_none(_mani_p)
+            if _mani_doc is None:
+                it("error", "package.json 解析失败(截断/坏 JSON/编码) —— 依赖读写都会失败, "
+                            "请先备份后修复该文件")
+                unreadable.append("package.json")
 
     # 残留锁
     lp = os.path.join(dsh_home(), "task-board", "ledger-v2.lock")
@@ -336,11 +411,15 @@ def audit(dsh_dir, log, include_dump=True):
             if inject_fixes:
                 fixables.extend(inject_fixes)
 
-    # 失效符号链接
-    broken = _broken_symlinks()
-    if broken:
-        fixables.append({"kind": "broken_links", "paths": broken})
-        it("warn", "%d 个失效 node_modules 链接(可修复:清理)" % len(broken))
+    # 失效符号链接(逐条判定: 能在当前 DSH 安装里找到同名包 → 重连; 否则清理)
+    _sec["v"] = "链接"
+    links = _link_issues(dsh_dir=dsh_dir)
+    if links:
+        _relink = [x for x in links if x["action"] == "relink"]
+        fixables.append({"kind": "link_issues", "links": links})
+        it("warn", "node_modules 存在 %d 条失效链接(可重连 %d / 可清理 %d) —— "
+                   "旧 DSH 安装路径残留, 会导致插件解析失败"
+           % (len(links), len(_relink), len(links) - len(_relink)))
 
     # 锁定停用回写强制(C# 1979): 锁定包被外部写回 bundles → 报错 + 纳入修复
     pinned = read_pinned_inactive()
@@ -365,6 +444,84 @@ def audit(dsh_dir, log, include_dump=True):
                % (type(ex).__name__, ex))
             unreadable.append(".dsh-market/state.json")
 
+    # ---- 插件节(对齐 C# DshCompatService: 依赖未安装/bundle 未激活/已失效/死依赖/不兼容可升级) ----
+    _sec["v"] = "插件"
+    plugins = []
+    try:
+        plugins = audit_plugins("web", dsh_dir)
+    except Exception as _pex:
+        it("warn", "插件清单审计失败(%s: %s) —— 本次无法核对插件状态" % (type(_pex).__name__, _pex))
+        unreadable.append("插件清单")
+    _by_name = {x["name"]: x for x in plugins}
+    _manifest_doc = _profile_manifest() or {}
+    _deps = _manifest_doc.get("dependencies") or {}
+    _bundles_now = ((_manifest_doc.get("dsh") or {}).get("profile") or {}).get("bundles") or []
+    _pinned_now = set(read_pinned_inactive())
+    # bundle 已失效: 声明在 bundles 里但哪儿都装不上。
+    # **内置 bundle(dsh-base/dsh-web-app)不是直接依赖**, 天然不在插件清单里 —— 不先排除
+    # 内置项与"DSH 自带 farm 里装着的包", 一键修复会把 dsh-base 从 bundles 里移掉,
+    # DSH 直接起不来(真机审计当场抓到这个误报)。
+    for b in _bundles_now:
+        if b in _by_name or b in BUILTIN_BUNDLES:
+            continue
+        if _find_pkg_in_farms(b, dsh_dir, profile_dir()):
+            continue
+        fixables.append({"kind": "bundle_remove", "name": b})
+        it("warn", "bundle 已失效: %s(bundles 里声明了, 但 profile 与 DSH 安装里都找不到;可修复:移出 bundles)" % b)
+    # bundle 未激活: 依赖声明了、装着、有 dsh.bundle, 却不在 bundles(且没被锁定/市场停用)
+    for name, row in _by_name.items():
+        if (name in _deps and name not in _bundles_now and name not in _pinned_now
+                and not row.get("disabled_by_market") and row.get("is_bundle")):
+            fixables.append({"kind": "bundle_add", "name": name})
+            it("warn", "bundle 未激活: %s(已安装且有 dsh.bundle;可修复:加入 bundles)" % name)
+    for row in plugins:
+        _n = row["name"]
+        if row.get("missing_specs"):
+            it("warn", "依赖未安装: %s(%s) —— pnpm 安装可能未完成" % (_n, ", ".join(row["missing_specs"])))
+            for _dep in row["missing_specs"][:6]:
+                _tgt = _find_pkg_in_farms(_dep, dsh_dir, profile_dir())
+                fixables.append({"kind": "peer_link", "plugin": _n, "dep": _dep, "target": _tgt or ""})
+        if row.get("dead_peers"):
+            for _dp in row["dead_peers"]:
+                fixables.append({"kind": "dead_peer", "plugin": _n, "peer": _dp,
+                                 "plugin_pkg": os.path.join(row["dir"], "package.json")})
+            it("warn", "死依赖声明: %s(%s) —— 可修复:从依赖声明移除"
+               % (_n, ", ".join(row["dead_peers"])))
+        if row.get("peer_issues") and not row.get("exempted") and not str(row.get("spec") or "").startswith("file:"):
+            fixables.append({"kind": "plugin_upgrade", "name": _n, "spec": row.get("spec") or ""})
+            it("warn", "插件与 DSH 不兼容: %s@%s(peer %s) —— 可修复:升级到最新版(pnpm add @latest)"
+               % (_n, row.get("version") or "?",
+                  "; ".join("%s %s" % (x["dep"], x["range"]) for x in row["peer_issues"])))
+        if row.get("errors") and not row.get("missing_specs"):
+            it("warn", "插件状态异常: %s(%s)" % (_n, "; ".join(row["errors"][:2])))
+    _abn = sum(1 for x in plugins if x.get("errors") or x.get("missing_specs")
+               or x.get("dead_peers") or (x.get("peer_issues") and not x.get("exempted")))
+    if _abn:
+        it("warn", "插件状态异常 %d 个(共 %d 个)" % (_abn, len(plugins)))
+    else:
+        it("ok", "插件 %d 个, 状态正常" % len(plugins))
+
+    # ---- 豁免节(C# ScanStaleExemptions: 不再安装/版本列表不含当前 DSH 版本 → 陈旧) ----
+    _sec["v"] = "豁免"
+    _compat_p = os.path.join(profile_dir(), "compatibility.json")
+    _exem = read_json(_compat_p, None)
+    if isinstance(_exem, dict) and _exem:
+        for _key, _vers in list(_exem.items()):
+            if not isinstance(_vers, list):
+                continue
+            _at = _key.rfind("@")
+            _pname, _pver = (_key[:_at], _key[_at + 1:]) if _at > 0 else (_key, "")
+            _row = _by_name.get(_pname)
+            _installed = bool(_row and _row.get("installed") and (_row.get("version") == _pver or not _pver))
+            if not _installed:
+                fixables.append({"kind": "stale_exempt", "key": _key})
+                it("warn", "陈旧豁免条目: %s —— 对应插件已不在 profile 中安装(或版本不符), "
+                           "该豁免不再生效;可修复:清理" % _key)
+            elif ver and ver not in [str(x) for x in _vers]:
+                fixables.append({"kind": "stale_exempt", "key": _key})
+                it("warn", "陈旧豁免条目: %s —— 豁免的 DSH 版本列表(%s)不含当前 %s;可修复:清理"
+                   % (_key, ", ".join(str(x) for x in _vers[:4]), ver))
+
     if not fixables:
         # "没有可修复项"不等于"一切正常": 有些项是**没能跑成**(文件读不动), 还有些是
         # 查出来但无法自动修的错误。旧写法一律报"0 错误 / 0 可修复项", 用户据此认为环境
@@ -377,7 +534,13 @@ def audit(dsh_dir, log, include_dump=True):
             it("warn", "复检结果:0 可修复项, 但有 %d 项错误(见上面 ✗), 需要手工处理" % _errs)
         else:
             it("ok", "复检结果:0 错误 / 0 可修复项")
-    return {"items": items, "fixables": fixables, "version": ver}
+    _errs = sum(1 for x in items if x["level"] == "error")
+    _warns = sum(1 for x in items if x["level"] == "warn")
+    probes["dump"] = (False if any(x["kind"] == "dump_failed" for x in fixables)
+                      else (True if any("--dump-config 正常" in x["text"] for x in items) else None))
+    return {"items": items, "fixables": fixables, "version": ver, "probes": probes,
+            "plugins": plugins, "counts": {"errors": _errs, "warns": _warns,
+                                           "fixables": len(fixables), "unreadable": len(unreadable)}}
 
 
 def repair(dsh_dir, report, log):
@@ -461,14 +624,81 @@ def repair(dsh_dir, report, log):
                         log("[兼容] 已注释失效补丁 '%s'(备份 %s)" % (old, bak))
                     write_file_atomic(patch_path, text)   # 非原子写会在被杀时留下半份补丁文件
                     fixed += 1
-            elif kind == "broken_links":
-                for p in f["paths"]:
+            elif kind in ("broken_links", "link_issues"):
+                # 逐条处置: relink(目标在当前 DSH 安装里找到) → 重建链接; 否则清理。
+                # 修前只删不连: 装好的插件因此解析失败, 得靠重装才恢复。
+                _links25b = f.get("links") or [{"path": p, "action": "remove", "target": ""}
+                                               for p in f.get("paths", [])]
+                for _li in _links25b:
+                    _lp, _act, _tgt = _li.get("path"), _li.get("action", "remove"), _li.get("target") or ""
                     try:
-                        os.remove(p)
-                        log("[兼容] 已清理失效链接: %s" % p)
+                        if _act == "relink" and _tgt and os.path.isdir(_tgt):
+                            if os.path.islink(_lp) or os.path.exists(_lp):
+                                os.remove(_lp)
+                            os.symlink(_tgt, _lp)
+                            log("[兼容] 已重连失效链接: %s → %s" % (_lp, _tgt))
+                        else:
+                            if os.path.islink(_lp) or os.path.exists(_lp):
+                                os.remove(_lp)
+                                log("[兼容] 已清理失效链接: %s" % _lp)
+                            else:
+                                continue
                         fixed += 1
-                    except OSError:
-                        pass
+                    except OSError as _lx:
+                        log("[兼容] ⚠ 处理失效链接失败 %s: %s" % (_lp, _lx))
+            elif kind == "bundle_add":
+                _ok_ba, _msg_ba = set_bundle_active("web", f["name"], True)
+                if not _ok_ba:
+                    log("[兼容] ⚠ 未能激活 bundle %s: %s" % (f["name"], _msg_ba))
+                    continue
+                log("[兼容] 已激活 bundle: %s" % f["name"])
+                fixed += 1
+            elif kind == "bundle_remove":
+                _ok_br, _msg_br = set_bundle_active("web", f["name"], False)
+                if not _ok_br:
+                    log("[兼容] ⚠ 未能移除失效 bundle %s: %s" % (f["name"], _msg_br))
+                    continue
+                log("[兼容] 已移出失效 bundle: %s" % f["name"])
+                fixed += 1
+            elif kind == "plugin_upgrade":
+                _ok_up, _msg_up = upgrade_plugin("web", f["name"], dsh_dir)   # 走公开包装: 拿 profile 锁
+                if not _ok_up:
+                    log("[兼容] ⚠ 升级插件 %s 失败: %s" % (f["name"], _msg_up))
+                    continue
+                log("[兼容] 已升级插件 %s: %s" % (f["name"], _msg_up))
+                fixed += 1
+            elif kind == "peer_link":
+                _dep, _tgt = f.get("dep") or "", f.get("target") or ""
+                if not _dep:
+                    continue
+                _base_nm = os.path.join(profile_dir(), "node_modules")
+                _lp = os.path.join(_base_nm, *_dep.split("/"))
+                if os.path.exists(_lp):
+                    continue                     # 已有人补上了
+                if not _tgt or not os.path.isdir(_tgt):
+                    log("[兼容] ⚠ 缺依赖 %s(%s) 在 DSH 安装里找不到可补链的实体目录, 跳过"
+                        % (_dep, f.get("plugin") or "?"))
+                    continue
+                try:
+                    os.makedirs(os.path.dirname(_lp), exist_ok=True)
+                    os.symlink(_tgt, _lp)
+                    log("[兼容] 已为 %s 补链缺失依赖 %s → %s" % (f.get("plugin") or "?", _dep, _tgt))
+                    fixed += 1
+                except OSError as _px:
+                    log("[兼容] ⚠ 补链 %s 失败: %s" % (_dep, _px))
+            elif kind == "stale_exempt":
+                _cp = os.path.join(profile_dir(), "compatibility.json")
+                _doc26e = read_json(_cp, None)
+                if not isinstance(_doc26e, dict) or f.get("key") not in _doc26e:
+                    continue
+                _bak26e = _backup(_cp)
+                if not _bak26e:
+                    log("[兼容] ⚠ 备份失败, 未清理陈旧豁免: %s" % f["key"])
+                    continue
+                _doc26e.pop(f["key"], None)
+                write_file_atomic(_cp, json.dumps(_doc26e, indent=2, ensure_ascii=False))
+                log("[兼容] 已清理陈旧豁免条目: %s(备份 %s)" % (f["key"], _bak26e))
+                fixed += 1
             elif kind == "pinned_writeback":
                 ok_w, msg_w = set_bundle_active("web", f["name"], False)  # 移除 + 保持锁定
                 if not ok_w:
@@ -1048,6 +1278,7 @@ def audit_plugins(profile="web", dsh_dir=""):
                 "name": name, "version": version, "dir": pdir_,
                 "state_label": state_label,
                 "spec": deps.get(name, "") or "(bundle)",
+                "is_bundle": bool((doc.get("dsh") or {}).get("bundle")),
                 "in_bundles": name in in_bundles, "installed": True,
                 "compatible": (not peer_issues) or exempted,
                 "exempted": exempted,

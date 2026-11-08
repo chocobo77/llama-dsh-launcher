@@ -1677,28 +1677,136 @@ function wire() {
     if (r.error) showNotice(r.error, true);
   };
   // 维护工具
-  $("btnCompat").onclick = async () => {
-    const r = await api("dsh/compat", { profile: collectProfile() }, 240000);   // audit 里 --dump-config 上限 180s
-    const html = r.report.items.map(i => `<div class="${i.level === "error" ? "evt-error" : i.level === "warn" ? "evt-warn" : i.level === "ok" ? "evt-ok" : ""}">${mEsc(i.text)}</div>`).join("");
-    const nFix = (r.report.fixables || []).length;
-    const btns = [{ label: "关闭", cls: "primary", value: 1 }];
-    if (nFix) btns.unshift({ label: `🔧 一键修复(${nFix} 项)`, value: "fix" });
-    const act = await showModal({ title: "🔧 DSH 兼容性检查", body: html || "(无输出)", buttons: btns });
-    for (const l of r.log) logLine(l);
-    if (act === "fix") {
-      // 修复入口此前压根没接到 UI(按钮写着"检查/修复"却只有检查); 服务端先重审再改写
-      const rr = await api("dsh/compat/repair", { profile: collectProfile() }, 480000);
-      if (rr.error) { showNotice(rr.error, true); return; }
-      for (const l of (rr.log || [])) logLine(l);
-      const html2 = (rr.report.items || []).map(i => `<div class="${i.level === "error" ? "evt-error" : i.level === "warn" ? "evt-warn" : i.level === "ok" ? "evt-ok" : ""}">${mEsc(i.text)}</div>`).join("");
-      await showModal({ title: `🔧 兼容性修复完成(${rr.fixed} 项)`, body: html2 || "(无输出)",
-                        buttons: [{ label: "关闭", cls: "primary", value: 1 }] });
-    }
+  $("btnCompat").onclick = () => showCompatModal().catch(e => showNotice(e.message, true));
+
+/* ===================== 维护工具: 结构化兼容性报告 ===================== */
+const CATS_ORDER = ["环境", "配置", "插件", "补丁", "链接", "豁免", "注入", "检查器"];
+const LV_ICON = { error: "✗", warn: "⚠", ok: "✓", info: "·" };
+const LV_CLS = { error: "evt-error", warn: "evt-warn", ok: "evt-ok", info: "" };
+function compatReportDom(rep) {
+  const box = document.createElement("div");
+  const probes = rep.probes || {};
+  const counts = rep.counts || {};
+  const badge = (label, val) => {
+    const bad = val === false || val === null || val === undefined;
+    const shown = val === true ? "✓" : val === false ? "✗" : (val == null ? "?" : String(val));
+    return '<span class="' + (bad ? "mbadge warnBadge" : "mbadge") + '">' + mEsc(label + " " + shown) + "</span>";
   };
+  let head = '<div class="tiny" style="margin:0 0 6px;display:flex;flex-wrap:wrap;gap:4px">' +
+    badge("DSH " + (rep.version || "?"), true) +
+    badge("git", probes.git) + badge("编译产物", probes.bin) +
+    badge("node24", probes.node24 || false) + badge("pnpm", probes.pnpm || false) +
+    (probes.dump === null || probes.dump === undefined ? "" : badge("dump-config", probes.dump)) +
+    '<span class="mbadge">✗ ' + (counts.errors || 0) + "</span>" +
+    '<span class="mbadge warnBadge">⚠ ' + (counts.warns || 0) + "</span>" +
+    '<span class="mbadge">🔧 ' + (counts.fixables || (rep.fixables || []).length) + "</span>" +
+    ((counts.unreadable || 0) ? '<span class="mbadge warnBadge">未核对 ' + counts.unreadable + "</span>" : "") +
+    "</div>";
+  box.innerHTML = head;
+  const byCat = new Map();
+  for (const it of (rep.items || [])) {
+    const c = it.cat || "其它";
+    if (!byCat.has(c)) byCat.set(c, []);
+    byCat.get(c).push(it);
+  }
+  const cats = [...byCat.keys()].sort((a, b) => {
+    const ia = CATS_ORDER.indexOf(a), ib = CATS_ORDER.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  for (const c of cats) {
+    const sec = document.createElement("div");
+    sec.style.cssText = "margin:8px 0 2px;font-weight:700;font-size:12px;color:var(--tone-info)";
+    sec.textContent = c;
+    box.appendChild(sec);
+    for (const it of byCat.get(c)) {
+      const row = document.createElement("div");
+      row.className = LV_CLS[it.level] || "";
+      row.style.cssText = "display:flex;gap:6px;padding:2px 0;font-size:12px;align-items:baseline";
+      row.innerHTML = '<span style="flex:none">' + (LV_ICON[it.level] || "·") + "</span>" +
+        '<span style="min-width:0;word-break:break-all">' + mEsc(it.text) + "</span>";
+      box.appendChild(row);
+    }
+  }
+  return box;
+}
+async function showCompatModal() {
+  let r = await api("dsh/compat", { profile: collectProfile() }, 240000);   // audit 里 --dump-config 上限 180s
+  if (r.error) { showNotice(r.error, true); return; }
+  for (const l of r.log || []) logLine(l);
+  for (;;) {
+    const rep = r.report || {};
+    const nFix = (rep.fixables || []).length;
+    const box = compatReportDom(rep);
+    const btns = [];
+    if (nFix) btns.push({ label: "🔧 一键修复(" + nFix + " 项)", value: "fix" });
+    btns.push({ label: "🗂 插件管理", value: "mgr" });
+    btns.push({ label: "关闭", cls: "primary", value: "close" });
+    const act = await showModal({ title: "🩺 DSH 维护工具 · 兼容性报告", body: "", extra: box, buttons: btns });
+    if (act === "mgr") { pluginManager(); return; }
+    if (act !== "fix") return;
+    const rr = await api("dsh/compat/repair", { profile: collectProfile() }, 480000);
+    if (rr.error) { showNotice(rr.error, true); return; }
+    for (const l of (rr.log || [])) logLine(l);
+    // 修复后仍不兼容的插件: 放行与否由用户逐次决定(工具不代替用户接受风险)
+    const stillBad = ((rr.report || {}).plugins || []).filter(
+      p => p.peer_issues && p.peer_issues.length && !p.exempted && !String(p.spec || "").startsWith("file:"));
+    if (stillBad.length) {
+      const exBox = document.createElement("div");
+      exBox.innerHTML = '<div class="tiny" style="margin-bottom:6px">修复 ' + (rr.fixed || 0) +
+        ' 项后, 以下插件仍与 DSH ' + mEsc(rr.report.version || "?") +
+        ' 不兼容。放行 = 写入精确版本豁免(只跳过版本校验, 真不兼容仍可能崩);保持现状 = 稍后在插件管理里处理。</div>';
+      for (const p of stillBad) {
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;gap:6px;align-items:center;padding:3px 0;font-size:12px";
+        row.innerHTML = '<span style="flex:1;min-width:0;word-break:break-all">' +
+          mEsc(p.name + "@" + (p.version || "?")) + "</span>";
+        const bYes = document.createElement("button");
+        bYes.textContent = "放行"; bYes.style.padding = "2px 8px"; bYes.style.fontSize = "11px";
+        bYes.onclick = async () => {
+          try {
+            const x = await api("dsh/plugins/exempt", { profile: {}, name: p.name, version: p.version });
+            showNotice(x.msg || (x.ok ? "已放行" : "失败"));
+            bYes.disabled = true; bYes.textContent = "已放行";
+          } catch (e) { showNotice(e.message, true); }
+        };
+        row.appendChild(bYes);
+        exBox.appendChild(row);
+      }
+      const v = await showModal({
+        title: "🩺 修复完成(" + (rr.fixed || 0) + " 项) · 复检" +
+          ((rr.report.counts || {}).errors ? "仍有错误 " + rr.report.counts.errors : "无错误"),
+        body: "", extra: exBox,
+        buttons: [{ label: "再看报告", value: "again", cls: "primary" }, { label: "关闭", value: "close" }]
+      });
+      if (v === "again") { r = { report: rr.report, log: rr.log || [] }; continue; }
+      return;
+    }
+    r = { report: rr.report, log: rr.log || [] };
+    showNotice("兼容性修复完成 " + (rr.fixed || 0) + " 项 · 复检" +
+      ((rr.report.counts || {}).errors ? "仍有错误 " + rr.report.counts.errors : "无错误") +
+      " —— 报告已刷新");
+  }
+}
   $("btnPlugins").onclick = async () => {
     const r = await api("dsh/plugins", { profile: collectProfile() });
-    const html = r.report.items.map(i => `<div class="${i.level === "error" ? "evt-error" : i.level === "warn" ? "evt-warn" : ""}">${mEsc(i.name)} <span class="tiny">${mEsc(i.note || "")}</span></div>`).join("");
-    await showModal({ title: `🧩 插件智能检测(${r.report.count} 个)`, body: html || "(无插件)", buttons: [{ label: "关闭", cls: "primary", value: 1 }, { label: "🗂 打开插件管理", value: "mgr" }] })
+    const c = r.counts || {};
+    const html = r.report.items.map(i => {
+      const cls = i.level === "error" ? "evt-error" : i.level === "warn" ? "evt-warn" : "";
+      const badge = i.level === "error" ? '<span class="mbadge warnBadge">✗</span> '
+        : i.level === "warn" ? '<span class="mbadge warnBadge">⚠</span> ' : '<span class="mbadge">✓</span> ';
+      return '<div style="display:flex;gap:6px;align-items:baseline;padding:2px 0;font-size:12px" class="' + cls + '">' +
+        badge + '<span style="font-weight:600;flex:none">' + mEsc(i.name) + "</span>" +
+        '<span class="tiny" style="min-width:0;word-break:break-all">' + mEsc(i.note || "") + "</span></div>";
+    }).join("");
+    const head = '<div class="tiny" style="margin-bottom:6px;display:flex;flex-wrap:wrap;gap:4px">' +
+      '<span class="mbadge">插件 ' + r.report.count + " 个</span>" +
+      '<span class="' + (c.abnormal ? "mbadge warnBadge" : "mbadge") + '">异常 ' + (c.abnormal || 0) + "</span>" +
+      '<span class="mbadge">市场停用 ' + (c.market < 0 ? "?" : c.market) + "</span>" +
+      '<span class="' + (c.links ? "mbadge warnBadge" : "mbadge") + '">失效链接 ' + (c.links || 0) + "</span></div>";
+    const box = document.createElement("div");
+    box.innerHTML = head + '<div style="max-height:340px;overflow:auto">' + (html || "(无插件)") + "</div>";
+    await showModal({ title: "🧩 插件智能检测", body: "", extra: box,
+                      buttons: [{ label: "关闭", cls: "primary", value: 1 }, { label: "🗂 打开插件管理", value: "mgr" }] })
       .then(v => { if (v === "mgr") pluginManager(); });
     for (const l of r.log) logLine(l);
   };
