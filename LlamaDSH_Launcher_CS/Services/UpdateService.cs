@@ -929,10 +929,13 @@ public static class UpdateService
 			}
 			(int ExitCode, string Output) pull = RunGit(dir, "pull --ff-only", 240);
 			bool stashed = false;
-			if (pull.ExitCode != 0 && LocalChangesBlocked(pull.Output))
+			// 本地未提交改动会挡住合并——而且直连 pull 因网络失败时, 输出里根本没有
+			// "local changes"字样, 后续镜像 merge 才会被改动挡住(曾在 merge 处误诊为
+			// "历史分叉")。所以只要 pull 失败就预检工作区脏状态, 统一先 stash,
+			// 覆盖直连 pull 与镜像 merge 两条路径(改动是用户/其它会话的真实补丁,
+			// 绝不丢弃; pop 冲突时保留在 stash 供手动处理)。
+			if (pull.ExitCode != 0 && (LocalChangesBlocked(pull.Output) || HasLocalChanges(dir)))
 			{
-				// 本地未提交改动挡住合并: stash → 合并 → pop 恢复(改动是用户/其它
-				// 会话的真实补丁, 绝不丢弃; pop 冲突时保留在 stash 供手动处理)
 				(bool ok, string err) = TryStash(dir, log);
 				if (!ok)
 				{
@@ -988,7 +991,7 @@ public static class UpdateService
 					{
 						StashPopSafe(dir, log); // 合并仍失败: 先把工作区还原再说
 					}
-					return (false, "镜像已获取上游，但本地无法快进合并（可能有本地提交/历史分叉）：\n" + Tail(merge.Output, 800));
+					return (false, "镜像已获取上游，但本地无法快进合并（" + (LocalChangesBlocked(merge.Output) ? "stash 后仍被本地改动挡住" : "可能有本地提交/历史分叉") + "）：\n" + Tail(merge.Output, 800));
 				}
 			}
 			if (stashed)
@@ -1010,6 +1013,13 @@ public static class UpdateService
 		return t.Contains("would be overwritten", StringComparison.OrdinalIgnoreCase)
 			|| t.Contains("Please commit your changes", StringComparison.OrdinalIgnoreCase)
 			|| t.Contains("local changes", StringComparison.OrdinalIgnoreCase);
+	}
+
+	/// <summary>工作区是否有未提交的已跟踪改动(untracked 不算: stash push 默认不 stash 它们, 也不挡快进合并)。</summary>
+	private static bool HasLocalChanges(string dir)
+	{
+		(int ExitCode, string Output) st = RunGit(dir, "status --porcelain -uno", 15);
+		return st.ExitCode == 0 && !string.IsNullOrWhiteSpace(st.Output);
 	}
 
 	private static (bool ok, string err) TryStash(string dir, Action<string>? log)

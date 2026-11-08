@@ -1913,15 +1913,39 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			if (IsDshRunning())
 			{
-				if (fromButton)
-				{
-					ShowNotice("DSH 正在运行，请先停止再更新。", isError: true);
-				}
-				else
+				if (!fromButton)
 				{
 					Log("[更新] 后台检测到 deepseek-harness 有更新，但 DSH 正在运行，跳过（请手动停止后点“检查更新”）");
+					return;
 				}
-				return;
+				// 一键路径(曾只弹一行通知条, 用户体感"点了没反应"): 弹窗询问先停 DSH 再继续
+				System.Windows.MessageBoxResult mbStop = System.Windows.MessageBox.Show(
+					"更新 deepseek-harness 需要先停止 DSH（当前正在运行）。\n\n现在停止 DSH 并继续更新？\n（更新完成前 DSH 不会自动重启；本地未提交的改动会被自动 stash，更新后自动恢复）",
+					"更新 deepseek-harness", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Question);
+				if (mbStop != System.Windows.MessageBoxResult.Yes)
+				{
+					Log("[更新] 用户取消停止 DSH，更新中止");
+					return;
+				}
+				Log("[更新] 按用户选择停止 DSH 以继续更新 ...");
+				try
+				{
+					StopDsh();
+				}
+				catch (Exception exStop)
+				{
+					LogError(exStop, "停止 DSH");
+				}
+				for (int wait = 0; wait < 16 && IsDshRunning(); wait++)
+				{
+					await Task.Delay(500); // 杀树是异步的, 最多等 8s
+				}
+				if (IsDshRunning())
+				{
+					ShowNotice("DSH 未能停止（进程仍在），请手动停止后再点“检查更新”。", isError: true);
+					return;
+				}
+				Log("[更新] DSH 已停止，继续更新流程");
 			}
 			string dir = EffectiveDshDir();
 			if (string.IsNullOrEmpty(dir))
@@ -1983,10 +2007,17 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}
 				return;
 			}
+			// 后台自动检查绝不弹模态框(打断用户操作, 曾被顺手点成"取消"): 只写日志
+			if (!fromButton)
+			{
+				Log("[更新] deepseek-harness 落后上游 " + info.Behind + " 个提交（当前 " + info.LocalHead.Substring(0, 7)
+					+ " → 上游 " + info.RemoteHead.Substring(0, 7) + "）。点“检查更新”按钮确认后执行 git pull + 全量重建。");
+				return;
+			}
 			string msg = "发现 deepseek-harness 上游更新（落后 " + info.Behind + " 个提交）:\n\n"
 				+ "  当前: " + info.LocalHead.Substring(0, 7) + "\n"
 				+ "  上游: " + info.RemoteHead.Substring(0, 7) + " (" + info.Branch + ")\n\n"
-				+ "将执行:\n  1. git pull --ff-only\n  2. 全量重建 (clean + build:lib + build:web)\n\n继续？";
+				+ "将执行:\n  1. git pull --ff-only（本地未提交改动会自动 stash 并在完成后恢复）\n  2. 全量重建 (clean + build:lib + build:web)\n\n继续？";
 			if (System.Windows.MessageBox.Show(msg, "更新 deepseek-harness", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
 			{
 				Log("[更新] 用户取消 DSH 更新");
