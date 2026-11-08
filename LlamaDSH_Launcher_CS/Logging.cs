@@ -15,9 +15,18 @@ namespace LlamaDSH_Launcher
         /// <summary>保护"轮转 + 追加"这一整段的进程内互斥。</summary>
         private static readonly object _logLock = new object();
 
-        public static string LogDir { get; } = Path.Combine(
+        public static string LogDir { get; private set; } = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             ".dsh_launcher_logs");
+
+        /// <summary>仅测试用: 把日志根切到临时目录, 防止冒烟测试覆盖真实用户的 run.log。</summary>
+        public static void SetLogDirForTests(string dir)
+        {
+            lock (_logLock)
+            {
+                LogDir = dir;
+            }
+        }
 
         static AppLog()
         {

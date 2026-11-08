@@ -50,6 +50,8 @@ namespace LlamaDSH_Launcher.Services
     {
         /// <summary>进程退出后等待读取任务收尾的宽限时间。</summary>
         private const int ReadGraceMs = 3000;
+        // 正常退出后的读取收尾上限: 兼顾大输出不截断与句柄被继承时不永久挂起
+        private const int DrainGraceMs = 30000;
 
         /// <summary>
         /// 执行进程并收集全部输出。
@@ -126,15 +128,17 @@ namespace LlamaDSH_Launcher.Services
                 return new ProcessResult(-1, Drain(outTask, ReadGraceMs), Drain(errTask, ReadGraceMs), true, true);
             }
 
-            // 无参 WaitForExit 确保异步读取完成收尾（成本极低，避免尾部输出丢失）。
-            try { p.WaitForExit(); } catch { }
+            // 限时收尾: 进程正常退出不代表管道句柄已释放——孙进程继承句柄时,
+            // 无参 WaitForExit/无限 Drain 永不落定(整个流水线可被吊死)。
+            try { p.WaitForExit(DrainGraceMs); } catch { }
 
             int exitCode;
             try { exitCode = p.ExitCode; }
             catch { exitCode = -1; }
 
-            // 正常退出后进程已不可能再产生输出，可以无限等待读取任务收尾——否则大输出会被静默截断。
-            return new ProcessResult(exitCode, Drain(outTask, -1), Drain(errTask, -1), false, true);
+            // 大输出不截断靠足量宽限(正常退出后管道随即 EOF, 90KB 毫秒级读完);
+            // 30s 仍读不完说明句柄被继承, 此时截断优于永久挂起。
+            return new ProcessResult(exitCode, Drain(outTask, DrainGraceMs), Drain(errTask, DrainGraceMs), false, true);
         }
 
         /// <summary>

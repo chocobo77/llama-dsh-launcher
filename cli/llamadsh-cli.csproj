@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    llamadsh-cli: 启动器 Agent 接口的控制台客户端(单文件)。
+    控制台子系统 => stdout 天然是管道, 脚本/agent `&` 调用可直接捕获并可等待;
+    GUI 主程序内嵌的 `LlamaDSH_Launcher.exe cli ...` 仍保留(真实终端里也能用)。
+    与主工程共享源码文件, 不引用 WPF。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>llamadsh-cli</AssemblyName>
+    <RootNamespace>LlamaDSH_Launcher.Cli</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\LlamaDSH_Launcher_CS\Logging.cs" Link="src\Logging.cs" />
+    <Compile Include="..\LlamaDSH_Launcher_CS\Services\AgentApi.cs" Link="src\AgentApi.cs" />
+    <Compile Include="..\LlamaDSH_Launcher_CS\Services\AgentCli.cs" Link="src\AgentCli.cs" />
+  </ItemGroup>
+
+</Project>

@@ -79,6 +79,33 @@ DSH 有启动 Web、停止、重建、打开网页。启动方式有三种：编
 
 关窗口默认最小化到托盘，进程不退出。双击托盘图标恢复窗口，右键菜单里能真正退出。
 
+窗口隐藏或最小化时自动进入**轻量化模式**（与 Linux 侧同款设计）：监控采样降到 30 秒一拍，llama 和 DSH 都没跑时进一步降到 60 秒纯休眠、零采样，后台几乎不占资源；显存熔断另有独立的 3 秒显存探针（NVML 进程内直读，不spawn子进程），降频不降低熔断响应。恢复窗口、切回监测页都会立刻打断休眠恢复全速刷新。托盘右键菜单里也有"轻量化模式(后台低频保活)"复选，可以在窗口开着时手动开/关。
+
+## Agent 调用 / 调试接口
+
+Windows 启动器内置本机 HTTP 控制面：**只绑 127.0.0.1**（默认端口 17325），X-Auth token 鉴权，出入全是 JSON。配套一个控制台小工具 `llamadsh-cli.exe`（随安装包分发），给 agent / 脚本 / 排障用：
+
+```
+llamadsh-cli status            全量状态快照（llama/dsh/GPU/熔断/轻量档/方案/路径）
+llamadsh-cli monitor           监控页同款数据（采样 + slots + 12 条速度历史）
+llamadsh-cli logs 300          运行日志尾部
+llamadsh-cli llama start|stop  启停 llama-server（带端口/模型预检，失败返回 JSON 原因）
+llamadsh-cli dsh start|stop    启停 DSH
+llamadsh-cli light toggle      托盘轻量档
+llamadsh-cli window hide       隐藏到托盘 / show 恢复
+llamadsh-cli profiles          方案列表；profile use <名> 切换
+llamadsh-cli breaker set pct 90  显存熔断配置
+llamadsh-cli raw slots         直连 llama API 透传（slots/props/health）
+llamadsh-cli api GET /api/status 任意端点逃生舱
+llamadsh-cli quit              退出（默认先停服务）
+```
+
+退出码 `0` 成功 / `1` 业务失败 / `2` 接口不可达，stdout 永远是一行可直接解析的 JSON。同样的能力也能经 `LlamaDSH_Launcher.exe cli <命令>` 使用。
+
+配置在 `%USERPROFILE%\.dsh_launcher_logs\agent.json`（端口 + token；`cli token` 直接读）。curl 用：`curl -H "X-Auth: <token>" http://127.0.0.1:17325/api/status`。禁用接口：`agent.json` 里 `"enabled": false` 或环境变量 `LLAMADSH_AGENT_DISABLE=1`；改端口用 `LLAMADSH_AGENT_PORT`。
+
+端点命名与 **Linux 侧启动器自带的 Web 控制面对齐**（`/api/llama/start`、`/api/lightweight` 等同名，见 `LlamaDSH_Launcher_Linux/main.py` ROUTES），跨平台脚本可共用词汇表。
+
 ## 环境要求
 
 - Windows 10 / 11 x64

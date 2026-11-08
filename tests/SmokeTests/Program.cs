@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Text;
 using LlamaDSH_Launcher.Services;
 
@@ -46,6 +47,8 @@ internal static class Program
         TestLogRotation();
         TestAuthenticode();
         TestDiagnostics();
+        TestAgentCliParse();
+        TestAgentApiHttp();
 
         Console.WriteLine();
         Console.WriteLine($"总计: {_passed + _failed}  通过: {_passed}  失败: {_failed}");
@@ -124,19 +127,22 @@ internal static class Program
     private static void TestLogRotation()
     {
         Console.WriteLine("[AppLog] 写入与轮转");
-        string dir = LlamaDSH_Launcher.AppLog.LogDir;
-        string file = Path.Combine(dir, "info.log");
-        long before = File.Exists(file) ? new FileInfo(file).Length : -1;
-        LlamaDSH_Launcher.AppLog.WriteInfo("smoke-test-marker");
-        long after = File.Exists(file) ? new FileInfo(file).Length : -1;
-        Check("日志可写且长度增加", after > before, $"{before} -> {after}");
-
-        // 轮转：把文件撑到 2MB 以上再写一条，应生成 .1
-        string big = Path.Combine(dir, "run.log");
-        string rolled = big + ".1";
+        // 隔离到临时目录: 此前直接撑爆真实用户的 run.log(2MB 'x' 覆盖)且不可恢复。
+        string realDir = LlamaDSH_Launcher.AppLog.LogDir;
+        string dir = Path.Combine(Path.GetTempPath(), "LlamaDSH_smoketest_logs_" + Guid.NewGuid().ToString("N"));
         try
         {
-            if (File.Exists(rolled)) File.Delete(rolled);
+            Directory.CreateDirectory(dir);
+            LlamaDSH_Launcher.AppLog.SetLogDirForTests(dir);
+            string file = Path.Combine(dir, "info.log");
+            long before = File.Exists(file) ? new FileInfo(file).Length : -1;
+            LlamaDSH_Launcher.AppLog.WriteInfo("smoke-test-marker");
+            long after = File.Exists(file) ? new FileInfo(file).Length : -1;
+            Check("日志可写且长度增加", after > before, $"{before} -> {after}");
+
+            // 轮转：把文件撑到 2MB 以上再写一条，应生成 .1
+            string big = Path.Combine(dir, "run.log");
+            string rolled = big + ".1";
             File.WriteAllText(big, new string('x', 2 * 1024 * 1024 + 1024));
             LlamaDSH_Launcher.AppLog.WriteRun("trigger-roll");
             Check("超过 2MB 触发轮转为 .1", File.Exists(rolled));
@@ -144,7 +150,8 @@ internal static class Program
         }
         finally
         {
-            try { if (File.Exists(rolled)) File.Delete(rolled); } catch { }
+            LlamaDSH_Launcher.AppLog.SetLogDirForTests(realDir);
+            try { Directory.Delete(dir, true); } catch { }
         }
     }
 
@@ -241,5 +248,92 @@ internal static class Program
     {
         s = s.TrimEnd();
         return s.Length <= n ? s : s.Substring(s.Length - n);
+    }
+
+    // ── Agent 调试/调用接口: cli 命令映射 + 真 HTTP 往返 ──────────────────────────
+    private static void TestAgentCliParse()
+    {
+        bool ok = AgentCli.TryParse(new[] { "cli", "status" }, out string m, out string p, out string b, out string e);
+        Check("cli status → GET status", ok && m == "GET" && p == "status");
+        ok = AgentCli.TryParse(new[] { "cli", "llama", "stop" }, out m, out p, out b, out e);
+        Check("cli llama stop → POST llama/stop", ok && m == "POST" && p == "llama/stop");
+        ok = AgentCli.TryParse(new[] { "cli", "breaker", "set", "gb", "20.5" }, out m, out p, out b, out e);
+        Check("cli breaker set gb 20.5 → body 含 gb/20.5", ok && b.Contains("gb") && b.Contains("20.5"));
+        ok = AgentCli.TryParse(new[] { "cli", "logs", "9999" }, out m, out p, out b, out e);
+        Check("cli logs 越界应失败", !ok);
+        ok = AgentCli.TryParse(new[] { "cli", "api", "POST", "/api/anything", "{\"a\":1}" }, out m, out p, out b, out e);
+        Check("cli api 逃生舱透传", ok && m == "POST" && p == "anything" && b == "{\"a\":1}");
+        ok = AgentCli.TryParse(new[] { "cli", "nope" }, out m, out p, out b, out e);
+        Check("未知命令失败", !ok);
+        ok = AgentCli.TryParse(new[] { "cli", "quit", "--no-stop" }, out m, out p, out b, out e);
+        Check("cli quit --no-stop → stop_services=false", ok && b.Contains("false"));
+    }
+
+    private static void TestAgentApiHttp()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Console.WriteLine("  SKIP  AgentApi HTTP(非 Windows 跳过)");
+            return;
+        }
+        string tmp = Path.Combine(Path.GetTempPath(), "dsh_agent_test_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tmp);
+        LlamaDSH_Launcher.AppLog.SetLogDirForTests(tmp);
+        try
+        {
+            int port = 47000 + (DateTime.Now.Millisecond % 2000);
+            Environment.SetEnvironmentVariable("LLAMADSH_AGENT_PORT", port.ToString());
+            Environment.SetEnvironmentVariable("LLAMADSH_AGENT_TOKEN", "testtoken123");
+            AgentApi api = new AgentApi();
+            api.RegisterGet("ping", delegate { return "{\"ok\":true}"; });
+            api.RegisterGet("whoami", delegate { return "{\"ok\":true,\"who\":\"test\"}"; });
+            api.RegisterPost("echo", delegate (string body)
+            {
+                return System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object> { ["ok"] = true, ["got"] = body });
+            });
+            bool started = api.Start(out string? fail);
+            Check("AgentApi 监听启动", started, fail);
+            if (!started)
+            {
+                return;
+            }
+            try
+            {
+                Check("agent.json 落盘(供 cli 读)", File.Exists(api.ConfigFile));
+                using HttpClient hc = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+                string r = hc.GetStringAsync("http://127.0.0.1:" + port + "/api/ping").GetAwaiter().GetResult();
+                Check("ping 免 token", r.Contains("\"ok\":true"));
+                HttpResponseMessage resp = hc.GetAsync("http://127.0.0.1:" + port + "/api/whoami").GetAwaiter().GetResult();
+                Check("无 token → 401", (int)resp.StatusCode == 401);
+                hc.DefaultRequestHeaders.TryAddWithoutValidation("X-Auth", "testtoken123");
+                r = hc.GetStringAsync("http://127.0.0.1:" + port + "/api/whoami").GetAwaiter().GetResult();
+                Check("带 token 取回数据", r.Contains("test"));
+                HttpResponseMessage pr = hc.PostAsync("http://127.0.0.1:" + port + "/api/echo",
+                    new StringContent("{\"x\":1}", Encoding.UTF8, "application/json")).GetAwaiter().GetResult();
+                string prBody = pr.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                bool gotEcho = false;
+                try
+                {
+                    using System.Text.Json.JsonDocument pd = System.Text.Json.JsonDocument.Parse(prBody);
+                    gotEcho = pd.RootElement.TryGetProperty("got", out System.Text.Json.JsonElement g)
+                        && g.GetString() == "{\"x\":1}";
+                }
+                catch { }
+                Check("POST 体原样透传给处理器", gotEcho, prBody);
+                HttpResponseMessage nf = hc.GetAsync("http://127.0.0.1:" + port + "/api/nope").GetAwaiter().GetResult();
+                string nfBody = nf.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                Check("未知端点 404 带端点清单", (int)nf.StatusCode == 404 && nfBody.Contains("endpoints"));
+            }
+            finally
+            {
+                api.Stop();
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("LLAMADSH_AGENT_PORT", null);
+            Environment.SetEnvironmentVariable("LLAMADSH_AGENT_TOKEN", null);
+            try { Directory.Delete(tmp, true); } catch { }
+        }
     }
 }

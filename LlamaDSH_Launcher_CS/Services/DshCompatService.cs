@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Formats.Tar;
@@ -1474,10 +1474,12 @@ public static class DshCompatService
                         if (!p.WaitForExit(Math.Max(5, timeoutSec) * 1000))
                         {
                                 try { p.Kill(true); } catch { }
-                                p.WaitForExit(); // 等 async 输出回调随进程终止落定, 再读 StringBuilder
+                                // 等 async 输出回调随进程终止落定, 再读 StringBuilder;
+                                // 必须限时: 无参 WaitForExit 在孙进程继承管道句柄时永不返回。
+                                p.WaitForExit(5000);
                                 return (-1, stdout.ToString(), "timeout");
                         }
-                        p.WaitForExit();
+                        p.WaitForExit(3000); // 同上: 限时等输出落定, 不无限吊死
                         return (p.ExitCode, stdout.ToString(), stderr.ToString());
                 }
                 catch (Exception ex)
@@ -3007,7 +3009,8 @@ public static class DshCompatService
                 {
                         return;
                 }
-                string script = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_compat_probe.mjs");
+                // GUID 名: 固定名在写入与执行之间可被同用户进程改写(node 完整语义), 且并发实例会互踩
+                string script = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_compat_probe_" + Guid.NewGuid().ToString("N") + ".mjs");
                 try
                 {
                         File.WriteAllText(script, NodeProbeScript, new UTF8Encoding(false));
@@ -3017,7 +3020,15 @@ public static class DshCompatService
                         r.ProbeErrors.Add("探针写入失败: " + ex.Message);
                         return;
                 }
-                (int ExitCode, string StdOut, string StdErr)? res = RunCapture(node, new[] { script, r.DshDir, r.ProfileDir }, r.DshDir, 180);
+                (int ExitCode, string StdOut, string StdErr)? res;
+                try
+                {
+                        res = RunCapture(node, new[] { script, r.DshDir, r.ProfileDir }, r.DshDir, 180);
+                }
+                finally
+                {
+                        try { File.Delete(script); } catch { }
+                }
                 if (!res.HasValue || res.Value.ExitCode != 0)
                 {
                         r.ProbeErrors.Add(Tail(res?.StdErr ?? "node 启动失败", 800));
@@ -3864,6 +3875,13 @@ process.stdout.write(JSON.stringify(out));
                         {
                                 return null;
                         }
+                        // 只有真正的链接(junction/符号链接)才算 reparse point;
+                        // 普通目录/文件返回 null, 让调用方"非空目录跳过"的保护能够生效,
+                        // 避免 RemoveLink 误删真实目录。
+                        if ((fi.Attributes & FileAttributes.ReparsePoint) == 0)
+                        {
+                                return null;
+                        }
                         return fi;
                 }
                 catch
@@ -3871,6 +3889,9 @@ process.stdout.write(JSON.stringify(out));
                         return null;
                 }
         }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode, EntryPoint = "RemoveDirectoryW")]
+        private static extern bool RemoveDirectoryNative(string path);
 
         private static void RemoveLink(string path)
         {
@@ -3890,9 +3911,14 @@ process.stdout.write(JSON.stringify(out));
                 catch
                 {
                 }
+                // 兜底: 直接调 RemoveDirectoryW 删除 reparse point(等价于 cmd 的 rmdir, 只删链接不动目标)。
+                // 不走 cmd.exe——手工拼引号在 cmd 语义下不成立, 路径含 & 等元字符还会构成命令注入。
                 try
                 {
-                        RunCapture("cmd.exe", new[] { "/c", "rmdir", "\"" + path + "\"" }, Path.GetDirectoryName(path), 20);
+                        if (RemoveDirectoryNative(path))
+                        {
+                                return;
+                        }
                 }
                 catch
                 {

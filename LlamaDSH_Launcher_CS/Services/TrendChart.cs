@@ -4,428 +4,434 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
-using System.Windows.Shapes;
 
 namespace LlamaDSH_Launcher.Services;
 
 /// <summary>
-/// llama-lens TrendChart 的 WPF 复刻: 标题+单位行, 多序列折线(1.5px, 面积渐隐),
-/// 3 条横向网格线, 底部 -60s/-30s/now, 右上图例=序列名:当前值; 悬停读值。
+/// 多序列时间趋势折线图(2026-11-04 起为独立实现):
+/// 头部=标题+图例(序列名:最新值)+单位; 绘图区 OnRender 直接绘制
+/// 三条水平参考线、按样本时间成比例的折线与面积渐变; 底部三个时间刻度;
+/// 悬停显示十字线与"序列 值 · -Ns"读数。yMin/yMax 传 NaN 表示自动量程。
 /// </summary>
 public class TrendChart : Grid
 {
-	private readonly TextBlock _title = new();
-	private string _titleText = "";
-	private readonly TextBlock _unit = new();
-	private readonly StackPanel _legend = new();
-	private readonly Grid _plot = new();
-	private readonly List<Shape?> _grid = new();
-	private readonly List<Path> _lines = new();
-	private readonly List<Path> _areas = new();
-	private Line? _crosshair;
-	private TextBlock _hoverTip = new();
-	private double? _yMin;
-	private double? _yMax;
-	private string _unitText = "";
+	private const double LineThickness = 1.5;
+
+	private readonly TextBlock _titleText = new();
+	private readonly TextBlock _unitText = new();
+	private readonly ItemsControl _legendItems = new();
+	private readonly PlotLayer _plot = new();
+	private readonly TextBlock _footLeft = new();
+	private readonly TextBlock _footMid = new();
+	private readonly TextBlock _footRight = new();
+	private readonly TextBlock _tip = new();
+
 	private List<(string name, Color color, double?[] data)> _series = new();
-	private DateTime[] _stampsForFoot = Array.Empty<DateTime>();
-	private int _hover = -1;
+	private DateTime[] _stamps = Array.Empty<DateTime>();
+	private double? _floor;
+	private double? _ceil;
+	private string _unit = "";
 
-	public TrendChart()
-	{
-		Init();
-	}
-
-	public TrendChart(string title, string unit, double height = 170)
-	{
-		Init();
-		Title = title;
-		Unit = unit;
-		Height = height;
-	}
-
+	/// <summary>序列各点的采样时刻(与数据等长); 缺省则按等间距渲染。</summary>
 	public DateTime[] StampsRef { get; set; } = Array.Empty<DateTime>();
 
 	public string Title
 	{
-		get => _titleText;
-		set { _titleText = value; _title.Text = value; }
+		get => _titleText.Text;
+		set => _titleText.Text = value ?? "";
 	}
 
 	public string Unit
 	{
-		get => _unitText;
-		set => _unitText = value;
+		get => _unit;
+		set
+		{
+			_unit = value ?? "";
+			_unitText.Text = _unit;
+		}
 	}
 
-	private void Init()
+	public TrendChart()
 	{
-		RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Auto) });
+		RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 		RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-		RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Auto) });
+		RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-		var head = new DockPanel { LastChildFill = false, Margin = new Thickness(0, 0, 0, 4) };
-		_title.Text = _titleText;
-		_title.FontSize = 12;
-		_title.FontWeight = FontWeights.Bold;
-		_title.Foreground = new SolidColorBrush(Color.FromRgb(0xee, 0xf1, 0xf3));
-		_unit.Text = Unit;
-		_unit.FontSize = 10;
-		_unit.Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f));
-		_legend.Orientation = Orientation.Horizontal;
-		DockPanel.SetDock(_legend, Dock.Right);
-		DockPanel.SetDock(_unit, Dock.Right);
-		head.Children.Add(_legend);
-		head.Children.Add(_unit);
-		head.Children.Add(_title);
-		SetRow(head, 0);
+		var header = new Grid();
+		header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+		header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+		header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+		_titleText.FontWeight = FontWeights.SemiBold;
+		_titleText.FontSize = 12.5;
+		_titleText.Foreground = BrushFrom(0xe6, 0xea, 0xef);
+		_titleText.VerticalAlignment = VerticalAlignment.Center;
+		Grid.SetColumn(_titleText, 0);
+		_legendItems.ItemsPanel = new ItemsPanelTemplate(new FrameworkElementFactory(typeof(WrapPanel)));
+		_legendItems.IsHitTestVisible = false;
+		_legendItems.VerticalAlignment = VerticalAlignment.Center;
+		Grid.SetColumn(_legendItems, 1);
+		_unitText.FontSize = 10.5;
+		_unitText.Foreground = BrushFrom(0x8b, 0x94, 0x9e);
+		_unitText.Margin = new Thickness(6, 0, 0, 0);
+		_unitText.VerticalAlignment = VerticalAlignment.Center;
+		Grid.SetColumn(_unitText, 2);
+		header.Children.Add(_titleText);
+		header.Children.Add(_legendItems);
+		header.Children.Add(_unitText);
+		header.Margin = new Thickness(2, 0, 2, 3);
+		SetRow(header, 0);
 
-		_plot.Background = new SolidColorBrush(Color.FromArgb(0x01, 0, 0, 0));
-		_plot.ClipToBounds = true;
-		for (int i = 0; i < 3; i++)
-		{
-			var ln = new Line { Stroke = new SolidColorBrush(Color.FromArgb(0x1f, 0x8f, 0xa3, 0xc8)), StrokeThickness = 1, X1 = 0, X2 = 100 };
-			_grid.Add(ln);
-			_plot.Children.Add(ln);
-		}
-		_crosshair = new Line { Y1 = 0, Y2 = 100, Stroke = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), StrokeThickness = 1, Opacity = 0.35, Visibility = Visibility.Collapsed, Stretch = Stretch.None };
-		_plot.Children.Add(_crosshair);
-		_hoverTip = new TextBlock
-		{
-			FontSize = 10,
-			FontFamily = new FontFamily("Consolas"),
-			Background = new SolidColorBrush(Color.FromArgb(0xe0, 0x16, 0x1b, 0x22)),
-			Padding = new Thickness(4, 1, 4, 1),
-			Foreground = new SolidColorBrush(Color.FromRgb(0xee, 0xf1, 0xf3)),
-			Visibility = Visibility.Collapsed,
-			VerticalAlignment = VerticalAlignment.Top,
-			HorizontalAlignment = HorizontalAlignment.Left,
-			Margin = new Thickness(6, 2, 0, 0),
-			IsHitTestVisible = false
-		};
-		System.Windows.Controls.Panel.SetZIndex(_hoverTip, 10);
-		_plot.Children.Add(_hoverTip);
-		_plot.MouseMove += OnMove;
-		_plot.MouseLeave += (_, _) => { _hover = -1; ShowHover(); };
+		_plot.Focusable = false;
 		SetRow(_plot, 1);
 
-		var foot = new Grid { Margin = new Thickness(0, 3, 0, 0) };
-		_footLabels = new TextBlock[3];
+		var footer = new Grid { Margin = new Thickness(2, 2, 2, 0) };
 		for (int i = 0; i < 3; i++)
 		{
-			var tb = new TextBlock { FontSize = 9, Foreground = new SolidColorBrush(Color.FromRgb(0x8e, 0x97, 0x9f)), FontFamily = new FontFamily("Consolas") };
-			_footLabels[i] = tb;
-			Grid.SetColumn(tb, i);
-			if (i == 1)
-			{
-				tb.HorizontalAlignment = HorizontalAlignment.Center;
-			}
-			if (i == 2)
-			{
-				tb.HorizontalAlignment = HorizontalAlignment.Right;
-			}
-			foot.ColumnDefinitions.Add(new ColumnDefinition());
-			foot.Children.Add(tb);
+			footer.ColumnDefinitions.Add(new ColumnDefinition());
 		}
-		SetRow(foot, 2);
+		_footLeft.FontSize = _footMid.FontSize = _footRight.FontSize = 9.5;
+		_footLeft.Foreground = _footMid.Foreground = _footRight.Foreground = BrushFrom(0x77, 0x80, 0x8a);
+		_footLeft.FontFamily = _footMid.FontFamily = _footRight.FontFamily = new FontFamily("Consolas");
+		_footMid.TextAlignment = TextAlignment.Center;
+		_footRight.TextAlignment = TextAlignment.Right;
+		Grid.SetColumn(_footLeft, 0);
+		Grid.SetColumn(_footMid, 1);
+		Grid.SetColumn(_footRight, 2);
+		footer.Children.Add(_footLeft);
+		footer.Children.Add(_footMid);
+		footer.Children.Add(_footRight);
+		SetRow(footer, 2);
 
-		Children.Add(head);
+		_tip.IsHitTestVisible = false;
+		_tip.Visibility = Visibility.Collapsed;
+		_tip.FontSize = 10.5;
+		_tip.FontFamily = new FontFamily("Consolas");
+		_tip.Foreground = BrushFrom(0xf0, 0xf3, 0xf6);
+		_tip.Background = new SolidColorBrush(Color.FromArgb(0xd9, 0x14, 0x1a, 0x21));
+		_tip.Padding = new Thickness(5, 2, 5, 2);
+		_tip.HorizontalAlignment = HorizontalAlignment.Left;
+		_tip.VerticalAlignment = VerticalAlignment.Top;
+		_tip.Margin = new Thickness(8, 20, 0, 0);
+		SetRow(_tip, 1);
+		Panel.SetZIndex(_tip, 9);
+
+		_plot.HoverIndex = -1;
+		_plot.PointHovered += (_, idx) => { _plot.HoverIndex = idx; RefreshTip(); };
+		_plot.PointLeft += (_, _) => { _plot.HoverIndex = -1; _tip.Visibility = Visibility.Collapsed; _plot.InvalidateVisual(); };
+
+		Children.Add(header);
 		Children.Add(_plot);
-		Children.Add(foot);
+		Children.Add(footer);
+		Children.Add(_tip);
 	}
 
-	private void OnMove(object sender, MouseEventArgs e)
+	/// <summary>设置序列(等长数组, null 表示该时刻无样本、断线)。yMin/yMax 传 NaN 走自动量程。</summary>
+	public void SetSeries(string unit, List<(string name, Color color, double?[] data)> series, double yMin, double yMax)
 	{
-		if (_series.Count == 0)
+		Unit = unit;
+		_series = series ?? new List<(string, Color, double?[])>();
+		_stamps = StampsRef ?? Array.Empty<DateTime>();
+		if (_stamps.Length < 2)
 		{
-			return;
+			_stamps = Array.Empty<DateTime>();
 		}
-		var pos = e.GetPosition(_plot);
-		double w = _plot.ActualWidth;
-		if (w <= 0)
+		_floor = double.IsNaN(yMin) ? null : yMin;
+		_ceil = double.IsNaN(yMax) ? null : yMax;
+		_plot.Bind(_series, _stamps, _floor, _ceil);
+		RebuildLegend();
+		RebuildFooter();
+		RefreshTip();
+	}
+
+	private void RebuildLegend()
+	{
+		var items = new List<UIElement>();
+		foreach ((string name, Color color, double?[] data) in _series)
 		{
-			return;
-		}
-		int maxLen = MaxLen();
-		// 时间映射下按最近样本点反查索引
-		double frac = Math.Max(0, Math.Min(1, pos.X / w));
-		int idx = 0;
-		double bestD = double.MaxValue;
-		for (int i = 0; i < maxLen; i++)
-		{
-			double xi = _stampsForFoot.Length == maxLen && maxLen > 1
-				&& (_stampsForFoot[^1] - _stampsForFoot[0]).TotalSeconds > 0.01
-				? (_stampsForFoot[i] - _stampsForFoot[0]).TotalSeconds
-				/ (_stampsForFoot[^1] - _stampsForFoot[0]).TotalSeconds * w
-				: maxLen > 1 ? i / (double)(maxLen - 1) * w : 0;
-			double d = Math.Abs(xi - frac * w);
-			if (d < bestD)
+			var sp = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 10, 0) };
+			sp.Children.Add(new System.Windows.Shapes.Ellipse
 			{
-				bestD = d;
-				idx = i;
+				Width = 7,
+				Height = 7,
+				Fill = new SolidColorBrush(color),
+				VerticalAlignment = VerticalAlignment.Center,
+				Margin = new Thickness(0, 0, 4, 0)
+			});
+			double? latest = null;
+			for (int i = data.Length - 1; i >= 0 && latest == null; i--)
+			{
+				latest = data[i];
 			}
+			sp.Children.Add(new TextBlock
+			{
+				Text = name + " " + (latest.HasValue ? latest.Value.ToString("0.##") : "—"),
+				FontSize = 10.5,
+				Foreground = BrushFrom(0xc3, 0xca, 0xd2),
+				VerticalAlignment = VerticalAlignment.Center
+			});
+			items.Add(sp);
 		}
-		_hover = idx;
-		if (_crosshair != null)
+		_legendItems.Items.Clear();
+		foreach (UIElement el in items)
 		{
-			_crosshair.Visibility = Visibility.Visible;
-			_crosshair.X1 = pos.X;
-			_crosshair.X2 = pos.X;
-			_crosshair.Y1 = 0;
-			_crosshair.Y2 = _plot.ActualHeight;
+			_legendItems.Items.Add(el);
 		}
-		ShowHover();
 	}
 
-	private void ShowHover()
+	private void RebuildFooter()
 	{
-		if (_crosshair != null && _hover < 0)
+		if (_stamps.Length >= 2 && (_stamps[^1] - _stamps[0]).TotalSeconds > 1)
 		{
-			_crosshair.Visibility = Visibility.Collapsed;
-		}
-		if (_hover < 0 || _series.Count == 0)
-		{
-			_hoverTip.Visibility = Visibility.Collapsed;
-			return;
-		}
-		var parts = new List<string>();
-		foreach (var (name, _, data) in _series)
-		{
-			double? v = idx(data, _hover);
-			parts.Add($"{name} {(v.HasValue ? v.Value.ToString("0.#") : "—")}");
-		}
-		// 读数时间标签按真实时间跨度(混合采样下 60-idx 恒等式不成立)
-		string agoTip;
-		if (_stampsForFoot.Length > 1 && _hover < _stampsForFoot.Length)
-		{
-			int ago = (int)Math.Max(0, (_stampsForFoot[^1] - _stampsForFoot[_hover]).TotalSeconds);
-			agoTip = ago > 0 ? $"  · -{ago}s" : "  · now";
+			int span = (int)Math.Round((_stamps[^1] - _stamps[0]).TotalSeconds);
+			_footLeft.Text = "-" + span + "s";
+			_footMid.Text = "-" + (span / 2) + "s";
+			_footRight.Text = "now";
 		}
 		else
 		{
-			agoTip = _hover >= 55 ? "  · now" : $"  · -{60 - _hover}s";
-		}
-		_hoverTip.Text = string.Join("  ", parts) + agoTip;
-		_hoverTip.Visibility = Visibility.Visible;
-	}
-
-	private static double? idx(double?[] a, int i)
-	{
-		return i >= 0 && i < a.Length ? a[i] : null;
-	}
-
-	/// <summary>设置序列(各序列等长 ≤60 点)。yMin/yMax 固定量程, NaN 自动。</summary>
-	public void SetSeries(string unit, List<(string name, Color color, double?[] data)> series, double yMin, double yMax)
-	{
-		_unitText = unit;
-		_series = series ?? new();
-		_stampsForFoot = _series.Count > 0 ? StampsRef ?? Array.Empty<DateTime>() : Array.Empty<DateTime>();
-		_yMin = double.IsNaN(yMin) ? null : yMin;
-		_yMax = double.IsNaN(yMax) ? null : yMax;
-		_unit.Text = unit;
-		Rebuild();
-		UpdateLegend();
-	}
-
-	private void UpdateLegend()
-	{
-		_legend.Children.Clear();
-		int i = _hover;
-		foreach (var (name, color, data) in _series)
-		{
-			double? v = i >= 0 ? idx(data, i) : LastVal(data);
-			var sp = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 0, 0, 0) };
-			sp.Children.Add(new System.Windows.Shapes.Ellipse { Width = 7, Height = 7, Fill = new SolidColorBrush(color), VerticalAlignment = VerticalAlignment.Center });
-			sp.Children.Add(new TextBlock
-			{
-				Text = $" {name} {(v.HasValue ? v.Value.ToString("0.#") : "—")}{(_unitText.Length > 0 ? " " + _unitText : "")}",
-				FontSize = 10,
-				FontFamily = new FontFamily("Consolas"),
-				Foreground = new SolidColorBrush(Color.FromRgb(0xc7, 0xcd, 0xd3)),
-				VerticalAlignment = VerticalAlignment.Center
-			});
-			_legend.Children.Add(sp);
+			_footLeft.Text = "-60s";
+			_footMid.Text = "-30s";
+			_footRight.Text = "now";
 		}
 	}
 
-	private static double? LastVal(double?[] a)
+	private void RefreshTip()
 	{
-		for (int i = a.Length - 1; i >= 0; i--)
+		int idx = _plot.HoverIndex;
+		if (idx < 0 || _series.Count == 0)
 		{
-			if (a[i].HasValue)
-			{
-				return a[i];
-			}
-		}
-		return null;
-	}
-
-	private Line? _baseline;
-	private TextBlock[]? _footLabels;
-
-	private int MaxLen()
-	{
-		int n = 0;
-		foreach (var (_, _, d) in _series)
-		{
-			if (d.Length > n)
-			{
-				n = d.Length;
-			}
-		}
-		return Math.Max(n, 1);
-	}
-
-	private void Rebuild()
-	{
-		// 窗口标签按实际时间跨度(采样间隔自适应)
-		if (_footLabels != null && _series.Count > 0)
-		{
-			var stamps = _series[0].data.Length >= 0 ? _stampsForFoot : null;
-			double windowSec = 60;
-			if (stamps != null && stamps.Length >= 2)
-			{
-				windowSec = Math.Max(1.0, (stamps[^1] - stamps[0]).TotalSeconds);
-			}
-			_footLabels[0].Text = $"-{windowSec:F0}s";
-			_footLabels[1].Text = $"-{windowSec / 2:F0}s";
-			_footLabels[2].Text = "now";
-		}
-		double w = _plot.ActualWidth;
-		double h = _plot.ActualHeight;
-		if (w <= 0 || h <= 0)
-		{
+			_tip.Visibility = Visibility.Collapsed;
 			return;
 		}
-		if (_baseline != null)
+		var parts = new List<string>();
+		foreach ((string name, _, double?[] data) in _series)
 		{
-			_plot.Children.Remove(_baseline);
-			_baseline = null;
+			string v = idx >= 0 && idx < data.Length && data[idx].HasValue ? data[idx]!.Value.ToString("0.##") : "—";
+			parts.Add(name + " " + v + (Unit.Length > 0 ? " " + Unit : ""));
 		}
-		for (int i = 0; i < _grid.Count; i++)
+		string when = "now";
+		if (_stamps.Length >= 2 && idx < _stamps.Length)
 		{
-			if (_grid[i] is Line ln)
-			{
-				double frac = (i + 1) / 4.0;
-				ln.X1 = 0;
-				ln.X2 = w;
-				ln.Y1 = ln.Y2 = h * frac;
-			}
+			int ago = (int)Math.Max(0, Math.Round((_stamps[^1] - _stamps[idx]).TotalSeconds));
+			when = ago > 0 ? "-" + ago + "s" : "now";
 		}
-		double top = _yMax ?? 0, bot = _yMin ?? 0;
-		if (!_yMax.HasValue || !_yMin.HasValue)
+		_tip.Text = string.Join("   ", parts) + "   " + when;
+		_tip.Visibility = Visibility.Visible;
+	}
+
+	private static SolidColorBrush BrushFrom(byte r, byte g, byte b)
+	{
+		return new SolidColorBrush(Color.FromRgb(r, g, b));
+	}
+
+	/// <summary>实际绘图画布: OnRender 里完成网格/面积/折线/悬停十字线, 并做样本命中检测。</summary>
+	private sealed class PlotLayer : FrameworkElement
+	{
+		private List<(string name, Color color, double?[] data)> _series = new();
+		private DateTime[] _stamps = Array.Empty<DateTime>();
+		private double? _floor;
+		private double? _ceil;
+		private float[] _xs = Array.Empty<float>();
+		private bool _hasData;
+
+		public int HoverIndex { get; set; } = -1;
+
+		public event EventHandler<int>? PointHovered;
+		public event EventHandler? PointLeft;
+
+		public void Bind(List<(string, Color, double?[])> series, DateTime[] stamps, double? floor, double? ceil)
 		{
-			foreach (var (_, _, data) in _series)
+			_series = series;
+			_stamps = stamps;
+			_floor = floor;
+			_ceil = ceil;
+			_hasData = false;
+			foreach ((_, _, double?[] d) in _series)
 			{
-				foreach (var v in data)
+				if (d.Length > 0)
 				{
-					if (!v.HasValue)
-					{
-						continue;
-					}
-					if (!_yMax.HasValue && v.Value > top)
-					{
-						top = v.Value;
-					}
-					if (!_yMin.HasValue && (top == 0 || v.Value < bot))
-					{
-						bot = Math.Min(0, v.Value);
-					}
+					_hasData = true;
+					break;
 				}
 			}
+			InvalidateVisual();
 		}
-		double span = top - bot;
-		if (span <= 1e-9)
+
+		protected override void OnMouseLeftButtonDown(MouseButtonEventArgs e)
 		{
-			top = bot + 1;
-			span = 1;
+			base.OnMouseLeftButtonDown(e);
+			e.Handled = true;
 		}
-		// 清旧线
-		foreach (var p in _lines)
+
+		protected override void OnMouseMove(MouseEventArgs e)
 		{
-			_plot.Children.Remove(p);
-		}
-		foreach (var p in _areas)
-		{
-			_plot.Children.Remove(p);
-		}
-		_lines.Clear();
-		_areas.Clear();
-		int maxLen = MaxLen();
-		bool timeX = _stampsForFoot.Length == maxLen && maxLen > 1
-			&& (_stampsForFoot[^1] - _stampsForFoot[0]).TotalSeconds > 0.01;
-		double stampSpan = timeX ? (_stampsForFoot[^1] - _stampsForFoot[0]).TotalSeconds : 0;
-		foreach (var (name, color, data) in _series)
-		{
-			var line = new Path
+			base.OnMouseMove(e);
+			if (_xs.Length == 0)
 			{
-				Stroke = new SolidColorBrush(color),
-				StrokeThickness = 1.5,
-				StrokeLineJoin = PenLineJoin.Round,
-				StrokeStartLineCap = PenLineCap.Round,
-				StrokeEndLineCap = PenLineCap.Round
-			};
-			var area = new Path { Fill = new SolidColorBrush(Color.FromArgb(0x14, color.R, color.G, color.B)) };
-			var geo = new StreamGeometry();
-			var ageo = new StreamGeometry();
-			bool any = false;
-			using (var ctx = geo.Open())
-			using (var actx = ageo.Open())
+				return;
+			}
+			double best = double.MaxValue;
+			int pick = 0;
+			for (int i = 0; i < _xs.Length; i++)
 			{
-				int start = -1;
-				for (int i = 0; i <= data.Length; i++)
+				double dist = Math.Abs(_xs[i] - e.GetPosition(this).X);
+				if (dist < best)
 				{
-					bool valid = i < data.Length && data[i].HasValue;
-					if (valid && start < 0)
+					best = dist;
+					pick = i;
+				}
+			}
+			PointHovered?.Invoke(this, pick);
+		}
+
+		protected override void OnMouseLeave(MouseEventArgs e)
+		{
+			base.OnMouseLeave(e);
+			PointLeft?.Invoke(this, EventArgs.Empty);
+		}
+
+		protected override void OnRender(DrawingContext dc)
+		{
+			double w = ActualWidth;
+			double h = ActualHeight;
+			if (w < 8 || h < 8 || !_hasData)
+			{
+				_xs = Array.Empty<float>();
+				return;
+			}
+
+			int len = 0;
+			foreach ((_, _, double?[] d) in _series)
+			{
+				len = Math.Max(len, d.Length);
+			}
+			if (len == 0)
+			{
+				return;
+			}
+
+			// 量程: 固定值优先; 自动量程取数据 min/max 并留 6% 呼吸空间
+			double y0 = _floor ?? double.MaxValue;
+			double y1 = _ceil ?? double.MinValue;
+			if (_floor == null || _ceil == null)
+			{
+				double dMin = double.MaxValue;
+				double dMax = double.MinValue;
+				foreach ((_, _, double?[] d) in _series)
+				{
+					foreach (double? v in d)
 					{
-						start = i;
-					}
-					if (!(start >= 0 && (!valid || i == data.Length - 1)))
-					{
-						continue;
-					}
-					int end = valid ? i : i - 1;
-					if (end > start)
-					{
-						// 时间戳有效时按真实时间映射 x(混合采样节奏不失真)
-						double XAt(int k) => timeX
-							? (_stampsForFoot[k] - _stampsForFoot[0]).TotalSeconds / stampSpan * w
-							: maxLen > 1 ? k / (double)(maxLen - 1) * w : 0;
-						Point P(int k) => new Point(XAt(k), h - ((data[k]!.Value - bot) / span) * (h - 6) - 3);
-						ctx.BeginFigure(P(start), false, false);
-						actx?.BeginFigure(P(start), false, false);
-						for (int j = start + 1; j <= end; j++)
+						if (v.HasValue)
 						{
-							var pj = P(j);
-							ctx.LineTo(pj, true, false);
-							actx?.LineTo(pj, true, false);
+							dMin = Math.Min(dMin, v.Value);
+							dMax = Math.Max(dMax, v.Value);
 						}
-						actx?.LineTo(new Point(P(end).X, h), true, false);
-						actx?.LineTo(new Point(P(start).X, h), true, false);
-						any = true;
 					}
-					start = -1;
+				}
+				if (dMin > dMax)
+				{
+					return;
+				}
+				if (dMax - dMin < 1e-9)
+				{
+					dMax = dMin + 1;
+				}
+				double pad = (dMax - dMin) * 0.06;
+				y0 = Math.Min(y0, dMin - pad);
+				y1 = Math.Max(y1, dMax + pad);
+			}
+			if (y1 <= y0)
+			{
+				y1 = y0 + 1;
+			}
+
+			// x 坐标: 有采样时刻则按真实时间成比例, 否则等间距
+			_xs = new float[len];
+			bool timed = _stamps.Length == len && len > 1 && (_stamps[^1] - _stamps[0]).TotalSeconds > 0.01;
+			double span = timed ? Math.Max(1e-6, (_stamps[^1] - _stamps[0]).TotalSeconds) : 1.0;
+			for (int i = 0; i < len; i++)
+			{
+				_xs[i] = timed
+					? (float)((_stamps[i] - _stamps[0]).TotalSeconds / span * w)
+					: (float)(len == 1 ? w / 2 : i / (double)(len - 1) * w);
+			}
+
+			double Y(double v) => h - (v - y0) / (y1 - y0) * h;
+
+			var penGrid = new Pen(new SolidColorBrush(Color.FromArgb(0x26, 0x93, 0xa7, 0xc9)), 1.0);
+			penGrid.Freeze();
+			for (int g = 1; g <= 3; g++)
+			{
+				double gy = h * g / 4.0;
+				dc.DrawLine(penGrid, new Point(0, gy), new Point(w, gy));
+			}
+
+			foreach ((_, Color color, double?[] data) in _series)
+			{
+				var stroke = new SolidColorBrush(color);
+				stroke.Freeze();
+				var pen = new Pen(stroke, LineThickness) { LineJoin = PenLineJoin.Round };
+				pen.Freeze();
+
+				// null 断点切段; 每段独立画 面积 + 折线
+				int i = 0;
+				while (i < data.Length)
+				{
+					if (!data[i].HasValue)
+					{
+						i++;
+						continue;
+					}
+					int j = i;
+					while (j < data.Length && data[j].HasValue)
+					{
+						j++;
+					}
+					if (j - i == 1)
+					{
+						dc.DrawEllipse(stroke, null, new Point(_xs[i], Y(data[i]!.Value)), 1.8, 1.8);
+					}
+					else
+					{
+						var line = new StreamGeometry();
+						var area = new StreamGeometry();
+						using (StreamGeometryContext g = line.Open())
+						{
+							g.BeginFigure(new Point(_xs[i], Y(data[i]!.Value)), false, false);
+							for (int k = i + 1; k < j; k++)
+							{
+								g.LineTo(new Point(_xs[k], Y(data[k]!.Value)), true, false);
+							}
+						}
+						using (StreamGeometryContext g = area.Open())
+						{
+							g.BeginFigure(new Point(_xs[i], h), true, true);
+							g.LineTo(new Point(_xs[i], Y(data[i]!.Value)), true, false);
+							for (int k = i + 1; k < j; k++)
+							{
+								g.LineTo(new Point(_xs[k], Y(data[k]!.Value)), true, false);
+							}
+							g.LineTo(new Point(_xs[j - 1], h), true, false);
+						}
+						var fill = new LinearGradientBrush(Color.FromArgb(0x33, color.R, color.G, color.B),
+							Color.FromArgb(0x05, color.R, color.G, color.B), 90);
+						fill.Freeze();
+						dc.DrawGeometry(fill, null, area);
+						dc.DrawGeometry(null, pen, line);
+					}
+					i = j;
 				}
 			}
-			if (!any)
+
+			if (HoverIndex >= 0 && HoverIndex < _xs.Length)
 			{
-				continue;
+				var cross = new Pen(new SolidColorBrush(Color.FromArgb(0x66, 0x9a, 0xa6, 0xb2)), 1.0)
+				{
+					DashStyle = DashStyles.Dash
+				};
+				cross.Freeze();
+				dc.DrawLine(cross, new Point(_xs[HoverIndex], 0), new Point(_xs[HoverIndex], h));
 			}
-			geo.Freeze();
-			ageo.Freeze();
-			line.Data = geo;
-			area.Data = ageo;
-			_plot.Children.Add(area);
-			_plot.Children.Add(line);
-			_areas.Add(area);
-			_lines.Add(line);
 		}
-		if (_lines.Count == 0)
-		{
-			// 空态虚线基线(受管, 防 Rebuild 累积)
-			_baseline = new Line { X1 = 0, Y1 = h - 3, X2 = w, Y2 = h - 3, Stroke = new SolidColorBrush(Color.FromRgb(0x2a, 0x30, 0x36)), StrokeThickness = 1, StrokeDashArray = new DoubleCollection { 3, 3 } };
-			_plot.Children.Add(_baseline);
-		}
-		ShowHover();
 	}
 }

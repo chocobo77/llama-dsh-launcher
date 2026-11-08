@@ -24,6 +24,9 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
+; 与 App.xaml.cs 单实例 Mutex 同名: 安装/卸载前要求关闭运行中的启动器,
+; 也防止手工跑 ISCC 时把 installer_staging 里正在被占用的旧 exe 打进包
+AppMutex=LlamaDSH_Launcher_SingleInstance_Mutex
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
@@ -54,6 +57,7 @@ Name: "startmenuicon"; Description: "创建开始菜单快捷方式"; GroupDescr
 [Files]
 Source: "installer_staging\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "installer_staging\gputemp.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "installer_staging\llamadsh-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "installer_staging\{#MyAppIcon}"; DestDir: "{app}\Resources"; Flags: ignoreversion
 
 [Icons]
@@ -80,6 +84,9 @@ external 'URLDownloadToFileW@urlmon.dll stdcall';
 const
   DOTNET8_VERSION = '8.0.30';
   DOTNET8_URL = 'https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/' + DOTNET8_VERSION + '/windowsdesktop-runtime-' + DOTNET8_VERSION + '-win-x64.exe';
+  // 构建机 2026-11-04 从上述官方 URL 下载实测: 58,510,672 字节, Authenticode Valid(CN=.NET, O=Microsoft Corporation)。
+  // 该运行时稍后以 runas 提权执行, 必须先过 SHA-256 + 验签双门, 不能只看文件存在。
+  DOTNET8_SHA256 = '8BD710AFA5DE396C9EB2A3B68D00279B7B9ACA372A2443E9ACD4F48FFDEF3F2D';
 
 function IsWindows10OrLater: Boolean;
 var
@@ -222,6 +229,39 @@ end;
 //  自动下载并安装 .NET 8 Desktop Runtime
 //  进度集成在安装程序界面内（TOutputProgressWizardPage），不弹终端
 // ----------------------------------------------------
+// 完整性门: 对将要 runas 提权执行的运行时安装包做 SHA-256(硬编码基线) + Authenticode 双验证。
+// 通过 powershell 现算(系统自带), 结果写临时文件回读; 任何一步不通过都返回 False。
+function VerifyDownloadedDotNetInstaller(InstallerPath: String): Boolean;
+var
+  OutFile, PsCmd: String;
+  ResultCode: Integer;
+  Lines: TArrayOfString;
+  I: Integer;
+  HashOk, SigOk: Boolean;
+begin
+  Result := False;
+  HashOk := False;
+  SigOk := False;
+  OutFile := ExpandConstant('{tmp}\dotnet_verify.txt');
+  if FileExists(OutFile) then DeleteFile(OutFile);
+  PsCmd := '-NoProfile -ExecutionPolicy Bypass -Command "' +
+    '$ErrorActionPreference=''Stop''; $p=''' + InstallerPath + ''';' +
+    'if ((Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash -ieq ''' + DOTNET8_SHA256 + ''') { Write-Output HASHOK } else { Write-Output HASHBAD };' +
+    '$s = Get-AuthenticodeSignature -LiteralPath $p;' +
+    'if (($s.Status -eq ''Valid'') -and ($s.SignerCertificate.Subject -match ''Microsoft Corporation'')) { Write-Output SIGOK } else { Write-Output SIGBAD }"' +
+    ' > "' + OutFile + '" 2>&1';
+  if not Exec('cmd.exe', '/c powershell.exe ' + PsCmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Exit;
+  if not LoadStringsFromFile(OutFile, Lines) then
+    Exit;
+  for I := 0 to GetArrayLength(Lines) - 1 do
+  begin
+    if Pos('HASHOK', Lines[I]) > 0 then HashOk := True;
+    if Pos('SIGOK', Lines[I]) > 0 then SigOk := True;
+  end;
+  Result := HashOk and SigOk;
+end;
+
 function DownloadAndInstallDotNet8(): Boolean;
 var
   InstallerPath: String;
@@ -275,8 +315,21 @@ begin
       Exit;
     end;
 
-    SetStatus(ProgressPage, '下载完成。');
+    SetStatus(ProgressPage, '下载完成。校验完整性...');
     ProgressPage.SetProgress(5, 10);
+
+    // ===== 1.5 完整性验证: SHA-256 + Authenticode(缺一不放行, 产物将以管理员权限执行) =====
+    if not VerifyDownloadedDotNetInstaller(InstallerPath) then
+    begin
+      SetStatus(ProgressPage, '完整性校验未通过, 已删除下载文件并中止。');
+      DeleteFile(InstallerPath);
+      ProgressPage.Hide;
+      MsgBox('下载的安装包未通过 SHA-256/数字签名校验, 已中止安装（网络通道可能被劫持）。' + #13#10#13#10 +
+             '请手动下载安装：https://dotnet.microsoft.com/download/dotnet/8.0', mbError, MB_OK);
+      Exit;
+    end;
+    SetStatus(ProgressPage, '完整性校验通过（SHA-256 + Microsoft 数字签名）。');
+    ProgressPage.SetProgress(6, 10);
 
     // ===== 2. 安装 =====
     SetStatus(ProgressPage, '正在安装 .NET ' + DOTNET8_VERSION + ' Desktop Runtime...');

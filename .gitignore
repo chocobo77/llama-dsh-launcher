@@ -4,6 +4,10 @@ obj/
 publish/
 *.user
 
+# 签名配置含证书路径, 严禁入库(模板 .example 才入库)
+LlamaDSH_Launcher_CS/signtool-config.inc
+*.pfx
+
 # Installer artifacts
 installer_output/
 installer_staging/
@@ -33,6 +37,8 @@ Desktop.ini
 # Archived review/audit artifacts (keep out of repo; delete or commit deliberately if needed)
 _archive/
 LlamaDSH_Launcher_CS/installer_staging_linux/
+pack_run.log
+pack_run.log
 
 # 本地修复记录，不公开
 /docs/
@@ -60,3 +66,6 @@ LlamaDSH_Launcher_Linux/gui-test-screenshots/
 /_ggml_h.txt
 /.zcode/
 
+
+# 本地运行配置(含机器本地路径/方案), 不入库
+LlamaDSH_Launcher_config.json

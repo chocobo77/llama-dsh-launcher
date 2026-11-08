@@ -20,6 +20,8 @@
     <Compile Include="..\..\LlamaDSH_Launcher_CS\Services\ProcessRunner.cs" Link="src\ProcessRunner.cs" />
     <Compile Include="..\..\LlamaDSH_Launcher_CS\Logging.cs" Link="src\Logging.cs" />
     <Compile Include="..\..\LlamaDSH_Launcher_CS\Services\AuthenticodeVerifier.cs" Link="src\AuthenticodeVerifier.cs" />
+    <Compile Include="..\..\LlamaDSH_Launcher_CS\Services\AgentApi.cs" Link="src\AgentApi.cs" />
+    <Compile Include="..\..\LlamaDSH_Launcher_CS\Services\AgentCli.cs" Link="src\AgentCli.cs" />
   </ItemGroup>
 
 </Project>

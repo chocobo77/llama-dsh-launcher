@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -1019,20 +1019,27 @@ public class GpuMonitor
 		{
 			string text = Path.Combine(Path.GetTempPath(), "LlamaDSH_Launcher");
 			Directory.CreateDirectory(text);
-			string text2 = Path.Combine(text, "gpu_perf.ps1");
+			// GUID 名 + 用完即删: 固定名在写入与 powershell 执行之间可被同用户进程改写
+			// (powershell 完整语义), 且 CleanupLauncherTemp 会误删正在使用的脚本; 残留交启动清扫。
+			string text2 = Path.Combine(text, "gpu_perf_" + Guid.NewGuid().ToString("N") + ".ps1");
 			lock (_lock)
 			{
-				if (!File.Exists(text2) || File.ReadAllText(text2) != PerfScript)
-				{
-					File.WriteAllText(text2, PerfScript, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
-				}
+				File.WriteAllText(text2, PerfScript, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
 				_psScriptFile = text2;
 			}
-			// 统一走 ProcessRunner（同时异步读两流 + 10s 超时），避免“先读后等”让超时失效。
-			ProcessResult psResult = ProcessRunner.Run(
-				"powershell.exe",
-				new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", text2 },
-				10000);
+			ProcessResult psResult;
+			try
+			{
+				// 统一走 ProcessRunner（同时异步读两流 + 10s 超时），避免“先读后等”让超时失效。
+				psResult = ProcessRunner.Run(
+					"powershell.exe",
+					new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", text2 },
+					10000);
+			}
+			finally
+			{
+				try { File.Delete(text2); } catch { }
+			}
 			if (!psResult.Started)
 			{
 				return;

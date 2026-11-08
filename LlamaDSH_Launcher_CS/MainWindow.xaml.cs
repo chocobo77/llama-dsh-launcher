@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.CodeDom.Compiler;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -68,6 +68,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	// 最近一次 AutoFill 提示集合（用于去重，避免击键刷屏）
 	private string? _lastAutoFillHints;
+
+	// 上一次由 AutoFill 写入的 alias 值(区分用户手改与自动值)
+	private string? _lastAutoFilledAlias;
 
 	// DSH 升级自动重建 (git HEAD 变化 → clean + build:lib + build:web)
 	private DispatcherTimer? _dshRebuildTimer;
@@ -241,9 +244,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		ShowSection("path");
 		SetupTray();
 		WireLiveRefresh();
-		RefreshCmd();
+		RefreshCmdNow();
 		StartPerfMonitor();
 		LoadState();
+		TryStartAgentApi();
 		_healthTimer.Tick += HealthCheck;
 		_healthTimer.Start();
 		_logTimer.Tick += delegate
@@ -285,14 +289,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				continue;
 			}
-			// 左侧导航: 组标题
+			// 左侧导航: 组标题(一级标题 = 大号 + 加粗 + accent 色, 与子组条目拉开层级;
+			// 与 Linux 端 webui 的 .navGrpTitle 同一套规格)
 			ParamNavPanel.Children.Add(new System.Windows.Controls.TextBlock
 			{
 				Text = g.Title,
-				Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158)),
-				FontSize = 11.0,
+				Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x3a, 0xa9, 0xff)),
+				FontSize = 13.0,
 				FontWeight = FontWeights.Bold,
-				Margin = new Thickness(4, 10, 0, 3)
+				Margin = new Thickness(4, 12, 0, 4)
 			});
 			// 子组聚合: 同一子组的参数聚拢（即使 yml 中不连续）
 			foreach (IGrouping<string, ParamDefinition> sg in items.GroupBy((ParamDefinition p) => p.Subgroup ?? ""))
@@ -458,6 +463,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			FontSize = 11.0,
 			VerticalAlignment = VerticalAlignment.Center
 		};
+		title.FontSize = 12.0;                     // 二级标题: 比组标题(13)小一号、常规色
 		DockPanel.SetDock(badge, Dock.Right);
 		DockPanel dp = new DockPanel();
 		dp.Children.Add(badge);
@@ -467,7 +473,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			Child = dp,
 			CornerRadius = new CornerRadius(4),
 			Padding = new Thickness(9, 5, 8, 5),
-			Margin = new Thickness(0, 1, 0, 1),
+			Margin = new Thickness(12, 1, 0, 1),   // 二级条目相对一级标题缩进
+
 			Background = System.Windows.Media.Brushes.Transparent,
 			Cursor = System.Windows.Input.Cursors.Hand,
 			ToolTip = g.Title + " ▸ " + sub + "（" + count + " 个参数）"
@@ -512,7 +519,30 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			ParamContent.Children.Add(panel);
 		}
 		int count = _navItems.FirstOrDefault(n => n.GrpId == grpId && n.Sub == sub).Count;
-		ParamBreadcrumb.Text = (grpTitle ?? grpId) + "  ▸  " + sub + "   ·   " + count + " 个参数";
+		// 面包屑按层级着色: 组名一级(accent/加粗/13px) ▸ 子组二级(亮色) · 计数弱色,
+		// 与左侧导航的层级规格一致(Linux 端 breadcrumb 同步这套样式)
+		ParamBreadcrumb.Inlines.Clear();
+		ParamBreadcrumb.Inlines.Add(new System.Windows.Documents.Run(grpTitle ?? grpId)
+		{
+			Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x3a, 0xa9, 0xff)),
+			FontSize = 13.0,
+			FontWeight = FontWeights.Bold
+		});
+		ParamBreadcrumb.Inlines.Add(new System.Windows.Documents.Run("  ▸  ")
+		{
+			Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158)),
+			FontSize = 12.0
+		});
+		ParamBreadcrumb.Inlines.Add(new System.Windows.Documents.Run(sub)
+		{
+			Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(230, 237, 243)),
+			FontSize = 12.0
+		});
+		ParamBreadcrumb.Inlines.Add(new System.Windows.Documents.Run("   ·   " + count + " 个参数")
+		{
+			Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158)),
+			FontSize = 11.0
+		});
 		foreach (var n in _navItems)
 		{
 			bool sel = n.GrpId == grpId && n.Sub == sub;
@@ -878,6 +908,19 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			ShowFromTray();
 		});
+		// 轻量化模式复选(对齐 Linux 侧 tray.py "轻量化模式(后台低频保活)")
+		System.Windows.Forms.ToolStripMenuItem lightItem = new System.Windows.Forms.ToolStripMenuItem("轻量化模式(后台低频保活)");
+		lightItem.Checked = _lightOn;
+		lightItem.Click += delegate
+		{
+			bool on = !_lightOn;
+			_lightOn = on;
+			lightItem.Checked = on;
+			_perfPulse = true;
+			Log("[轻量化] " + (on ? "开: 重采样降至 30s(全空闲 60s 零采样), 熔断保持 3s 探针" : "关: 恢复正常采样节奏"));
+		};
+		_trayLightItem = lightItem;
+		contextMenuStrip.Items.Add(lightItem);
 		contextMenuStrip.Items.Add("退出程序", null, delegate
 		{
 			QuitApp();
@@ -893,7 +936,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		Activate();
 	}
 
-	/// <summary>进入托盘轻量模式: 一次性 GC 清理 + 提示条隐藏 + 采样降频(_trayMode)。</summary>
+	/// <summary>进入托盘轻量模式: _trayMode + 自动开轻量化(_lightOn, 对齐 Linux 侧关窗自动置位),
+	/// 一次性 GC 清理 + 提示条隐藏; 采样走 30s/60s 低频档。</summary>
 	private void EnterTrayLightMode()
 	{
 		if (_trayMode)
@@ -901,6 +945,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return;
 		}
 		_trayMode = true;
+		_lightOn = true;
+		SyncTrayLightItem();
+		// 进轻量档前把熔断配置缓存拉齐(UI 线程直读), 3s 探针第一拍就能正确门控
+		SyncBreakerProbeCache();
 		try
 		{
 			// 软件渲染 + 长时间运行积累的托管对象, 隐藏后无 UI 压力, 一次性回收
@@ -920,10 +968,24 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return;
 		}
 		_trayMode = false;
+		// 恢复窗口 = 有人在看了: 关轻量化并打断长休眠立刻补拍(Linux 侧 _watched 的等价物)
+		_lightOn = false;
+		SyncTrayLightItem();
+		_perfPulse = true;
 		// 立即用最近一拍全量刷新(轻量模式期间跳过了视觉重建)
 		if (_lastPerfDict != null)
 		{
 			OnPerf(_lastPerfDict, _lastPerfGpus ?? new List<GpuDevInfo>());
+		}
+	}
+
+	/// <summary>托盘菜单"轻量化模式"勾与真实开关同步(Linux 侧 tray._sync_lightweight 同理)。</summary>
+	private void SyncTrayLightItem()
+	{
+		System.Windows.Forms.ToolStripMenuItem? item = _trayLightItem;
+		if (item != null)
+		{
+			item.Checked = _lightOn;
 		}
 	}
 
@@ -2322,7 +2384,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		InputModelPath.TextChanged += delegate
 		{
-			AutoFill(InputModelPath.Text);
+			// AutoFill(目录扫描)与 RefreshCmd(建命令含磁盘探测)统一延后合并执行
+			_pendingAutoFillPath = InputModelPath.Text;
 			RefreshCmd();
 		};
 		InputMtpPath.TextChanged += delegate
@@ -2360,9 +2423,20 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		if (_pw.TryGetValue("alias", out (System.Windows.Controls.CheckBox, System.Windows.Controls.Control) value))
 		{
 			string text = (string.IsNullOrWhiteSpace(mp) ? "" : Path.GetFileNameWithoutExtension(mp.Trim().Trim('"')));
-			if (value.Item2 is System.Windows.Controls.TextBox textBox && textBox.Text != text)
+			if (value.Item2 is System.Windows.Controls.TextBox textBox)
 			{
-				textBox.Text = text;
+				string cur = textBox.Text ?? "";
+				// 仅当 alias 为空或仍是上一次自动填充的值时才覆盖;
+				// 用户手改过的 alias 不再被模型路径变化静默冲掉。
+				if (cur != text && (string.IsNullOrWhiteSpace(cur) || cur == _lastAutoFilledAlias))
+				{
+					textBox.Text = text;
+					_lastAutoFilledAlias = text;
+				}
+				else if (cur == text)
+				{
+					_lastAutoFilledAlias = text;
+				}
 			}
 		}
 		try
@@ -2921,6 +2995,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private sealed class GgufTensorStats
 	{
 		public bool Ok;
+		/// <summary>部分分片解析成功、部分失败: 统计不完整, 预估偏乐观, 必须向用户明示。</summary>
+		public bool Partial;
 		public int LayerCount;
 		/// <summary>token_embd / output 等非层张量（ngl>0 时在 GPU）。</summary>
 		public double EmbedOutputBytes;
@@ -2988,8 +3064,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			r.DensePerLayer = new double[layerCount];
 			r.ExpertPerLayer = new double[layerCount];
 		}
+		int shardsTotal = 0;
+		int shardsOk = 0;
 		foreach (string shard in GgufShardPaths(modelPath))
 		{
+			shardsTotal++;
+			bool parsed = false;
 			try
 			{
 				using FileStream fs = new FileStream(shard, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
@@ -3044,13 +3124,24 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					{
 						r.EmbedOutputBytes += bytes;
 					}
-					r.Ok = true;
 				}
+				parsed = true;
 			}
 			catch
 			{
-				// 单分片解析失败继续其余分片; 全部失败时 Ok=false 走近似回退
+				// 单分片解析失败继续其余分片; 部分成功会标记 Partial, 不再冒充 Ok
 			}
+			if (parsed)
+			{
+				shardsOk++;
+			}
+		}
+		// Ok 仅在所有声明分片全部解析成功后置位: 部分成功若被当成功,
+		// 显存预估偏乐观 → 启动后 OOM 且用户无从知道估算基于残缺数据。
+		r.Ok = shardsOk > 0 && shardsOk == shardsTotal;
+		if (shardsOk > 0 && shardsOk < shardsTotal)
+		{
+			r.Partial = true;
 		}
 		return r;
 	}
@@ -3091,6 +3182,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			// --n-cpu-moe / --cpu-moe / --ngl / --moe-cache-mib 任意组合下都能算准每层归属
 			string metaWarn = "";
 			GgufTensorStats ts = ReadGgufTensorStats(modelPath, layers);
+			if (ts.Partial)
+			{
+				metaWarn += "⚠ 张量表仅解析到部分分片, 显存预估可能偏乐观; ";
+				Log("[显存] 警告: 分片张量表解析不完整, 估算基于部分数据");
+			}
 			double ncmV = 0.0;
 			bool hasNcm = RoleText("n_cpu_moe", out string ncmStr) && double.TryParse(ncmStr, out ncmV) && ncmV > 0.0;
 			// 上 GPU 的层数: ngl=-1/auto 视为全层(fit 会下调, 预算偏保守), "all" 同
@@ -3437,7 +3533,37 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		return sb.ToString();
 	}
 
+	private System.Windows.Threading.DispatcherTimer? _cmdDebounceTimer;
+
+	private string? _pendingAutoFillPath;
+
+	/// <summary>去抖入口: 原先每次击键都在 UI 线程做目录枚举 + GGUF 头解析(ResolveModelPath/ReadGgufArch),
+	/// 网络盘/移动介质上会逐键卡顿假死。250ms 内只生效最后一次; AutoFill 的 3 次 GetFiles 一并延后。</summary>
 	private void RefreshCmd()
+	{
+		if (_cmdDebounceTimer == null)
+		{
+			_cmdDebounceTimer = new System.Windows.Threading.DispatcherTimer
+			{
+				Interval = TimeSpan.FromMilliseconds(250)
+			};
+			_cmdDebounceTimer.Tick += delegate
+			{
+				_cmdDebounceTimer!.Stop();
+				string? p = _pendingAutoFillPath;
+				_pendingAutoFillPath = null;
+				if (p != null)
+				{
+					AutoFill(p);
+				}
+				RefreshCmdNow();
+			};
+		}
+		_cmdDebounceTimer.Stop();
+		_cmdDebounceTimer.Start();
+	}
+
+	private void RefreshCmdNow()
 	{
 		// EvaluateDepUI 内部会改勾选状态并触发 Checked/Unchecked；此时不要递归重建命令。
 		if (_inDepEval)
@@ -3517,7 +3643,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void RefreshCmd_Click(object s, RoutedEventArgs e)
 	{
-		RefreshCmd();
+		RefreshCmdNow();
 	}
 
 	/// <summary>进入/退出命令预览编辑态。编辑只允许在基础命令后追加自定义参数。</summary>
@@ -3560,7 +3686,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		CmdPreview.Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(13, 17, 23));
 		BtnEditCmd.Content = "✏ 编辑命令（仅追加自定义参数）";
 		BtnCancelCmd.Visibility = Visibility.Collapsed;
-		RefreshCmd();
+		RefreshCmdNow();
 	}
 
 	private void ApplyCmdEdit()
@@ -3597,7 +3723,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		CmdPreview.Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(13, 17, 23));
 		BtnEditCmd.Content = "✏ 编辑命令（仅追加自定义参数）";
 		BtnCancelCmd.Visibility = Visibility.Collapsed;
-		RefreshCmd();
+		RefreshCmdNow();
 	}
 
 	/// <summary>自定义参数不能使用配置区已管理的旗标（含旧别名/否定旗标），防止从这里覆盖配置。</summary>
@@ -4126,14 +4252,39 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
     // 断开远程/关闭启动器均不中断(修复二次远程场景下转换意外退出)
     private void StartDetachedConversion(string dir, string outtype, string pyExe, string pyPre, string script, string outFile, double srcBytes, Action<string?> onDone)
     {
+        if (outtype != "f16" && outtype != "f32" && outtype != "q8_0")
+        {
+            Log("[转换] 非法 outtype: " + outtype + "(仅支持 f16/f32/q8_0)");
+            onDone(null);
+            return;
+        }
         string logPath = Path.Combine(dir, "llamadsh_convert.log");
-        string cmdPath = Path.Combine(Path.GetTempPath(), "llamadsh_convert.cmd");
+        // GUID 目录内 GUID 名: 固定名在写入与 cmd 执行之间可被同用户进程改写;
+        // 单独子目录避免 CleanupLauncherTemp 按通配误删正在逐行解析中的 .cmd。
+        string cmdDir = Path.Combine(Path.GetTempPath(), "LlamaDSH_Launcher", "convert");
+        try
+        {
+            Directory.CreateDirectory(cmdDir);
+        }
+        catch
+        {
+            cmdDir = Path.GetTempPath();
+        }
+        string cmdPath = Path.Combine(cmdDir, "convert_" + Guid.NewGuid().ToString("N") + ".cmd");
         try
         {
             File.WriteAllText(logPath, "");
         string pyCmd = Q + pyExe + Q + " " + ((pyPre.Length > 0) ? (pyPre + " ") : "") + Q + script + Q + " " + Q + dir + Q + " --outfile " + Q + outFile + Q + " --outtype " + outtype;
-        string cmdText = "@echo off" + Environment.NewLine + "cd /d " + Q + dir + Q + Environment.NewLine + pyCmd + " >> " + Q + logPath + Q + " 2>&1" + Environment.NewLine + "echo EXITCODE:%errorlevel% >> " + Q + logPath + Q;
-        File.WriteAllText(cmdPath, cmdText);
+        // chcp 65001 + UTF-8(无 BOM): 原先 UTF-8 无 BOM 被 cmd 按 OEM(GBK) 解析, 中文路径必失效;
+        // PYTHONIOENCODING/PYTHONUTF8 固定 python 输出为 UTF-8, 与轮询解码及字节记账一致。
+        string cmdText = "@echo off" + Environment.NewLine
+            + "chcp 65001 >nul" + Environment.NewLine
+            + "set \"PYTHONIOENCODING=utf-8\"" + Environment.NewLine
+            + "set \"PYTHONUTF8=1\"" + Environment.NewLine
+            + "cd /d " + Q + dir + Q + Environment.NewLine
+            + pyCmd + " >> " + Q + logPath + Q + " 2>&1" + Environment.NewLine
+            + "echo EXITCODE:%errorlevel% >> " + Q + logPath + Q;
+        File.WriteAllText(cmdPath, cmdText, new UTF8Encoding(false));
         }
         catch (Exception ex)
         {
@@ -4218,14 +4369,17 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
                     if (fs.Length > _convertLogPos)
                     {
                         fs.Seek(_convertLogPos, SeekOrigin.Begin);
-                        using (StreamReader sr = new StreamReader(fs))
+                        // 按真实字节记账: 原先解码后反推 UTF-8 字节数, 遇到 GBK 混入(替换符)即发散,
+                        // 后续轮询错位导致日志重复/丢失。现在直接切字节到最后一个换行符。
+                        using (MemoryStream ms = new MemoryStream())
                         {
-                            string text = sr.ReadToEnd();
-                            int num = text.LastIndexOf((char)10);
-                            if (num >= 0)
+                            fs.CopyTo(ms);
+                            byte[] raw = ms.ToArray();
+                            int lastNl = Array.LastIndexOf(raw, (byte)10);
+                            if (lastNl >= 0)
                             {
-                                string done = text.Substring(0, num + 1);
-                                _convertLogPos += Encoding.UTF8.GetByteCount(done);
+                                _convertLogPos += lastNl + 1;
+                                string done = Encoding.UTF8.GetString(raw, 0, lastNl + 1);
                                 string[] parts = done.Split((char)10);
                                 foreach (string value in parts)
                                 {
@@ -5368,7 +5522,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		try
 		{
-			string text = Path.Combine(Path.GetTempPath(), "LlamaDSH_GameAccessProbe.ps1");
+			// GUID 名: 固定名在写入与提权子进程读取之间可被改写(powershell 语义);
+			// 探针由分离子进程异步消费不能就地删, 残留由 UpdateService.CleanupLauncherTemp 按龄清扫。
+			string text = Path.Combine(Path.GetTempPath(), "LlamaDSH_GameAccessProbe_" + Guid.NewGuid().ToString("N") + ".ps1");
 			using (Stream manifestResourceStream = typeof(MainWindow).Assembly.GetManifestResourceStream("LlamaDSH_Launcher.Resources.GameAccessProbe.ps1")!)
 			{
 				if (manifestResourceStream == null)
@@ -6280,7 +6436,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void ParseTimings(string text)
 	{
-		// llama-lens LogPoller 状态机接管全部日志解析(相位/速度/进度/任务汇总/启动块)
+		// 日志状态机接管全部日志解析(相位/速度/进度/任务汇总/启动块)
 		_llamaApi?.FeedLogLine(text);
 	}
 
@@ -6406,148 +6562,235 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					return 0;
 				}
 			});
-			int num = 0;
 			// 捕获局部引用: StopPerf 的 Join(3s) 超时后把 _perfCts 置 null, 而本线程
 			// 可能还在 Sleep(监测页隐藏时最长 30s) —— 循环条件重读共享字段会 NRE 崩进程
 			var perfCts = _perfCts;
+			// 重采样的到期时刻(Environment.TickCount64, 无回绕): 0 = 立即可拍(首拍/被打断/档位切换)
+			long heavyDueAt = 0;
+			// 3s 熔断探针可用性: NVML 进程内取空 → 停用(nvidia-smi 绝不在轻量下 3s 一轮),
+			// 熔断退回重拍节奏; 60s 后重试, NVML 晚装好也能恢复
+			bool probeOk = true;
+			long probeRetryAt = 0;
+			bool prevIdle = false;
 			while (perfCts != null && !perfCts.IsCancellationRequested)
 			{
-				try
+				// 档位计算(对齐 Linux 侧 core.Monitor._cadence/_watched):
+				//   llama 存活判定 = 进程对象 或 API 在线(外部/接管实例, 与熔断轮询一致)
+				//   轻量化(_trayMode 自动 或 托盘菜单手动)且无人看监测页 → 低频档; 否则正常档
+				bool llamaNow = IsAlive(_llamaProc) || (_llamaApi != null && _llamaApi.Online);
+				bool busyNow = llamaNow || DshAliveForPerf();
+				bool watchedNow = !_trayMode && _monitorTabVisible;
+				bool lightNow = _lightOn && !watchedNow;
+				bool lightIdle = lightNow && !busyNow;
+				// 全空闲轻量化驻留: 进入时把重拍推到 60s 后, 期间零采样(后台几乎零占用,
+				// Linux light 分支同款语义); 一旦有服务出现, 退出时立即补拍
+				if (lightIdle != prevIdle)
 				{
-					Dictionary<string, string> d = new Dictionary<string, string>();
-					try
-					{
-						if (_cpuCounter != null)
-						{
-							d["cpu"] = _cpuCounter.NextValue().ToString("F1");
-						}
-					}
-					catch (Exception ex3)
-					{
-						d["cpu_err"] = ex3.Message;
-					}
-					try
-					{
-						if (_diskReadCounter != null)
-						{
-							d["disk_read"] = _diskReadCounter.NextValue().ToString("F0", CultureInfo.InvariantCulture);
-						}
-						if (_diskWriteCounter != null)
-						{
-							d["disk_write"] = _diskWriteCounter.NextValue().ToString("F0", CultureInfo.InvariantCulture);
-						}
-					}
-					catch (Exception ex4b)
-					{
-						d["disk_err"] = ex4b.Message;
-					}
-					try
-					{
-						if (_ramAvailCounter != null && _ramTotalBytes > 0.0)
-						{
-							double availBytes = _ramAvailCounter.NextValue() * 1048576.0;
-							d["ram_used"] = Math.Max(0.0, _ramTotalBytes - availBytes).ToString("F0", CultureInfo.InvariantCulture);
-							d["ram_total"] = _ramTotalBytes.ToString("F0", CultureInfo.InvariantCulture);
-						}
-					}
-					catch (Exception ex4c)
-					{
-						d["ram_err"] = ex4c.Message;
-					}
-					// llama-server /slots + /props(llama-lens 采集): 存活即轮询
-					try
-					{
-						if (IsAlive(_llamaProc))
-						{
-							_llamaApi?.PollFast();
-							_llamaApi?.PollSlowIfNeeded();
-						}
-					}
-					catch (Exception exLp)
-					{
-						LogError(exLp, "llama /slots 采集异常");
-					}
-					try
-					{
-						if (_coreCounters != null && _coreCounters.Length > 0)
-						{
-							_corePcts = _coreCounters.Select(c => Math.Max(0.0, Math.Min(100.0, c.NextValue()))).ToArray();
-						}
-					}
-					catch
-					{
-					}
-					try
-					{
-						var rows = new List<(string, double, double)>();
-						double rxSum = 0;
-						foreach (var (name, rx, tx) in _netCounters)
-						{
-							double r = Math.Max(0.0, rx.NextValue()) / 1048576.0;
-							double t = Math.Max(0.0, tx.NextValue()) / 1048576.0;
-							rows.Add((name, r, t));
-							rxSum += r;
-						}
-						_netSamples = rows;
-						_netRxMbs = rxSum;
-					}
-					catch
-					{
-					}
-					// 每拍查询(NVML 为进程内直采, 开销极低): 2 倍频会让温度/功率卡在半数拍上显示无数据
-					foreach (KeyValuePair<string, string> item in _gpuMonitor.QueryGpu())
-					{
-						d[item.Key] = item.Value;
-					}
-					// NVML/回退采样含进程外调用, 留在 perf 线程; UI 线程只做渲染
-					var gpusNow = NvmlMonitor.SamplePerDevice();
-					if (gpusNow.Count == 0)
-					{
-						gpusNow = NvmlMonitor.SampleViaNvidiaSmi();
-					}
-					List<GpuDevInfo> gpusSnapshot = gpusNow;
-					Dictionary<string, string> dSnap = d;
-					_lastPerfDict = dSnap;
-					_lastPerfGpus = gpusSnapshot;
-					((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
-					{
-						OnPerf(dSnap, gpusSnapshot);
-					}, Array.Empty<object>());
-					num++;
+					heavyDueAt = lightIdle ? Environment.TickCount64 + 60000 : 0;
+					prevIdle = lightIdle;
 				}
-				catch (Exception ex5)
+				if (!lightIdle && Environment.TickCount64 >= heavyDueAt)
 				{
-					LogError(ex5, "性能监控异常");
+					try
+					{
+						HeavySample(llamaNow);
+					}
+					catch (Exception ex5)
+					{
+						LogError(ex5, "性能监控异常");
+					}
+					// 重拍节奏(对齐 Linux 侧 core.Monitor._cadence):
+					//   轻量化 30s 一拍; 正常: 服务存活或监测页可见 3s, 否则 30s(Strata #4066)
+					//   熔断不依赖重拍: 下面另有 3s 探针, 轻量下响应速度不降级
+					int heavyGap;
+					double cacheTtl;
+					if (lightNow)
+					{
+						heavyGap = 30000;
+						cacheTtl = 28.0;
+					}
+					else if (busyNow || watchedNow)
+					{
+						heavyGap = 3000;
+						cacheTtl = 2.5;
+					}
+					else
+					{
+						heavyGap = 30000;
+						cacheTtl = 24.0;
+					}
+					_gpuMonitor.CacheTtlSeconds = cacheTtl;
+					heavyDueAt = Environment.TickCount64 + heavyGap;
 				}
-				// 采样节奏(Strata #4066): 监测页可见 3s, 不可见 30s; llama 运行中保底 3s(熔断时效);
-				// 托盘/最小化轻量模式: llama 运行中仍 3s(熔断不断), 空闲 60s
-				bool llamaRunning = IsAlive(_llamaProc);
-				int sleepMs;
-				double cacheTtl;
-				if (llamaRunning)
+				else if (lightNow && llamaNow && _brkEnabledCache && (probeOk || Environment.TickCount64 >= probeRetryAt))
 				{
-					sleepMs = 3000;
-					cacheTtl = 2.5;
+					// 轻量化下的 3s 熔断轻探针: 只 NVML 进程内读显存(毫秒级、零子进程、零分配压力),
+					// 其余采样保持低频。阈值走 UI 同步缓存; 命中只是门控, 最终判定由 UI 线程
+					// CheckVramBreaker 读真实控件复核(配置刚改也不会误杀)
+					try
+					{
+						List<GpuDevInfo> probe = NvmlMonitor.SamplePerDevice();
+						if (probe.Count == 0)
+						{
+							probeOk = false;
+							probeRetryAt = Environment.TickCount64 + 60000;
+						}
+						else
+						{
+							probeOk = true;
+							if (!_vramBreakerTriggered)
+							{
+								double usedMb = 0.0;
+								double totalMb = 0.0;
+								foreach (GpuDevInfo g in probe)
+								{
+									usedMb += g.MemUsedMb;
+									totalMb += g.MemTotalMb;
+								}
+								double thr = BitConverter.Int64BitsToDouble(_brkThrBits);
+								bool hit = _brkTypeGbCache
+									? usedMb / 1024.0 >= thr
+									: totalMb > 0.0 && usedMb / totalMb * 100.0 >= thr;
+								if (hit)
+								{
+									List<GpuDevInfo> probeSnap = probe;
+									((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
+									{
+										CheckVramBreaker(probeSnap);
+									}, Array.Empty<object>());
+								}
+							}
+						}
+					}
+					catch (Exception exBrk)
+					{
+						LogError(exBrk, "熔断探针异常");
+					}
 				}
-				else if (_trayMode)
+				if (lightNow)
 				{
-					sleepMs = 60000;
-					cacheTtl = 55.0;
+					SyncBreakerProbeCache();
 				}
-				else
+				// 打盹: 轻量档 3s(熔断探针节奏), 正常档 ≤5s(Linux _sleep_until_next 同理);
+				// 且不睡过重拍到期时刻
+				int nap = (int)Math.Min(Math.Max(heavyDueAt - Environment.TickCount64, 1), lightNow ? 3000 : 5000);
+				if (SleepChunked(nap, lightNow))
 				{
-					bool fast = _monitorTabVisible;
-					sleepMs = fast ? 3000 : 30000;
-					cacheTtl = fast ? 2.5 : 24.0;
+					_perfPulse = false;
+					heavyDueAt = 0; // 提前醒(档位变了/有人开页/要求补拍): 立刻重算并重采一拍
 				}
-				_gpuMonitor.CacheTtlSeconds = cacheTtl;
-				Thread.Sleep(sleepMs);
 			}
 		})
 		{
 			IsBackground = true
 		};
 		_perfThread.Start();
+	}
+
+	/// <summary>完整采样一拍(perf 线程): CPU/磁盘/内存/分核/网卡/GPU + llama API + BeginInvoke OnPerf。
+	/// 轻量化模式只每 30s 走一次; 显存熔断不依赖这拍(perf 循环里有独立 3s 探针)。</summary>
+	private void HeavySample(bool llamaNow)
+	{
+		Dictionary<string, string> d = new Dictionary<string, string>();
+		try
+		{
+			if (_cpuCounter != null)
+			{
+				d["cpu"] = _cpuCounter.NextValue().ToString("F1");
+			}
+		}
+		catch (Exception ex3)
+		{
+			d["cpu_err"] = ex3.Message;
+		}
+		try
+		{
+			if (_diskReadCounter != null)
+			{
+				d["disk_read"] = _diskReadCounter.NextValue().ToString("F0", CultureInfo.InvariantCulture);
+			}
+			if (_diskWriteCounter != null)
+			{
+				d["disk_write"] = _diskWriteCounter.NextValue().ToString("F0", CultureInfo.InvariantCulture);
+			}
+		}
+		catch (Exception ex4b)
+		{
+			d["disk_err"] = ex4b.Message;
+		}
+		try
+		{
+			if (_ramAvailCounter != null && _ramTotalBytes > 0.0)
+			{
+				double availBytes = _ramAvailCounter.NextValue() * 1048576.0;
+				d["ram_used"] = Math.Max(0.0, _ramTotalBytes - availBytes).ToString("F0", CultureInfo.InvariantCulture);
+				d["ram_total"] = _ramTotalBytes.ToString("F0", CultureInfo.InvariantCulture);
+			}
+		}
+		catch (Exception ex4c)
+		{
+			d["ram_err"] = ex4c.Message;
+		}
+		// llama-server /slots + /props 采集: 存活即轮询(API 在线兜底接管实例)
+		try
+		{
+			if (llamaNow)
+			{
+				_llamaApi?.PollFast();
+				_llamaApi?.PollSlowIfNeeded();
+			}
+		}
+		catch (Exception exLp)
+		{
+			LogError(exLp, "llama /slots 采集异常");
+		}
+		try
+		{
+			if (_coreCounters != null && _coreCounters.Length > 0)
+			{
+				_corePcts = _coreCounters.Select(c => Math.Max(0.0, Math.Min(100.0, c.NextValue()))).ToArray();
+			}
+		}
+		catch
+		{
+		}
+		try
+		{
+			var rows = new List<(string, double, double)>();
+			double rxSum = 0;
+			foreach (var (name, rx, tx) in _netCounters)
+			{
+				double r = Math.Max(0.0, rx.NextValue()) / 1048576.0;
+				double t = Math.Max(0.0, tx.NextValue()) / 1048576.0;
+				rows.Add((name, r, t));
+				rxSum += r;
+			}
+			_netSamples = rows;
+			_netRxMbs = rxSum;
+		}
+		catch
+		{
+		}
+		// 每重拍查询(NVML 为进程内直采, 开销极低): 2 倍频会让温度/功率卡在半数拍上显示无数据
+		foreach (KeyValuePair<string, string> item in _gpuMonitor.QueryGpu())
+		{
+			d[item.Key] = item.Value;
+		}
+		// NVML/回退采样含进程外调用, 留在 perf 线程; UI 线程只做渲染
+		var gpusNow = NvmlMonitor.SamplePerDevice();
+		if (gpusNow.Count == 0)
+		{
+			gpusNow = NvmlMonitor.SampleViaNvidiaSmi();
+		}
+		List<GpuDevInfo> gpusSnapshot = gpusNow;
+		Dictionary<string, string> dSnap = d;
+		_lastPerfDict = dSnap;
+		_lastPerfGpus = gpusSnapshot;
+		_perfSampledAtUtc = DateTime.UtcNow;
+		((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
+		{
+			OnPerf(dSnap, gpusSnapshot);
+		}, Array.Empty<object>());
 	}
 
 	private void StopPerf()
@@ -6566,6 +6809,77 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			LogError(ex, "释放 CPU 计数器失败");
 		}
 		_cpuCounter = null;
+	}
+
+	/// <summary>
+	/// 分块休眠(Linux 侧 core.Monitor._sleep_until_next 的等价实现): 每 ≤5s 醒一次复查——
+	/// 窗口恢复/手动关轻量化/打开监测页/要求补拍, 都不必等完当前 30~60s 的长休眠。
+	/// 返回 true = 提前醒(调用方应立即重算档位并补拍); 3s 档下等价于一次 Thread.Sleep。
+	/// </summary>
+	private bool SleepChunked(int sleepMs, bool light)
+	{
+		int slept = 0;
+		while (slept < sleepMs)
+		{
+			int chunk = Math.Min(sleepMs - slept, 5000);
+			Thread.Sleep(chunk);
+			slept += chunk;
+			if (_perfPulse)
+			{
+				return true;
+			}
+			if (_perfCts != null && _perfCts.IsCancellationRequested)
+			{
+				return true;
+			}
+			if (light && !_lightOn)
+			{
+				return true;
+			}
+			if (!_trayMode && _monitorTabVisible)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/// <summary>同步熔断探针配置缓存: UI 线程直读控件; perf 线程调用时 BeginInvoke 异步直读。</summary>
+	private void SyncBreakerProbeCache()
+	{
+		if (!((DispatcherObject)this).Dispatcher.CheckAccess())
+		{
+			((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)new Action(SyncBreakerProbeCache), Array.Empty<object>());
+			return;
+		}
+		_brkEnabledCache = ChkVramBreaker?.IsChecked == true;
+		_brkTypeGbCache = ComboVramBreakerType?.SelectedIndex == 1;
+		double thr;
+		if (!double.TryParse(TxtVramBreakerVal?.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out thr))
+		{
+			thr = double.MaxValue;
+		}
+		_brkThrBits = BitConverter.DoubleToInt64Bits(thr);
+	}
+
+	/// <summary>perf 线程安全读取 DSH 存活(对齐 Linux busy 判定里的 dsh.running)。
+	/// _dshProc/_dshTracker 由 UI 线程改写, 这里捕获局部引用 + try/catch, 不碰控件。</summary>
+	private bool DshAliveForPerf()
+	{
+		try
+		{
+			Process dp = _dshProc;
+			if (dp != null && IsAlive(dp))
+			{
+				return true;
+			}
+			ProcessTracker tr = _dshTracker;
+			return tr != null && tr.Poll() == null;
+		}
+		catch
+		{
+			return false;
+		}
 	}
 
 	// 配置端口缓存: 采集线程读, 只在 UI 线程写(GetLlamaPort 直接读控件会跨线程异常,
@@ -6625,11 +6939,29 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	// ── 监测标签页(Strata Monitor 复刻): 60 秒历史 + 图表/状态卡/Gauge/请求表 ──
 	// 监测页是否可见(Strata #4066: 可见 3s / 不可见 30s 采样)
-	private bool _monitorTabVisible = true;
+	private volatile bool _monitorTabVisible = true;
 
 	// 托盘轻量模式: 最小化到托盘时置位(最小化到任务栏同样生效), 恢复窗口清除。
-	// perf 线程读(volatile): 采样降频 + OnPerf 走轻量路径(只推历史与熔断)
+	// perf 线程读(volatile): OnPerf 走轻量路径(只推历史与熔断)
 	private volatile bool _trayMode;
+
+	// 轻量化开关(对齐 Linux 侧 core.Monitor.lightweight): 隐藏/最小化窗口自动开,
+	// 托盘菜单"轻量化模式(后台低频保活)"可手动开/关; perf 线程读(volatile)。
+	// 开且无人看监测页: 有服务存活 30s 一拍(历史/熔断仍生效), 全空闲 60s 纯休眠零采样。
+	private volatile bool _lightOn;
+
+	// 手动切换/恢复窗口/打开监测页时置位: perf 线程最长 60s 的休眠被立即打断补拍
+	// (Linux 侧 core.Monitor._sleep_until_next ≤5s 复查唤醒的等价实现)
+	private volatile bool _perfPulse;
+
+	// 熔断配置缓存(UI 线程写, perf 线程 3s 探针读): 轻量化下探针不碰控件;
+	// 最终判定仍由 UI 线程 CheckVramBreaker 读真实控件, 缓存只做探针门控
+	private volatile bool _brkEnabledCache;
+	private volatile bool _brkTypeGbCache;
+	private long _brkThrBits = BitConverter.DoubleToInt64Bits(double.MaxValue);
+
+	// 托盘菜单里的"轻量化模式"复选项(自动置位与手动勾选同步显示)
+	private System.Windows.Forms.ToolStripMenuItem? _trayLightItem;
 
 	private void MainTabs_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
 	{
@@ -6638,6 +6970,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		if (_monitorTabVisible && _lastPerfDict != null)
 		{
 			OnPerf(_lastPerfDict, _lastPerfGpus ?? new List<GpuDevInfo>());
+		}
+		// 同时打断 perf 线程的长休眠(空闲/轻量档最长 30~60s), 立刻采一拍新数据
+		if (_monitorTabVisible)
+		{
+			_perfPulse = true;
 		}
 	}
 
@@ -6715,7 +7052,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	// 副行信息: GPU 数量/名称, CPU 型号拓扑(性能线程初始化时采集)
 	private string _cpuName = "处理器";
 
-	// llama-server HTTP 采集(llama-lens 移植): /slots 差分 + /props 模型信息 + 事件流
+	// llama-server HTTP 采集: /slots 差分 + /props 模型信息 + 事件流
 	private LlamaApiMonitor? _llamaApi;
 
 	// 扩展采集: 磁盘读写/物理内存/能耗积分(GPU 功率 × 采样间隔)
@@ -6741,7 +7078,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		b.Foreground = new SolidColorBrush(ok ? System.Windows.Media.Color.FromRgb(0x4a, 0xde, 0x80) : System.Windows.Media.Color.FromRgb(0x8b, 0x94, 0x9e));
 	}
 
-	// Llama 状态卡(llama-lens LlamaStateCard 全字段对齐)
+	// Llama 状态卡(全字段)
 	private void UpdatePhaseCard()
 	{
 		var api = _llamaApi;
@@ -6765,7 +7102,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		string ctxText = ctxUsed >= 0 && ctxTotal > 0 ? $"{FmtTok(ctxUsed)} / {FmtTok(ctxTotal)}" : "—";
 		string ctxPct = ctxUsed >= 0 && ctxTotal > 0 ? $" ({ctxUsed * 100.0 / ctxTotal:F0}%)" : "";
 
-		// 相位文案与配色(= upstream phaseText/phaseClass: decoding=cyan, prompt=green, 离线=danger)
+		// 相位文案与配色(decoding=cyan, prompt=green, 离线=danger)
 		string phaseText;
 		System.Windows.Media.Color pillBg;
 		System.Windows.Media.Color pillFg;
@@ -6818,14 +7155,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		MonModelName.Text = string.IsNullOrEmpty(modelName) ? (llamaUp ? "已连接 · 模型未报告" : "未加载模型") : modelName;
 
-		// KV 缓存命中(= upstream cacheHit): 活动槽 cached/prompt
+		// KV 缓存命中: 活动槽 cached/prompt
 		string cacheHitText = "";
 		if (act != null && act.NPromptTokens > 0 && act.NPromptCache > 0)
 		{
 			cacheHitText = $" · 缓存命中 {Math.Min(100.0, act.NPromptCache * 100.0 / act.NPromptTokens):F1}%";
 		}
 
-		// 任务已运行(= upstream elapsed, started_at 起算)
+		// 任务已运行(started_at 起算)
 		string elapsedText = "";
 		if (online && phase != "idle" && api?.TaskStartedAt is DateTime t0)
 		{
@@ -6836,7 +7173,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 		}
 
-		// n_remain>0 表示设了上限; -1/0 = 不限(= upstream nRemain)
+		// n_remain>0 表示设了上限; -1/0 = 不限
 		bool hasLimit = act != null && act.NRemain > 0;
 		string remainText = hasLimit ? FmtTok(act.NRemain) : "不限";
 		double barPct = -1.0;
@@ -6844,7 +7181,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		string rightText;
 		if (online && phase == "prompt_processing")
 		{
-			// 预填充: 进度/速度/耗时 + ETA(= upstream prefillEta)
+			// 预填充: 进度/速度/耗时 + ETA
 			double prog = api?.PromptProgress ?? 0.0;
 			long total = api?.PromptTotalTokens ?? 0;
 			double spd = api?.LogPromptSpeed ?? 0.0;
@@ -6886,7 +7223,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		else
 		{
-			// 空闲/离线/熔断: idle-note + 上次任务(= upstream last_task 行)
+			// 空闲/离线/熔断: idle-note + 上次任务
 			var lt = api?.LastTask;
 			Stat1Label.Text = "上次输出";
 			Stat1Val.Text = (lt?.TotalTokens ?? lt?.DecodedTokens) is long tok && tok > 0 ? FmtTok(tok) : "—";
@@ -7068,7 +7405,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		return $"{(int)(sec / 3600)}h{(int)(sec / 60) % 60:D2}m";
 	}
 
-	// Slot 表(llama-lens SlotTable)
+	// Slot 表
 	private static string FmtTok(double n)
 	{
 		if (n >= 1000000.0)
@@ -7082,7 +7419,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		return ((long)n).ToString();
 	}
 
-	// 模型信息卡(llama-lens ModelInfoCard)
+	// 模型信息卡
 	private void UpdateModelInfoCard(LlamaApiMonitor? api)
 	{
 		var m = api?.Model;
@@ -7123,7 +7460,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		MiModal.Text = mods.Count > 0 ? string.Join(" · ", mods) : "—";
 	}
 
-	// 事件流(llama-lens EventFeed)
+	// 事件流
 	private void UpdateEventFeed(LlamaApiMonitor? api)
 	{
 		if (api == null)
@@ -7195,9 +7532,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private Dictionary<string, string>? _lastPerfDict;
 	private List<GpuDevInfo>? _lastPerfGpus;
 
+	// 最近一拍重采样的 UTC 时刻(Agent /api/monitor 用来自报数据年龄)
+	private DateTime _perfSampledAtUtc;
+
 	/// <summary>
-	/// 托盘轻量模式性能路径: 只做历史序列入库与显存熔断判定, 不碰任何视觉元素。
-	/// llama 运行中保持 3s 采样(熔断时效), 空闲时 perf 线程拉长到 60s。
+	/// 托盘轻量模式性能路径(重拍, 30s 一次): 只做历史序列入库与显存熔断复核, 不碰任何视觉元素。
+	/// 熔断响应不靠这拍 —— perf 循环在轻量下有独立 3s 显存探针(NVML 进程内直读), 降频不降级。
+	/// 全空闲时重拍退到 60s 且零采样。
 	/// </summary>
 	private void TrayLightPerf(Dictionary<string, string> d, List<GpuDevInfo> gpusPre)
 	{
@@ -7245,6 +7586,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			_hRam.Push(null);
 		}
+		if (d.TryGetValue("cpu", out string vCpuL) && double.TryParse(vCpuL, NumberStyles.Float, CultureInfo.InvariantCulture, out var cpuPctL))
+		{
+			_hCpu.Push(cpuPctL);
+		}
+		else
+		{
+			_hCpu.Push(null);
+		}
 		CheckVramBreaker(gpusPre);
 	}
 
@@ -7252,6 +7601,53 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// 显存熔断: llama 运行中显存越过阈值立即停止服务(整机 OOM 保护, 无防抖、绝不容许突破)。
 	/// 百分比模式=各卡已用/总量; GB 模式=各卡已用合计。
 	/// </summary>
+	// 驱动器快照缓存: GetDrives/IsReady 对失效映射网络盘、空读卡器会阻塞数秒,
+	// 原先每 3s 在 UI 线程执行导致监测页周期性整体冻结。后台 30s 刷新, UI 只读缓存。
+	private static List<(string Name, double TotalGb, double FreeGb)> _driveSnapshot = new();
+
+	private static DateTime _driveSnapAt = DateTime.MinValue;
+
+	private static int _driveSnapBusy;
+
+	private static List<(string Name, double TotalGb, double FreeGb)> DrivesCached()
+	{
+		if ((DateTime.Now - _driveSnapAt).TotalSeconds > 30.0
+			&& Interlocked.CompareExchange(ref _driveSnapBusy, 1, 0) == 0)
+		{
+			Task.Run(delegate
+			{
+				try
+				{
+					var list = new List<(string, double, double)>();
+					foreach (var drv in System.IO.DriveInfo.GetDrives())
+					{
+						try
+						{
+							if (!drv.IsReady || drv.DriveType != System.IO.DriveType.Fixed)
+							{
+								continue;
+							}
+							list.Add((drv.Name, drv.TotalSize / 1073741824.0, drv.AvailableFreeSpace / 1073741824.0));
+						}
+						catch
+						{
+						}
+					}
+					_driveSnapshot = list;
+				}
+				catch
+				{
+				}
+				finally
+				{
+					_driveSnapAt = DateTime.Now;
+					Interlocked.Exchange(ref _driveSnapBusy, 0);
+				}
+			});
+		}
+		return _driveSnapshot;
+	}
+
 	private void CheckVramBreaker(List<GpuDevInfo> gpus)
 	{
 		if (_vramBreakerTriggered || ChkVramBreaker?.IsChecked != true || gpus.Count == 0)
@@ -7305,19 +7701,22 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			TrayLightPerf(d, gpusPre);
 			return;
 		}
-		// 速度历史: 日志 tg_3s / prompt 行 > /slots 差分 (llama-lens speeds())
+		// 速度历史: 日志 tg_3s / prompt 行 > /slots 差分。
+		// 每拍必推(空闲推 null, api 不在也推): 以前只在速度>0 时推, 这 60 个槽的时间窗
+		// 就漂移成"攒满 60 个活跃样本的时长"(可能跨几小时), 时间映射的曲线把长间隔当成
+		// 相邻点直连、底部窗口标签乱跳 —— 监测页曲线紊乱的直接来源(Linux 端一直是每拍
+		// null 填充, 所以同一份数据在那边是平的)。
 		var api = _llamaApi;
 		if (api != null)
 		{
 			var (gSpd, pSpd, _) = api.Speeds();
-			if (gSpd > 0.0)
-			{
-				_hTps.Push(gSpd);
-			}
-			if (pSpd > 0.0)
-			{
-				_hPf.Push(pSpd);
-			}
+			_hTps.Push(gSpd > 0.0 ? gSpd : null);
+			_hPf.Push(pSpd > 0.0 ? pSpd : null);
+		}
+		else
+		{
+			_hTps.Push(null);
+			_hPf.Push(null);
 		}
 		bool decoding = api != null && api.Online && api.Phase == "decoding";
 		bool prompting = api != null && api.Online && api.Phase == "prompt_processing";
@@ -7489,6 +7888,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			_hCpu.Push(cpuPct);
 		}
+		else
+		{
+			_hCpu.Push(null);
+		}
 		double ramUsedGb = double.NaN, ramTotalGb = double.NaN;
 		if (d.TryGetValue("ram_used", out string vRu) && d.TryGetValue("ram_total", out string vRt) && double.TryParse(vRu, NumberStyles.Float, CultureInfo.InvariantCulture, out var vRu2) && double.TryParse(vRt, NumberStyles.Float, CultureInfo.InvariantCulture, out var vRt2) && vRt2 > 0.0)
 		{
@@ -7544,7 +7947,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 		}
 
-	// ============ 构建器: GPU 每卡面板(llama-lens GpuPanel) ============
+	// ============ 构建器: GPU 每卡面板 ============
 		void BuildGpuPanels(List<GpuDevInfo> gpus)
 		{
 			GpuPanelsHost.Children.Clear();
@@ -7629,7 +8032,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 		}
 
-		// ============ 系统面板(CPU 每核/内存/磁盘/网络, llama-lens Cpu/Mem/Disk/NetPanel) ============
+		// ============ 系统面板(CPU 每核/内存/磁盘/网络) ============
 		void BuildSysPanels(Dictionary<string, string> d, double ramUsedGb, double ramTotalGb)
 		{
 			// CPU
@@ -7684,16 +8087,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			double wr = d.TryGetValue("disk_write", out string vDw1) && double.TryParse(vDw1, NumberStyles.Float, CultureInfo.InvariantCulture, out var vDw2) ? vDw2 / 1048576.0 : 0;
 			DiskHeadSub.Text = $"读 {rd:F1} MB/s · 写 {wr:F1} MB/s";
 			DiskRowsHost.Children.Clear();
-			foreach (var drv in System.IO.DriveInfo.GetDrives())
+			foreach (var dr in DrivesCached())
 			{
 				try
 				{
-					if (!drv.IsReady || drv.DriveType != System.IO.DriveType.Fixed)
-					{
-						continue;
-					}
-					double total = drv.TotalSize / 1073741824.0;
-					double free = drv.AvailableFreeSpace / 1073741824.0;
+					double total = dr.TotalGb;
+					double free = dr.FreeGb;
 					double used = total - free;
 					double pct = total > 0 ? used / total * 100.0 : 0;
 					var row = new Grid { Margin = new Thickness(0, 2, 0, 2) };
@@ -7701,7 +8100,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 					row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
 					DiskRowsHost.Children.Add(row);
-					var name = new TextBlock { Text = drv.Name, FontSize = 11, FontFamily = new FontFamily("Consolas"), Foreground = new SolidColorBrush(Color.FromRgb(0xc7, 0xcd, 0xd3)), VerticalAlignment = VerticalAlignment.Center };
+					var name = new TextBlock { Text = dr.Name, FontSize = 11, FontFamily = new FontFamily("Consolas"), Foreground = new SolidColorBrush(Color.FromRgb(0xc7, 0xcd, 0xd3)), VerticalAlignment = VerticalAlignment.Center };
 					Grid.SetColumn(name, 0);
 					row.Children.Add(name);
 					var barWrap = CreateBar(pct, pct >= 90 ? Color.FromRgb(0xff, 0x5a, 0x6e) : pct >= 70 ? Color.FromRgb(0xf5, 0xb5, 0x3d) : Color.FromRgb(0x34, 0xd3, 0x99), 6);
@@ -7739,7 +8138,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 		}
 
-		// ============ Slot 卡片(llama-lens SlotTable 卡片式) ============
+		// ============ Slot 卡片(卡片式) ============
 		void BuildSlotCards(List<LlamaApiMonitor.SlotInfo> slots, bool llamaUp)
 		{
 			SlotCardsHost.Children.Clear();
@@ -7907,7 +8306,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			try
 			{
-				File.WriteAllText(_stateFile, JsonSerializer.Serialize(stateFile, new JsonSerializerOptions
+				WriteTextAtomic(_stateFile, JsonSerializer.Serialize(stateFile, new JsonSerializerOptions
 				{
 					WriteIndented = true
 				}));
@@ -8082,7 +8481,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}
 				if (stateFile.LlamaPid.HasValue || stateFile.DshPid.HasValue)
 				{
-					File.WriteAllText(_stateFile, JsonSerializer.Serialize(stateFile, new JsonSerializerOptions
+					WriteTextAtomic(_stateFile, JsonSerializer.Serialize(stateFile, new JsonSerializerOptions
 					{
 						WriteIndented = true
 					}));
@@ -8111,6 +8510,22 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		catch (Exception ex)
 		{
 			LogError(ex, "删除状态文件失败");
+		}
+	}
+
+	// 原子文本写: tmp + File.Replace, 与 SaveConfigFile 同语义。
+	// 状态文件半写入(杀进程/断电)会导致重启后无法接管 llama/DSH, 代价高。
+	private static void WriteTextAtomic(string path, string text)
+	{
+		string tmpPath = path + ".tmp";
+		File.WriteAllText(tmpPath, text);
+		if (File.Exists(path))
+		{
+			File.Replace(tmpPath, path, null);
+		}
+		else
+		{
+			File.Move(tmpPath, path);
 		}
 	}
 
@@ -8200,7 +8615,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		profileConfig.VramBreakerEnabled = ChkVramBreaker?.IsChecked == true;
 		profileConfig.VramBreakerType = ComboVramBreakerType?.SelectedIndex ?? 0;
 		double vramBreakerValue;
-		if (!double.TryParse(TxtVramBreakerVal?.Text, out var result))
+		// 全链路 InvariantCulture(与 CheckVramBreaker 的解析一致):
+		// 逗号小数 locale 下 CurrentCulture 读写会让熔断阈值"90,5"解析失败而静默失效。
+		if (!double.TryParse(TxtVramBreakerVal?.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var result))
 		{
 			NoScrollComboBox comboVramBreakerType = ComboVramBreakerType;
 			vramBreakerValue = ((comboVramBreakerType != null && comboVramBreakerType.SelectedIndex == 0) ? 90 : 20);
@@ -8246,7 +8663,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		if (TxtVramBreakerVal != null)
 		{
-			TxtVramBreakerVal.Text = c.VramBreakerValue.ToString();
+			TxtVramBreakerVal.Text = c.VramBreakerValue.ToString(CultureInfo.InvariantCulture);
 		}
 		foreach (KeyValuePair<string, bool> boolParam in c.BoolParams)
 		{
@@ -8270,7 +8687,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}
 			}
 		}
-		RefreshCmd();
+		RefreshCmdNow();
 	}
 
 	private void SaveConfigFile()
@@ -8337,7 +8754,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			if (base.WindowState != WindowState.Minimized)
 			{
-				File.WriteAllText(_windowStateFile, JsonSerializer.Serialize(new ConfigFile
+				WriteTextAtomic(_windowStateFile, JsonSerializer.Serialize(new ConfigFile
 				{
 					WindowWidth = base.ActualWidth,
 					WindowHeight = base.ActualHeight
@@ -9094,9 +9511,603 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		StopPerf();
 		FlushRunLog();
+		try { _agentApi?.Stop(); } catch { }
 		_trayIcon?.Dispose();
 		_trayIcon = null; // 重入的托盘分支会对已 Dispose 的 NotifyIcon 调方法
 		System.Windows.Application.Current.Shutdown();
+	}
+
+	// ═════════════════ Agent 调试/调用接口(127.0.0.1 + token; 内核见 Services/AgentApi.cs) ═════════════════
+	// 端点命名对齐 Linux 侧 main.py ROUTES。所有涉 UI/控件的操作统一 marshal 回 UI 线程,
+	// 带超时保护, 永不把异常抛回 HTTP 线程池。stdout/HTTP 输出均为可解析 JSON。
+
+	private AgentApi? _agentApi;
+
+	private void TryStartAgentApi()
+	{
+		try
+		{
+			AgentApi api = new AgentApi();
+			api.RegisterGet("ping", delegate
+			{
+				return "{\"ok\":true,\"app\":\"llamadsh-launcher\",\"cli\":\"LlamaDSH_Launcher.exe cli help\"}";
+			});
+			api.RegisterGet("status", delegate { return AgentStatusJson(); });
+			api.RegisterGet("monitor", delegate { return AgentMonitorJson(); });
+			api.RegisterGet("logs", AgentLogsTail);
+			api.RegisterGet("profiles", delegate { return AgentProfilesJson(); });
+			api.RegisterGet("breaker", delegate { return AgentBreakerGet(); });
+			api.RegisterGet("llama/raw", AgentLlamaRaw);
+			api.RegisterPost("llama/start", delegate { return AgentLlamaStart(); });
+			api.RegisterPost("llama/stop", delegate { return AgentLlamaStop(); });
+			api.RegisterPost("dsh/start", delegate { return AgentDshStart(); });
+			api.RegisterPost("dsh/stop", delegate { return AgentDshStop(); });
+			api.RegisterPost("lightweight", AgentLightweight);
+			api.RegisterPost("window", AgentWindowOp);
+			api.RegisterPost("profiles/use", AgentProfileUse);
+			api.RegisterPost("breaker", AgentBreakerSet);
+			api.RegisterPost("logs/clear", delegate
+			{
+				lock (_runLogLock)
+				{
+					_runLog.Clear();
+					_runLogCount = 0;
+				}
+				return AgentOk("运行日志缓冲已清空(LogArea 界面内容不动)");
+			});
+			api.RegisterPost("config/save", delegate
+			{
+				return AgentOp(delegate
+				{
+					_profiles[_currentProfile] = BuildConfig();
+					SaveConfigFile();
+					return AgentOk("当前界面配置已写回配置文件");
+				});
+			});
+			api.RegisterPost("quit", AgentQuitOp);
+			string? fail;
+			if (api.Start(out fail))
+			{
+				_agentApi = api;
+				Log("[Agent] 调试接口就绪: http://127.0.0.1:" + api.Port + "/api/status  (token 见 " + api.ConfigFile + ")");
+			}
+			else
+			{
+				Log("[Agent] 接口未启用: " + fail);
+			}
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "Agent 接口启动失败");
+		}
+	}
+
+	private string AgentStatusJson()
+	{
+		Dictionary<string, object>? d = AgentUi(AgentBuildStatus, 10000);
+		return d == null ? AgentErr("UI 线程 10s 内未响应(界面可能卡在弹窗)") : JsonSerializer.Serialize(d, AgentApi.JsonOpts);
+	}
+
+	private Dictionary<string, object> AgentBuildStatus()
+	{
+		bool llamaAlive = IsAlive(_llamaProc);
+		int llamaPid = llamaAlive ? _llamaProc!.Id : (_llamaApi != null && _llamaApi.Online ? _llamaApi.ActivePort > 0 ? -_llamaApi.ActivePort : 0 : 0);
+		int dshPid = _dshProc != null && IsAlive(_dshProc) ? _dshProc.Id : (_dshTracker != null && _dshTracker.Poll() == null ? _dshTracker.Pid : 0);
+		ProfileConfig pc = _profiles.TryGetValue(_currentProfile, out ProfileConfig? pcv) && pcv != null ? pcv : new ProfileConfig();
+		return new Dictionary<string, object>
+		{
+			["ok"] = true,
+			["app"] = "LlamaDSH_Launcher",
+			["version"] = (System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "?"),
+			["pid"] = Environment.ProcessId,
+			["uptime_s"] = Math.Round((DateTime.Now - Process.GetCurrentProcess().StartTime).TotalSeconds, 1),
+			["ui"] = new Dictionary<string, object>
+			{
+				["window_visible"] = IsVisible,
+				["minimized"] = WindowState == WindowState.Minimized,
+				["tray_mode"] = _trayMode,
+				["lightweight"] = _lightOn,
+				["monitor_tab_visible"] = _monitorTabVisible,
+				["exiting"] = _exiting
+			},
+			["llama"] = new Dictionary<string, object>
+			{
+				["running"] = llamaAlive || (_llamaApi != null && _llamaApi.Online),
+				["pid"] = llamaPid,
+				["api_online"] = _llamaApi != null && _llamaApi.Online,
+				["api_port"] = _llamaApi?.ActivePort ?? 0,
+				["cfg_port"] = GetLlamaPort(),
+				["phase"] = _llamaApi?.Phase ?? "idle",
+				["ctx_used"] = _llamaApi?.CtxUsed ?? -1,
+				["ctx_total"] = _llamaApi?.CtxTotal ?? 0,
+				["gen_tps"] = Math.Round(_llamaApi?.GenTps ?? 0.0, 2),
+				["prompt_tps"] = Math.Round(_llamaApi?.PromptTps ?? 0.0, 2),
+				["model"] = _llamaApi?.Model?.Name ?? "",
+				["last_task"] = _llamaApi?.LastTask,
+				["last_cmd"] = _lastCmd
+			},
+			["dsh"] = new Dictionary<string, object>
+			{
+				["running"] = HasDsh(),
+				["pid"] = dshPid,
+				["dir"] = (InputDshDir?.Text ?? "").Trim()
+			},
+			["vram_breaker"] = new Dictionary<string, object>
+			{
+				["enabled"] = ChkVramBreaker?.IsChecked == true,
+				["type"] = ComboVramBreakerType?.SelectedIndex == 1 ? "gb" : "pct",
+				["value"] = double.TryParse(TxtVramBreakerVal?.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double thr) ? thr : 0.0,
+				["triggered"] = _vramBreakerTriggered
+			},
+			["profile"] = new Dictionary<string, object>
+			{
+				["current"] = _currentProfile,
+				["model_path"] = pc.ModelPath,
+				["mtp_path"] = pc.MtpPath,
+				["llama_dir"] = pc.LlamaDir,
+				["dsh_dir"] = pc.DshDir,
+				["active_variant"] = pc.ActiveLlamaVariant,
+				["variants"] = pc.LlamaVariants
+			},
+			["gpus"] = _lastPerfGpus ?? new List<GpuDevInfo>(),
+			["system"] = _lastPerfDict ?? new Dictionary<string, string>(),
+			["sampled_at_utc"] = _perfSampledAtUtc == default ? "" : _perfSampledAtUtc.ToString("O"),
+			["paths"] = new Dictionary<string, object>
+			{
+				["config_dir"] = _configDir,
+				["log_dir"] = AppLog.LogDir,
+				["state_file"] = _stateFile,
+				["agent_config"] = _agentApi?.ConfigFile ?? ""
+			},
+			["agent_port"] = _agentApi?.Port ?? 0
+		};
+	}
+
+	private string AgentMonitorJson()
+	{
+		Dictionary<string, object>? d = AgentUi(delegate
+		{
+			LlamaApiMonitor? api = _llamaApi;
+			return new Dictionary<string, object>
+			{
+				["ok"] = true,
+				["sampled_at_utc"] = _perfSampledAtUtc == default ? "" : _perfSampledAtUtc.ToString("O"),
+				["age_s"] = _perfSampledAtUtc == default ? -1.0 : Math.Round((DateTime.UtcNow - _perfSampledAtUtc).TotalSeconds, 1),
+				["lightweight"] = _lightOn,
+				["system"] = _lastPerfDict ?? new Dictionary<string, string>(),
+				["gpus"] = _lastPerfGpus ?? new List<GpuDevInfo>(),
+				["llama"] = new Dictionary<string, object>
+				{
+					["online"] = api != null && api.Online,
+					["port"] = api?.ActivePort ?? 0,
+					["phase"] = api?.Phase ?? "idle",
+					["ctx_used"] = api?.CtxUsed ?? -1,
+					["ctx_total"] = api?.CtxTotal ?? 0,
+					["gen_tps"] = api?.GenTps ?? 0.0,
+					["prompt_tps"] = api?.PromptTps ?? 0.0,
+					["mtp_acceptance"] = api?.MtpAcceptance,
+					["boot"] = api?.Boot,
+					["model"] = api?.Model,
+					["slots"] = api?.SlotsSnapshot(),
+					["total_events"] = api?.TotalEvents ?? 0
+				},
+				["hist"] = new Dictionary<string, object>
+				{
+					["tps"] = _hTps.Values,
+					["pf"] = _hPf.Values,
+					["ctx"] = _hCtx.Values,
+					["mtp"] = _hMtp.Values,
+					["gpu_util"] = _hGpuUtil.Values,
+					["gpu_mem"] = _hGpuMem.Values,
+					["temp"] = _hTemp.Values,
+					["power"] = _hPower.Values,
+					["cpu"] = _hCpu.Values,
+					["ram"] = _hRam.Values,
+					["net"] = _hNet.Values,
+					["net_tx"] = _hNetTx.Values
+				},
+				["hist_ticks"] = _hTps.Ticks
+			};
+		}, 10000);
+		return d == null ? AgentErr("UI 线程 10s 内未响应") : JsonSerializer.Serialize(d, AgentApi.JsonOpts);
+	}
+
+	private string AgentLogsTail(string query)
+	{
+		int n = 200;
+		Match m = Regex.Match(query ?? "", "n=(\\d+)");
+		if (m.Success && int.TryParse(m.Groups[1].Value, out int mn) && mn >= 1 && mn <= 2000)
+		{
+			n = mn;
+		}
+		string joined;
+		lock (_runLogLock)
+		{
+			joined = _runLog.ToString();
+		}
+		string[] all = joined.Split('\n');
+		List<string> tail = new List<string>();
+		for (int i = Math.Max(0, all.Length - n); i < all.Length; i++)
+		{
+			string ln = all[i].TrimEnd('\r');
+			if (ln.Length > 0)
+			{
+				tail.Add(ln);
+			}
+		}
+		return JsonSerializer.Serialize(new Dictionary<string, object> { ["ok"] = true, ["count"] = tail.Count, ["lines"] = tail }, AgentApi.JsonOpts);
+	}
+
+	private string AgentProfilesJson()
+	{
+		Dictionary<string, object>? d = AgentUi(delegate
+		{
+			return new Dictionary<string, object>
+			{
+				["ok"] = true,
+				["current"] = _currentProfile,
+				["names"] = new List<string>(_profiles.Keys),
+				["configs"] = _profiles
+			};
+		}, 10000);
+		return d == null ? AgentErr("UI 线程 10s 内未响应") : JsonSerializer.Serialize(d, AgentApi.JsonOpts);
+	}
+
+	private string AgentBreakerGet()
+	{
+		Dictionary<string, object>? d = AgentUi(delegate
+		{
+			return new Dictionary<string, object>
+			{
+				["ok"] = true,
+				["enabled"] = ChkVramBreaker?.IsChecked == true,
+				["type"] = ComboVramBreakerType?.SelectedIndex == 1 ? "gb" : "pct",
+				["value"] = double.TryParse(TxtVramBreakerVal?.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double thr) ? thr : 0.0,
+				["triggered"] = _vramBreakerTriggered
+			};
+		}, 10000);
+		return d == null ? AgentErr("UI 线程 10s 内未响应") : JsonSerializer.Serialize(d, AgentApi.JsonOpts);
+	}
+
+	private string AgentBreakerSet(string body)
+	{
+		bool? enabled = null;
+		string? type = null;
+		double? value = null;
+		try
+		{
+			using JsonDocument doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(body) ? "{}" : body);
+			if (doc.RootElement.TryGetProperty("enabled", out JsonElement e) && (e.ValueKind == JsonValueKind.True || e.ValueKind == JsonValueKind.False))
+			{
+				enabled = e.GetBoolean();
+			}
+			if (doc.RootElement.TryGetProperty("type", out JsonElement t) && t.ValueKind == JsonValueKind.String)
+			{
+				type = t.GetString();
+			}
+			if (doc.RootElement.TryGetProperty("value", out JsonElement v) && v.TryGetDouble(out double dv))
+			{
+				value = dv;
+			}
+		}
+		catch (Exception ex)
+		{
+			return AgentErr("JSON 解析失败: " + ex.Message);
+		}
+		if (enabled == null && type == null && value == null)
+		{
+			return AgentErr("至少给一个字段: {\"enabled\":true|false,\"type\":\"pct|gb\",\"value\":90.0}");
+		}
+		return AgentOp(delegate
+		{
+			if (type != null)
+			{
+				if (type.ToLowerInvariant() is not ("pct" or "percent" or "gb"))
+				{
+					return AgentErr("type 仅支持 pct|gb");
+				}
+				ComboVramBreakerType.SelectedIndex = type.ToLowerInvariant() == "gb" ? 1 : 0;
+			}
+			if (value.HasValue)
+			{
+				if (value.Value <= 0.0)
+				{
+					return AgentErr("阈值需为正数");
+				}
+				TxtVramBreakerVal.Text = value.Value.ToString(CultureInfo.InvariantCulture);
+			}
+			if (enabled.HasValue)
+			{
+				ChkVramBreaker.IsChecked = enabled.Value;
+			}
+			SyncBreakerProbeCache();
+			return JsonSerializer.Serialize(new Dictionary<string, object>
+			{
+				["ok"] = true,
+				["enabled"] = ChkVramBreaker?.IsChecked == true,
+				["type"] = ComboVramBreakerType?.SelectedIndex == 1 ? "gb" : "pct",
+				["value"] = double.TryParse(TxtVramBreakerVal?.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double thr) ? thr : 0.0,
+				["note"] = "已即时生效(熔断判定用新值); 要长期保存请再调 config/save"
+			}, AgentApi.JsonOpts);
+		});
+	}
+
+	private string AgentLlamaRaw(string query)
+	{
+		Match m = Regex.Match(query ?? "", "path=(\\w+)");
+		string sub = m.Success ? m.Groups[1].Value.ToLowerInvariant() : "slots";
+		if (sub is not ("slots" or "props" or "health"))
+		{
+			return AgentErr("path 仅支持 slots|props|health");
+		}
+		int port = _llamaApi?.ActivePort ?? 0;
+		if (port <= 0)
+		{
+			return AgentErr("llama API 当前不在线(无活动端口)");
+		}
+		try
+		{
+			using System.Net.Http.HttpClient hc = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+			string raw = hc.GetStringAsync("http://127.0.0.1:" + port + "/" + sub).GetAwaiter().GetResult();
+			object data;
+			try
+			{
+				using JsonDocument pd = JsonDocument.Parse(raw);
+				data = pd.RootElement.Clone();
+			}
+			catch
+			{
+				data = raw;
+			}
+			return JsonSerializer.Serialize(new Dictionary<string, object> { ["ok"] = true, ["port"] = port, ["path"] = "/" + sub, ["data"] = data }, AgentApi.JsonOpts);
+		}
+		catch (Exception ex)
+		{
+			return AgentErr("llama /" + sub + " 不可达: " + ex.Message);
+		}
+	}
+
+	private string AgentLlamaStart()
+	{
+		return AgentOp(delegate
+		{
+			if (IsAlive(_llamaProc))
+			{
+				return AgentErr("Llama 已在运行");
+			}
+			int prePort;
+			try { prePort = GetLlamaPort(); } catch { prePort = 1234; }
+			if (ProcessHelper.FindProcessByPort(prePort).HasValue)
+			{
+				return AgentErr("端口 " + prePort + " 已被占用(遗留 llama-server?), 先处理再启动");
+			}
+			string? preModel = ResolveModelPath(throwOnError: false);
+			if (!string.IsNullOrEmpty(preModel) && !preModel.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+				&& !File.Exists(preModel) && !Directory.Exists(preModel))
+			{
+				return AgentErr("模型路径不存在: " + preModel);
+			}
+			StartLlama();
+			return AgentOk("启动指令已下发; 用 cli status/monitor 跟踪 phase 与端口。注意: safetensors 分片会弹转换确认框, agent 场景请用 GGUF 路径");
+		}, 60000);
+	}
+
+	private string AgentLlamaStop()
+	{
+		return AgentOp(delegate
+		{
+			if (!IsAlive(_llamaProc))
+			{
+				return AgentErr("Llama 未在运行");
+			}
+			StopLlama();
+			return AgentOk("已停止");
+		}, 60000);
+	}
+
+	private string AgentDshStart()
+	{
+		return AgentOp(delegate
+		{
+			if (HasDsh())
+			{
+				return AgentErr("DSH 已在运行");
+			}
+			StartDsh();
+			return AgentOk("启动指令已下发; 用 cli status 跟踪 pid");
+		}, 60000);
+	}
+
+	private string AgentDshStop()
+	{
+		return AgentOp(delegate
+		{
+			if (!HasDsh())
+			{
+				return AgentErr("DSH 未在运行");
+			}
+			StopDsh();
+			return AgentOk("已停止");
+		}, 60000);
+	}
+
+	private string AgentLightweight(string body)
+	{
+		bool? on = null;
+		try
+		{
+			using JsonDocument doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(body) ? "{}" : body);
+			if (doc.RootElement.TryGetProperty("on", out JsonElement v) && (v.ValueKind == JsonValueKind.True || v.ValueKind == JsonValueKind.False))
+			{
+				on = v.GetBoolean();
+			}
+		}
+		catch (Exception ex)
+		{
+			return AgentErr("JSON 解析失败: " + ex.Message);
+		}
+		return AgentOp(delegate
+		{
+			_lightOn = on ?? !_lightOn; // 不带 on 字段 = toggle
+			SyncTrayLightItem();
+			_perfPulse = true;
+			return JsonSerializer.Serialize(new Dictionary<string, object>
+			{
+				["ok"] = true,
+				["lightweight"] = _lightOn,
+				["tray_mode"] = _trayMode
+			}, AgentApi.JsonOpts);
+		});
+	}
+
+	private string AgentWindowOp(string body)
+	{
+		string? action = AgentBodyStr(body, "action");
+		return AgentOp(delegate
+		{
+			switch (action)
+			{
+				case "show":
+					ShowFromTray();
+					break;
+				case "hide":
+					if (_trayIcon == null)
+					{
+						return AgentErr("无托盘图标, 不能隐藏到托盘");
+					}
+					EnterTrayLightMode();
+					Hide();
+					break;
+				case "minimize":
+					WindowState = WindowState.Minimized;
+					break;
+				default:
+					return AgentErr("action 仅支持 show|hide|minimize");
+			}
+			return JsonSerializer.Serialize(new Dictionary<string, object>
+			{
+				["ok"] = true,
+				["window_visible"] = IsVisible,
+				["minimized"] = WindowState == WindowState.Minimized,
+				["tray_mode"] = _trayMode
+			}, AgentApi.JsonOpts);
+		});
+	}
+
+	private string AgentProfileUse(string body)
+	{
+		string? name = AgentBodyStr(body, "name");
+		if (string.IsNullOrEmpty(name))
+		{
+			return AgentErr("缺 {\"name\":\"方案名\"}");
+		}
+		return AgentOp(delegate
+		{
+			if (!_profiles.ContainsKey(name))
+			{
+				return AgentErr("方案不存在: " + name + "; 可用: " + string.Join(", ", _profiles.Keys));
+			}
+			// 走 ComboBox 通道 = ProfileChanged 完整流程(先写回旧方案面板, 再应用新方案)
+			ComboProfile.SelectedItem = name;
+			return AgentOk("已切换到方案: " + name);
+		});
+	}
+
+	private string AgentQuitOp(string body)
+	{
+		bool stop = true;
+		try
+		{
+			using JsonDocument doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(body) ? "{}" : body);
+			if (doc.RootElement.TryGetProperty("stop_services", out JsonElement v))
+			{
+				stop = v.ValueKind == JsonValueKind.True;
+			}
+		}
+		catch
+		{
+		}
+		// Background 优先级: 先让本次 HTTP 响应发出去, 再在 UI 线程收尾退出
+		Dispatcher.BeginInvoke((Delegate)(Action)delegate
+		{
+			try { if (stop && IsAlive(_llamaProc)) { StopLlama(); } } catch { }
+			try { if (stop && HasDsh()) { StopDsh(); } } catch { }
+			_exiting = true;
+			System.Windows.Application.Current?.Shutdown();
+		}, System.Windows.Threading.DispatcherPriority.Background);
+		return AgentOk("正在退出(stop_services=" + (stop ? "true" : "false") + ")");
+	}
+
+	/// <summary>操作 marshal 到 UI 线程执行(带超时/异常兜底): HTTP 线程永远拿到 JSON。</summary>
+	private string AgentOp(Func<string> op, int timeoutMs = 30000)
+	{
+		try
+		{
+			System.Windows.Threading.DispatcherOperation<string> dop = Dispatcher.InvokeAsync<string>(op);
+			if (!dop.Task.Wait(timeoutMs))
+			{
+				return AgentErr("UI 操作 " + (timeoutMs / 1000) + "s 未返回(可能在等弹窗确认; 操作可能仍在进行)");
+			}
+			return dop.Result ?? AgentErr("操作返回空");
+		}
+		catch (AggregateException aex)
+		{
+			return AgentErr(aex.GetBaseException().Message);
+		}
+		catch (Exception ex)
+		{
+			return AgentErr(ex.Message);
+		}
+	}
+
+	/// <summary>只读快照 marshal 到 UI 线程; 超时返回 default 而不是卡死调用方。</summary>
+	private T? AgentUi<T>(Func<T> fn, int timeoutMs = 10000)
+	{
+		try
+		{
+			System.Windows.Threading.DispatcherOperation<T> dop = Dispatcher.InvokeAsync<T>(fn);
+			if (!dop.Task.Wait(timeoutMs))
+			{
+				return default;
+			}
+			return dop.Result;
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "Agent UI 快照失败");
+			return default;
+		}
+	}
+
+	private static string? AgentBodyStr(string body, string prop)
+	{
+		try
+		{
+			using JsonDocument doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(body) ? "{}" : body);
+			if (doc.RootElement.TryGetProperty(prop, out JsonElement v) && v.ValueKind == JsonValueKind.String)
+			{
+				return v.GetString();
+			}
+		}
+		catch
+		{
+		}
+		return null;
+	}
+
+	private static string AgentOk(string? msg = null)
+	{
+		Dictionary<string, object> d = new Dictionary<string, object> { ["ok"] = true };
+		if (msg != null)
+		{
+			d["msg"] = msg;
+		}
+		return JsonSerializer.Serialize(d, AgentApi.JsonOpts);
+	}
+
+	private static string AgentErr(string msg)
+	{
+		return JsonSerializer.Serialize(new Dictionary<string, object> { ["ok"] = false, ["error"] = msg }, AgentApi.JsonOpts);
 	}
 
 }

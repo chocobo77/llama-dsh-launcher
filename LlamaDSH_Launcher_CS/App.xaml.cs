@@ -18,6 +18,13 @@ public partial class App : System.Windows.Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        // 内置 Agent CLI(cli 子命令): 在任何启动逻辑之前处理——它只是 HTTP 客户端,
+        // 不触发血统重启/单实例 mutex, 打完请求把退出码原样返回。
+        if (e.Args.Length > 0 && string.Equals(e.Args[0], "cli", StringComparison.OrdinalIgnoreCase))
+        {
+            Environment.Exit(LlamaDSH_Launcher.Services.AgentCli.Run(e.Args));
+        }
+
         // 安装器血统检测与血统切断：Inno Setup"安装完成后运行"拉起本程序时，会遗留
         // __COMPAT_LAYER=ElevateCreateProcess 等不可见的安装器上下文。实测(调用代码隔离
         // 探针 V1)：同样的 WMI 调用代码在用户自己的进程中一切正常，唯独从启动器进程

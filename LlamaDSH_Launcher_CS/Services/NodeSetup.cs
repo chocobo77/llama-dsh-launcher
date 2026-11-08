@@ -122,6 +122,15 @@ namespace LlamaDSH_Launcher.Services
         /// <summary>下载指定版本 node MSI 到 tempDir；成功返回本地路径，失败返回 null。</summary>
         public static async Task<string?> DownloadMsiAsync(string version, string tempDir, Action<string>? log = null)
         {
+            // version 来自远端 index.json, 直接拼 URL 与本地文件名:
+            // 含 ../、引号、空格即为路径穿越/参数注入, 必须先过形态白名单。
+            if (string.IsNullOrEmpty(version) ||
+                !System.Text.RegularExpressions.Regex.IsMatch(version, @"^v\d+\.\d+\.\d+$"))
+            {
+                AppLog.WriteError($"NodeSetup.DownloadMsiAsync：版本号形态非法: {version}");
+                log?.Invoke($"  版本号形态非法: {version}，放弃下载。");
+                return null;
+            }
             string fileName = $"node-{version}-x64.msi";
             foreach (string mirrorBase in MirrorBases)
             {
@@ -197,13 +206,16 @@ namespace LlamaDSH_Launcher.Services
         }
 
         /// <summary>
-        /// 校验下载的 MSI：优先与同目录 SHASUMS256.txt 比对 SHA-256；
-        /// 取不到校验和或计算哈希失败时回退为“数字签名校验（签名主体须为 Node.js Foundation）”，
-        /// 签名校验不通过即判定该源不可用（该包随后会以 runas 提权执行，不能只看体积就放行）。
+        /// 校验下载的 MSI。两道门:
+        /// 1) Authenticode 无条件前置(WinVerifyTrust + 官方主体):此前"哈希优先"的顺序下,
+        ///    恶意/被劫持镜像可以同目录提供自洽的 SHASUMS256.txt 自证一致,最强的一道门被完全跳过。
+        /// 2) SHA-256:校验和优先从官方 nodejs.org 取,取不到才回退下载镜像同目录;不匹配即拒。
+        /// 该校验后的包随后会以 runas 提权执行,不能只看体积就放行。
         /// </summary>
         private static async Task<bool> VerifyMsiAsync(string path, string mirrorBase, string version, string fileName, Action<string>? log)
         {
             const long MinBytes = 5L * 1024 * 1024;
+            const string OfficialBase = "https://nodejs.org/dist";
             long size;
             try
             {
@@ -220,17 +232,23 @@ namespace LlamaDSH_Launcher.Services
                 log?.Invoke("  下载文件过小，疑似损坏，尝试下一源...");
                 return false;
             }
-            string? expected = await TryGetExpectedSha256Async(mirrorBase, version, fileName, log);
+            if (!VerifyMsiSignature(path, log))
+            {
+                log?.Invoke("  安装包数字签名校验未通过，已丢弃该文件，尝试下一源...");
+                return false;
+            }
+            log?.Invoke("  安装包数字签名校验通过（签名主体为 Node.js 官方）。");
+            string? expected = await TryGetExpectedSha256Async(OfficialBase, version, fileName, log);
+            string hashSource = "官方校验和";
+            if (string.IsNullOrEmpty(expected) && !string.Equals(mirrorBase, OfficialBase, StringComparison.OrdinalIgnoreCase))
+            {
+                expected = await TryGetExpectedSha256Async(mirrorBase, version, fileName, log);
+                hashSource = "镜像校验和(官方不可达)";
+            }
             if (string.IsNullOrEmpty(expected))
             {
-                AppLog.WriteInfo($"NodeSetup.VerifyMsiAsync：未能取得 {fileName} 的 SHA-256，回退为数字签名校验（{size / 1024.0 / 1024.0:F1} MB）。");
-                log?.Invoke($"  未取得官方 SHA-256，改为校验安装包数字签名（文件大小 {size / 1024.0 / 1024.0:F1} MB）...");
-                if (!VerifyMsiSignature(path, log))
-                {
-                    log?.Invoke("  安装包数字签名校验未通过，已丢弃该文件，尝试下一源...");
-                    return false;
-                }
-                log?.Invoke("  安装包数字签名校验通过（签名主体为 Node.js 官方）。");
+                AppLog.WriteInfo($"NodeSetup.VerifyMsiAsync：未能取得 {fileName} 的 SHA-256，仅凭已通过的 Authenticode 放行（{size / 1024.0 / 1024.0:F1} MB）。");
+                log?.Invoke($"  未取得 SHA-256（官方与镜像均失败），凭数字签名放行（文件大小 {size / 1024.0 / 1024.0:F1} MB）。");
                 return true;
             }
             string actual;
@@ -242,19 +260,13 @@ namespace LlamaDSH_Launcher.Services
             catch (Exception ex)
             {
                 AppLog.WriteError($"NodeSetup.VerifyMsiAsync：计算 SHA-256 失败 {path}：{ex.Message}");
-                log?.Invoke("  计算 SHA-256 失败，改为校验安装包数字签名...");
-                if (!VerifyMsiSignature(path, log))
-                {
-                    log?.Invoke("  安装包数字签名校验未通过，已丢弃该文件，尝试下一源...");
-                    return false;
-                }
-                log?.Invoke("  安装包数字签名校验通过（签名主体为 Node.js 官方）。");
+                log?.Invoke("  计算 SHA-256 失败，凭已通过的数字签名放行。");
                 return true;
             }
             if (string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
             {
-                AppLog.WriteInfo($"NodeSetup.VerifyMsiAsync：{fileName} SHA-256 校验通过。");
-                log?.Invoke("  SHA-256 校验通过。");
+                AppLog.WriteInfo($"NodeSetup.VerifyMsiAsync：{fileName} SHA-256 校验通过（{hashSource}）。");
+                log?.Invoke($"  SHA-256 校验通过（{hashSource}）。");
                 return true;
             }
             AppLog.WriteError($"NodeSetup.VerifyMsiAsync：{fileName} SHA-256 不匹配（期望 {expected}，实际 {actual}）。");
@@ -368,11 +380,16 @@ namespace LlamaDSH_Launcher.Services
             try
             {
                 log?.Invoke("正在运行 Node 安装器（如弹出 UAC 授权窗口请点“是”，随后等待进度条走完）...");
-                var psi = new ProcessStartInfo("msiexec.exe", $"/i \"{msiPath}\" /passive /norestart")
+                var psi = new ProcessStartInfo("msiexec.exe")
                 {
                     UseShellExecute = true, // runas 需要 shell 执行
                     Verb = "runas"          // 触发 UAC 提权（已提权时无提示）
                 };
+                // ArgumentList: 手工拼引号在提权上下文里是参数注入面(路径含引号/空格即可逃逸)
+                psi.ArgumentList.Add("/i");
+                psi.ArgumentList.Add(msiPath);
+                psi.ArgumentList.Add("/passive");
+                psi.ArgumentList.Add("/norestart");
                 using var p = Process.Start(psi);
                 if (p == null)
                 {

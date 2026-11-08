@@ -409,7 +409,7 @@
           <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel Name="MonitorRoot" Margin="8">
 
-              <!-- ═══ 摘要条(llama-lens MetricsPanel strip): label+大数值+unit 单元格 ═══ -->
+              <!-- ═══ 摘要条: label+大数值+unit 单元格 ═══ -->
               <Border Background="#161a1d" CornerRadius="10" Padding="14,10" BorderBrush="#2a3036" BorderThickness="1">
                 <DockPanel>
                   <Button DockPanel.Dock="Right" Name="BtnSnapshot" Content="📷" Click="Snapshot_Click" ToolTip="保存监测页截图为 PNG" Padding="8,3" VerticalAlignment="Center" />

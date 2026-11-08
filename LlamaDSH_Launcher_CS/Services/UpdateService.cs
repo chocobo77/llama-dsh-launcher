@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.IO;
@@ -30,9 +30,20 @@ public static class UpdateService
 	private static readonly string UpdateTempRoot = Path.Combine(
 		Path.GetTempPath(), "LlamaDSH_Launcher", "updates");
 
+	// 正在进行的下载数: 清理入口据此跳过 updates 目录, 防并发互删
+	private static int _activeDownloads;
+
 	// ==================== llama.cpp ====================
 
-	private static Dictionary<string, string> digests = new();
+	// 资产名来自远端 JSON, 会被 Path.Combine 到临时目录:
+	// 绝对路径或 ..\ 会直接逃出 TEMP, 必须先过形态白名单。
+	internal static bool IsSafeAssetName(string name)
+	{
+		return !string.IsNullOrEmpty(name)
+			&& name == Path.GetFileName(name)
+			&& !name.Contains("..", StringComparison.Ordinal)
+			&& Regex.IsMatch(name, @"^[A-Za-z0-9._\-]+$");
+	}
 
 	public sealed class LlamaReleaseInfo
 	{
@@ -239,13 +250,21 @@ public static class UpdateService
 		// 收集全部 Windows x64 预编译主包候选（排除 cudart 纯运行库与 arm64）
 		var cands = new List<(string, string, string)>();
 		var sizes = new Dictionary<string, long>();
-		digests = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+		Dictionary<string, string> digests = new(StringComparer.OrdinalIgnoreCase);
 		if (release.TryGetProperty("assets", out JsonElement assets) && assets.ValueKind == JsonValueKind.Array)
 		{
 			foreach (JsonElement a in assets.EnumerateArray())
 			{
 				string name = a.TryGetProperty("name", out JsonElement ne) ? ne.GetString() ?? "" : "";
 				string url = a.TryGetProperty("browser_download_url", out JsonElement ue) ? ue.GetString() ?? "" : "";
+				if (!IsSafeAssetName(name))
+				{
+					if (name.Length > 0)
+					{
+						AppLog.WriteError($"UpdateService.BuildFromReleaseJson: 资产名形态非法, 已跳过: {name}");
+					}
+					continue;
+				}
 				if (!name.Contains("-bin-win-") || !name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
 				{
 					continue;
@@ -287,6 +306,10 @@ public static class UpdateService
 			foreach (JsonElement a in assets2.EnumerateArray())
 			{
 				string name = a.TryGetProperty("name", out JsonElement ne2) ? ne2.GetString() ?? "" : "";
+				if (!IsSafeAssetName(name))
+				{
+					continue;
+				}
 				if (a.TryGetProperty("size", out JsonElement se3) && se3.ValueKind == JsonValueKind.Number)
 				{
 					sizes[name] = se3.GetInt64();
@@ -375,6 +398,94 @@ public static class UpdateService
 		return null;
 	}
 
+	/// <summary>只走直连的 GET(不试镜像), 用于把 GitHub 元数据锚定到官方源。</summary>
+	private static string? HttpGetStringDirect(string url, int timeoutSec = 15)
+	{
+		try
+		{
+			using CancellationTokenSource cts = new(TimeSpan.FromSeconds(timeoutSec));
+			using HttpRequestMessage req = new(HttpMethod.Get, url);
+			req.Headers.TryAddWithoutValidation("User-Agent", "LlamaDSH_Launcher");
+			using HttpResponseMessage resp = Http.Send(req, cts.Token);
+			if (!resp.IsSuccessStatusCode)
+			{
+				return null;
+			}
+			return resp.Content.ReadAsStringAsync(cts.Token).GetAwaiter().GetResult();
+		}
+		catch
+		{
+			return null;
+		}
+	}
+
+	/// <summary>
+	/// 从 AssetUrl(github.com/&lt;owner&gt;/&lt;repo&gt;/releases/download/&lt;tag&gt;/&lt;asset&gt;)反推 API 地址,
+	/// 直连 GitHub 取主包与 cudart 的 digest 覆盖镜像通道的值; 直连失败保持原状。
+	/// </summary>
+	private static void AnchorReleaseDigests(LlamaReleaseInfo release)
+	{
+		try
+		{
+			Uri? u;
+			try
+			{
+				u = new Uri(release.AssetUrl);
+			}
+			catch
+			{
+				return;
+			}
+			if (!string.Equals(u.Host, "github.com", StringComparison.OrdinalIgnoreCase))
+			{
+				return;
+			}
+			string[] segs = u.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+			if (segs.Length < 5 || !string.Equals(segs[2], "releases", StringComparison.OrdinalIgnoreCase)
+				|| !string.Equals(segs[3], "download", StringComparison.OrdinalIgnoreCase))
+			{
+				return;
+			}
+			string api = $"https://api.github.com/repos/{segs[0]}/{segs[1]}/releases/tags/{Uri.EscapeDataString(segs[4])}";
+			string? json = HttpGetStringDirect(api, 15);
+			if (json == null)
+			{
+				AppLog.WriteInfo("UpdateService.AnchorReleaseDigests: 直连 api.github.com 不可达, 沿用当前通道摘要(可能来自镜像)。");
+				return;
+			}
+			using JsonDocument doc = JsonDocument.Parse(json);
+			if (!doc.RootElement.TryGetProperty("assets", out JsonElement assets) || assets.ValueKind != JsonValueKind.Array)
+			{
+				return;
+			}
+			foreach (JsonElement a in assets.EnumerateArray())
+			{
+				string name = a.TryGetProperty("name", out JsonElement ne) ? ne.GetString() ?? "" : "";
+				string dig = a.TryGetProperty("digest", out JsonElement de) && de.ValueKind == JsonValueKind.String ? de.GetString() ?? "" : "";
+				if (dig.Length == 0)
+				{
+					continue;
+				}
+				if (string.Equals(name, release.AssetName, StringComparison.OrdinalIgnoreCase))
+				{
+					if (release.Digest.Length > 0 && !string.Equals(dig, release.Digest, StringComparison.OrdinalIgnoreCase))
+					{
+						AppLog.WriteError($"UpdateService.AnchorReleaseDigests: {name} 的摘要与直连 GitHub 不一致(镜像可疑), 以直连为准。");
+					}
+					release.Digest = dig;
+				}
+				else if (release.CudartName.Length > 0 && string.Equals(name, release.CudartName, StringComparison.OrdinalIgnoreCase))
+				{
+					release.CudartDigest = dig;
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			AppLog.WriteError("UpdateService.AnchorReleaseDigests 异常: " + ex.Message);
+		}
+	}
+
 	private static int? ParseBuildFromTag(string tag)
 	{
 		string t = (tag ?? "").Trim();
@@ -401,6 +512,9 @@ public static class UpdateService
 	/// <summary>下载 llama.cpp 预编译 zip 并覆盖到目标目录（最小更新：只换二进制，不碰模型）。</summary>
 	public static async Task<(bool ok, string message)> ApplyLlamaUpdateAsync(string dir, LlamaReleaseInfo release)
 	{
+		Interlocked.Increment(ref _activeDownloads);
+		try
+		{
 		try
 		{
 			string targetDir = (dir ?? "").Trim().Trim('"');
@@ -437,6 +551,15 @@ public static class UpdateService
 			catch
 			{
 			}
+			// 纵深防御: 上游解析已白名单, 拼路径前再兜底一次(远端元数据不可信)
+			if (!IsSafeAssetName(release.AssetName) || (!string.IsNullOrEmpty(release.CudartName) && !IsSafeAssetName(release.CudartName)))
+			{
+				return (false, "release 元数据含非法资产名, 已拒绝下载(路径穿越防护)。");
+			}
+			// 摘要锚定: release JSON 可能经镜像取得(镜像与载荷同源, 可自证一致)。
+			// 这里尽力直连 api.github.com 复核一次; 直连不通则沿用现有摘要,
+			// 摘要缺失时 DownloadAssetAsync 会 fail-closed(拒绝仅凭体积放行)。
+			AnchorReleaseDigests(release);
 			string zipPath = Path.Combine(UpdateTempRoot, release.AssetName);
 			string extractDir = Path.Combine(UpdateTempRoot, "extract_" + release.Build);
 			if (Directory.Exists(extractDir))
@@ -455,7 +578,7 @@ public static class UpdateService
 			bool downloaded = await DownloadAssetAsync(urls, zipPath, release.Size, release.Digest);
 			if (!downloaded)
 			{
-				return (false, "下载 llama.cpp 预编译包失败（GitHub/镜像均不可达或文件过小）");
+				return (false, "下载 llama.cpp 预编译包失败（GitHub/镜像均不可达、文件过小、或该 release 资产无 sha256 摘要被安全策略拦截——详见 AppLog）");
 			}
 
 			// CUDA 主包需配套 cudart 运行库, 一并下载
@@ -525,6 +648,11 @@ public static class UpdateService
 		{
 			return (false, "更新失败: " + ex.Message);
 		}
+		}
+		finally
+		{
+			Interlocked.Decrement(ref _activeDownloads);
+		}
 	}
 
 	/// <summary>
@@ -562,8 +690,19 @@ public static class UpdateService
 							continue;
 						}
 						// 内容哈希校验: 镜像链(gh-proxy/ghfast/ghproxy)任一环可返回等长篡改内容,
-						// GitHub API 的 asset digest(sha256:...)是唯一强校验来源
-						if (!string.IsNullOrEmpty(expectedDigest))
+						// GitHub API 的 asset digest(sha256:...)是唯一强校验来源。
+						// 摘要缺失时默认 fail-closed——"只看体积"的通道不构成完整性保证
+						// (产物随后会被启动器直接执行)。应急覆盖: 环境变量 LLAMADSH_ALLOW_UNVERIFIED_UPDATE=1。
+						if (string.IsNullOrEmpty(expectedDigest))
+						{
+							if (Environment.GetEnvironmentVariable("LLAMADSH_ALLOW_UNVERIFIED_UPDATE") != "1")
+							{
+								AppLog.WriteError($"下载中止({u}): release 资产无 sha256 摘要, 拒绝仅凭体积校验; 应急可用 LLAMADSH_ALLOW_UNVERIFIED_UPDATE=1 覆盖(不建议)。");
+								return false;
+							}
+							AppLog.WriteError($"下载 {destPath}: 无摘要, 已按 LLAMADSH_ALLOW_UNVERIFIED_UPDATE=1 只做体积校验。");
+						}
+						else
 						{
 							string want = expectedDigest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase)
 								? expectedDigest[7..].ToLowerInvariant() : expectedDigest.ToLowerInvariant();
@@ -1083,30 +1222,43 @@ public static class UpdateService
 		catch
 		{
 		}
+		// 只清理静置超过 1 小时的残留: 正在被监控/转换/提权探针使用的文件不误删。
+		DateTime ageCut = DateTime.UtcNow.AddHours(-1);
 		try
 		{
 			string launcherTemp = Path.Combine(Path.GetTempPath(), "LlamaDSH_Launcher");
 			if (Directory.Exists(launcherTemp))
 			{
-				// gpu_perf.ps1 每次写入前会自校验，删除无影响
-				foreach (string f in Directory.GetFiles(launcherTemp, "*.ps1"))
+				foreach (string pattern in new[] { "*.ps1", "*.cmd", "*.log" })
 				{
-					TryDelete(f);
+					foreach (string f in Directory.GetFiles(launcherTemp, pattern))
+					{
+						if (OlderThan(f, ageCut))
+						{
+							TryDelete(f);
+						}
+					}
 				}
-				foreach (string f in Directory.GetFiles(launcherTemp, "*.cmd"))
+				// 转换 GUID 子目录里的引导 .cmd: cmd.exe 会逐行解析运行中的 .cmd,
+				// 转换上限 3 小时, 故 8 小时内不清, 防删掉正在运行的引导脚本。
+				string convDir = Path.Combine(launcherTemp, "convert");
+				if (Directory.Exists(convDir))
 				{
-					TryDelete(f);
-				}
-				foreach (string f in Directory.GetFiles(launcherTemp, "*.log"))
-				{
-					TryDelete(f);
+					DateTime convCut = DateTime.UtcNow.AddHours(-8);
+					foreach (string f in Directory.GetFiles(convDir, "*.cmd"))
+					{
+						if (OlderThan(f, convCut))
+						{
+							TryDelete(f);
+						}
+					}
 				}
 			}
 		}
 		catch
 		{
 		}
-		// 根临时目录下的旧重建/转换引导文件
+		// 根临时目录下的旧重建/转换引导文件与提权探针残留
 		string tmp = Path.GetTempPath();
 		foreach (string f in new string[]
 		{
@@ -1116,7 +1268,36 @@ public static class UpdateService
 			Path.Combine(tmp, "conversion_kit.zip")
 		})
 		{
-			TryDelete(f);
+			if (OlderThan(f, ageCut))
+			{
+				TryDelete(f);
+			}
+		}
+		foreach (string f in Directory.GetFiles(tmp, "LlamaDSH_GameAccessProbe*.ps1"))
+		{
+			if (OlderThan(f, ageCut))
+			{
+				TryDelete(f);
+			}
+		}
+		foreach (string f in Directory.GetFiles(tmp, "LlamaDSH_dsh_compat_probe_*.mjs"))
+		{
+			if (OlderThan(f, ageCut))
+			{
+				TryDelete(f);
+			}
+		}
+	}
+
+	private static bool OlderThan(string path, DateTime utcCut)
+	{
+		try
+		{
+			return File.GetLastWriteTimeUtc(path) < utcCut;
+		}
+		catch
+		{
+			return false;
 		}
 	}
 
@@ -1124,10 +1305,12 @@ public static class UpdateService
 	{
 		try
 		{
-			if (Directory.Exists(UpdateTempRoot))
+			// 下载流程正在写这个目录时跳过, 否则会删掉别的调用正在下载的 .part/摘要锚定文件
+			if (_activeDownloads > 0 || !Directory.Exists(UpdateTempRoot))
 			{
-				Directory.Delete(UpdateTempRoot, true);
+				return;
 			}
+			Directory.Delete(UpdateTempRoot, true);
 		}
 		catch
 		{
