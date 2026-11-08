@@ -4218,11 +4218,13 @@ import subprocess as _sp26
 
 _old_dir26 = os.path.expanduser("~/probe_r17/old")
 os.makedirs(_old_dir26, exist_ok=True)
+# 对照基准必须**钉死在修复前的提交**(c823951 = 第十七轮之前): 写 HEAD 的话, 修完一提交
+# HEAD 就变成了"修后", 下一次跑全套时对照全体失效(修前副本 == 修后代码, 六条对照全红/全绿失义)。
+_OLD_REF26 = "c823951"
 for _mod26 in ("main.py", "core.py", "updates.py", "toolchain.py", "webui/app.js"):
     _dst26 = os.path.join(_old_dir26, _mod26.replace("/", "_"))
-    if not os.path.exists(_dst26):
-        _sp26.run(["git", "show", "HEAD:./" + _mod26], stdout=open(_dst26, "w"),
-                  cwd=APP, check=True)
+    _sp26.run(["git", "show", "%s:./%s" % (_OLD_REF26, _mod26)], stdout=open(_dst26, "w"),
+              cwd=APP, check=True)
 
 
 def _load_old26(fname, as_name):
@@ -4391,6 +4393,36 @@ _tc_old26 = io.open(os.path.join(_old_dir26, "toolchain.py"), encoding="utf-8").
 check("解压目录名必须含 pid(修前 extract_<build> 固定名, 两个变体并发更新同一 build 会互删现场)",
       "extract_%d_%d" in _tc_src26 and 'extract_%d"' in _tc_old26,
       "toolchain.py 解压目录名形态不对")
+# --------------------------------- 27. 第十八轮(曲线紊乱 / 标题层级) --
+# 27.1 CPU/内存采样的"双层解包": _read_cpu_times 返回的已是 (total, cores), 再解包一层
+#      会让第二拍起 util() 对 tuple 减法抛 TypeError → except 把 CPU/内存整块打回 0。
+#      独立进程只跑一拍发现不了 —— 必须**连跑两拍**再断言。
+import time as _t27
+_c1 = monitor.cpu_mem_usage()
+_t27.sleep(1.1)
+_c2 = monitor.cpu_mem_usage()
+check("CPU/内存采样第二拍必须仍是真值(修前双层解包, 第二拍起 TypeError → 永远显示 0)",
+      _c2["mem_used"] > 0 and _c2["mem_total"] > 0 and len(_c2["cpu_cores"]) > 0,
+      str((_c2["cpu"], _c2["mem_used"], len(_c2["cpu_cores"]))))
+check("对照: 第一拍 cpu 允许是 0(首拍无差分基线), 但 mem 必须为真",
+      _c1["mem_used"] > 0, str(_c1))
+# 27.2 图表面积必须按 null 段独立闭合(修前把多段 path 首尾连成大多边形, 跨缺口画大斜面)
+_js27 = io.open("webui/app.js", encoding="utf-8").read()
+check("drawSpark/drawTrend 的面积必须按段闭合(跨 null 不得直连)",
+      _js27.count("for (const sg of segs)") == 2
+      and "dLine + `L ${last[0].toFixed(2)}" not in _js27
+      and "dArea = dLine +" not in _js27, str(_js27.count("for (const sg of segs)")))
+# 27.3 参数导航标题层级契约: 组标题(accent/13px)与子组(缩进/12px)、面包屑分组着色
+_css27 = io.open("webui/style.css", encoding="utf-8").read()
+check("参数导航的组/子组标题必须有层级样式(13px accent 组标题 + 缩进 12px 子组)",
+      "font-size: 13px" in _css27 and "var(--tone-info)" in _css27
+      and ".navGrpTitle:first-child" in _css27 and "margin-left: 12px" in _css27
+      and ".breadcrumb .bcGrp" in _css27 and ".breadcrumb .bcSub" in _css27,
+      "style.css 层级样式缺失")
+check("面包屑必须按层级输出结构化 span(组名/分隔/子组/计数)",
+      'class="bcGrp"' in _js27 and 'class="bcSep"' in _js27
+      and 'class="bcSub"' in _js27 and 'class="bcCnt"' in _js27, "app.js 面包屑未分层")
+
 shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)
 

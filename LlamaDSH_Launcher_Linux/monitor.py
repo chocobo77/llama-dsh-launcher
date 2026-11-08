@@ -22,6 +22,7 @@ _vendor_cache = {"t": 0.0, "v": "unknown"}
 # ---------------------------------------------------------------- CPU / 内存 --
 
 _cpu_prev = {"t": 0.0, "cores": [], "util": 0.0, "core_utils": []}
+_cmu_fail, _cmu_fail_at = "", 0.0
 
 
 def _read_cpu_times():
@@ -40,8 +41,11 @@ def _read_cpu_times():
 
 def cpu_mem_usage():
     try:
-        totals = _read_cpu_times()
-        total, cores = totals[0], totals[1:]
+        # _read_cpu_times 返回的**已经是** (total, cores) 二元组: 再解包一层, cores 就成了
+        # "包着一层的元组", 第二拍起 util() 对 tuple 做减法抛 TypeError → except 把 CPU/内存
+        # 整块打回 0 —— 首拍真实、之后全 0, 曲线上就是"内存直坠 0、CPU 平 0"(监测页紊乱
+        # 的数据侧根因)。独立进程只跑一拍永远发现不了。
+        total, cores = _read_cpu_times()
         now = time.time()
         prev = _cpu_prev
         if now - prev["t"] >= 0.5 and prev["cores"]:
@@ -74,7 +78,15 @@ def cpu_mem_usage():
                 "cpu_cores": [round(x, 1) for x in prev["core_utils"]],
                 "mem_used": mem_used, "mem_total": mem_total,
                 "mem_pct": round(100.0 * mem_used / mem_total, 1) if mem_total else 0.0}
-    except Exception:
+    except Exception as _ex:
+        # 静默吞掉 = CPU/内存整块永远显示 0, 用户分不清"真的空闲"与"采样坏了"。
+        # 限流记一次(换错才再记), 详情进 run.log。
+        global _cmu_fail, _cmu_fail_at
+        now = time.time()
+        if str(type(_ex).__name__) + str(_ex) != _cmu_fail or now - _cmu_fail_at > 300:
+            _cmu_fail, _cmu_fail_at = str(type(_ex).__name__) + str(_ex), now
+            import applog as _al
+            _al.run("[monitor] CPU/内存采样失败(显示为 0): %s: %s" % (type(_ex).__name__, _ex))
         return {"cpu": 0.0, "cpu_cores": [], "mem_used": 0, "mem_total": 0, "mem_pct": 0.0}
 
 

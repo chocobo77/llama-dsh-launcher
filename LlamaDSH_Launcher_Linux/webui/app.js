@@ -278,7 +278,10 @@ function selectSubgroup(g, sub, items) {
   document.querySelectorAll(".navItem").forEach(x =>
     x.classList.toggle("active", x.dataset.key === g.id + "|" + sub));
   const label = sub || "其它";
-  $("paramBreadcrumb").textContent = `${g.title} ▸ ${label} · ${items.length} 个参数`;
+  // 层级化面包屑: 组名(一级, accent 加粗) ▸ 子组(二级, 亮色) · 计数(弱色, 靠右)
+  $("paramBreadcrumb").innerHTML =
+    `<span class="bcGrp">${mEsc(g.title)}</span><span class="bcSep">▸</span>` +
+    `<span class="bcSub">${mEsc(label)}</span><span class="bcCnt">${items.length} 个参数</span>`;
   const host = $("paramContent");
   host.innerHTML = "";
   for (const d of items) buildParamRow(d, host);
@@ -962,25 +965,32 @@ function drawSpark(svg, values, stamps, max, tone, unit) {
     top = Math.max(0, ...values.filter(v => v != null));
     if (top <= 0) top = 1e-9;
   }
-  // 面积 + 折线(分段断点)
-  let dLine = "", dArea = "";
+  // 面积 + 折线(按 null 断点分段; 面积**每段独立**闭合 —— 修前把整条多段 path 首尾
+  // 连成一个大多边形, 跨 null 段画出横贯全图的大斜面, 是"曲线紊乱"的图形侧根因之一)
+  let dLine = "";
   let started = false;
-  const pts = [];
+  const segs = [];
+  let seg = [];
   for (let i = 0; i < n; i++) {
     const v = values[i];
     if (v == null) {
-      if (started) { dLine += " "; started = false; }
+      if (seg.length > 1) segs.push(seg);
+      seg = [];
+      started = false;
       continue;
     }
     const x = xAt(i, n, stamps, W);
     const y = base - (v / top) * 26;
-    pts.push([x, y]);
+    seg.push([x, y]);
     dLine += (started ? "L" : "M") + x.toFixed(2) + " " + y.toFixed(2) + " ";
     started = true;
   }
-  if (pts.length > 1) {
-    const first = pts[0], last = pts[pts.length - 1];
-    dArea = dLine + `L ${last[0].toFixed(2)} ${base} L ${first[0].toFixed(2)} ${base} Z`;
+  if (seg.length > 1) segs.push(seg);
+  for (const sg of segs) {
+    const first = sg[0], last = sg[sg.length - 1];
+    const dArea = `M ${first[0].toFixed(2)} ${base} L ` +
+      sg.map(p => `${p[0].toFixed(2)} ${p[1].toFixed(2)}`).join(" L ") +
+      ` L ${last[0].toFixed(2)} ${base} Z`;
     svg.appendChild(svgEl("path", { d: dArea, fill: tone, class: "area" }));
   }
   if (dLine.trim()) {
@@ -1004,23 +1014,32 @@ function drawTrend(svg, unit, series, stamps, yMin, yMax, legendHost) {
     const y = H * i / 4;
     svg.appendChild(svgEl("line", { x1: 0, y1: y, x2: W, y2: y, class: "gridline" }));
   }
-  const n = Math.max(...series.map(s => s.data.length), 1);
   for (const s of series) {
     const vals = s.data;
     let dLine = "", started = false;
-    const pts = [];
+    const segs = [];
+    let seg = [];
     for (let i = 0; i < vals.length; i++) {
       const v = vals[i];
-      if (v == null) { if (started) { dLine += " "; started = false; } continue; }
+      if (v == null) {
+        if (seg.length > 1) segs.push(seg);
+        seg = [];
+        started = false;
+        continue;
+      }
       const x = xAt(i, vals.length, stamps, W);
       const y = H - ((v - bot) / (top - bot)) * (H - 6) - pad;
-      pts.push([x, y]);
+      seg.push([x, y]);
       dLine += (started ? "L" : "M") + x.toFixed(2) + " " + y.toFixed(2) + " ";
       started = true;
     }
-    if (pts.length > 1) {
-      const first = pts[0], last = pts[pts.length - 1];
-      svg.appendChild(svgEl("path", { d: dLine + `L ${last[0].toFixed(2)} ${H - pad} L ${first[0].toFixed(2)} ${H - pad} Z`, fill: s.color, class: "area" }));
+    if (seg.length > 1) segs.push(seg);
+    for (const sg of segs) {
+      const first = sg[0], last = sg[sg.length - 1];
+      const dArea = `M ${first[0].toFixed(2)} ${H - pad} L ` +
+        sg.map(p => `${p[0].toFixed(2)} ${p[1].toFixed(2)}`).join(" L ") +
+        ` L ${last[0].toFixed(2)} ${H - pad} Z`;
+      svg.appendChild(svgEl("path", { d: dArea, fill: s.color, class: "area" }));
     }
     if (dLine.trim()) svg.appendChild(svgEl("path", { d: dLine, stroke: s.color, class: "series" }));
   }
@@ -1053,12 +1072,25 @@ function drawTrend(svg, unit, series, stamps, yMin, yMax, legendHost) {
     hover.setAttribute("x1", frac * W);
     hover.setAttribute("x2", frac * W);
     // 反查最近样本点
+    // frac 是"时间占比": 样本节奏混档(3s/30s)时按线性序号反查会指到错的样本,
+    // 必须换算回时刻再取最近的一条 stamps(与 xAt 的时间映射同口径)。
+    const timedAxis = stamps && stamps.length > 1 && stamps[stamps.length - 1] - stamps[0] > 0.01;
+    const tHover = timedAxis ? stamps[0] + frac * (stamps[stamps.length - 1] - stamps[0]) : null;
     let parts = [];
     for (const s of series) {
       const vals = s.data;
       if (!vals.length) continue;
-      let idx = Math.round(frac * (vals.length - 1));
-      idx = Math.max(0, Math.min(vals.length - 1, idx));
+      let idx;
+      if (timedAxis && stamps.length === vals.length) {
+        idx = 0;
+        let best = Infinity;
+        for (let i = 0; i < stamps.length; i++) {
+          const dd = Math.abs(stamps[i] - tHover);
+          if (dd < best) { best = dd; idx = i; }
+        }
+      } else {
+        idx = Math.max(0, Math.min(vals.length - 1, Math.round(frac * (vals.length - 1))));
+      }
       let v = vals[idx], step = 1;
       while (v == null && idx >= 0 && idx < vals.length) { v = vals[idx - step] ?? vals[idx + step]; step++; if (step > 5) break; }
       parts.push(`${s.name} ${v == null ? "—" : (Math.round(v * 10) / 10) + " " + unit}`);
