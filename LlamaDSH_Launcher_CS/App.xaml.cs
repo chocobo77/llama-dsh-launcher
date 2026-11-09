@@ -65,6 +65,10 @@ public partial class App : System.Windows.Application
         // DPI 适配
         try { SetProcessDpiAwareness(2); } catch { }
 
+        // 把改动前已经落盘的凭据抹掉: 旧 run.log 里存着 DSH 启动横幅的 ?token=,
+        // 而「复制诊断信息」会把尾部原样带出去。后台跑, 不挡启动。
+        System.Threading.Tasks.Task.Run(() => { try { AppLog.ScrubExisting(); } catch { } });
+
         // 单实例检查（M6）：经 explorer 重启自身时，旧实例可能尚未释放 mutex，
         // 新实例只尝试一次会误判“已在运行”后退出（表现为双击没反应）。
         // 因此最多重试 3 次、每次间隔 300ms，全部失败才提示重复启动。

@@ -278,7 +278,7 @@ except StopIteration:
     pass
 finally:
     core.time.sleep = orig_sleep
-logged = [t for (_seq, t) in hub.since(0)[0] if "[转换]" in t]
+logged = [t for (_seq, _lv, t) in hub.since(0)[0] if "[转换]" in t]
 joined = "\n".join(logged)
 check("转换日志不拆半行", "part" not in joined.replace("partial2", "")
       and "partial2" in joined and "[转换] line1" in joined, joined[-300:])
@@ -4501,6 +4501,163 @@ _pm28 = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "procma
                 encoding="utf-8").read()
 check("进程扫描要含 Node 24 的 comm(MainThread): 只按 node 过滤会永远查不到 DSH",
       '"MainThread"' in _pm28, "procman 未放宽 MainThread")
+
+# 29 日志子系统: 轮转 / 脱敏 / 级别字段 / 游标跨重启 / 折叠可回溯
+#     2026-11-09 实测: DSH 启动横幅 `dsh web: http://127.0.0.1:3080/?token=…` 明文进了
+#     run.log 和 agent 的 logs 响应 —— 脱敏必须在进缓冲与写盘之前做完, 只在界面遮一层没用。
+# 29.1 脱敏: URL 查询串 / JSON 字段 / Bearer 头三种形态, 且落盘与进缓冲都已过
+import re as _re29
+_c29 = _applog_top.redact("dsh web: http://127.0.0.1:3080/?token=Ab3xK9qR7sT1vZ2&x=1")
+check("脱敏-URL 查询串 token", "Ab3xK9qR7sT1vZ2" not in _c29 and "token=‹已隐藏›" in _c29, _c29)
+_c29b = _applog_top.redact('发现文件 {"port": 17325, "token": "S3cr3tT0kenValue"}')
+check("脱敏-JSON 字段 token",
+      "S3cr3tT0kenValue" not in _c29b and '"token": "‹已隐藏›"' in _c29b, _c29b)
+_c29c = _applog_top.redact("401 unauthorized: Authorization: Bearer AbCdEfGhIjKlMnOp==")
+check("脱敏-Authorization Bearer 头",
+      "AbCdEfGhIjKlMnOp" not in _c29c and "Bearer ‹已隐藏›" in _c29c, _c29c)
+_applog_top.run("脱敏哨兵: http://127.0.0.1:3080/?token=DiskSecretValue9999")
+_run29 = io.open(os.path.join(_applog_top.LOG_DIR, "run.log"), encoding="utf-8").read()
+check("脱敏在写盘前生效: run.log 里不得出现明文 token",
+      "DiskSecretValue9999" not in _run29 and "脱敏哨兵" in _run29, _run29[-200:])
+_hub29 = core.LogHub()
+_hub29.log("[DSH] dsh web: http://127.0.0.1:3080/?token=RingSecretValue7777")
+check("进环形缓冲的文本同样已脱敏(logs 响应不再回显 token)",
+      "RingSecretValue7777" not in "\n".join(t for (_s, _l, t) in _hub29.since(0)[0]),
+      str(_hub29.since(0)[0])[-160:])
+
+# 29.2 轮转: 单文件超过 MAX_BYTES 必须滚出 .1, 且最多保留 3 份历史
+_rp29 = os.path.join(_applog_top.LOG_DIR, "run.log")
+with io.open(_rp29, "a", encoding="utf-8") as _f29:
+    _f29.write("x" * (_applog_top.MAX_BYTES + 4096) + "\n")
+_applog_top.run("轮转后的哨兵行")
+check("run.log 超过 MAX_BYTES 必须滚动出 .1",
+      os.path.exists(_rp29 + ".1") and os.path.getsize(_rp29) < _applog_top.MAX_BYTES
+      and "轮转后的哨兵行" in io.open(_rp29, encoding="utf-8").read(),
+      str([os.path.getsize(_rp29), os.path.exists(_rp29 + ".1")]))
+# 真 4 MiB 文件写三轮太慢: 临时把上限调小, 只验"保留 3 份、最老的丢掉"
+_omax29 = _applog_top.MAX_BYTES
+_applog_top.MAX_BYTES = 20
+for _i29 in range(8):
+    _applog_top.info("轮转代数哨兵 %d" % _i29)
+_applog_top.MAX_BYTES = _omax29
+_gp29 = os.path.join(_applog_top.LOG_DIR, "info.log")
+check("轮转只保留 3 份历史(.1 最新, .3 之后旧的丢弃)",
+      all(os.path.exists(_gp29 + "." + str(_i29)) for _i29 in (1, 2, 3))
+      and not os.path.exists(_gp29 + ".4"),
+      str([os.path.exists(_gp29 + "." + str(_i29)) for _i29 in (1, 2, 3, 4)]))
+
+# 29.3 级别字段: ring 里存 (seq, level, text), 落盘时 ERROR/WARN 带标签、INFO 不带
+_h29 = core.LogHub()
+_h29.log("级别哨兵 普通行")
+_h29.warn("级别哨兵 警告行")
+try:
+    raise ValueError("级别哨兵 异常体")
+except ValueError as _ex29:
+    _h29.error_ex(_ex29, "级别哨兵 上下文")
+_rows29 = list(_h29.since(0)[0])
+_lv29 = dict((t, lv) for (_s, lv, t) in _rows29)
+check("ring 存 (seq, level, text): 缺省 INFO / warn→WARN / error_ex→ERROR",
+      _lv29.get("级别哨兵 普通行") == "INFO"
+      and _lv29.get("[WARN] 级别哨兵 警告行") == "WARN"
+      and _lv29.get("[ERROR] 级别哨兵 上下文: ValueError: 级别哨兵 异常体") == "ERROR",
+      str(_lv29)[:260])
+_run29b = io.open(os.path.join(_applog_top.LOG_DIR, "run.log"), encoding="utf-8").read()
+check("run.log 里 ERROR/WARN 带标签、INFO 不带(且标签不叠加)",
+      "] [WARN] 级别哨兵 警告行" in _run29b and "] [ERROR] 级别哨兵 上下文" in _run29b
+      and "] 级别哨兵 普通行" in _run29b and "[ERROR] [ERROR]" not in _run29b,
+      _run29b[-260:])
+
+# 29.4 logs 端点: level/grep 过滤 + boot/ring/seq_first_available
+main.HUB.log("[GrepSentinel29] info 行")
+main.HUB.warn("[GrepSentinel29] warn 行")
+try:
+    raise RuntimeError("GrepSentinel29 ctx")
+except RuntimeError as _ex29b:
+    main.HUB.error_ex(_ex29b, "GrepSentinel29 上下文")
+
+
+def _texts29(_r29):
+    return "\n".join(_l["text"] for _l in _r29["lines"])
+
+
+_r29e = main.api_logs({"after": 0, "level": "error"})
+_r29w = main.api_logs({"after": 0, "level": "WARN"})
+_r29g = main.api_logs({"after": 0, "grep": "grepsentinel29] warn"})
+check("logs?level= 大小写不敏感, 只回该级别(error)",
+      "GrepSentinel29 上下文" in _texts29(_r29e) and "info 行" not in _texts29(_r29e)
+      and "warn 行" not in _texts29(_r29e), _texts29(_r29e)[:260])
+check("logs?level= 只回该级别(warn)",
+      "warn 行" in _texts29(_r29w) and "info 行" not in _texts29(_r29w)
+      and "GrepSentinel29 上下文" not in _texts29(_r29w), _texts29(_r29w)[:260])
+check("logs?grep= 是大小写不敏感的子串过滤",
+      "warn 行" in _texts29(_r29g) and "info 行" not in _texts29(_r29g), _texts29(_r29g)[:260])
+_q29 = main._query_body("after=0&level=error&grep=GrepSentinel29%20%E4%B8%8A%E4%B8%8B%E6%96%87")
+check("GET /api/logs?level=&grep= 的字符串入参同样生效(_query_body 已 unquote)",
+      "GrepSentinel29 上下文" in _texts29(main.api_logs(_q29)), str(_q29))
+_r29all = main.api_logs({"after": 0})
+check("logs 每行带 level 字段, 响应带 boot/ring/seq_first_available",
+      all("level" in _l for _l in _r29all["lines"])
+      and _r29all["boot"] == main.HUB.boot == main.api_logs({})["boot"]
+      and _r29all["ring"] == 2000
+      and _r29all["seq_first_available"] == main.HUB.ring[0][0],
+      str({k: v for k, v in _r29all.items() if k != "lines"})[:260])
+_r29stale = main.api_logs({"after": 10 ** 9})
+check("上一进程留下的 after 不得报错, 且响应足以让客户端发现重启(boot 变了/游标作废)",
+      _r29stale["lines"] == [] and _r29stale["after"] == 10 ** 9
+      and _r29stale["boot"] == main.HUB.boot and _r29stale["gap"] is False,
+      str({k: v for k, v in _r29stale.items() if k != "lines"})[:260])
+_fresh29 = core.LogHub()
+check("boot 格式是 %Y%m%d%H%M%S-pid(重启必换 pid)且响应里的 boot 进程内稳定",
+      bool(_re29.match(r"^\d{14}-%d$" % os.getpid(), _fresh29.boot))
+      and _fresh29.seq == 0 and _fresh29.seq_first_available() == 1
+      and main.api_logs({})["boot"] == main.HUB.boot, _fresh29.boot)
+# 环滚过一轮之后, 游标落在现存缓冲之前的那段行确实没了: 必须如实说出去
+_ovf29 = core.LogHub()
+_ovf29.seq = 4999
+_ovf29._emit("环头哨兵行")
+_real_hub29 = main.HUB
+main.HUB = _ovf29
+_r29gap = main.api_logs({"after": 100})
+main.HUB = _real_hub29
+check("游标落在现存缓冲之前(中间行已被挤出环)时必须如实给出 gap 与环头 seq",
+      _r29gap["gap"] is True and _r29gap["seq_first_available"] == 5000
+      and _r29gap["lines"][0] == {"seq": 5000, "level": "INFO", "text": "环头哨兵行"},
+      str({k: v for k, v in _r29gap.items() if k != "lines"})[:260])
+
+# 29.5 DSH 噪音折叠可回溯: 汇总行要指出全文所在的 boot log
+_h29c = core.LogHub()
+_h29c.dsh_boot_log = "/tmp/llamadsh-1000/dsh_boot.log"
+for _i29 in range(3):
+    _h29c.log("[dsh] noise tail %d" % _i29)
+_h29c.log("[dsh] listening on 127.0.0.1:3080")
+_fold29 = [t for (_s, _l, t) in _h29c.since(0)[0] if "已隐藏" in t]
+check("折叠汇总行必须指出全文所在路径(否则隐藏等于丢证据)",
+      len(_fold29) == 1
+      and "已隐藏 3 行非日志内容, 全文见 /tmp/llamadsh-1000/dsh_boot.log" in _fold29[0],
+      str(_fold29))
+_h29d = core.LogHub()
+for _i29 in range(2):
+    _h29d.log("[dsh] noise tail again %d" % _i29)
+_h29d.log("[dsh] http://127.0.0.1:1")
+check("boot log 路径未设置时不加后半句(不指向一个不存在的路径)",
+      all("全文见" not in t for (_s, _l, t) in _h29d.since(0)[0]),
+      str([t for (_s, _l, t) in _h29d.since(0)[0]])[:200])
+_oldbl29 = core.DSH_BOOT_LOG
+core.DSH_BOOT_LOG = os.path.join(_SELFTEST_HOME, "boot29.log")
+_h29e = core.LogHub()
+core.DshRunner(_h29e, {"defs": []})._spawn(["__no_such_command_29__"])
+core.DSH_BOOT_LOG = _oldbl29
+check("DshRunner 启动 DSH 时把 boot log 路径接到 hub 上(折叠行才指得出去)",
+      _h29e.dsh_boot_log.endswith("boot29.log"), _h29e.dsh_boot_log)
+
+# 29.6 webui 消费端: 游标必须随 boot 重置。seq 每次服务端启动从 1 重来, 面板手上的
+#      after 会永远大于新 seq_last —— 日志区静默冻结, 用户分不清"没日志"和"收不到了"。
+_js29 = io.open(os.path.join(APP, "webui", "app.js"), encoding="utf-8").read()
+check("webui 日志游标要在服务端重启(boot 变化或 gap)时归零重收",
+      "LOG_BOOT" in _js29 and "r.gap" in _js29 and "LOG_AFTER = 0" in _js29,
+      "pollLogs 未处理 boot/gap")
+check("webui 渲染级别前缀(ERROR/WARN), INFO 不加噪",
+      'l.level !== "INFO"' in _js29, "pollLogs 未渲染 level")
 
 shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)

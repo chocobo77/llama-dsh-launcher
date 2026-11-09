@@ -105,16 +105,27 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private readonly string _windowStateFile;
 
-	private readonly StringBuilder _runLog;
+	// 运行日志环形缓冲: (序号, 级别, 文本)。容量与 Linux 侧 LogHub.ring 对齐为 2000,
+	// agent 的 logs 端点与 run.log 是同一份内容的两个视图(以前是两个独立真相)。
+	private readonly Queue<(long seq, DateTimeOffset ts, string level, string text)> _runRing = new Queue<(long, DateTimeOffset, string, string)>();
 
 	private readonly object _runLogLock;
 
-	private int _runLogCount;
-
-	// 运行日志的单调行序号(agent logs 游标基准), 与 _runLogCount 不同: 后者折叠时会回退
+	// 运行日志的单调行序号(agent logs 游标基准)
 	private long _runLogSeq;
 
-	private const int RunLogMaxLines = 5000;
+	// 已落盘到的序号: run.log 增量写用它当游标(以前只在退出时整段落盘,
+	// 崩溃或被 taskkill 就把本次会话的日志全丢掉)
+	private long _runLogFlushedSeq;
+
+	private long _runLogLastFlushTick;
+
+	private const int RunLogMaxLines = 2000;
+
+	// 攒这么多行或距上次落盘这么久就写一次 run.log
+	private const int RunLogFlushLines = 200;
+
+	private const long RunLogFlushMs = 5000L;
 
 	private string _configDir;
 
@@ -207,7 +218,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		_stateFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh_launcher_state.json");
 		_cfgPathFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".llamadsh_config_path.json");
 		_windowStateFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".llamadsh_window.json");
-		_runLog = new StringBuilder();
 		_runLogLock = new object();
 		_profiles = new Dictionary<string, ProfileConfig>();
 		_currentProfile = "默认方案";
@@ -6432,7 +6442,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					_lastLogLine = text;
 					stringBuilder.AppendLine(text);
-					AppendRunLog($"[{DateTime.Now:HH:mm:ss}] {text}");
+					AppendRunLog(text);
 					ParseTimings(text);
 				}
 			}
@@ -6494,11 +6504,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			return;
 		}
-		string summary = "[dsh] ……(已隐藏 " + _dshHiddenCount + " 行非日志内容)";
+		// 折叠只留计数会把原文彻底丢掉, 所以指一条能查到全文的路(DSH 的 boot log 是全量输出)
+		string hint = string.IsNullOrEmpty(_dshBootLogPath) ? "" : (", 全文见 " + _dshBootLogPath);
+		string summary = "[dsh] ……(已隐藏 " + _dshHiddenCount + " 行非日志内容" + hint + ")";
 		_dshHiddenCount = 0;
 		_lastLogLine = summary;
 		stringBuilder.AppendLine(summary);
-		AppendRunLog($"[{DateTime.Now:HH:mm:ss}] {summary}");
+		AppendRunLog(summary);
 	}
 
 	private static bool IsDshNoise(string content)
@@ -6566,25 +6578,55 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 	}
 
-	private void AppendRunLog(string line)
+	/// <summary>
+	/// 进运行日志环形缓冲并按时增量落盘。级别只给 ERROR/WARN 打标签(INFO 省略, 保持可读),
+	/// agent 的 `logs?level=` 按这里存的级别过滤。文本一律先脱敏, 免得 DSH 启动横幅里的
+	/// `?token=…` 被写进 run.log 与 logs 响应。
+	/// </summary>
+	private void AppendRunLog(string text, string level = "INFO")
 	{
 		lock (_runLogLock)
 		{
-			_runLog.AppendLine(line);
-			// 单调递增的行序号: agent `logs?after=` 游标要用它。折叠只裁缓冲, 序号不回退,
-			// 于是"缓冲里最后一行的序号"就能反推每一行的序号。
 			_runLogSeq++;
-			if (++_runLogCount > 5000)
+			_runRing.Enqueue((_runLogSeq, DateTimeOffset.Now, level, AppLog.Redact(text ?? "")));
+			while (_runRing.Count > RunLogMaxLines)
 			{
-				string text = _runLog.ToString();
-				int num = text.IndexOf('\n', text.Length / 2);
-				if (num > 0)
+				_runRing.Dequeue();
+			}
+			// 增量落盘: 以前只在退出时整段写, 崩溃/被 taskkill 就把本次会话一行都不留
+			// (实测被杀的那次 run.log 里一行都没有)。环形缓冲留 2000 行远大于 200 的
+			// 触发阈值, 所以未落盘的行不会先被挤出缓冲。
+			long now = Environment.TickCount64;
+			if (_runLogSeq - _runLogFlushedSeq >= RunLogFlushLines || now - _runLogLastFlushTick >= RunLogFlushMs)
+			{
+				FlushRunLogLocked();
+			}
+		}
+	}
+
+	/// <summary>把缓冲里未落盘的行逐行写进 run.log（每行带自己的时间戳）。</summary>
+	private void FlushRunLogLocked()
+	{
+		try
+		{
+			List<(string level, string text)> pending = new List<(string, string)>();
+			foreach ((long seq, DateTimeOffset ts, string level, string text) in _runRing)
+			{
+				if (seq > _runLogFlushedSeq)
 				{
-					_runLog.Clear();
-					_runLog.Append(text.Substring(num + 1));
-					_runLogCount = 2500;
+					pending.Add((level, text));
 				}
 			}
+			if (pending.Count > 0)
+			{
+				AppLog.WriteRunLines(pending);
+			}
+			_runLogFlushedSeq = _runLogSeq;
+			_runLogLastFlushTick = Environment.TickCount64;
+		}
+		catch (Exception ex)
+		{
+			AppLog.WriteError("运行日志落盘失败: " + ex.Message);
 		}
 	}
 
@@ -6599,7 +6641,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			select x.TrimEnd())));
 		string text2 = msg + ((text.Length == 0) ? "" : ("\n" + text));
 		AppLog.WriteError(text2);
-		AppendRunLog($"[{DateTime.Now:HH:mm:ss}] [ERROR] {text2}");
+		AppendRunLog(text2, "ERROR");
 		try
 		{
 			((DispatcherObject)this).Dispatcher.BeginInvoke((Delegate)(Action)delegate
@@ -6614,17 +6656,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void FlushRunLog()
 	{
-		try
+		lock (_runLogLock)
 		{
-			lock (_runLogLock)
-			{
-				AppLog.WriteRun(_runLog.ToString());
-				_runLog.Clear();
-				_runLogCount = 0;
-			}
-		}
-		catch
-		{
+			FlushRunLogLocked();
 		}
 	}
 
@@ -6706,14 +6740,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 	}
 
-	private void Log(string text)
+	private void Log(string text, string level = "INFO")
 	{
 		// 后台线程一律转发 UI 线程: LogArea 是 WPF 依赖对象, 跨线程直摸会抛
 		// "调用线程无法访问此对象"——PullDsh 等后台回调传进来的 Log 曾因此
 		// 把成功的 git fetch 判成失败
 		if (!Dispatcher.CheckAccess())
 		{
-			Dispatcher.BeginInvoke((Action)(() => Log(text)));
+			Dispatcher.BeginInvoke((Action)(() => Log(text, level)));
 			return;
 		}
 		if (!string.IsNullOrWhiteSpace(text) && (!(text == _lastLogLine) || text.StartsWith("[Perf] Error")))
@@ -6722,7 +6756,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			bool follow = ShouldAutoScroll();
 			double keepOffset = LogArea.VerticalOffset;
 			LogArea.AppendText(text + Environment.NewLine);
-			AppendRunLog($"[{DateTime.Now:HH:mm:ss}] {text}");
+			AppendRunLog(text, level);
 			TruncateLogIfNeeded();
 			if (follow)
 			{
@@ -8796,10 +8830,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		DshIdentity.Verdict v = verdict ?? ProcessHelper.DshIdentityProbe(pid, EffectiveDshDir());
 		if (!v.Ok)
 		{
-			Log($"[DSH] 拒绝接管 PID {pid}: {v.Reason}");
+			Log($"[DSH] 拒绝接管 PID {pid}: {v.Reason}", "WARN");
 			if (!v.CommandLineReadable)
 			{
-				Log("[DSH] 提示: DSH 若以管理员权限运行，未提权的启动器读不到它的命令行——以管理员身份重新运行启动器即可正常接管。");
+				Log("[DSH] 提示: DSH 若以管理员权限运行，未提权的启动器读不到它的命令行——以管理员身份重新运行启动器即可正常接管。", "WARN");
 			}
 			return;
 		}
@@ -9922,10 +9956,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				lock (_runLogLock)
 				{
-					_runLog.Clear();
-					_runLogCount = 0;
+					// 先落盘再清缓冲: 否则被清掉的行永远进不了 run.log(清空只该影响 agent 侧视图)
+					FlushRunLogLocked();
+					_runRing.Clear();
 				}
-				return AgentOk("运行日志缓冲已清空(LogArea 界面内容不动)");
+				return AgentOk("运行日志缓冲已清空(LogArea 界面内容不动; run.log 不删, seq 不回卷)");
 			});
 			api.RegisterPost("config/save", delegate (string body)
 			{
@@ -10501,10 +10536,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		return d == null ? AgentErr("UI 线程 10s 内未响应") : JsonSerializer.Serialize(d, AgentApi.JsonOpts);
 	}
 
+	/// <summary>
+	/// agent `logs`: 尾部若干行(after 省略)或游标增量(after=&lt;seq&gt;)。
+	/// 过滤参数 level(error/warn/info, 大小写不敏感)与 grep(子串, 大小写不敏感)。
+	/// boot/seq_first_available/gap 是给轮询客户端的: seq 每次进程启动都从 1 重来,
+	/// 客户端手上的 after 是上一轮的大数时会永久返回空且不报错, 必须能发现"重启了"。
+	/// </summary>
 	private string AgentLogsTail(string input)
 	{
 		int n = 200;
 		long after = -1L;
+		string level = "";
+		string grep = "";
 		string q = input ?? "";
 		if (q.TrimStart().StartsWith("{", StringComparison.Ordinal))
 		{
@@ -10536,6 +10579,14 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 						after = aestr;
 					}
 				}
+				if (root.TryGetProperty("level", out JsonElement le) && le.ValueKind == JsonValueKind.String)
+				{
+					level = le.GetString() ?? "";
+				}
+				if (root.TryGetProperty("grep", out JsonElement ge) && ge.ValueKind == JsonValueKind.String)
+				{
+					grep = ge.GetString() ?? "";
+				}
 			}
 			catch (Exception ex)
 			{
@@ -10555,32 +10606,58 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				after = af;
 			}
+			Match m3 = Regex.Match(q, "level=([A-Za-z]+)");
+			if (m3.Success)
+			{
+				level = m3.Groups[1].Value;
+			}
+			Match m4 = Regex.Match(q, "grep=([^&]+)");
+			if (m4.Success)
+			{
+				grep = Uri.UnescapeDataString(m4.Groups[1].Value);
+			}
 		}
-		string joined;
+		List<(long seq, DateTimeOffset ts, string level, string text)> snap = new List<(long, DateTimeOffset, string, string)>();
 		long seqLast;
 		lock (_runLogLock)
 		{
-			joined = _runLog.ToString();
+			foreach ((long seq, DateTimeOffset ts, string lvl, string text) in _runRing)
+			{
+				snap.Add((seq, ts, lvl, text));
+			}
 			seqLast = _runLogSeq;
 		}
-		string[] all = joined.Split('\n');
-		List<string> lines = new List<string>();
-		foreach (string raw in all)
+		string wantLevel = (level ?? "").Trim().ToUpperInvariant();
+		if (wantLevel == "WARNING")
 		{
-			string ln = raw.TrimEnd('\r');
-			if (ln.Length > 0)
-			{
-				lines.Add(ln);
-			}
+			wantLevel = "WARN";
 		}
-		// 缓冲里保存的是尾部若干行: 最后一行的序号就是 _runLogSeq
-		long firstSeq = seqLast - lines.Count + 1;
+		List<(long seq, DateTimeOffset ts, string level, string text)> kept = new List<(long, DateTimeOffset, string, string)>();
+		foreach ((long seq, DateTimeOffset ts, string lvl, string text) in snap)
+		{
+			if (wantLevel.Length > 0 && wantLevel != "ALL" && lvl.ToUpperInvariant() != wantLevel)
+			{
+				continue;
+			}
+			if (grep.Length > 0 && text.IndexOf(grep, StringComparison.OrdinalIgnoreCase) < 0)
+			{
+				continue;
+			}
+			kept.Add((seq, ts, lvl, text));
+		}
+		long firstAvail = (snap.Count > 0) ? snap[0].seq : (seqLast + 1);
+		Dictionary<string, object> common = new Dictionary<string, object>
+		{
+			["ok"] = true,
+			["boot"] = AppLog.BootId,
+			["ring"] = RunLogMaxLines,
+			["seq_first_available"] = firstAvail
+		};
 		if (after >= 0)
 		{
 			List<Dictionary<string, object>> picked = new List<Dictionary<string, object>>();
-			for (int i = 0; i < lines.Count; i++)
+			foreach ((long seq, DateTimeOffset ts, string lvl, string text) in kept)
 			{
-				long seq = firstSeq + i;
 				if (seq <= after)
 				{
 					continue;
@@ -10588,34 +10665,32 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				picked.Add(new Dictionary<string, object>
 				{
 					["seq"] = seq,
-					["text"] = lines[i]
+					["ts"] = ts.ToString("yyyy-MM-dd HH:mm:ss"),
+					["level"] = lvl,
+					["text"] = text
 				});
 			}
 			if (picked.Count > n)
 			{
 				picked = picked.GetRange(picked.Count - n, n);
 			}
-			return JsonSerializer.Serialize(new Dictionary<string, object>
-			{
-				["ok"] = true,
-				["count"] = picked.Count,
-				["after"] = ((picked.Count > 0) ? (long)picked[picked.Count - 1]["seq"] : after),
-				["lines"] = picked
-			}, AgentApi.JsonOpts);
+			// 游标落在已有缓冲之前 = 中间的行已被挤出(或进程重启过), 如实说出去
+			common["count"] = picked.Count;
+			common["after"] = ((picked.Count > 0) ? (long)picked[picked.Count - 1]["seq"] : after);
+			common["gap"] = (after < firstAvail - 1) || (after > seqLast);
+			common["lines"] = picked;
+			return JsonSerializer.Serialize(common, AgentApi.JsonOpts);
 		}
 		List<string> tail = new List<string>();
-		for (int i = Math.Max(0, lines.Count - n); i < lines.Count; i++)
+		for (int i = Math.Max(0, kept.Count - n); i < kept.Count; i++)
 		{
-			tail.Add(lines[i]);
+			tail.Add(kept[i].text);
 		}
-		return JsonSerializer.Serialize(new Dictionary<string, object>
-		{
-			["ok"] = true,
-			["count"] = tail.Count,
-			["lines"] = tail,
-			["seq_first"] = firstSeq,
-			["seq_last"] = seqLast
-		}, AgentApi.JsonOpts);
+		common["count"] = tail.Count;
+		common["lines"] = tail;
+		common["seq_first"] = (kept.Count > 0) ? kept[0].seq : firstAvail;
+		common["seq_last"] = seqLast;
+		return JsonSerializer.Serialize(common, AgentApi.JsonOpts);
 	}
 
 	private string AgentProfilesJson()

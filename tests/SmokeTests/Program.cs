@@ -127,7 +127,7 @@ internal static class Program
 
     private static void TestLogRotation()
     {
-        Console.WriteLine("[AppLog] 写入与轮转");
+        Console.WriteLine("[AppLog] 写入 / 轮转 / 脱敏 / 逐行时间戳");
         // 隔离到临时目录: 此前直接撑爆真实用户的 run.log(2MB 'x' 覆盖)且不可恢复。
         string realDir = LlamaDSH_Launcher.AppLog.LogDir;
         string dir = Path.Combine(Path.GetTempPath(), "LlamaDSH_smoketest_logs_" + Guid.NewGuid().ToString("N"));
@@ -141,13 +141,55 @@ internal static class Program
             long after = File.Exists(file) ? new FileInfo(file).Length : -1;
             Check("日志可写且长度增加", after > before, $"{before} -> {after}");
 
-            // 轮转：把文件撑到 2MB 以上再写一条，应生成 .1
+            // 轮转：撑到 4 MB 以上再写一条，应生成 .1；连续撑 4 次只保留 .1/.2/.3
             string big = Path.Combine(dir, "run.log");
-            string rolled = big + ".1";
-            File.WriteAllText(big, new string('x', 2 * 1024 * 1024 + 1024));
-            LlamaDSH_Launcher.AppLog.WriteRun("trigger-roll");
-            Check("超过 2MB 触发轮转为 .1", File.Exists(rolled));
-            Check("轮转后原文件变小", new FileInfo(big).Length < 2 * 1024 * 1024);
+            for (int i = 0; i < 4; i++)
+            {
+                File.WriteAllText(big, new string('x', 4 * 1024 * 1024 + 1024));
+                LlamaDSH_Launcher.AppLog.WriteRun("trigger-roll-" + i);
+            }
+            Check("超过 4MB 触发轮转为 .1", File.Exists(big + ".1"));
+            Check("历史保留 3 份(.1/.2/.3)", File.Exists(big + ".2") && File.Exists(big + ".3"));
+            Check("不无限累积历史", !File.Exists(big + ".4"));
+            Check("轮转后原文件变小", new FileInfo(big).Length < 4 * 1024 * 1024);
+
+            // run.log 逐行时间戳: 以前整段一次写, 只有首行带日期且那是落盘时刻,
+            // run.log 里出现 "[2026-11-09 02:35:48] [02:34:34] …" 的错位双戳
+            string run = File.ReadAllText(big);
+            int stamps = System.Text.RegularExpressions.Regex.Matches(run, @"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]").Count;
+            LlamaDSH_Launcher.AppLog.WriteRunLines(new[]
+            {
+                (Level: "INFO", Text: "普通一行"),
+                (Level: "ERROR", Text: "炸了"),
+                (Level: "WARN", Text: "小心")
+            });
+            run = File.ReadAllText(big);
+            Check("一次写多行 = 每行一个时间戳", System.Text.RegularExpressions.Regex.Matches(run, @"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]").Count == stamps + 3,
+                "stamps " + stamps + " -> " + System.Text.RegularExpressions.Regex.Matches(run, @"\[\d{4}-\d{2}-\d{2}").Count);
+            Check("ERROR/WARN 带级别标签, INFO 不带",
+                run.Contains("[ERROR] 炸了") && run.Contains("[WARN] 小心") && run.Contains("] 普通一行") && !run.Contains("[INFO] 普通一行"));
+
+            // 脱敏: DSH 启动横幅的 ?token= 会原样进日志, 还会被 agent logs / 复制诊断带走
+            Check("脱敏: URL 查询里的 token",
+                LlamaDSH_Launcher.AppLog.Redact("dsh web: http://127.0.0.1:3080/?token=abcDEF123_GH&x=1").Contains("‹已隐藏›")
+                && !LlamaDSH_Launcher.AppLog.Redact("http://127.0.0.1:3080/?token=abcDEF123_GH").Contains("abcDEF123_GH"));
+            Check("脱敏: JSON 里的 token 字段",
+                LlamaDSH_Launcher.AppLog.Redact("{\"token\":\"s3cr3tValue\"}").Contains("‹已隐藏›"));
+            Check("脱敏: Authorization Bearer",
+                LlamaDSH_Launcher.AppLog.Redact("Authorization: Bearer abcdefghijklmnop1234").Contains("‹已隐藏›"));
+            Check("落盘也过脱敏(不能只挡界面)",
+                !LlamaDSH_Launcher.AppLog.Tail("run.log", 4096).Contains("abcDEF123_GH")
+                || !File.ReadAllText(big).Contains("token=abcDEF123_GH"));
+            Check("Tail 只读末尾(不把整份日志读进内存)", LlamaDSH_Launcher.AppLog.Tail("run.log", 64).Length <= 64);
+
+            // 历史日志里已落盘的凭据要被抹掉: 只挡"今后不写"不够, 复制诊断会把尾部原样带走
+            string leak = Path.Combine(dir, "crash.log");
+            File.WriteAllText(leak, "[2026-11-09 09:00:00] [dsh] dsh web: http://127.0.0.1:3080/?token=LEAKme123456\n");
+            File.WriteAllText(leak + ".1", "[2026-11-08 09:00:00] Bearer LEAKold99999888\n");
+            LlamaDSH_Launcher.AppLog.ScrubExisting();
+            Check("启动时清掉历史日志里的凭据(含滚动出的 .1)",
+                !File.ReadAllText(leak).Contains("LEAKme123456") && !File.ReadAllText(leak + ".1").Contains("LEAKold99999888")
+                && File.ReadAllText(leak).Contains("‹已隐藏›"));
         }
         finally
         {
@@ -164,6 +206,7 @@ internal static class Program
         Check("含上下文", text.Contains("这是一条测试错误"));
         Check("含环境信息", text.Contains("系统:") && text.Contains("运行时:") && text.Contains("程序版本:"));
         Check("含日志目录", text.Contains("日志目录:"));
+        Check("含本次启动标识(客户端据此发现进程重启)", text.Contains("本次启动:"));
         Check("长度合理", text.Length > 100, "len=" + text.Length);
     }
 

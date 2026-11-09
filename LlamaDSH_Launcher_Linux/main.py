@@ -611,12 +611,17 @@ def api_status(_):
 
 
 def api_logs(body):
-    """运行日志读取: 游标(after)与尾部(n)两种口径同用一个端点。
+    """运行日志读取: 游标(after)与尾部(n)两种口径同用一个端点, 另有 level/grep 过滤。
 
     Windows 侧是 GET /api/logs?n=200(纯尾部), Linux 侧历来是 POST {"after":N}(增量游标)。
     调用方(双端互查的脚本、cli)不该为同一个端点写两套分支, 所以两个参数都收:
-    给了 n 就按"尾部 N 条"取(仍走同一个 seq 计数器, 返回结构不变: lines 带 seq/text),
+    给了 n 就按"尾部 N 条"取(仍走同一个 seq 计数器, 返回结构不变: lines 带 seq/level/text),
     这样 n 与 after 也能叠用 = "游标之后的尾部 N 条"(与 Windows 的 after 分支同口径)。
+
+    level(error/warn/info, 大小写不敏感;省略或 all = 不过滤)与 grep(子串, 大小写不敏感)
+    必须先过滤再截尾部 N 条, 否则命中行会在过滤前就被截掉。
+    boot / seq_first_available / gap 是给轮询客户端的: seq 每次进程启动都从 1 重来,
+    客户端手上的 after 是上一轮的大数时会永久返回空且不报错 —— 比对 boot 就知道重启过了。
     """
     try:
         after = int(body.get("after") or 0)
@@ -626,13 +631,31 @@ def api_logs(body):
     if n is None:
         limit = 400
     else:
+        # 上限 2000 与 Windows 同口径(环形缓冲本身也只有 2000 条)
         try:
-            # 上限 2000 与 Windows 同口径(环形缓冲本身也只有 2000 条)
             limit = max(1, min(int(n), 2000))
         except (TypeError, ValueError):
             limit = 200
-    items, new_after = HUB.since(after, limit)
-    return {"lines": [{"seq": s, "text": t} for s, t in items], "after": new_after}
+    want = str(body.get("level") or "").strip().upper()
+    if want == "WARNING":                      # Windows 侧同口径: WARNING 归一成 WARN
+        want = "WARN"
+    needle = str(body.get("grep") or "")
+    low = needle.lower()
+    items, _ = HUB.since(after, HUB.RING_SIZE)   # 先拿游标之后的全部, 过滤后再截尾部
+    kept = [it for it in items
+            if (not want or want == "ALL" or it[1] == want)
+            and (not needle or low in it[2].lower())]
+    if len(kept) > limit:
+        kept = kept[-limit:]
+    first_avail = HUB.seq_first_available()
+    return {"lines": [{"seq": s, "level": lv, "text": t} for s, lv, t in kept],
+            "count": len(kept),
+            "after": (kept[-1][0] if kept else after),
+            "boot": HUB.boot,
+            "ring": HUB.RING_SIZE,
+            "seq_first_available": first_avail,
+            # 游标落在现存缓冲之前 = 中间的行已被挤出环(重启另看 boot)
+            "gap": after < first_avail - 1}
 
 
 def api_logs_clear(_):

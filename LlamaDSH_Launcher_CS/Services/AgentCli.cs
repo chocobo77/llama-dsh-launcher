@@ -130,13 +130,44 @@ public static class AgentCli
 				return true;
 			case "logs":
 			{
+				// cli logs [行数] [level=error|warn|info] [grep=文本] [after=序号]
+				// after= 是增量游标: 响应里的 boot/gap 用来发现"启动器重启过, 游标已失效"
 				int n = 200;
-				if (rest.Length > 0 && (!int.TryParse(rest[0], out n) || n < 1 || n > 2000))
+				string q = "";
+				foreach (string tok in rest)
 				{
-					error = "logs 行数需为 1~2000";
-					return false;
+					int eq = tok.IndexOf('=');
+					if (eq <= 0)
+					{
+						if (!int.TryParse(tok, out n) || n < 1 || n > 2000)
+						{
+							error = "logs 行数需为 1~2000";
+							return false;
+						}
+						continue;
+					}
+					string key = tok.Substring(0, eq).ToLowerInvariant();
+					string val = tok.Substring(eq + 1);
+					if (key == "level" || key == "grep")
+					{
+						q += "&" + key + "=" + Uri.EscapeDataString(val);
+					}
+					else if (key == "after")
+					{
+						if (!long.TryParse(val, out long af) || af < 0)
+						{
+							error = "logs after 需为非负整数";
+							return false;
+						}
+						q += "&after=" + af;
+					}
+					else
+					{
+						error = "logs 不支持参数 " + key + "（可用: 行数 / level= / grep= / after=）";
+						return false;
+					}
 				}
-				path = "logs?n=" + n;
+				path = "logs?n=" + n + q;
 				return true;
 			}
 			case "profiles":
@@ -378,7 +409,7 @@ public static class AgentCli
 
   status                 全量状态快照(llama/dsh/GPU/熔断/轻量档/方案/路径)
   monitor                监控页同款数据(采样字典+GPU+slots+速度历史)
-  logs [行数]            运行日志尾部(默认 200, 上限 2000)
+  logs [行数] [level=error|warn|info] [grep=文本] [after=序号]   运行日志(游标增量; 响应含 boot/ring/gap)
   profiles               方案列表与全部配置
   profile use <名>       切换方案
   breaker                查询显存熔断; on|off 开关; set pct|gb <值> 设阈值

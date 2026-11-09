@@ -7,7 +7,7 @@ const $ = (id) => document.getElementById(id);
 let SCHEMA = { groups: [], params: [] };
 let CFG = { Profiles: {}, CurrentProfile: "默认方案" };
 let PROF = null;
-let LOG_AFTER = 0, LOG_LINES = [];
+let LOG_AFTER = 0, LOG_LINES = [], LOG_BOOT = "";
 let CFG_DIR = "";
 let FLAG_ARGS = {};          // 逐参数发射片段(preview 下发)
 let LAST_TOTAL_EVENTS = -1;  // 事件流增量指纹(4bf9416: 单调序号)
@@ -521,9 +521,19 @@ async function editCustomArgs() {
 async function pollLogs() {
   try {
     const r = await api("logs", { after: LOG_AFTER });
+    // 游标 seq 每次服务端重启都从 1 重来: 手上的 after 会永远大于新的 seq_last,
+    // 于是日志面板静默冻结(看不出是没日志还是收不到了)。boot 变了或 gap=true
+    // 都表示游标作废, 归零重收并清掉面板, 免得把旧内容再堆一份。
+    if ((r.boot && r.boot !== LOG_BOOT) || r.gap) {
+      LOG_BOOT = r.boot || "";
+      LOG_AFTER = 0;
+      LOG_LINES = [];
+      $("logArea").value = "";
+      return;
+    }
     if (r.lines && r.lines.length) {
       LOG_AFTER = r.after;
-      for (const l of r.lines) LOG_LINES.push(l.text);
+      for (const l of r.lines) LOG_LINES.push((l.level && l.level !== "INFO") ? ("[" + l.level + "] " + l.text) : l.text);
       if (LOG_LINES.length > 4000) LOG_LINES = LOG_LINES.slice(-3500);
       $("logArea").value = LOG_LINES.join("\n");
       if ($("chkAutoScroll").checked) { $("logArea").scrollTop = $("logArea").scrollHeight; }

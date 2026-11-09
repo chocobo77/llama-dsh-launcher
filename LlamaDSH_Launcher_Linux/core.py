@@ -107,25 +107,38 @@ def _abs_exe(name):
 # ===================================================================== 日志 ==
 
 class LogHub:
-    """UI 日志环形缓冲(2000 条,seq 增量读取,非破坏性,支持多消费者)+ run.log 环。"""
+    """UI 日志环形缓冲(2000 条,seq 增量读取,非破坏性,支持多消费者)+ run.log 环。
+
+    ring 里是 (seq, level, text)。seq 每次进程启动都从 1 重来, 单靠它无法表达"换了一轮":
+    客户端手上的 after 是上一轮的大数时会永久返回空且不报错, 所以 boot/seq_first_available
+    必须一起出现在 logs 响应里, 让客户端发现重启并重置游标。
+    """
+
+    RING_SIZE = 2000
 
     def __init__(self):
-        self.ring = collections.deque(maxlen=2000)
+        self.ring = collections.deque(maxlen=self.RING_SIZE)
         self.run = collections.deque(maxlen=5000)
         self.seq = 0
+        # 进程内固定: 同一次启动里所有 logs 响应的 boot 相同, 换进程必变
+        self.boot = time.strftime("%Y%m%d%H%M%S") + "-" + str(os.getpid())
+        self.dsh_boot_log = ""      # DshRunner 启动 DSH 时写入; 空 → 折叠行不带"全文见"
         self._last_line = ""
         self._dsh_hidden = 0
 
-    def _emit(self, text):
+    def _emit(self, text, level="INFO"):
         self.seq += 1
-        self.ring.append((self.seq, text))
+        self.ring.append((self.seq, level, text))
 
     # 去重只该吞"刷屏"的重复行。收尾/退出这类一行代表**一次请求**的行被吞掉, 就会让
     # "为什么又没退成功"在 run.log 里完全看不见(连点两次"关闭服务并退出", 第二次零痕迹,
     # 现场排障时只能看到一次请求, 误判成"请求根本没到服务端")。
     _DEDUP_EXEMPT = ("[Perf] Error", "[退出]", "[收到 SIGINT]", "[收到 SIGTERM]")
 
-    def log(self, text):
+    def log(self, text, level=None):
+        """进环形缓冲并落 run.log。level 缺省 INFO;ERROR/WARN 给文本打标签。"""
+        text = applog.redact(text)
+        level = (level or "INFO").upper()
         if text == self._last_line and not text.startswith(self._DEDUP_EXEMPT):
             return
         self._last_line = text
@@ -134,25 +147,40 @@ class LogHub:
             self._dsh_hidden += 1
             return
         if self._dsh_hidden:
-            self._emit("[dsh] ……(已隐藏 %d 行非日志内容)" % self._dsh_hidden)
+            hint = (", 全文见 %s" % self.dsh_boot_log) if self.dsh_boot_log else ""
+            self._emit("[dsh] ……(已隐藏 %d 行非日志内容%s)" % (self._dsh_hidden, hint))
             self._dsh_hidden = 0
-        self._emit(text)
+        # 标签只加一次: 调用方手写的 "[ERROR] " 不重复叠加
+        if level in ("ERROR", "WARN") and not text.startswith("[%s]" % level):
+            text = "[%s] %s" % (level, text)
+        self._emit(text, level)
         self.run.append("[%s] %s" % (ts, text))
         applog.run(text)      # applog 自己带日期: 再传一遍时间戳会在 run.log 里双戳
+
+    def warn(self, text):
+        self.log(text, "WARN")
 
     def error_ex(self, ex, ctx):
         applog.error_ex(ex, ctx)
         import traceback
         tb = traceback.format_exc().splitlines()[:3]
-        self.log("[ERROR] %s: %s: %s" % (ctx, type(ex).__name__, ex))
+        self.log("%s: %s: %s" % (ctx, type(ex).__name__, ex), "ERROR")
         for ln in tb:
-            self.log("    " + ln)
+            self.log("    " + ln, "ERROR")
 
     def since(self, after, max_items=400):
+        """游标之后的条目, 元素是 (seq, level, text);返回 (条目, 新游标)。"""
         out = [it for it in self.ring if it[0] > after]
         if len(out) > max_items:
             out = out[-max_items:]
         return out, (out[-1][0] if out else after)
+
+    def seq_first_available(self):
+        """环里现存的最小 seq;环空时给 seq+1, 与"游标之后没有行"口径一致。
+
+        客户端拿它和手上的 after 一比就知道中间的行是被挤出了环还是进程重启过。
+        """
+        return self.ring[0][0] if self.ring else self.seq + 1
 
 
 # ================================================================ Llama ====
@@ -757,6 +785,8 @@ class DshRunner:
     def _spawn(self, argv, detached=True, cwd=None):
         try:
             fh = open(DSH_BOOT_LOG, "ab")
+            # 折叠掉的非日志行只进了这个文件; 汇总行要能把用户指到全文所在
+            self.hub.dsh_boot_log = DSH_BOOT_LOG
             kwargs = {}
             if detached:
                 kwargs["start_new_session"] = True

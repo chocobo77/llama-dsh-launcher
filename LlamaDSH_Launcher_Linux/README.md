@@ -59,6 +59,14 @@ python3 main.py            # 默认端口 8788,被占用自动 +1
 - 所有 JSON 响应(含 4xx/5xx 与业务失败)都带 `ok`:业务失败 = HTTP 200 + `ok:false + error`,
   处理器抛异常 = 500 + `ok:false`。退出端点是 `quit`(`{"stop_services":true|false}`,默认停服务),
   `shutdown` 作为历史别名保留。
+- `logs` 除 `n`/`after` 外还收 `level`(`error`/`warn`/`info`,大小写不敏感)与 `grep`(子串,
+  大小写不敏感),过滤发生在截尾部 N 条之前;每条行带 `level`。响应另有 `boot`(本次启动标识,
+  `%Y%m%d%H%M%S`-`pid`)、`ring`、`seq_first_available`、`gap`:`seq` 每次进程启动从 1 重来,
+  轮询方看到 `boot` 变了必须把游标归零,否则会永久读到空列表且不报错。
+- 日志文本在进环形缓冲与落盘前一律脱敏(URL `?token=`、JSON `"token": "…"`、`Bearer …` 三种形态
+  换成 `‹已隐藏›`)——DSH 启动横幅 `dsh web: http://127.0.0.1:3080/?token=…` 实测明文进过 run.log
+  和 logs 响应;真 token 只从 `agent.json` 取。落盘的 ERROR/WARN 行带 `[ERROR]`/`[WARN]` 标签,
+  INFO 不带(肉眼可读),按级别筛用 `level=`。
 
 ```bash
 curl -s http://127.0.0.1:8788/api/ping                    # 免 token 探活
@@ -189,8 +197,11 @@ DSH 兼容服务中的入口注入改写(词法机)、死依赖全量扫描为�
 - `~/.llamadsh_config_path.json`、`~/.dsh_launcher_state.json`、`~/.llamadsh_dsh_build.json`
 - `~/.llamadsh/params_override.yml`(override 层支持 subgroup/offValue/offFlag/wide)
 - `~/.dsh/pinned_plugins.json`、`~/.dsh/profiles/web/{package.json,compatibility.json,…}`
-- `~/.dsh_launcher_logs/{info,run,error,crash}.log`;`agent.json`(0600,端口+token+enabled,
+- `~/.dsh_launcher_logs/{info,run,error,crash}.log`(单文件超过 4 MiB 滚动出 `.1/.2/.3`,共保留
+  3 份历史,`.1` 最新);`agent.json`(0600,端口+token+enabled,
   与 Windows 同字段)、`~/.dsh_launcher_token`(0600,旧版纯文本 token,向后兼容)
+- DSH 的分离启动全量输出在 `$TMPDIR/llamadsh-<uid>/dsh_boot.log`(0700 私有命名空间);
+  界面日志里被折叠成"已隐藏 N 行非日志内容"的那些行,汇总行会指名这份文件,全文在里面
 - llama.cpp 变体建议目录:`~/llama.cpp-<owner>`(与现有目录并排);更新临时:
   `~/.cache/llamadsh/updates`
 
