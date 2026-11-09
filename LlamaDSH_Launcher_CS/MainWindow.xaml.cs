@@ -1533,7 +1533,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			_llamaUpdBusy = true;
 			ok.IsEnabled = false;
 			ok.Content = "⏳ 获取版本...";
-			var latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease(repo, LlamaBackendPreference()));
+			string backendSel = ResolveBackend();
+			Log("[后端] 安装变体按 " + backendSel + " 取预编译包（" + (ComboBackendChoice().Length > 0 ? "方案显式选择" : "按显卡自动") + "）");
+			var latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease(repo, backendSel));
 			if (latest == null)
 			{
 				_llamaUpdBusy = false;
@@ -1891,7 +1893,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			SetLlamaUpdBtn(true, "⏳ 检查中...");
 			int? local = await Task.Run(() => UpdateService.GetLocalLlamaBuild(dir));
 			string repo = CurrentLlamaRepo();
-			Services.UpdateService.LlamaReleaseInfo? latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease(repo, LlamaBackendPreference()));
+			string backendUpd = ResolveBackend();
+			Services.UpdateService.LlamaReleaseInfo? latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease(repo, backendUpd));
 			SetLlamaUpdBtn(false);
 			if (latest == null)
 			{
@@ -7677,6 +7680,80 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		return "vulkan";
 	}
 
+	// 方案里显式选的后端(""=自动); 生效后端 = 显式优先, 否则按厂商探测
+	private bool _backendGuard;
+
+	/// <summary>读下拉框里的显式选择。必须在 UI 线程调用(读 WPF 控件)。</summary>
+	private string ComboBackendChoice()
+	{
+		if (ComboLlamaBackend?.SelectedItem is not System.Windows.Controls.ComboBoxItem item)
+		{
+			return "";
+		}
+		return BackendChoice.Normalize(item.Tag as string);
+	}
+
+	/// <summary>按方案值选下拉项; 不认识的值(或旧配置里没这个字段)落回「自动」。</summary>
+	private void SetComboBackendChoice(string choice)
+	{
+		string want = BackendChoice.Normalize(choice);
+		_backendGuard = true;
+		int idx = 0;
+		if (ComboLlamaBackend != null)
+		{
+			for (int i = 0; i < ComboLlamaBackend.Items.Count; i++)
+			{
+				if (ComboLlamaBackend.Items[i] is System.Windows.Controls.ComboBoxItem it
+					&& BackendChoice.Normalize(it.Tag as string) == want)
+				{
+					idx = i;
+					break;
+				}
+			}
+			ComboLlamaBackend.SelectedIndex = idx;
+		}
+		_backendGuard = false;
+		RefreshBackendHint();
+	}
+
+	/// <summary>把「生效后端」写进旁边的说明, 免得用户选完不知道实际取哪个包。</summary>
+	private void RefreshBackendHint()
+	{
+		if (LblBackendHint == null)
+		{
+			return;
+		}
+		LblBackendHint.Text = BackendChoice.Hint(ComboBackendChoice(), LlamaBackendPreference());
+	}
+
+	private void LlamaBackend_Changed(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+	{
+		if (_backendGuard)
+		{
+			return;
+		}
+		string c = ComboBackendChoice();
+		RefreshBackendHint();
+		string label = (c.Length > 0) ? c : ("自动(" + LlamaBackendPreference() + ")");
+		string note = IsLlamaRunning() ? "；正在跑的 Llama 仍用当前目录里的二进制，下次检查更新/安装变体时才按新后端取包" : "";
+		Log("[后端] llama.cpp 预编译后端已设为 " + label + note);
+		try
+		{
+			_profiles[_currentProfile] = BuildConfig();
+			SaveConfigFile();
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "保存 Llama 后端选择");
+		}
+	}
+
+	/// <summary>当前生效的后端(供下载/检查更新用)。必须在 UI 线程调用; 后台线程请用 BackendChoice.Resolve(读到的 choice, 探测值)。</summary>
+	private string ResolveBackend()
+	{
+		return BackendChoice.Resolve(ComboBackendChoice(), LlamaBackendPreference());
+	}
+
 	// 真进度条: pct 有值=决定填充, 无值=不定态滑块
 	private void SetMonBar(bool active, System.Windows.Media.Color tone, double? pct)
 	{
@@ -8937,6 +9014,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			MmprojUrl = InputMmprojUrl.Text,
 			NoMmprojOffload = (ChkNoMmprojOffload.IsChecked == true),
 			LlamaDir = InputLlamaDir.Text,
+			LlamaBackend = ComboBackendChoice(),
 			LlamaVariants = _llamaVariants,
 			ActiveLlamaVariant = _activeVariant,
 			DshDir = InputDshDir.Text,
@@ -9032,6 +9110,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		ChkNoMmprojOffload.IsChecked = c.NoMmprojOffload;
 		InputLlamaDir.Text = c.LlamaDir;
 		LoadLlamaVariants(c);
+		SetComboBackendChoice(c.LlamaBackend);
 		InputDshDir.Text = c.DshDir;
 		ComboDshMode.SelectedIndex = c.DshMode;
 		ChkDshAdmin.IsChecked = c.DshAdminMode;
@@ -10107,7 +10186,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			llamaDir = Toolchain.NormalizeDir(InputLlamaDir.Text);
 			dshDir = EffectiveDshDir();
-			backend = LlamaBackendPreference();
+			backend = ResolveBackend();
 			return 0;
 		}, 5000);
 		string dir = (!string.IsNullOrWhiteSpace(dirArg)) ? Toolchain.NormalizeDir(dirArg) : ((target == "llama") ? llamaDir : dshDir);
@@ -10166,7 +10245,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			llamaDir = Toolchain.NormalizeDir(InputLlamaDir.Text);
 			dshDir = EffectiveDshDir();
-			backend = LlamaBackendPreference();
+			backend = ResolveBackend();
 			llamaRunning = IsAlive(_llamaProc);
 			dshRunning = HasDsh();
 			return 0;
@@ -10405,7 +10484,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				["llama_dir"] = pc.LlamaDir,
 				["dsh_dir"] = pc.DshDir,
 				["active_variant"] = pc.ActiveLlamaVariant,
-				["variants"] = pc.LlamaVariants
+				["variants"] = pc.LlamaVariants,
+				// 后端选择口径与 Linux 侧 toolchain/variants 的字段名一致: 生效值 / 自动探测值 / 方案里的显式选择(""=自动)
+				["backend"] = BackendChoice.Resolve(pc.LlamaBackend, LlamaBackendPreference()),
+				["backend_auto"] = LlamaBackendPreference(),
+				["backend_choice"] = BackendChoice.Normalize(pc.LlamaBackend)
 			},
 			// Linux 侧 status 里 profile 只是一个名字字符串；两个口径并存
 			["profile_name"] = _currentProfile,

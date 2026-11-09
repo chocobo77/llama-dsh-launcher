@@ -50,6 +50,7 @@ internal static class Program
         TestAgentCliParse();
         TestAgentApiHttp();
         TestDshIdentityJudge();
+        TestBackendChoice();
         TestProcLiveness();
 
         Console.WriteLine();
@@ -346,6 +347,58 @@ internal static class Program
     /// 显存熔断、退出回调)随即抛 InvalidOperationException，且最先抛的位置正好在
     /// "清理字段"之前 → 每 3 秒一次未处理异常刷屏，模型启动失败的真正原因反而看不到。
     /// </summary>
+    /// <summary>
+    /// llama.cpp 预编译后端选择口径(Windows/Linux 共用同一方案字段 LlamaBackend)。
+    /// 资产名用真实 release(llama-b12212)的那一份: 资产改名过(-win-cpu-x64 取代 avx2-x64)、
+    /// ROCm 名字带 ROCm 版本(-win-rocm-10.0-x64), token 一漂移就会静默装错后端。
+    /// </summary>
+    private static void TestBackendChoice()
+    {
+        Console.WriteLine("[BackendChoice] llama.cpp 后端选择与预编译包 token");
+        Check("空选择走自动探测", LlamaDSH_Launcher.BackendChoice.Resolve("", "vulkan") == "vulkan");
+        Check("显式选择压过自动探测", LlamaDSH_Launcher.BackendChoice.Resolve("rocm", "vulkan") == "rocm");
+        Check("大小写/空白规范化", LlamaDSH_Launcher.BackendChoice.Normalize(" ROCm ") == "rocm");
+        Check("不认识的值落回自动", LlamaDSH_Launcher.BackendChoice.Normalize("metal") == ""
+            && LlamaDSH_Launcher.BackendChoice.Resolve("metal", "sycl") == "sycl");
+        Check("自动探测也拿不到时兜底 vulkan", LlamaDSH_Launcher.BackendChoice.Resolve("", "") == "vulkan");
+
+        string[] real = {
+            "llama-b12212-bin-win-cpu-arm64.zip", "llama-b12212-bin-win-cpu-x64.zip",
+            "llama-b12212-bin-win-cuda-12.4-x64.zip", "llama-b12212-bin-win-cuda-13.5-arm64.zip",
+            "llama-b12212-bin-win-cuda-13.5-x64.zip", "llama-b12212-bin-win-opencl-adreno-arm64.zip",
+            "llama-b12212-bin-win-openvino-2026.4.1-x64.zip", "llama-b12212-bin-win-rocm-10.0-x64.zip",
+            "llama-b12212-bin-win-sycl-x64.zip", "llama-b12212-bin-win-vulkan-arm64.zip",
+            "llama-b12212-bin-win-vulkan-x64.zip", "llama-b12212-xcframework.zip",
+        };
+        Func<string, string> pick = delegate(string backend)
+        {
+            string[] chain = LlamaDSH_Launcher.BackendChoice.FallbackTokens(backend);
+            foreach (string token in chain)
+            {
+                foreach (string n in real)
+                {
+                    if (n.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        return n;
+                    }
+                }
+            }
+            return "";
+        };
+        Check("ROCm 取到带 ROCm 版本号的资产", pick("rocm") == "llama-b12212-bin-win-rocm-10.0-x64.zip", pick("rocm"));
+        Check("Vulkan 不抓成 vulkan-arm64", pick("vulkan") == "llama-b12212-bin-win-vulkan-x64.zip", pick("vulkan"));
+        Check("SYCL 取 sycl-x64", pick("sycl") == "llama-b12212-bin-win-sycl-x64.zip", pick("sycl"));
+        Check("CUDA 走 cuda- token 且抓 x64", pick("cuda") == "llama-b12212-bin-win-cuda-12.4-x64.zip", pick("cuda"));
+        Check("ROCm 缺失时回退 Vulkan 而非 CPU",
+            LlamaDSH_Launcher.BackendChoice.FallbackTokens("rocm")[1] == "vulkan-x64"
+            && LlamaDSH_Launcher.BackendChoice.FallbackTokens("rocm")[2] == "cpu-x64");
+        Check("自动/未知后端链里保留 rocm 兜底",
+            Array.IndexOf(LlamaDSH_Launcher.BackendChoice.FallbackTokens(""), "rocm-") > 0);
+        Check("说明文案区分手动与自动",
+            LlamaDSH_Launcher.BackendChoice.Hint("rocm", "vulkan").Contains("手动")
+            && LlamaDSH_Launcher.BackendChoice.Hint("", "cuda").Contains("自动检测"));
+    }
+
     private static void TestProcLiveness()
     {
         Console.WriteLine("[ProcLiveness] 进程对象脱钩后的判定");

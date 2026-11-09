@@ -284,13 +284,14 @@ public static class UpdateService
 				digests[name] = aDigest;
 			}
 		}
-		// 按显卡挑后端: NVIDIA=CUDA(取最高版本), Intel=SYCL(原生低比特内核), AMD/默认=Vulkan; 依次回退
-		(string name, string url, string digest)? chosen = backend switch
+		// 按后端挑预编译包: CUDA 取版本号最高的 cuda-X.Y-x64; 其余按 BackendChoice 的 token 链逐级回退。
+		// 后端可以是方案里显式选的(自动/vulkan/rocm/cuda/sycl), 也可以是按显卡厂商自动探测的。
+		(string name, string url, string digest)? chosen = (backend == "cuda") ? PickCudaAsset(cands) : null;
+		string[] chain = BackendChoice.FallbackTokens(backend);
+		for (int ci = 0; ci < chain.Length && chosen == null; ci++)
 		{
-			"sycl" => PickAsset(cands, "sycl-x64") ?? PickAsset(cands, "vulkan-x64") ?? PickAsset(cands, "avx2-x64"),
-			"cuda" => PickCudaAsset(cands) ?? PickAsset(cands, "vulkan-x64") ?? PickAsset(cands, "avx2-x64"),
-			_ => PickAsset(cands, "vulkan-x64") ?? PickAsset(cands, "avx2-x64"),
-		};
+			chosen = PickAsset(cands, chain[ci]);
+		}
 		chosen ??= cands.Count > 0 ? cands[0] : null;
 		if (chosen == null)
 		{

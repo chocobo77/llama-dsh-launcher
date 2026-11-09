@@ -4646,6 +4646,47 @@ for _i29 in range(50):
 _n29 = len([t for (_s, _l, t) in _h29f.since(0)[0] if "重复刷屏哨兵" in t])
 check("同一异常连报 50 次时环形缓冲不得全额堆同一份(去重必须生效)", _n29 < 50, "ring 里有 %d 条" % _n29)
 
+# 29.8 llama.cpp 后端选择(与 Windows 侧「Llama 后端」下拉共用方案字段 LlamaBackend)。
+#      status 必须给出 backend/backend_auto/backend_choice 三件套; 自动探测要进程内缓存,
+#      因为探测跑 nvidia-smi -L 与 lspci(各最多 10 秒), 而状态页每 2 秒轮询一次 status。
+check("toolchain.backend_preference 带进程内缓存与 refresh 逃生门",
+      "_backend_pref_cache" in io.open("toolchain.py", encoding="utf-8").read()
+      and "refresh=True" in io.open("toolchain.py", encoding="utf-8").read(),
+      "未见缓存")
+_main29_be = io.open("main.py", encoding="utf-8").read()
+check("api_status 暴露 backend/backend_auto/backend_choice(字段名与 Windows status 一致)",
+      '"backend": toolchain.resolve_backend(prof)' in _main29_be
+      and '"backend_auto": toolchain.backend_preference()' in _main29_be
+      and '"backend_choice":' in _main29_be, "status 缺后端三件套")
+
+
+class _BeProbeStub:
+    calls = 0
+
+    def gpu_vendor_for_backend(self):
+        _BeProbeStub.calls += 1
+        return "vulkan"
+
+
+_tc_be_real = toolchain.monitor
+toolchain.monitor = _BeProbeStub()
+toolchain._backend_pref_cache = None
+try:
+    _b1_be = toolchain.backend_preference()
+    _b2_be = toolchain.backend_preference()
+    check("自动探测只跑一次外部命令, 第二次走缓存(状态页 2s 轮询不能每次都 lspci)",
+          _BeProbeStub.calls == 1 and _b1_be == _b2_be == "vulkan", "calls=%d" % _BeProbeStub.calls)
+    toolchain.backend_preference(refresh=True)
+    check("refresh=True 能强制重探", _BeProbeStub.calls == 2, "calls=%d" % _BeProbeStub.calls)
+    check("显式后端压过自动探测(rocm 在 RDNA3 上常快于 Vulkan)",
+          toolchain.resolve_backend({"LlamaBackend": " ROCm "}) == "rocm", "")
+    check("空/未知后端回落到自动探测值",
+          toolchain.resolve_backend({"LlamaBackend": ""}) == "vulkan"
+          and toolchain.resolve_backend({"LlamaBackend": "metal"}) == "vulkan", "")
+finally:
+    toolchain.monitor = _tc_be_real
+    toolchain._backend_pref_cache = None
+
 shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)
 

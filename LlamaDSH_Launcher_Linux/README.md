@@ -107,6 +107,9 @@ curl -s -H "X-Auth: $TOK" http://127.0.0.1:8788/api/job?id=1   # 任务模型轮
 - **后端切换**(2026-10-31 增补):运行环境页「llama 后端」下拉——自动(按显卡)/
   Vulkan/ROCm/CUDA/SYCL;选择存方案 `LlamaBackend`,变体安装/检查更新/更新链全部
   遵循;ROCm 资产名带版本(`rocm-10.0-x64`),匹配 token 用 `rocm-`。
+  `/api/status` 顶层给 `backend`/`backend_auto`/`backend_choice` 三件套(与 Windows 的
+  `status.profile` 同名,见 docs/API-CONTRACT.md);自动探测在进程内缓存(探测要跑
+  nvidia-smi -L 与 lspci,状态页 2 秒一轮不能每次都跑),`backend_preference(refresh=True)` 强制重探。
 - 变体 = 独立目录,存于方案 `LlamaVariants`;激活切换 = 切 `LlamaDir`(运行中禁切);
   旧配置自动迁移"标准 llama.cpp"。
 - 仓库链接解析(f3374cf 最终算法):主页/.git/tree/releases 深链/裸 owner/repo。

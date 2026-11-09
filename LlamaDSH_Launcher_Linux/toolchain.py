@@ -338,12 +338,22 @@ def find_llama_server_exe(llama_dir):
 
 # ------------------------------------------------------------ 后端挑选 ----
 
-def backend_preference():
-    """显卡 → 后端: NVIDIA=cuda, Intel=sycl, AMD/默认=vulkan(52d1f36 Linux 化)。"""
-    try:
-        return monitor.gpu_vendor_for_backend()
-    except Exception:
-        return "vulkan"
+_backend_pref_cache = None
+
+
+def backend_preference(refresh=False):
+    """显卡 → 后端: NVIDIA=cuda, Intel=sycl, AMD/默认=vulkan(52d1f36 Linux 化)。
+
+    探测要跑 nvidia-smi -L 与 lspci(各自最多 10 秒), 而状态页每 2 秒就轮询一次 status,
+    所以进程内只探一次并缓存; 换显卡或装完驱动重启启动器才会变。要强制重探传 refresh=True。
+    """
+    global _backend_pref_cache
+    if _backend_pref_cache is None or refresh:
+        try:
+            _backend_pref_cache = monitor.gpu_vendor_for_backend()
+        except Exception:
+            _backend_pref_cache = "vulkan"
+    return _backend_pref_cache
 
 
 VALID_BACKENDS = ("vulkan", "rocm", "cuda", "sycl")

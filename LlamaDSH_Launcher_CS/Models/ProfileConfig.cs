@@ -26,6 +26,12 @@ public class ProfileConfig
 
 	public string LlamaDir { get; set; } = "";
 
+	/// <summary>
+	/// llama.cpp 预编译后端: ""=按显卡自动, 可显式 vulkan/rocm/cuda/sycl。
+	/// 与 Linux 侧同一个字段同名同义(那边见 state.py 默认方案), 只影响下载哪个预编译包。
+	/// </summary>
+	public string LlamaBackend { get; set; } = "";
+
 	public string DshDir { get; set; } = "";
 
 	public int DshMode { get; set; }

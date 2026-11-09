@@ -39,6 +39,14 @@ DSH 有启动 Web、停止、重建、打开网页。启动方式有三种：编
 
 需要提权的时候勾「以管理员身份启动 DSH」，启动时弹 UAC。
 
+### Llama 后端与预编译包
+
+「程序目录」区里有个「Llama 后端」下拉：自动（按显卡检测）、Vulkan、ROCm、CUDA、SYCL。它只决定**检查更新 / 安装变体时下载哪个预编译包**，不改命令行参数，也不影响正在运行的进程。
+
+自动口径是 NVIDIA→CUDA、Intel→SYCL、AMD 或认不出来→Vulkan。AMD RDNA3 上 ROCm 构建通常比 Vulkan 快，NVIDIA 机器有时反倒想用 Vulkan 避开 cudart 缺库，所以能显式指定（ROCm 的资产名带 ROCm 版本，如 `llama-b12110-bin-win-rocm-10.0-x64.zip`）。旁边一行写清当前生效值：`生效: rocm（手动）` 或 `生效: vulkan（自动检测）`。挑包时逐级回退（如 ROCm 缺失退回 Vulkan，再退回 CPU 包）。
+
+选择存在方案里，字段名两端一致（`LlamaBackend`，空=自动）：Windows 选完 Linux 认，Linux 选完 Windows 也认。`/api/status` 给出三件套 `backend`(生效) / `backend_auto`(探测值) / `backend_choice`(方案里的显式选择)。
+
 ### 日志与诊断
 
 底部日志区实时显示子进程输出，能自动滚动、清空、打开日志目录。连续重复的行会折叠；DSH 的纯噪音行折成一行计数，并写明全文在哪个 boot log 里。

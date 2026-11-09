@@ -172,7 +172,7 @@
               <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
                 <Button Content="浏览..." Margin="4,0,0,0" Click="BrowseLlama_Click" />
                 <Button Name="BtnSearchLlama" Content="🔍 自动检索" Margin="4,0,0,0" ToolTip="自动检索 llama-server.exe 所在目录" Click="SearchLlama_Click" />
-                <Button Name="BtnCheckLlamaUpdate" Content="🔄 检查更新" Margin="4,0,0,0" ToolTip="检查 llama.cpp 最新预编译版并覆盖更新（Vulkan-x64，需先停止 Llama 服务，不触碰模型）" Click="CheckLlamaUpdate_Click" />
+                <Button Name="BtnCheckLlamaUpdate" Content="🔄 检查更新" Margin="4,0,0,0" ToolTip="检查 llama.cpp 最新预编译版并覆盖更新（按下面「Llama 后端」所选包，默认按显卡自动；需先停止 Llama 服务，不触碰模型）" Click="CheckLlamaUpdate_Click" />
               </StackPanel>
               <TextBox Name="InputLlamaDir" TextWrapping="Wrap" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" TextChanged="InputLlamaDir_TextChanged" />
             </DockPanel>
@@ -183,6 +183,17 @@
                 <Button Name="BtnRemoveLlamaVariant" Content="移除" Margin="4,0,0,0" Click="RemoveLlamaVariant_Click" ToolTip="从列表移除当前选中的变体(不删除目录文件)" />
               </StackPanel>
               <local:NoScrollComboBox x:Name="ComboLlamaVariant" SelectionChanged="LlamaVariant_SelectionChanged" ToolTip="llama.cpp 变体(分支)。切换即切换上方程序目录; 检查更新按当前变体的仓库进行" />
+            </DockPanel>
+            <DockPanel Margin="0,0,0,6">
+              <Label Content="Llama 后端:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />
+              <TextBlock Name="LblBackendHint" DockPanel.Dock="Right" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" Margin="8,0,0,0" ToolTip="实际用于检查更新/安装变体的预编译后端" />
+              <local:NoScrollComboBox x:Name="ComboLlamaBackend" SelectionChanged="LlamaBackend_Changed" ToolTip="llama.cpp 预编译后端。「自动」按显卡厂商选(NVIDIA=CUDA、Intel=SYCL、AMD/未知=Vulkan)；也可显式指定，例如 AMD RDNA3 上 ROCm 构建通常快于 Vulkan。只影响下载哪个预编译包，不改命令行参数，也不影响正在运行的进程。与 Linux 版共用同一方案字段 LlamaBackend。">
+                <ComboBoxItem Content="自动（按显卡检测）" Tag="" />
+                <ComboBoxItem Content="Vulkan" Tag="vulkan" />
+                <ComboBoxItem Content="ROCm" Tag="rocm" />
+                <ComboBoxItem Content="CUDA" Tag="cuda" />
+                <ComboBoxItem Content="SYCL" Tag="sycl" />
+              </local:NoScrollComboBox>
             </DockPanel>
             <DockPanel Margin="0,0,0,6">
               <Label Content="DSH 项目目录:" DockPanel.Dock="Left" Width="110" VerticalAlignment="Center" />

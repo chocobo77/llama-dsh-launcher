@@ -604,6 +604,13 @@ def api_status(_):
         "profile_name": name,
         "lightweight": MON.lightweight,
         "dsh_stale_lock": DSH.stale_lock_present(),
+        # llama.cpp 预编译后端: 生效值 / 自动探测值 / 方案里的显式选择(""=自动)。
+        # Windows 侧把同名三个字段放进 profile 对象里(那边 profile 是对象, 这边历来是字符串),
+        # 跨端脚本按 profile 的类型取即可, 字段名一致(见 docs/API-CONTRACT.md)。
+        "backend": toolchain.resolve_backend(prof),
+        "backend_auto": toolchain.backend_preference(),
+        "backend_choice": (lambda c: c if c in toolchain.VALID_BACKENDS else "")(
+            (prof.get("LlamaBackend") or "").strip().lower()),
     }
 
 

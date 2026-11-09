@@ -24,6 +24,7 @@
     <Compile Include="..\..\LlamaDSH_Launcher_CS\Services\AgentCli.cs" Link="src\AgentCli.cs" />
     <Compile Include="..\..\LlamaDSH_Launcher_CS\Services\DshIdentity.cs" Link="src\DshIdentity.cs" />
     <Compile Include="..\..\LlamaDSH_Launcher_CS\Services\ProcLiveness.cs" Link="src\ProcLiveness.cs" />
+    <Compile Include="..\..\LlamaDSH_Launcher_CS\Services\BackendChoice.cs" Link="src\BackendChoice.cs" />
   </ItemGroup>
 
 </Project>
