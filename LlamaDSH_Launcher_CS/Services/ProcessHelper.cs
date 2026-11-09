@@ -89,7 +89,7 @@ public static class ProcessHelper
 		{
 			using (Process process = Process.GetProcessById(pid))
 			{
-				if (!process.HasExited)
+				if (ProcLiveness.Alive(process))
 				{
 					process.Kill(entireProcessTree: false);
 				}

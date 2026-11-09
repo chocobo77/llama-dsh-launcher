@@ -290,12 +290,12 @@ _hlog = _insp.getsource(core.LogHub.log)
 check("run.log 不双时间戳(applog 已带日期, LogHub 只喂正文)",
       "applog.run(text)" in _hlog and 'applog.run("[%s' not in _hlog
       and 'self.run.append("[%s' in _hlog, _hlog.strip()[-120:])
-# --------------- LlamaRunner.stop 的幂等 / 用户停止不被 OOM 重启推翻 --------
+# --------------- LlamaRunner.stop 的幂等 / 用户停止(SIGTERM)收进 stopped -----
 # 本轮 A1: 端口缓存存在而 proc is None 时, stop() 把 None 交给 kill_process_tree,
 #          它的 except 里 `pids = [int(pid)]` 对 None 再抛一次同一个 TypeError,
 #          异常逃出 stop() → 状态清理整段被跳过, 面板永远显示 running。
-# 本轮 A2: stop() 发的 SIGTERM 退出码是 -15, 以前走"异常退出"分支; 本轮见过 OOM
-#          时接着自动降层重启一个 llama-server —— 收尾场景下它就是孤儿。
+# 本轮 A2: stop() 发的 SIGTERM 退出码是 -15, 以前走"异常退出"分支被当成崩溃 ——
+#          user_stopped 必须把它收进"已停止(用户请求)"。
 import procman
 
 _clear_real = core.state.clear_state_for
@@ -314,27 +314,19 @@ try:
         def wait(self):
             return -15                    # SIGTERM: 我们自己 stop() 发的
 
-    def _drive(oom, user):
+    def _drive(user):
         r = core.LlamaRunner(_Silent(), {"defs": []})
-        r.last_profile = {"OomRetryEnabled": True}
-        r.mem_state = {"oom_seen": oom, "offloaded": 30,
-                       "total_layers": 40, "buffers": {}}
         r.proc = _FakeProc()
         r.user_stopped = user
-        gone = []
-        r._relaunch = lambda: gone.append(1)
         r._wait_exit()
-        time.sleep(0.3)                   # 降层重启在独立线程里
-        return r, gone
+        return r
 
-    r_stop, gone_stop = _drive(True, True)
-    check("用户/收尾要的停不被 OOM 自动降层重启推翻(否则收尾时新 llama-server 变孤儿)",
-          gone_stop == [] and r_stop.status == "stopped" and r_stop.oom_retry_left == 3,
-          "%s %s" % (gone_stop, r_stop.status))
-    r_crash, gone_crash = _drive(True, False)
-    check("对照: 真崩溃且本轮 OOM 时仍会自动降层重启(新防线没把正常功能挡死)",
-          gone_crash == [1] and r_crash.status == "crashed",
-          "%s %s" % (gone_crash, r_crash.status))
+    r_stop = _drive(True)
+    check("用户/收尾要的停(SIGTERM -15)收进 stopped, 不判成 crashed(面板与日志不误报)",
+          r_stop.status == "stopped", r_stop.status)
+    r_crash = _drive(False)
+    check("对照: 非 0 退出码且非用户停止时仍判 crashed(分支本身没被动过)",
+          r_crash.status == "crashed", r_crash.status)
 
     r_idle = core.LlamaRunner(_Silent(), {"defs": []})
     r_idle.proc = None
@@ -1311,27 +1303,8 @@ check("兜底 SIGTERM 后还要等服务确认死亡(否则 llama/DSH 还在跑�
 
 
 
-# --- 11) 第三轮 review: 在途重启 / DSH 停止 / 看门狗预算 / 打包黑名单分族 ---
-# 11.1 OOM 降层是"sleep 1s 后再 start": 这期间用户点"停止"必须能作废那次在途重启,
-#      否则 stop() 刚清完状态, 1s 后又冒出一个 llama-server(收尾时就是孤儿)。
-_started1 = []
-_r1 = core.LlamaRunner(_Silent(), {"defs": []})
-_r1.last_profile = {"OomRetryEnabled": True}
-_r1.start = lambda p, skip_vram_confirm=False: (_started1.append(1), (True, ""))[1]
-_r1.user_stopped = True
-_r1.oom_retry_active = True
-_r1._relaunch()
-check("用户已停止时, 已排下的 OOM 降层重启必须作废(单靠决策点的标志挡不住在途那次)",
-      _started1 == [] and _r1.oom_retry_active is False, str(_started1))
-_started2 = []
-_r2 = core.LlamaRunner(_Silent(), {"defs": []})
-_r2.last_profile = {"OomRetryEnabled": True}
-_r2.start = lambda p, skip_vram_confirm=False: (_started2.append(1), (True, ""))[1]
-_r2._relaunch()
-check("对照: 没有用户停止时降层重启照常进行(防线没把正常功能挡死)",
-      _started2 == [1], str(_started2))
-
-# 11.2 接管来的 DSH 退出后 PID 会被复用: 照 tracker.pid 杀整树 = 打死无辜进程。
+# --- 11) 第三轮 review: DSH 停止 / 看门狗预算 / 打包黑名单分族 ---
+# 11.1 接管来的 DSH 退出后 PID 会被复用: 照 tracker.pid 杀整树 = 打死无辜进程。
 class _ReusedTracker:
     pid = 0
 
@@ -1362,7 +1335,7 @@ check("DSH 启动失败自动重试必须认 user_stopped(否则停止/收尾后
 check("提权停止要连子进程树一起 sudo kill(C# 用 taskkill /F /T, 只杀根 PID 会留 pnpm)",
       "procman.child_pids(pid)" in inspect.getsource(core.DshRunner.stop), "")
 
-# 11.3 收尾看门狗: 预算必须大于 stop() 最坏合法路径, 到点要补杀 + 留痕
+# 11.2 收尾看门狗: 预算必须大于 stop() 最坏合法路径, 到点要补杀 + 留痕
 check("收尾看门狗预算必须比 stop() 最坏合法路径长(ss 10s + sudo 15s + 两轮杀树 ≈ 32s)",
       "_EXIT_WATCHDOG_S = 45" in main_src and "threading.Timer(_EXIT_WATCHDOG_S" in main_src, "")
 _wd0 = main_src.index("def _watchdog_fire")
@@ -1378,7 +1351,7 @@ check("_dsh_running_guard 要用 poll 感知的 DSH.running(句柄残留会让�
 check("DSH 崩掉/被外部杀掉后要有 5s 对账把状态落回(否则面板假在线且 guard 永久拒绝)",
       'DSH.status.startswith("running") and not DSH.running' in main_src, "")
 
-# 11.4 打包忽略项分两族: 声明条目只豁免开发期目录, 结构性目录永不进包
+# 11.3 打包忽略项分两族: 声明条目只豁免开发期目录, 结构性目录永不进包
 _pg = os.path.join(_tmp, "pack_glob")
 os.makedirs(os.path.join(_pg, "scripts", "node_modules", "dep"))
 os.makedirs(os.path.join(_pg, "dist"))
@@ -1409,7 +1382,7 @@ check("开发期目录按大小写无关比对也要甩掉(C# 用 OrdinalIgnoreC
       not any(f.split("/")[0] in ("Tests", "Docs") for f in _f_case)
       and "index.js" in _f_case, str(_f_case))
 
-# 11.5 激活守卫: 版本检查被豁免 ≠ peer 真的对上了(C# FilterBundleActivation 2693)
+# 11.4 激活守卫: 版本检查被豁免 ≠ peer 真的对上了(C# FilterBundleActivation 2693)
 _k_ex, _d_ex = _compat.filter_bundle_activation(
     ["demo-plugin"], [{"name": "demo-plugin", "compatible": True, "exempted": True,
                        "peer_issues": [{"dep": "@deepseek-ai/dsh-core", "range": "^0.9",
@@ -1418,7 +1391,7 @@ _k_ex, _d_ex = _compat.filter_bundle_activation(
 check("已豁免版本检查但 peer 仍不匹配的包不得自动激活(激活后 DSH 模块加载会失败)",
       _k_ex == [] and _d_ex and "豁免" in _d_ex[0]["reason"], str((_k_ex, _d_ex)))
 
-# 11.6 pnpm 写依赖不在 JOBS 里, 收尾退出时必须能点名
+# 11.5 pnpm 写依赖不在 JOBS 里, 收尾退出时必须能点名
 _compat.begin_profile_op("web", "本地插件安装")
 check("正在写依赖的动作要能被收尾点名(同步跑在 HTTP 线程, 不在 JOBS 里)",
       any("本地插件安装" in x for x in _compat.inflight_ops()), str(_compat.inflight_ops()))
@@ -1429,7 +1402,7 @@ _compat.end_profile_op("web")
 check("clear 后在途集合必须为空(否则会一直误报有任务在跑)",
       _compat.inflight_ops() == [], str(_compat.inflight_ops()))
 
-# 11.7 托盘兜底: 等待窗与文案要对齐服务端 45s 收尾预算
+# 11.6 托盘兜底: 等待窗与文案要对齐服务端 45s 收尾预算
 _tsrc = inspect.getsource(_tray.TrayIcon._stop_all_then_quit)
 check("兜底 SIGTERM 后的等待窗要盖住服务端收尾预算(否则把正常收尾误报成残留)",
       "for _ in range(50)" in _tsrc and "45s" in _tsrc, _tsrc[:100])
@@ -3185,10 +3158,6 @@ class _IdleLlama23:
     def get_port():
         return None
 
-    @staticmethod
-    def oom_recredit():
-        pass
-
 
 _seen23 = {"sys": 0, "gpu": 0}
 _real_ss23, _real_qg23 = core.monitor.sample_system, core.monitor.query_gpus
@@ -4658,6 +4627,24 @@ check("webui 日志游标要在服务端重启(boot 变化或 gap)时归零重�
       "pollLogs 未处理 boot/gap")
 check("webui 渲染级别前缀(ERROR/WARN), INFO 不加噪",
       'l.level !== "INFO"' in _js29, "pollLogs 未渲染 level")
+
+# 29.7 退出与采样路径不留陈旧引用、不逐轮刷错误。
+#      Windows 侧同期实测事故: 读线程在管道 EOF 后 Dispose(Process)，字段仍指着该对象，
+#      裸 HasExited 让 HealthCheck/显存熔断/退出回调每 3 秒抛一次未处理异常，而"清理字段"
+#      的代码正好在抛点之后 → 状态永久中毒，用户只看到刷屏、看不到启动失败的真原因。
+#      Linux 侧 poll() 不会抛，但同样要求"判死即置空引用"与"同一错误限流记录"。
+_core29 = io.open("core.py", encoding="utf-8").read()
+_mon29 = io.open("monitor.py", encoding="utf-8").read()
+check("停止路径必须把已退出进程的引用置空(poll 判死即 self.proc = None)",
+      "if self.proc is not None and self.proc.poll() is not None:\n            self.proc = None" in _core29,
+      "core.py 里没找到 proc 自愈")
+check("采样异常必须限流记录(同一错误 5 分钟内只记一次), 否则 error.log 被噪音埋掉",
+      "_cmu_fail" in _mon29 and "300" in _mon29, "monitor.py 未见限流")
+_h29f = core.LogHub()
+for _i29 in range(50):
+    _h29f.error_ex(RuntimeError("同一个哨兵错误"), "重复刷屏哨兵")
+_n29 = len([t for (_s, _l, t) in _h29f.since(0)[0] if "重复刷屏哨兵" in t])
+check("同一异常连报 50 次时环形缓冲不得全额堆同一份(去重必须生效)", _n29 < 50, "ring 里有 %d 条" % _n29)
 
 shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)

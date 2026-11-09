@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """启动器核心运行时:日志管线、Llama/DSH 进程运行器、监控循环、显存熔断、
-OOM 自动降层重试、safetensors 转换、DSH 重建。
+safetensors 转换、DSH 重建。
 
 f564fe7 语义: 旧日志解析层(ParseTimings//metrics 兜底/TTFT)已删除,
 统一由 llapimon.LlamaApiMonitor 承接。
@@ -202,15 +202,10 @@ class LlamaRunner:
         self._cached_port = 0
         self._port_lock = threading.Lock()
         self.api = llapimon.LlamaApiMonitor(self._port_getter)
-        # OOM 自动降层重试(0314b6b + 4bf9416)
-        self.oom_retry_left = 3
-        self.oom_retry_active = False
-        # 用户/收尾主动停止的标志: 没有它, stop() 发出的 SIGTERM 会被 _wait_exit
-        # 当成"异常退出"(退出码 -15), 本轮见过 OOM 时接着自动降层重启一个
-        # llama-server —— 收尾场景下那个新进程直接变成孤儿。
+        # 用户/收尾主动停止的标志: 没有它, stop() 发出的 SIGTERM(退出码 -15)会被
+        # _wait_exit 当成"异常退出"判成 crashed, 面板状态与日志跟着误报。
         self.user_stopped = False
-        self.mem_state = {"oom_seen": False, "offloaded": 0, "total_layers": 0, "buffers": {}}
-        self.persist_config = None  # main.py 注入: 降层落盘
+        self.mem_state = {"offloaded": 0, "total_layers": 0, "buffers": {}}
         self._pump_threads = []
 
     @property
@@ -335,10 +330,7 @@ class LlamaRunner:
             cmd_list = lst
         self.last_cmd_list = cmd_list
         self.last_cmd = " ".join(cmdline.qa(x) for x in cmd_list)
-        # OOM 额度: 用户手动启动重置为 3(4bf9416);重试路径保持
-        if not self.oom_retry_active:
-            self.oom_retry_left = 3
-        self.mem_state = {"oom_seen": False, "offloaded": 0, "total_layers": 0, "buffers": {}}
+        self.mem_state = {"offloaded": 0, "total_layers": 0, "buffers": {}}
         self.api.reset_log_machine()
         try:
             env = dict(os.environ)
@@ -402,95 +394,16 @@ class LlamaRunner:
         self.proc = None
         state.clear_state_for("LlamaPid")
         if self.user_stopped:
-            # stop() 自己发的 SIGTERM: 退出码是 -15/-9, 绝不能走下面的"异常退出"
-            # 分支, 否则本轮见过 OOM 时会自动降层再拉一个 llama-server 起来
-            # (收尾/关服务时那个新进程就是孤儿)。
+            # stop() 自己发的 SIGTERM: 退出码是 -15/-9, 不能走下面的"异常退出"分支,
+            # 否则用户要的"停止"(含收尾/关服务)会被判成崩溃, 面板与日志一起误报。
             self.status = "stopped"
             self.hub.log("--- Llama 已停止(用户请求) ---")
-            self.oom_retry_left = 3
         elif code != 0:
             self.status = "crashed"
             self.hub.log("--- Llama 异常退出 (退出码 %s) --- 请查看上方日志,通常是显存不足或参数错误导致 ---" % code)
-            self._maybe_oom_retry()
         else:
             self.status = "stopped"
             self.hub.log("--- Llama 已退出 ---")
-            # 干净退出才重置 OOM 额度(4bf9416)
-            self.oom_retry_left = 3
-
-    # ------------------------------------------------------------ OOM 降层 --
-    def _maybe_oom_retry(self):
-        """退出码非 0 且检测到 OOM → --gpu-layers ×0.85(下限 4)自动重启,最多 3 次。"""
-        if self.user_stopped:
-            return                      # 二次防线: 用户/收尾要的"停"不能被重启推翻
-        st = self.mem_state
-        if not (st.get("oom_seen") and self.oom_retry_left > 0 and self.last_profile):
-            return
-        if not self.last_profile.get("OomRetryEnabled", True):
-            return
-        defs = self.schema["defs"]
-        sp = cmdline.ParamState(self.last_profile, defs)
-        ngl_def = sp.role_def("ngl")
-        cur = None
-        if ngl_def is not None:
-            v = sp.raw_value(ngl_def["flag"])
-            cur = cmdline._try_float(v)
-        base = None
-        if cur is not None and cur > 0:
-            base = int(cur)
-        elif st.get("offloaded", 0) > 0:
-            base = st["offloaded"]
-        elif st.get("total_layers", 0) > 0:
-            base = st["total_layers"]
-        if not base:
-            self.hub.log("[OOM] 无法确定当前卸载层数,放弃自动降层(请手动调小 --gpu-layers 或上下文)")
-            return
-        new_ngl = max(4, int(base * 0.85))
-        if new_ngl >= base:
-            new_ngl = base - 1
-        if new_ngl < 4:
-            self.hub.log("[OOM] 降层后仍低于 4 层,放弃重试。请调小 ctx、量化 KV 或换更小的量化。")
-            return
-        flag = ngl_def["flag"] if ngl_def is not None else "gpu-layers"
-        vp = self.last_profile.setdefault("ValueParams", {})
-        vp[flag] = {"Enabled": True, "Value": str(new_ngl)}
-        self.oom_retry_left -= 1
-        self.oom_retry_active = True
-        self.hub.log("[OOM] 自动降层重试: --gpu-layers %d → %d(剩余重试 %d 次)" % (base, new_ngl, self.oom_retry_left))
-        threading.Thread(target=self._relaunch, daemon=True).start()
-
-    def _relaunch(self):
-        time.sleep(1.0)
-        # 决策与执行之间隔了 1s: 这期间用户点"停止"或走收尾都改不了已经排下的重启。
-        # user_stopped 是**实例级**标志, 只挡决策点(core.py:321/341)挡不住这里在途的
-        # 那一次 —— 收尾场景下 os._exit 之前 Popen 出来的 llama-server 直接是孤儿。
-        if self.user_stopped or self.running:
-            self.oom_retry_active = False
-            self.hub.log("[OOM] 已放弃自动降层重启(进程已被停止或已被接管)")
-            return
-        try:
-            ok, msg = self.start(self.last_profile, skip_vram_confirm=True)
-        except Exception as ex:
-            # start() 抛异常(Popen 失败、参数落盘炸了)时这个线程当场死掉, oom_retry_active
-            # 永远卡在 True —— 此后的 OOM 都不再补降层额度, 表现成"越跑越容易 OOM"且无痕迹。
-            self.oom_retry_active = False
-            self.hub.log("[OOM] 降层重启异常(%s: %s), 已放弃本次重试" % (type(ex).__name__, ex))
-            return
-        if not ok:
-            self.hub.log("[OOM] 重试启动失败: %s" % msg)
-            self.oom_retry_active = False
-
-    def oom_recredit(self):
-        """API 在线补重置 + 降层值落盘(4bf9416: 否则下次启动回到 OOM 原值重演崩溃循环)。"""
-        if self.oom_retry_active and self.api.online:
-            self.oom_retry_active = False
-            self.oom_retry_left = 3
-            self.hub.log("[OOM] 服务已稳定在线,重试额度已恢复,降层值已写入方案")
-            if self.persist_config:
-                try:
-                    self.persist_config()
-                except Exception:
-                    pass
 
     # ------------------------------------------------------------ 停止 ------
     def stop(self):
@@ -501,7 +414,7 @@ class LlamaRunner:
             pid = procman.find_process_by_port(port, name_filter=("llama-server",))
         else:
             pid = None
-        # 先立标志再杀: _wait_exit 会看到它, 不会把 SIGTERM 的 -15 当崩溃去 OOM 重启
+        # 先立标志再杀: _wait_exit 会看到它, 不会把 SIGTERM 的 -15 当崩溃退出处理
         self.user_stopped = True
         if pid is None:
             # 没在跑(或已经自己退出): 幂等收尾, 不谎报"停止失败"也不抛异常
@@ -524,8 +437,7 @@ class LlamaRunner:
         # 日志与状态标签都要能看出"没停掉"(C# FinishStopLlama 的"仍在运行"同语义)。
         self.status = "stopped" if ok else "stop_failed"
         self.api.reset_log_machine()
-        self.mem_state = {"oom_seen": False, "offloaded": 0, "total_layers": 0, "buffers": {}}
-        self.oom_retry_active = False
+        self.mem_state = {"offloaded": 0, "total_layers": 0, "buffers": {}}
         if not quiet:
             self.hub.log("--- 已停止 ---")
         state.clear_state_for("LlamaPid")
@@ -1141,7 +1053,6 @@ class Monitor:
                         if llama_alive or api_online:
                             self.llama.api.poll_fast()
                             self.llama.api.poll_slow_if_needed()
-                            self.llama.oom_recredit()
                         gpus = monitor.query_gpus()
                         sysi = monitor.sample_system()
                         vt_sum, vu_sum = self._vram_sums(gpus)
@@ -1167,7 +1078,6 @@ class Monitor:
                 if llama_alive or api_online or self._watched():
                     self.llama.api.poll_fast()
                     self.llama.api.poll_slow_if_needed()
-                    self.llama.oom_recredit()
                 gpus, sysi, (gen, prompt, src) = self._sample_all()
                 self.h["tps"].push(gen if gen > 0 else None)
                 self.h["pf"].push(prompt if prompt > 0 else None)

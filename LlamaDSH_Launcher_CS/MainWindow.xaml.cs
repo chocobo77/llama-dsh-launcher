@@ -1012,7 +1012,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		if (_trayIcon != null)
 		{
-			string text = ((_llamaProc != null && !_llamaProc.HasExited) ? "运行中" : "已停止");
+			string text = (IsAlive(_llamaProc) ? "运行中" : "已停止");
 			string text2 = (HasDsh() ? "运行中" : "已停止");
 			_trayIcon.Text = "Llama:" + text + " | DSH:" + text2;
 		}
@@ -1034,7 +1034,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void QuitApp()
 	{
-		bool flag = _llamaProc != null && !_llamaProc.HasExited;
+		bool flag = IsAlive(_llamaProc);
 		bool flag2 = HasDsh();
 		bool flag3 = true;
 		if (flag | flag2)
@@ -4255,7 +4255,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					try
 					{
-						if (p != null && !p.HasExited)
+						if (IsAlive(p))
 						{
 							p.Kill(true);
 							Log("[" + tag + "] 收到取消指令，已结束进程");
@@ -4275,7 +4275,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					try
 					{
-						if (p != null && !p.HasExited)
+						if (IsAlive(p))
 						{
 							p.Kill(true);
 							Log("[" + tag + "] 超过 " + (timeoutMs / 60000) + " 分钟未完成，已强制结束");
@@ -4621,7 +4621,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		//IL_0224: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0229: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0242: Expected O, but got Unknown
-		if (_llamaProc != null && !_llamaProc.HasExited)
+		if (IsAlive(_llamaProc))
 		{
 			ShowNotice("Already running");
 			return;
@@ -4651,11 +4651,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		_vramBreakerTriggered = false;
 		LblVramBreaker.Text = "";
-		_oomSeenInRun = false;
-		if (!_oomRetryActive)
-		{
-			_oomRetryLeft = 3; // 用户手动启动时重置重试额度
-		}
 		_llamaApi?.ResetLogMachine();
 		string? stDir = DetectSafetensorsDir();
 		if (stDir != null)
@@ -4703,8 +4698,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 		}
 		LogParamHints();
-		// OOM 自动重试路径跳过预算弹窗: ngl 已下调、数字只会更宽松，弹窗只会打扰
-		if (!_oomRetryActive && !ConfirmVramFit())
+		if (!ConfirmVramFit())
 		{
 			Log("--- 启动已取消 ---");
 			return;
@@ -4773,7 +4767,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		if (_llamaProc != null)
 		{
-			if (_llamaProc.HasExited)
+			if (!IsAlive(_llamaProc))
 			{
 				Log("Llama failed");
 				DisposeProc(ref _llamaProc);
@@ -4791,9 +4785,27 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 	}
 
+	/// <summary>
+	/// 退出处理的外壳：这里再抛异常会把 HealthCheck 定时器、显存熔断、退出回调全部打成
+	/// 未处理异常反复刷屏(实测 InvalidOperationException 每 3 秒一次)，而且清理字段的代码
+	/// 正好在抛点之后 → 引用长期指向已释放对象，状态永久中毒。兜底必须自己把引用清掉。
+	/// </summary>
 	private void OnLlamaDone()
 	{
-		if (_llamaProc != null && _llamaProc.HasExited)
+		try
+		{
+			OnLlamaDoneCore();
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "Llama 退出处理失败");
+			DisposeProc(ref _llamaProc);
+		}
+	}
+
+	private void OnLlamaDoneCore()
+	{
+		if (_llamaProc != null && !IsAlive(_llamaProc))
 		{
 			int exitCode = 0;
 			try
@@ -4811,81 +4823,27 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				LblLlamaStatus.Text = "● 启动失败/崩溃";
 				LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
-				Log("--- Llama 异常退出 (退出码 " + exitCode + ") --- 请查看上方日志，通常是显存不足或参数错误导致 ---");
-				// OOM 自动降层重试（ollama 同款闭环）: 显存不足信号 + 开关开启 + 还有重试额度
-				if (_oomSeenInRun && ChkOomRetry.IsChecked == true && _oomRetryLeft > 0)
+				// 把原因说到脸上: 光有退出码用户只能猜。日志里出现过显存分配失败就直接点名,
+				// 并且附上最近一次采样的显存占用数字(非 N 卡上没有 CUDA 那种显眼报错,
+				// 只有"显存只剩 XX MB"这种数字才看得出是被别的进程占满了)。
+				string vramNow = "";
+				List<GpuDevInfo>? gnow = _lastPerfGpus;
+				if (gnow != null && gnow.Count > 0 && gnow[0].MemTotalMb > 0)
 				{
-					if (TryAutoReduceNglAndRelaunch())
-					{
-						return;
-					}
+					vramNow = string.Format("；最近一次采样的显存占用 {0}/{1} MB({2:F0}%)",
+						(long)gnow[0].MemUsedMb, (long)gnow[0].MemTotalMb, 100.0 * gnow[0].MemUsedMb / gnow[0].MemTotalMb);
 				}
-				// 重试未执行(额度耗尽/开关关闭/降层失败): 必须复位, 否则
-				// _oomRetryActive 卡死 → 之后手动启动永久跳过显存预算确认弹窗
-				_oomRetryActive = false;
+				string why = "可能是显存已被别的进程占满（见监控页显存占用），或参数错误" + vramNow;
+				Log("--- Llama 异常退出 (退出码 " + exitCode + ") --- " + why + " ---");
 			}
 			else
 			{
 				LblLlamaStatus.Text = "● 已停止";
 				LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
 				Log("--- Llama 已退出 ---");
-				_oomRetryLeft = 3; // 干净退出(用户手动停止)才重置重试额度
-				_oomRetryActive = false;
 			}
 			ClearStateFor("llama");
 		}
-	}
-
-	/// <summary>
-	/// OOM 自动降层重试（ollama 同款闭环）: 把 --gpu-layers 降到上一轮实际上 GPU 层数的 85%
-	/// （auto/全层首次重试直接从总层数起算），改写输入框后自动重新启动。成功进入运行态后
-	/// 重试额度重置；连续 3 次失败或层数低于 4 时放弃，保留用户可手动调整的空间。
-	/// </summary>
-	private bool TryAutoReduceNglAndRelaunch()
-	{
-		if (_pw.TryGetValue("gpu-layers", out (System.Windows.Controls.CheckBox ec, System.Windows.Controls.Control vw) pair))
-		{
-			string cur = ((pair.vw is System.Windows.Controls.ComboBox c) ? c.Text : ((System.Windows.Controls.TextBox)pair.vw).Text).Trim();
-			int baseNgl;
-			if (!int.TryParse(cur, out int curNgl) || curNgl <= 0)
-			{
-				// auto/全层: 优先用上一轮实际 offload 的层数, 更符合"上次实际的 85%"语义
-				baseNgl = _offloadedLayers > 0 ? _offloadedLayers : (_totalLayers > 0 ? _totalLayers : 0);
-				if (baseNgl <= 0)
-				{
-					return false;
-				}
-			}
-			else
-			{
-				baseNgl = curNgl;
-			}
-			int newNgl = Math.Max(4, (int)Math.Floor(baseNgl * 0.85));
-			if (newNgl >= baseNgl)
-			{
-				newNgl = baseNgl - 1;
-			}
-			if (newNgl < 4)
-			{
-				Log("[OOM 重试] 层数已降到下限以下，放弃自动重试（当前 " + cur + "）。请调小 ctx、量化 KV 或换更小的量化。");
-				return false;
-			}
-			_oomRetryLeft--;
-			_oomRetryActive = true;
-			pair.ec.IsChecked = true;
-			if (pair.vw is System.Windows.Controls.ComboBox cb)
-			{
-				cb.Text = newNgl.ToString();
-			}
-			else
-			{
-				((System.Windows.Controls.TextBox)pair.vw).Text = newNgl.ToString();
-			}
-			Log("[OOM 重试] 显存不足，已把 --gpu-layers 从 " + cur + " 降到 " + newNgl + "（剩余自动重试 " + _oomRetryLeft + " 次），自动重启...");
-			StartLlama();
-			return true;
-		}
-		return false;
 	}
 
 	/// <summary>加载一次当前配置的模型，读到显存实测值就自动停止。</summary>
@@ -4938,7 +4896,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					try
 					{
 						using Process p = Process.GetProcessById(pid.Value);
-						processAlive = !p.HasExited;
+						processAlive = IsAlive(p);
 					}
 					catch
 					{
@@ -5432,31 +5390,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private double _obsRsMiB = -1.0;
 	private double _obsComputeMiB = -1.0;
 	private bool _obsLogged;
-	// OOM 自动降层重试状态
-	private bool _oomSeenInRun;
-	private int _offloadedLayers;
-	private int _totalLayers;
-	private int _oomRetryLeft = 3;
-	private bool _oomRetryActive;
 
 	private void NoteLlamaMemoryLine(string text)
 	{
 		// llama 自己说"适配不下"时，说明当前参数已超出可用显存，静态占用再好看也没用。
 		if (text.Contains("failed to fit params", StringComparison.OrdinalIgnoreCase))
 		{
-			_oomSeenInRun = true;
 			Log("[显存] llama 报告无法把参数适配进可用显存（failed to fit params）：实际上已经超了，建议调小 ubatch 或把更多专家放到 CPU");
-		}
-		else if (text.Contains("out of memory", StringComparison.OrdinalIgnoreCase) || text.Contains("failed to allocate", StringComparison.OrdinalIgnoreCase))
-		{
-			_oomSeenInRun = true;
-		}
-		// offloaded X/Y layers to GPU: 记录总层数与实际上 GPU 层数（OOM 降层重试的基准）
-		Match offload = Regex.Match(text, @"offloaded\s+(\d+)/(\d+)\s+layers", RegexOptions.IgnoreCase);
-		if (offload.Success)
-		{
-			_offloadedLayers = int.TryParse(offload.Groups[1].Value, out int offN) ? offN : 0;
-			_totalLayers = int.TryParse(offload.Groups[2].Value, out int totN) ? totN : 0;
 		}
 		// buffer 汇总行解析（ollama 同款思路：从日志读取 llama 实际计算结果）
 		double mib = -1.0;
@@ -6012,7 +5952,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		else
 		{
 			Log("DSH failed");
-			bool dshExited = _dshProc != null && _dshProc.HasExited;
+			bool dshExited = _dshProc != null && !IsAlive(_dshProc);
 			DisposeProc(ref _dshProc);
 			_dshTracker = null;
 			if (dshExited && _dshRetriesLeft > 0)
@@ -6033,6 +5973,21 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void OnDshDone()
 	{
+		try
+		{
+			OnDshDoneCore();
+		}
+		catch (Exception ex)
+		{
+			// 同 OnLlamaDone: 退出处理里抛异常会污染后续所有轮询, 兜底要清引用
+			LogError(ex, "DSH 退出处理失败");
+			DisposeProc(ref _dshProc);
+			_dshTracker = null;
+		}
+	}
+
+	private void OnDshDoneCore()
+	{
 		// 收尾守卫方向不能反：这里被调用的前提正是"进程已退出"。原先写成 if (HasDsh())，
 		// 而 HasDsh() 在进程死后返回 false，于是 DSH 崩溃/被外部结束时的整段收尾
 		// （状态标签、按钮复位、状态文件）全被跳过 —— 界面永远停在"● 运行中"、
@@ -6041,7 +5996,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			return;
 		}
-		bool stillAlive = (_dshProc != null && !_dshProc.HasExited) || (_dshTracker != null && !_dshTracker.Poll().HasValue);
+		bool stillAlive = IsAlive(_dshProc) || (_dshTracker != null && !_dshTracker.Poll().HasValue);
 		if (stillAlive)
 		{
 			// 输出流提前结束（子孙继承了管道句柄）但进程还在：不改状态，HealthCheck 会继续对账
@@ -6050,7 +6005,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		int exitCode = 0;
 		try
 		{
-			if (_dshProc != null && _dshProc.HasExited)
+			if (_dshProc != null && !IsAlive(_dshProc))
 			{
 				exitCode = _dshProc.ExitCode;
 			}
@@ -6178,7 +6133,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				using (Process process = Process.GetProcessById(adminKillPid.Value))
 				{
 					// 同一个 PID 但启动时刻不同 = 已被复用, 绝不能对它 /T
-					stillAlive = !process.HasExited && (!adminKillStart.HasValue || process.StartTime == adminKillStart.Value);
+					stillAlive = IsAlive(process) && (!adminKillStart.HasValue || process.StartTime == adminKillStart.Value);
 				}
 			}
 			catch
@@ -6223,7 +6178,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		try
 		{
 			using Process p = Process.GetProcessById(pid.Value);
-			return !p.HasExited;
+			return IsAlive(p);
 		}
 		catch
 		{
@@ -6296,7 +6251,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private bool HasDsh()
 	{
-		if (_dshProc == null || _dshProc.HasExited)
+		if (!IsAlive(_dshProc))
 		{
 			if (_dshTracker != null)
 			{
@@ -6309,7 +6264,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private bool HasRunning()
 	{
-		if (_llamaProc == null || _llamaProc.HasExited)
+		if (!IsAlive(_llamaProc))
 		{
 			return HasDsh();
 		}
@@ -8026,7 +7981,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			return;
 		}
-		if (_llamaProc == null || _llamaProc.HasExited)
+		if (!IsAlive(_llamaProc))
 		{
 			return;
 		}
@@ -8299,25 +8254,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			UpdateTrends();
 		}
 		UpdatePhaseCard();
-
-		// OOM 重试成功后真正进入 API 在线态才补重置额度(3 秒进程存活不算数)
-		if (api != null && api.Online && _oomRetryActive)
-		{
-			_oomRetryActive = false;
-			_oomRetryLeft = 3;
-			Log("[OOM] 服务已在线, 重试额度重置为 3");
-			// 降层值落盘: 否则下次启动回到 OOM 原值, 重演崩溃循环
-			try
-			{
-				_profiles[_currentProfile] = BuildConfig();
-				SaveConfigFile();
-				Log("[OOM] 降层后的配置已写入当前方案");
-			}
-			catch (Exception exPer)
-			{
-				LogError(exPer, "OOM 降层配置持久化失败");
-			}
-		}
 
 	// ============ 构建器: GPU 每卡面板 ============
 		void BuildGpuPanels(List<GpuDevInfo> gpus)
@@ -8647,14 +8583,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private static bool IsAlive(Process? p)
 	{
-		try
-		{
-			return p != null && !p.HasExited;
-		}
-		catch
-		{
-			return false;
-		}
+		// 判定不了(对象已与进程脱钩/被读线程释放)一律按已退出处理, 见 ProcLiveness
+		return ProcLiveness.Alive(p);
 	}
 
 	private void SaveState()
@@ -8715,10 +8645,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				Process pidProc = Process.GetProcessById(stateFile.LlamaPid.Value);
 				// PID 复用防护: 只有 llama-server 本尊才接管, 否则"停止"会误杀无关进程
-				if (pidProc.HasExited || !pidProc.ProcessName.StartsWith("llama-server", StringComparison.OrdinalIgnoreCase))
+				if (!IsAlive(pidProc) || !pidProc.ProcessName.StartsWith("llama-server", StringComparison.OrdinalIgnoreCase))
 				{
 					Log($"状态文件中的 Llama PID {stateFile.LlamaPid.Value} 已失效(进程退出或 PID 被复用), 跳过接管");
-					pidProc.Dispose();
+					ProcLiveness.SafeDispose(pidProc);
 					ClearStateFile();
 				}
 				else
@@ -8730,6 +8660,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
 					Log($"Resumed Llama:{stateFile.LlamaPid.Value}");
 				}
+			}
+			catch (ArgumentException)
+			{
+				// PID 已不存在是陈旧状态里最常见的一种失效, 不是故障: 给一行说明并清状态,
+				// 不该往 error.log 写一整段栈(以前每次启动都留一段, 把真错误埋了)
+				Log($"状态文件中的 Llama PID {stateFile.LlamaPid.Value} 已不存在, 跳过接管");
+				ClearStateFile();
 			}
 			catch (Exception ex2)
 			{
@@ -8781,6 +8718,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 								}, Array.Empty<object>());
 								return;
 							}
+						}
+						catch (ArgumentException)
+						{
+							// 陈旧状态里的 PID 已不存在: 不是故障, 下面还有端口/孤儿扫描两条兜底
+							Log($"状态文件中的 DSH PID {dp} 已不存在, 改按端口/孤儿扫描接管");
 						}
 						catch (Exception ex3)
 						{
@@ -9893,7 +9835,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			e.Cancel = true;
 			return;
 		}
-		bool flag = _llamaProc != null && !_llamaProc.HasExited;
+		bool flag = IsAlive(_llamaProc);
 		bool flag2 = HasDsh();
 		bool flag3 = true;
 		if (flag | flag2)
@@ -10225,7 +10167,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			llamaDir = Toolchain.NormalizeDir(InputLlamaDir.Text);
 			dshDir = EffectiveDshDir();
 			backend = LlamaBackendPreference();
-			llamaRunning = _llamaProc != null && !_llamaProc.HasExited;
+			llamaRunning = IsAlive(_llamaProc);
 			dshRunning = HasDsh();
 			return 0;
 		}, 5000);
@@ -10364,7 +10306,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				["ok"] = true,
 				["cmd"] = _lastCmd ?? "",
-				["llama_running"] = _llamaProc != null && !_llamaProc.HasExited,
+				["llama_running"] = IsAlive(_llamaProc),
 				["dsh_running"] = HasDsh()
 			};
 		}, 5000);

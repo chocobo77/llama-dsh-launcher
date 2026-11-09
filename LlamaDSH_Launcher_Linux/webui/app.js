@@ -192,7 +192,6 @@ function collectProfile() {
     VramBreakerEnabled: $("chkBreaker").checked,
     VramBreakerType: parseInt($("comboBreakerType").value) || 0,
     VramBreakerValue: parseFloat($("txtBreakerVal").value) || 90,
-    OomRetryEnabled: $("chkOomRetry").checked,
     LlamaBackend: $("comboBackend").value,
   });
 }
@@ -207,7 +206,6 @@ function applyProfile(p) {
   $("chkBreaker").checked = !!p.VramBreakerEnabled;
   $("comboBreakerType").value = String(p.VramBreakerType || 0);
   $("txtBreakerVal").value = p.VramBreakerValue ?? 90;
-  $("chkOomRetry").checked = p.OomRetryEnabled !== false;
   $("comboBackend").value = (p.LlamaBackend || "").toLowerCase();
   for (const d of SCHEMA.params) {
     if (d.hidden || d.flag === "model" || d.flag === "model-draft") continue;
@@ -1574,7 +1572,7 @@ function wire() {
   for (const id of ["inModel", "inMtp", "inMmproj", "inMmprojUrl", "inLlamaDir", "inDshDir"]) {
     $(id).addEventListener("input", schedulePreview);
   }
-  for (const id of ["chkNoMmprojOffload", "comboDshMode", "chkDshAdmin", "chkBreaker", "comboBreakerType", "txtBreakerVal", "chkOomRetry"]) {
+  for (const id of ["chkNoMmprojOffload", "comboDshMode", "chkDshAdmin", "chkBreaker", "comboBreakerType", "txtBreakerVal"]) {
     $(id).addEventListener("change", schedulePreview);
   }
   // 浏览按钮

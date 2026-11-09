@@ -61,8 +61,6 @@ def default_profile():
         "CustomArgs": [],
         # 实测设备侧显存(MiB)与指纹,换模型后作废
         "VramMeasuredMiB": 0.0, "VramMeasuredModel": "", "VramMeasuredFp": "",
-        # OOM 自动降层重试(默认开)
-        "OomRetryEnabled": True,
         # llama.cpp 后端: ""=按显卡自动;可显式指定 vulkan/rocm/cuda/sycl
         "LlamaBackend": "",
     }

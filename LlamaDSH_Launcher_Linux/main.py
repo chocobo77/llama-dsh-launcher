@@ -213,12 +213,11 @@ def takeover_on_boot():
     refresh_schema()
     sync_active_profile()
     name, _ = current_profile()
-    LLAMA.persist_config = persist_config
     HUB.log("[配置] 已加载 %s(方案: %s,参数 %d 项)" % (state.config_file_path(), name, len(SCHEMA["defs"])))
 
 
 def persist_config():
-    """OOM 降层落盘: 把内存中的 CONFIG(含降层后的 gpu-layers)写盘。"""
+    """把内存中的 CONFIG 写盘(变体切换/移除/安装等配置写操作的统一落盘入口)。"""
     try:
         state.save_config(CONFIG)
         HUB.log("[配置] 已保存: %s" % state.config_file_path())

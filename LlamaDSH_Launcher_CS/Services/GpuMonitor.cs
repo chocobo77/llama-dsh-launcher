@@ -810,10 +810,14 @@ public class GpuMonitor
 
 	public void StartGpuTempLoop()
 	{
-		if (_gpuTempProc != null && !_gpuTempProc.HasExited)
+		if (ProcLiveness.Alive(_gpuTempProc))
 		{
 			return;
 		}
+		// 上一轮启动器被杀/崩溃会把 --loop 采样子进程留下成孤儿(实测三个并存, 还锁着
+		// gputemp.exe 让后续构建/升级失败)。只有启动器会起这个进程, 且单实例保证同一时刻
+		// 只有一个启动器, 所以起自己这个之前清掉现存实例是安全的。
+		ReapStaleGpuTempLoops();
 		string text = FindGpuTempExe();
 		if (text == null)
 		{
@@ -847,11 +851,44 @@ public class GpuMonitor
 		}
 	}
 
+	private static void ReapStaleGpuTempLoops()
+	{
+		try
+		{
+			Process[] stale = Process.GetProcessesByName("gputemp");
+			if (stale.Length == 0)
+			{
+				return;
+			}
+			foreach (Process p in stale)
+			{
+				try
+				{
+					p.Kill(true);
+					p.WaitForExit(2000);
+				}
+				catch (Exception ex)
+				{
+					AppLog.WriteError("清理遗留 gputemp 采样进程失败: " + ex.Message);
+				}
+				finally
+				{
+					ProcLiveness.SafeDispose(p);
+				}
+			}
+			AppLog.WriteInfo($"清理了 {stale.Length} 个上一轮遗留的 gputemp 采样进程");
+		}
+		catch (Exception ex)
+		{
+			AppLog.WriteError("枚举遗留 gputemp 采样进程失败: " + ex.Message);
+		}
+	}
+
 	private void ReadGpuTempLoop()
 	{
 		try
 		{
-			while (_gpuTempProc != null && !_gpuTempProc.HasExited)
+			while (ProcLiveness.Alive(_gpuTempProc))
 			{
 				// 常驻进程（--loop）不能整体等待退出：用首行看门狗，8s 内没有输出即判定数据源不可用。
 				Task<string?> readTask = _gpuTempProc.StandardOutput.ReadLineAsync();
@@ -914,7 +951,7 @@ public class GpuMonitor
 	{
 		try
 		{
-			if (_gpuTempProc != null && !_gpuTempProc.HasExited)
+			if (ProcLiveness.Alive(_gpuTempProc))
 			{
 				_gpuTempProc.Kill();
 			}
@@ -969,7 +1006,7 @@ public class GpuMonitor
 	{
 		lock (_lock)
 		{
-			if (_gpuTempProc != null && !_gpuTempProc.HasExited)
+			if (ProcLiveness.Alive(_gpuTempProc))
 			{
 				if (_cachedGpuTemp.HasValue)
 				{

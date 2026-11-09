@@ -50,6 +50,7 @@ internal static class Program
         TestAgentCliParse();
         TestAgentApiHttp();
         TestDshIdentityJudge();
+        TestProcLiveness();
 
         Console.WriteLine();
         Console.WriteLine($"总计: {_passed + _failed}  通过: {_passed}  失败: {_failed}");
@@ -337,6 +338,49 @@ internal static class Program
         Check("命令行判定: 真 DSH 入口 apps/cli 命中", DshIdentity.CommandLineMatches("node apps/cli/lib/bin.js web", nodeImg, null));
         Check("命令行判定: 无关 node 服务不命中", !DshIdentity.CommandLineMatches("node server.js", nodeImg, null));
         Check("端口无人监听 → 指纹为未知而非否定", DshIdentity.HttpFingerprint(1) == null);
+    }
+
+    /// <summary>
+    /// 进程对象与进程脱钩后的存活判定。实测事故: PumpProcessStreams 在管道 EOF 后
+    /// Dispose(Process)，字段仍指着该对象，UI 侧裸 HasExited 轮询(HealthCheck 定时器、
+    /// 显存熔断、退出回调)随即抛 InvalidOperationException，且最先抛的位置正好在
+    /// "清理字段"之前 → 每 3 秒一次未处理异常刷屏，模型启动失败的真正原因反而看不到。
+    /// </summary>
+    private static void TestProcLiveness()
+    {
+        Console.WriteLine("[ProcLiveness] 进程对象脱钩后的判定");
+        int self = Environment.ProcessId;
+        Check("自己的 PID 判活", LlamaDSH_Launcher.ProcLiveness.PidAlive(self));
+        Check("不存在的 PID 判不活且不抛", !LlamaDSH_Launcher.ProcLiveness.PidAlive(int.MaxValue - 1));
+        Check("PID 复用防护: 启动时刻对不上判不活",
+            !LlamaDSH_Launcher.ProcLiveness.PidAlive(self, DateTime.Now.AddDays(-5)));
+
+        Process? p = null;
+        try
+        {
+            p = Process.Start(new ProcessStartInfo("cmd.exe", "/c exit 3")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("  跳过(启动 cmd 失败): " + ex.Message);
+            return;
+        }
+        if (p == null)
+        {
+            Console.WriteLine("  跳过(cmd 返回 null)");
+            return;
+        }
+        bool exited = p.WaitForExit(5000);
+        Check("进程退出后 Alive 为假", exited && !LlamaDSH_Launcher.ProcLiveness.Alive(p), "exited=" + exited);
+        LlamaDSH_Launcher.ProcLiveness.SafeDispose(p);
+        Check("Alive(null) 为假", !LlamaDSH_Launcher.ProcLiveness.Alive(null));
+        Check("Dispose 之后 Alive 仍为假且不抛", !LlamaDSH_Launcher.ProcLiveness.Alive(p));
+        LlamaDSH_Launcher.ProcLiveness.SafeDispose(p); // 重复释放不该抛
+        Check("重复 SafeDispose 不抛", true);
     }
 
     private static void TestAgentApiHttp()

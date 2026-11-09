@@ -308,13 +308,11 @@
               <RowDefinition Height="Auto" />
               <RowDefinition Height="Auto" />
               <RowDefinition Height="Auto" />
-              <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
             <Button Grid.Row="0" Grid.Column="0" Name="BtnLlamaStart" Content="▶ 启动 Llama" Background="#238636" Foreground="#FFFFFFFF" Height="30" Width="122" FontSize="12" Margin="0,0,10,8" HorizontalAlignment="Left" Click="StartLlama_Click" />
             <Button Grid.Row="0" Grid.Column="1" Name="BtnLlamaStop" Content="⏹ 停止 Llama" Background="#da3633" Foreground="#FFFFFFFF" Height="30" Width="122" FontSize="12" Margin="0,0,0,8" HorizontalAlignment="Left" IsEnabled="False" Click="StopLlama_Click" />
             <TextBlock Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Name="LblLlamaStatus" Text="● 已停止" Foreground="#8b949e" FontSize="12" Margin="0,0,0,8" />
-            <CheckBox Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" Name="ChkOomRetry" Content="OOM 自动降层重试" IsChecked="True" Foreground="#8b949e" FontSize="11" VerticalAlignment="Center" Margin="0,0,0,8" ToolTip="启动因显存不足失败时，自动降低 --gpu-layers（每次 ×0.85，最多 3 次）并重新启动；需要重新勾选参数面板后手动保存才会持久化" />
-            <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal">
+            <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal">
               <CheckBox Name="ChkVramBreaker" Content="🔒 显存熔断" Foreground="#c9d1d9" FontSize="11" VerticalAlignment="Center" IsChecked="False" ToolTip="显存超过阈值时自动停止 Llama 服务，防止爆显存" />
               <local:NoScrollComboBox x:Name="ComboVramBreakerType" Width="100" Margin="8,0,4,0" VerticalAlignment="Center" FontSize="11">
                 <ComboBoxItem Content="百分比 (%)" IsSelected="True" />

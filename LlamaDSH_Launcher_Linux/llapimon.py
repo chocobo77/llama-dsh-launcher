@@ -58,7 +58,7 @@ _RE_BOOT_SLOTS = re.compile(
     r"n_slots\s*=\s*(?P<slots>\d+)\s*,\s*n_ctx_slot\s*=\s*(?P<ctx>\d+)\s*,\s*kv_unified\s*=\s*'(?P<kv>\w+)'")
 _RE_LISTEN = re.compile(r"listening on\s+(?P<addr>\S+)")
 
-# OOM / 显存实测(core.py 共用): 降层与 buffer 汇总行
+# OOM 关键词 / 显存实测(core.py 共用): offload 与 buffer 汇总行
 _RE_OFFLOAD = re.compile(r"offloaded\s+(\d+)/(\d+)\s+layers")
 OOM_MARKERS = ("failed to fit params", "out of memory", "failed to allocate")
 
@@ -642,9 +642,9 @@ class LlamaApiMonitor:
 
     # ------------------------------------------------------------- OOM 检测
     def note_memory_line(self, line, state):
-        """显存不足/降层/实测分配(core.py 调用)。
+        """显存不足提示 / 实测分配(core.py 调用)。
 
-        state: {"oom_seen": bool, "offloaded": int, "total_layers": int,
+        state: {"offloaded": int, "total_layers": int,
                 "buffers": {"model": MiB, "kv": MiB, "rs": MiB, "compute": MiB}}
         返回给用户看的提示文案, 无提示返回 None。
         """
@@ -652,9 +652,7 @@ class LlamaApiMonitor:
         hint = None
         for marker in OOM_MARKERS:
             if marker in low:
-                if not state.get("oom_seen"):
-                    hint = "检测到显存不足(建议调小 ubatch 或把更多专家放到 CPU)"
-                state["oom_seen"] = True
+                hint = "检测到显存不足(建议调小 ubatch 或把更多专家放到 CPU)"
                 break
         m = _RE_OFFLOAD.search(line)
         if m:
