@@ -379,7 +379,8 @@ namespace LlamaDSH_Launcher.Services
             needReboot = false;
             try
             {
-                log?.Invoke("正在运行 Node 安装器（如弹出 UAC 授权窗口请点“是”，随后等待进度条走完）...");
+                // "会不会弹授权窗口"依本机 UAC 策略：写死"会弹"在内置管理员/EnableLUA=0 的机器上是错的
+                log?.Invoke("正在运行 Node 安装器（本机 UAC: " + InstallScope.UacFact + "；若弹出授权窗口请点“是”，随后等待进度条走完）...");
                 var psi = new ProcessStartInfo("msiexec.exe")
                 {
                     UseShellExecute = true, // runas 需要 shell 执行

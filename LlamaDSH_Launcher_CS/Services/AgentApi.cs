@@ -19,6 +19,15 @@ namespace LlamaDSH_Launcher.Services;
 /// 本类不感知 UI: 路由由宿主(MainWindow)注册为 Func&lt;输入, JSON 字符串&gt; 委托,
 /// 线程 marshalling 全部由宿主决定。GET 处理器收到的是 query(去 '?'), POST 是请求体。
 /// </summary>
+/// <summary>
+/// 处理器用来回「请求体形态不对」的异常：被 Handle 捕获后回 **400**，与 Linux 侧
+/// _body_shape_error 同口径（业务失败仍走 200 + ok:false）。见 docs/API-CONTRACT.md §1。
+/// </summary>
+public sealed class AgentBadRequestException : Exception
+{
+	public AgentBadRequestException(string message) : base(message) { }
+}
+
 public sealed class AgentApi
 {
 	/// <summary>默认端口; agent.json / LLAMADSH_AGENT_PORT 可覆盖(>1024 才允许, 无需管理员的环回段)。</summary>
@@ -300,6 +309,24 @@ public sealed class AgentApi
 			}
 			string result = fn(input) ?? "{\"ok\":false,\"error\":\"处理器返回空\"}";
 			Send(ctx, 200, result);
+		}
+		catch (AgentBadRequestException ex)
+		{
+			// 契约 §1: **请求体类型错误两端都是 400**(Linux 由 _body_shape_error 挡成 400)。
+			// 业务失败(本来就没在跑、DSH 没配目录、停止没停掉)才是 200 + ok:false。
+			// 以前 Windows 把类型错误也回成 200 + ok:false，跨端脚本按状态码分支就会走错路。
+			try
+			{
+				Send(ctx, 400, JsonSerializer.Serialize(new Dictionary<string, object>
+				{
+					["ok"] = false,
+					["error"] = ex.Message
+				}, JsonOpts));
+			}
+			catch
+			{
+				// 响应发不出去(连接被对端关闭): 无进一步动作
+			}
 		}
 		catch (Exception ex)
 		{

@@ -34,15 +34,13 @@ public partial class App : System.Windows.Application
         // 发起必失败——即问题在进程血统而非代码或环境。因此检测到安装器血统标记时，
         // 就经 explorer.exe 以用户 shell 的干净血统重启自己(无论是否提权)。
         //
-        // 两条硬约束（缺任何一条都会变成"无限反复启动"，2026-11-10 实测踩到；判定已抽到
-        // Services\LineageGuard.cs，由 selftest.ps1 直接测）：
-        //   ① 判定必须走白名单，不能"非空即重启"。「仅为自己安装」(PrivilegesRequired=lowest)
-        //      下 Setup 给子进程挂的是 RunAsInvoker——它既不提权也不影响 WMI，本来就不需要切血统。
-        //   ② 自重启一次封顶：重启前写标记文件，窗口内已有标记就不再重启。凭证不能用命令行参数，
-        //      因为加了参数 explorer 就不会拉起程序（实测：只有不带参数的形式有效）。
-        //      封顶之所以必须存在：explorer 是否把子进程滤成非提权依机器（本机实测会被滤掉、
-        //      __COMPAT_LAYER 也不跨跳传播；内置管理员/UAC 关闭的机器上则判定持续成立），
-        //      旧逻辑等于把"不会循环"押在机器 UAC 配置上。
+        // 判定与封顶的全部理由、约束和白名单都在 Services\LineageGuard.cs（由 selftest.ps1
+        // 直接跑），这里只执行动作。要点：
+        //   ① 判定走白名单，不能"非空即重启"（用户级安装的 RunAsInvoker 不需要切血统）。
+        //   ② 自重启一次封顶（凭证走磁盘标记文件；explorer 拉起不带参数，命令行传不了凭证）。
+        //   ③ 封顶 fail-closed：凭证写不出来就**不重启**，宁可留脏血统也不开无界重启。
+        //   ④ [Run] 的 runasoriginaluser 只换令牌、不改环境块，装完自动启动那份仍带
+        //      compat=ElevateCreateProcess（2026-11-11 09:38 实测），别指望它挡血统。
         try
         {
             string? compatLayer = Environment.GetEnvironmentVariable("__COMPAT_LAYER");
@@ -50,36 +48,52 @@ public partial class App : System.Windows.Application
             {
                 var principal = new System.Security.Principal.WindowsPrincipal(identity);
                 bool elevated = principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
-                string markerPath = Path.Combine(Path.GetTempPath(), Services.LineageGuard.MarkerFileName);
+                string markerPath = Services.LineageGuard.MarkerPath;
                 Services.LineageGuard.Decision decision = Services.LineageGuard.Decide(elevated, compatLayer, markerPath);
                 if (decision == Services.LineageGuard.Decision.CappedAlreadyReset)
                 {
                     // 判定仍成立但窗口内已重置过：不再自启，按当前血统直接启动（封顶的意义就在这里，
                     // 否则在 explorer 不滤提权令牌的机器上这条链每次判定都成立 → 无限反复启动）。
                     AppLog.WriteInfo($"lineage flags still present after reset (compat={compatLayer ?? "-"}, elevated={elevated}, pid={Environment.ProcessId}), {Services.LineageGuard.MarkerTtlSeconds}s 内已重置过，不再自启，按当前血统直接启动");
+                    // 凭证用完即弃：留着它只靠 TTL 过期，会把窗口内下一次"确实带着脏血统"的启动
+                    // 也误判成已重置过(= 当初 WMI 必失败的症状回来)。
+                    Services.LineageGuard.ClearRelaunchMarker(markerPath);
                 }
                 else if (decision == Services.LineageGuard.Decision.Relaunch)
                 {
                     string? exePath = Process.GetCurrentProcess().MainModule?.FileName;
                     if (!string.IsNullOrEmpty(exePath) && File.Exists(exePath))
                     {
-                        Services.LineageGuard.MarkRelaunchAttempted(markerPath);
-                        AppLog.WriteInfo($"installer/elevated lineage detected (compat={compatLayer ?? "-"}, elevated={elevated}, pid={Environment.ProcessId}), relaunching clean via explorer.exe: {exePath}");
-                        Process.Start(new ProcessStartInfo
+                        if (!Services.LineageGuard.TryMarkRelaunchAttempted(markerPath, out string markFailure))
                         {
-                            FileName = "explorer.exe",
-                            // 必须不带额外参数：实测加了参数 explorer 就不会拉起程序。
-                            // 一次性凭证走 LineageGuard 的标记文件，不走参数。
-                            Arguments = "\"" + exePath + "\"",
-                            UseShellExecute = true
-                        });
-                        Shutdown();
-                        return;
+                            // fail-closed：没有可信凭证就绝不重启。这条链在"判定持续成立"的机器上
+                            // 每次启动都会成立，重启一次 = 无限反复启动（2026-11-10 实测过的事故）。
+                            AppLog.WriteError("血统封顶凭证写不出来(" + markFailure + ")，marker=" + markerPath
+                                + "；放弃切血统重启，按当前血统直接启动(compat=" + (compatLayer ?? "-") + ", elevated=" + elevated + ")");
+                        }
+                        else
+                        {
+                            AppLog.WriteInfo($"installer/elevated lineage detected (compat={compatLayer ?? "-"}, elevated={elevated}, pid={Environment.ProcessId}), relaunching clean via explorer.exe: {exePath}");
+                            Process.Start(new ProcessStartInfo
+                            {
+                                FileName = "explorer.exe",
+                                // 必须不带额外参数：实测加了参数 explorer 就不会拉起程序。
+                                // 一次性凭证走 LineageGuard 的标记文件，不走参数。
+                                Arguments = "\"" + exePath + "\"",
+                                UseShellExecute = true
+                            });
+                            Shutdown();
+                            return;
+                        }
                     }
                 }
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            // 以前这里是空的 catch：血统判定本身出错时既看不见原因，也看不出"这次到底切没切血统"。
+            AppLog.WriteError("血统判定异常(按当前血统直接启动): " + ex.GetType().Name + ": " + ex.Message);
+        }
 
         // 禁用 WPF 硬件加速：AMD 驱动在长期运行 WPF 应用时可能泄漏显存/系统内存，
         // 导致"无法创建新的堆栈防护页面"。启动器界面简单，软件渲染完全够用。

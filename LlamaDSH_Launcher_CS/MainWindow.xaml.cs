@@ -4625,6 +4625,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		//IL_0224: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0229: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0242: Expected O, but got Unknown
+		_llamaStartOutcome = "start_failed"; // 悲观默认: 下面每条提前 return 都是没拉起(契约 §1.2)
 		if (IsAlive(_llamaProc))
 		{
 			ShowNotice("Already running");
@@ -4669,6 +4670,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			BtnLlamaStart.IsEnabled = false;
 			Log("--- 检测到 safetensors，将自动准备环境(下载脚本/安装依赖)并转换，目录: " + stDir + " ---");
 			EnsureConvertAndLaunchAsync(stDir, outtype);
+			_llamaStartOutcome = "converting"; // 转换在后台排上了; 真正的启动要等转换完成
 			return;
 		}
 		List<string> list;
@@ -4740,6 +4742,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				throw new Exception("● 启动失败");
 			}
 			SaveState();
+			_llamaStartOutcome = "started"; // 进程已拉起(是否在跑由 VerifyLlama/cli monitor 判)
 		}
 		catch (Exception ex2)
 		{
@@ -4928,15 +4931,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
 				Log("--- Llama 进程未在 20 秒内退出，启动按钮保持禁用；可再次点停止或手动结束进程 ---");
 			}
-			// 把权威"停了没"回填给等待中的 agent 调用(HTTP worker 线程); 手动停止路径无等待者为 null。
-			_llamaStopSettled?.TrySetResult(!IsLlamaRunning());
-			_llamaStopSettled = null;
+			// 把权威"停了没"回填给等待中的 agent 调用(HTTP worker 线程); 手动停止路径无等待者。
+			SettleStopWaiters(_llamaStopSettled, !IsLlamaRunning());
 		}
 		catch (Exception ex)
 		{
 			LogError(ex, "等待 Llama 退出");
-			_llamaStopSettled?.TrySetResult(false);
-			_llamaStopSettled = null;
+			SettleStopWaiters(_llamaStopSettled, false);
 		}
 	}
 
@@ -5462,6 +5463,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void StartDsh()
 	{
+		_dshStartOutcome = "start_failed"; // 悲观默认: 下面每条提前 return / catch 都是没拉起(契约 §1.2)
 		if (HasDsh())
 		{
 			ShowNotice("Already running");
@@ -5525,7 +5527,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					_dshProc = null;
 					_dshTracker = null;
 					_dshVerifyDeadline = DateTime.Now.AddSeconds(30.0);
-					Log("--- 正在启动 DSH (" + text3 + " · 管理员提权" + (InstallScope.IsUserScoped ? "，用户级安装：会弹 UAC 确认" : "") + ") ---");
+					Log("--- 正在启动 DSH (" + text3 + " · 管理员提权" + (InstallScope.IsUserScoped ? "，用户级安装" : "")
+						+ "；本机 UAC: " + InstallScope.UacFact + "；程序目录可写: " + InstallScope.WritabilityLabel + ") ---");
+					_dshStartOutcome = "started";
 					StartDshVerifyLoop();
 					return;
 				}
@@ -5543,6 +5547,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				_dshTracker = null;
 				_dshVerifyDeadline = DateTime.Now.AddSeconds(30.0);
 				Log("--- 正在启动 DSH (" + text3 + " · 分离模式) ---");
+				_dshStartOutcome = "started";
 				StartDshVerifyLoop();
 				return;
 			}
@@ -5588,6 +5593,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				OnDshDone();
 			});
 			Log("--- 正在启动 DSH (" + text3 + ") ---");
+			_dshStartOutcome = "started";
 			DispatcherTimer dispatcherTimer = new DispatcherTimer
 			{
 				Interval = TimeSpan.FromSeconds(3.0)
@@ -5726,6 +5732,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		ChkDshAdmin.ToolTip = "以管理员身份启动 DSH（子进程为高完整性，可读取游戏进程内存，如 Elite Dangerous）。需先停止再启动才生效；取消勾选恢复普通方式启动。"
 			+ "\n\n" + InstallScope.ElevationNote
 			+ (InstallScope.IsUserScoped ? "\n需要静默提权的话：重新运行安装包并选择「为所有用户安装」。" : "");
+		// 最该警告的组合：exe 所在目录当前用户可写 + 本机提权静默通过 = 任何能改这个目录的人
+		// 都能静默拿到管理员令牌。这条只在实测成立时打，不再按"安装方式"猜。
+		if (InstallScope.InstallDirWritable == true && InstallScope.UacLikelySilent)
+		{
+			Log("[安装] 安全提示: 程序目录可被当前用户改写，且本机 UAC 策略下提权静默通过("
+				+ InstallScope.UacFact + ")。这条组合下「以管理员身份启动」可被任何能改该目录的人利用。", "WARN");
+		}
 	}
 
 	// 管理员提权启动：ShellExecute runas 把子进程提升到 admin（是否弹 UAC 由系统 UAC 设置决定：
@@ -6178,7 +6191,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 						WindowStyle = ProcessWindowStyle.Hidden,
 						Arguments = "/F /T /PID " + adminKillPid.Value
 					});
-					Log("--- 提权 DSH 进程普通停止无效（UIPI），已下发提权 taskkill ---");
+					Log("--- 提权 DSH 进程普通停止无效（UIPI），已下发提权 taskkill（本机 UAC: " + InstallScope.UacFact
+						+ "；程序目录可写: " + InstallScope.WritabilityLabel + "）---");
 				}
 				catch (Exception ex2)
 				{
@@ -6244,15 +6258,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
 				Log("--- DSH 进程未在 30 秒内退出，启动按钮保持禁用；可再次点停止或手动结束进程 ---");
 			}
-			// 把权威"停了没"回填给等待中的 agent 调用(HTTP worker 线程); 手动停止路径无等待者为 null。
-			_dshStopSettled?.TrySetResult(!stillAlive);
-			_dshStopSettled = null;
+			// 把权威"停了没"回填给等待中的 agent 调用(HTTP worker 线程); 手动停止路径无等待者。
+			SettleStopWaiters(_dshStopSettled, !stillAlive);
 		}
 		catch (Exception ex)
 		{
 			LogError(ex, "等待 DSH 退出");
-			_dshStopSettled?.TrySetResult(false);
-			_dshStopSettled = null;
+			SettleStopWaiters(_dshStopSettled, false);
 		}
 	}
 
@@ -10801,7 +10813,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		catch (Exception ex)
 		{
-			return AgentErr("JSON 解析失败: " + ex.Message);
+			return AgentErr400("请求体必须是合法 JSON 对象(契约 §1): " + ex.Message);
 		}
 		if (enabled == null && type == null && value == null)
 		{
@@ -10903,14 +10915,33 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				return AgentErr("模型路径不存在: " + preModel);
 			}
 			StartLlama();
-			return AgentOk("启动指令已下发; 用 cli status/monitor 跟踪 phase 与端口。注意: safetensors 分片会弹转换确认框, agent 场景请用 GGUF 路径");
+			// §1.2 启动三态(与 dsh/start 同口径): safetensors 分片会弹转换确认框, agent 场景请用 GGUF 路径。
+			return AgentStartOutcome(_llamaStartOutcome, "用 cli status/monitor 跟踪 phase 与端口; 失败原因见 cli logs");
 		}, 60000);
 	}
 
 	// agent 停止调用的"权威收尾回执": FinishStop*Async 在 UI 线程上确认最终下场后,
 	// 用它唤醒等待中的 HTTP worker 线程; 手动点停止按钮时它们为 null(无人等待)。
-	private TaskCompletionSource<bool>? _llamaStopSettled;
-	private TaskCompletionSource<bool>? _dshStopSettled;
+	// 队列而不是单槽: 两个停止请求并发时单槽会被后者覆盖, 前一个 caller 只能等满超时得到
+	// 假的 stop_failed(其实已被后一次停掉)。
+	private readonly System.Collections.Concurrent.ConcurrentQueue<TaskCompletionSource<bool>> _llamaStopSettled = new System.Collections.Concurrent.ConcurrentQueue<TaskCompletionSource<bool>>();
+	private readonly System.Collections.Concurrent.ConcurrentQueue<TaskCompletionSource<bool>> _dshStopSettled = new System.Collections.Concurrent.ConcurrentQueue<TaskCompletionSource<bool>>();
+
+	// agent 启动调用的下场回执(§1.2): StartLlama/StartDsh 各有十几条提前 return 的失败路径,
+	// 与其把签名改成 bool 再逐条改返回值, 不如"进入即置 start_failed, 真正拉起的那一刻置 started"
+	// —— 悲观默认不会把"没拉起"说成"拉起了"。手动点按钮时没人读它, 无副作用。
+	// 失败的具体原因仍只进 run.log(agent 侧用 cli logs / logs 端点查)。
+	private string _llamaStartOutcome = "";
+	private string _dshStartOutcome = "";
+
+	/// <summary>唤醒所有在等这次停止下场的 agent 调用(并发停止时队列里可能有多个)。</summary>
+	private static void SettleStopWaiters(System.Collections.Concurrent.ConcurrentQueue<TaskCompletionSource<bool>> q, bool stopped)
+	{
+		while (q.TryDequeue(out TaskCompletionSource<bool>? tcs))
+		{
+			try { tcs.TrySetResult(stopped); } catch { }
+		}
+	}
 
 	private string AgentLlamaStop(string body)
 	{
@@ -10933,7 +10964,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}, AgentApi.JsonOpts);
 			}
 			tcs = new TaskCompletionSource<bool>();
-			_llamaStopSettled = tcs;
+			_llamaStopSettled.Enqueue(tcs);
 			StopLlama();
 			return ""; // 空串 = 让 AgentOp 放行, 真实状态在本线程等 TCS
 		}, 60000);
@@ -10977,7 +11008,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				return AgentErr("DSH 已在运行");
 			}
 			StartDsh();
-			return AgentOk("启动指令已下发; 用 cli status 跟踪 pid");
+			// §1.2 启动三态: "下发了启动"不等于"拉起来了"。提权被拒/UAC 取消/目录没找到
+			// 以前一律回 ok:true，agent 侧完全看不出差别(而用户级安装下提权会真弹确认框)。
+			return AgentStartOutcome(_dshStartOutcome, "用 cli status 跟踪 pid");
 		}, 60000);
 	}
 
@@ -11000,7 +11033,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}, AgentApi.JsonOpts);
 			}
 			tcs = new TaskCompletionSource<bool>();
-			_dshStopSettled = tcs;
+			_dshStopSettled.Enqueue(tcs);
 			StopDsh();
 			return ""; // 空串 = 让 AgentOp 放行, 真实状态在本线程等 TCS
 		}, 60000);
@@ -11045,8 +11078,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}
 				else if (v.ValueKind != JsonValueKind.Null)
 				{
-					// 非布尔的 on(Linux 侧由 _body_shape_error 挡成 400, 这里按业务失败回 ok:false)
-					return AgentErr("on 必须是布尔(当前是 " + v.ValueKind + ")");
+					// 非布尔的 on: 类型错误 → 400，与 Linux 侧 _body_shape_error 同口径(契约 §1)
+					return AgentErr400("on 必须是布尔(当前是 " + v.ValueKind + ")");
 				}
 			}
 			if (doc.RootElement.TryGetProperty("toggle", out JsonElement t))
@@ -11057,13 +11090,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}
 				else if (t.ValueKind != JsonValueKind.False && t.ValueKind != JsonValueKind.Null)
 				{
-					return AgentErr("toggle 必须是布尔(当前是 " + t.ValueKind + ")");
+					return AgentErr400("toggle 必须是布尔(当前是 " + t.ValueKind + ")");
 				}
 			}
 		}
 		catch (Exception ex)
 		{
-			return AgentErr("JSON 解析失败: " + ex.Message);
+			return AgentErr400("请求体必须是合法 JSON 对象(契约 §1): " + ex.Message);
 		}
 		return AgentOp(delegate
 		{
@@ -11087,7 +11120,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				["ok"] = true,
 				["lightweight"] = _lightOn,
-				// Linux 侧 lightweight 只认显式 on；Windows 不带字段是 toggle。两个键都回，
+				// 两端都回 on 与 lightweight 两个键(§3.4 已统一：都不带参数一律报错，不再"即翻转/即关")，
 				// 跨端脚本读同一个字段名即可
 				["on"] = _lightOn,
 				["tray_mode"] = _trayMode,
@@ -11287,6 +11320,39 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private static string AgentErr(string msg)
 	{
 		return JsonSerializer.Serialize(new Dictionary<string, object> { ["ok"] = false, ["error"] = msg }, AgentApi.JsonOpts);
+	}
+
+	/// <summary>
+	/// 类型/形态错误专用：抛出后由 AgentApi 回 **400**（与 Linux 的 _body_shape_error 同口径）。
+	/// 业务失败(本来就没在跑、没配目录、停止没停掉)仍用 AgentErr → 200 + ok:false。
+	/// </summary>
+	private static string AgentErr400(string msg)
+	{
+		throw new AgentBadRequestException(msg);
+	}
+
+	/// <summary>
+	/// 启动端点的三态回报（契约 §1.2）：ok 只代表"这次调用被受理并真的拉起了进程"。
+	///   started / converting = 进程已拉起或转换已排上(是否在跑由 cli status / monitor 判)；
+	///   start_failed = 没拉起(UAC 被拒、DSH 目录没找到、参数检查没过、命令构建失败…具体原因进
+	///   run.log，用 cli logs 查)。以前一律回 ok:true，agent 侧完全看不出提权被用户取消了。
+	/// </summary>
+	private static string AgentStartOutcome(string outcome, string hint)
+	{
+		bool launched = outcome == "started" || outcome == "converting";
+		Dictionary<string, object> d = new Dictionary<string, object>
+		{
+			["ok"] = launched,
+			["started"] = launched,
+			["converting"] = outcome == "converting",
+			["status"] = string.IsNullOrEmpty(outcome) ? "start_failed" : outcome,
+			["msg"] = launched ? ("已受理(" + outcome + "); " + hint) : ("未能拉起进程; 原因见 cli logs; " + hint)
+		};
+		if (!launched)
+		{
+			d["error"] = "start_failed";
+		}
+		return JsonSerializer.Serialize(d, AgentApi.JsonOpts);
 	}
 
 }
