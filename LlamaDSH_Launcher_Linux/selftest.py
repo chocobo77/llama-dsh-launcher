@@ -4687,6 +4687,158 @@ finally:
     toolchain.monitor = _tc_be_real
     toolchain._backend_pref_cache = None
 
+# --- 30) 契约统一批次: 布尔入参 / 三态停止 / profile 回写守卫 / 脱敏纵深 ----------
+#      对应 docs/API-CONTRACT.md §1.1(停止三态)、§3.4(lightweight/monitor/profile)、§5(脱敏)。
+_c30_main = io.open("main.py", encoding="utf-8").read()
+_c30_core = io.open("core.py", encoding="utf-8").read()
+
+# 30.1 停止端点三态回报(契约 §1.1): ok 只代表"流程执行过", status 才是进程下场。
+check("core.stop() 透传真实 status(两个 runner 各一处 return self.status + §1.1 注释)",
+      _c30_core.count("契约 §1.1") >= 2 and _c30_core.count("return self.status") >= 2,
+      "core.py 未见三态回报")
+check("api_llama_stop/api_dsh_stop 把 status 放进响应(而非恒 ok:true 就当停好)",
+      '"status": LLAMA.stop()' in _c30_main and '"status": DSH.stop()' in _c30_main, "main.py stop 未透 status")
+_c30_old_lstop, _c30_old_dstop = main.LLAMA.stop, main.DSH.stop
+try:
+    main.LLAMA.stop = lambda: "stopped"
+    _c30_rs = main.api_llama_stop({})
+    check("llama/stop 停成功 → ok:true + status:stopped",
+          _c30_rs.get("ok") is True and _c30_rs.get("status") == "stopped", str(_c30_rs))
+    main.LLAMA.stop = lambda: "stop_failed"
+    _c30_rs2 = main.api_llama_stop({})
+    check("llama/stop 没停掉 → 仍 ok:true 但 status:stop_failed(查不到≠没在跑)",
+          _c30_rs2.get("ok") is True and _c30_rs2.get("status") == "stop_failed", str(_c30_rs2))
+    main.DSH.stop = lambda: "stop_failed"
+    _c30_rsd = main.api_dsh_stop({})
+    check("dsh/stop 没停掉 → status:stop_failed", _c30_rsd.get("status") == "stop_failed", str(_c30_rsd))
+finally:
+    main.LLAMA.stop, main.DSH.stop = _c30_old_lstop, _c30_old_dstop
+
+# 30.2 轻量化两端统一语义(契约 §3.4): on=设定 / toggle=true=翻转 / 都不带=明确报错。
+_c30_old_lw = main.MON.lightweight
+try:
+    main.MON.lightweight = False
+    _c30_on = main.api_lightweight({"on": True})
+    check("lightweight {on:true} 显式开", _c30_on.get("lightweight") is True and main.MON.lightweight is True, str(_c30_on))
+    _c30_off = main.api_lightweight({"on": False})
+    check("lightweight {on:false} 显式关", _c30_off.get("lightweight") is False and main.MON.lightweight is False, str(_c30_off))
+    _c30_tg = main.api_lightweight({"toggle": True})
+    check("lightweight {toggle:true} 翻转(关→开)", _c30_tg.get("lightweight") is True and main.MON.lightweight is True, str(_c30_tg))
+    _c30_em = main.api_lightweight({})
+    check("lightweight 空 body 不再默认关(Linux 旧 bool()→False 已与两端相反)，必须 ok:false + error",
+          _c30_em.get("ok") is False and bool(_c30_em.get("error")), str(_c30_em))
+    _c30_tg2 = main.api_lightweight({"toggle": True})
+    check("lightweight {toggle:true} 再翻(开→关)", _c30_tg2.get("lightweight") is False and main.MON.lightweight is False, str(_c30_tg2))
+finally:
+    main.MON.lightweight = _c30_old_lw
+
+# 30.3 monitor visible 缺省一律按"在看"(打点启用快采), 非布尔已在入口挡成 400。
+_c30_old_vis, _c30_old_snap = main.MON.monitor_visible, getattr(main.MON, "snapshot", None)
+try:
+    main.MON.snapshot = {}
+    main.api_monitor({})
+    check("monitor 缺 visible → 按在看(True)", main.MON.monitor_visible is True, "")
+    main.api_monitor({"visible": None})
+    check("monitor visible:null → 按在看(True)", main.MON.monitor_visible is True, "")
+    main.api_monitor({"visible": False})
+    check("monitor visible:false → 不打点(False)", main.MON.monitor_visible is False, "")
+    main.api_monitor({"visible": True})
+    check("monitor visible:true → 打点(True)", main.MON.monitor_visible is True, "")
+finally:
+    main.MON.monitor_visible = _c30_old_vis
+    if _c30_old_snap is not None:
+        main.MON.snapshot = _c30_old_snap
+
+# 30.4 布尔入参类型门(_body_shape_error): "false"/0/[]/1 不得被 bool() 误判成 True。
+check("_body_shape_error: on=\"false\"(字符串)挡成布尔错", "必须是布尔" in (main._body_shape_error({"on": "false"}) or ""), "")
+check("_body_shape_error: toggle=0(int)挡成布尔错", "必须是布尔" in (main._body_shape_error({"toggle": 0}) or ""), "")
+check("_body_shape_error: visible=[](空列表 bool()→False)挡成布尔错", "必须是布尔" in (main._body_shape_error({"visible": []}) or ""), "")
+check("_body_shape_error: active=1(int 但非 bool)挡成布尔错", "必须是布尔" in (main._body_shape_error({"active": 1}) or ""), "")
+check("_body_shape_error: 真布尔放行", main._body_shape_error({"on": True, "visible": False, "active": True, "toggle": False}) is None, "")
+check("_body_shape_error: visible=null 放行(交给缺省语义)", main._body_shape_error({"visible": None}) is None, "")
+check("_body_shape_error: 空对象放行", main._body_shape_error({}) is None, "")
+check("_body_shape_error: 非对象请求体挡掉", (main._body_shape_error([]) or "") != "", "")
+
+# 30.5 profile 回写守卫(契约 §4): 传 profile 写回当前方案;不带/null 绝不以空覆盖用户已有方案。
+check("四处写回点(preview/llama_start/dsh_start/args_map)改用 _resolve_profile",
+      _c30_main.count("prof = _resolve_profile(body)") >= 4, "写回点未收敛")
+_c30_old_cfg = main.CONFIG
+try:
+    main.CONFIG = {"CurrentProfile": "web", "Profiles": {"web": {"DshDir": "/saved"}}}
+    _c30_wb = main._resolve_profile({"profile": {"X": 1}})
+    check("_resolve_profile 传 profile 对象 → 写回当前方案并返回它",
+          _c30_wb == {"X": 1} and main.CONFIG["Profiles"]["web"] == {"X": 1}, str(main.CONFIG))
+    main.CONFIG = {"CurrentProfile": "web", "Profiles": {"web": {"DshDir": "/saved"}}}
+    _c30_np = main._resolve_profile({})
+    check("_resolve_profile 不带 profile → 返回已存方案且不覆盖",
+          _c30_np == {"DshDir": "/saved"} and main.CONFIG["Profiles"]["web"] == {"DshDir": "/saved"}, str(main.CONFIG))
+    main.CONFIG = {"CurrentProfile": "web", "Profiles": {"web": {"DshDir": "/saved"}}}
+    _c30_nl = main._resolve_profile({"profile": None})
+    check("_resolve_profile profile:null → 不以 None 覆盖，保留已存方案",
+          _c30_nl == {"DshDir": "/saved"} and main.CONFIG["Profiles"]["web"] == {"DshDir": "/saved"}, str(main.CONFIG))
+finally:
+    main.CONFIG = _c30_old_cfg
+
+# 30.6 set_active 必须显式布尔，缺 active 不再 bool(None)→False 误关插件。
+_c30_sa = main.api_plugins_set_active({"name": "x"})
+check("plugins/set_active 缺 active → ok:false + msg(不误关插件)",
+      _c30_sa.get("ok") is False and bool(_c30_sa.get("msg")), str(_c30_sa))
+
+# 30.7 /api/job 缺 id / 空串 / 未知 id 都说清楚，不冒充"任务还在跑"。
+_c30_j0 = main.api_job({})
+check("job 缺 id → ok:false + 缺少 id", _c30_j0.get("ok") is False and "缺少 id" in (_c30_j0.get("error") or ""), str(_c30_j0))
+_c30_js = main.api_job({"id": "   "})
+check("job id 空白串 → ok:false + 缺少 id", _c30_js.get("ok") is False and "缺少 id" in (_c30_js.get("error") or ""), str(_c30_js))
+_c30_ju = main.api_job({"id": "99999999"})
+check("job 未知 id → ok:false + 未知任务 id(而非含糊 status:unknown)",
+      _c30_ju.get("ok") is False and "未知任务 id" in (_c30_ju.get("error") or ""), str(_c30_ju))
+
+# 30.8 脱敏纵深(§5): job 的 log 与 result 进 HTTP 响应前都过 redact；_redact_deep 只抹字符串叶。
+_c30_rd = main._redact_deep({"a": "http://x/?token=SECRETVAL1", "b": [1, {"c": "Bearer SUPERSECRETVALUE12"}]})
+check("_redact_deep 保结构(dict/list 原样)且抹字符串叶凭据",
+      set(_c30_rd) == {"a", "b"} and _c30_rd["b"][0] == 1
+      and "SECRETVAL1" not in _c30_rd["a"] and "SUPERSECRETVALUE12" not in _c30_rd["b"][1]["c"]
+      and "已隐藏" in _c30_rd["b"][1]["c"], str(_c30_rd))
+_c30_jid = main.run_job(
+    "脱敏哨兵",
+    lambda log: (log("访问 http://h/?token=PLAINTEXT1"),
+                 {"u": "http://h/?token=PLAINTEXT1", "nested": {"auth": "Bearer SUPERSECRETVALUE12"}})[1])
+_c30_dl = time.time() + 5.0
+while main.JOBS.get(_c30_jid, {}).get("status") == "running" and time.time() < _c30_dl:
+    time.sleep(0.05)
+_c30_jlog = "".join(main.JOBS.get(_c30_jid, {}).get("log", []))
+_c30_jr = main.api_job({"id": _c30_jid})
+_c30_jres = str(_c30_jr.get("result"))
+check("run_job 落 job 的 log 行过脱敏", "PLAINTEXT1" not in _c30_jlog and "已隐藏" in _c30_jlog, _c30_jlog[:160])
+check("run_job 落 job 的 result(含嵌套)过脱敏且 /api/job 回出去也无明文",
+      _c30_jr.get("status") == "done" and "PLAINTEXT1" not in _c30_jres
+      and "SUPERSECRETVALUE12" not in _c30_jres and "已隐藏" in _c30_jres, _c30_jres[:200])
+
+# 30.9 脱敏上线前落盘的历史日志，启动时回头清一遍(scrub_existing)：就地重写 run/info/error/crash 及 .1/.2/.3。
+_c30_sdir = os.path.join(_SELFTEST_HOME, "scrub30")
+os.makedirs(_c30_sdir, exist_ok=True)
+_c30_old_ld = _applog_top.LOG_DIR
+_applog_top.LOG_DIR = _c30_sdir
+try:
+    io.open(os.path.join(_c30_sdir, "run.log"), "w", encoding="utf-8").write("横幅 http://127.0.0.1:3080/?token=OLDPLAIN123\n")
+    io.open(os.path.join(_c30_sdir, "error.log.1"), "w", encoding="utf-8").write("Authorization: Bearer SUPEROLDTOKEN12345\n")
+    io.open(os.path.join(_c30_sdir, "info.log"), "w", encoding="utf-8").write("干净行无凭据\n")
+    io.open(os.path.join(_c30_sdir, "notes.log"), "w", encoding="utf-8").write("?token=NOTALOGFILE9\n")
+    _c30_sc = _applog_top.scrub_existing()
+    _c30_run = io.open(os.path.join(_c30_sdir, "run.log"), encoding="utf-8").read()
+    _c30_err1 = io.open(os.path.join(_c30_sdir, "error.log.1"), encoding="utf-8").read()
+    _c30_info = io.open(os.path.join(_c30_sdir, "info.log"), encoding="utf-8").read()
+    _c30_notes = io.open(os.path.join(_c30_sdir, "notes.log"), encoding="utf-8").read()
+    check("scrub_existing 抹掉历史 run.log 里的明文 token", "OLDPLAIN123" not in _c30_run and "已隐藏" in _c30_run, _c30_run)
+    check("scrub_existing 连 .1 轮转备份一起清(旧明文常在轮转文件里)", "SUPEROLDTOKEN12345" not in _c30_err1 and "已隐藏" in _c30_err1, _c30_err1)
+    check("scrub_existing 不改写无凭据的文件(幂等/无谓写盘)", _c30_info == "干净行无凭据\n", _c30_info)
+    check("scrub_existing 只扫 _LOG_FILES(run/info/error/crash)，其它名不动", "NOTALOGFILE9" in _c30_notes, _c30_notes)
+    check("scrub_existing 返回改动的文件数(此处应为 2)", _c30_sc == 2, str(_c30_sc))
+    _c30_sc2 = _applog_top.scrub_existing()
+    check("scrub_existing 二次跑无更多改动(已清干净)", _c30_sc2 == 0, str(_c30_sc2))
+finally:
+    _applog_top.LOG_DIR = _c30_old_ld
+
 shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)
 

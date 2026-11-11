@@ -4927,10 +4927,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				LblLlamaStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
 				Log("--- Llama 进程未在 20 秒内退出，启动按钮保持禁用；可再次点停止或手动结束进程 ---");
 			}
+			// 把权威"停了没"回填给等待中的 agent 调用(HTTP worker 线程); 手动停止路径无等待者为 null。
+			_llamaStopSettled?.TrySetResult(!IsLlamaRunning());
+			_llamaStopSettled = null;
 		}
 		catch (Exception ex)
 		{
 			LogError(ex, "等待 Llama 退出");
+			_llamaStopSettled?.TrySetResult(false);
+			_llamaStopSettled = null;
 		}
 	}
 
@@ -6220,10 +6225,15 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
 				Log("--- DSH 进程未在 30 秒内退出，启动按钮保持禁用；可再次点停止或手动结束进程 ---");
 			}
+			// 把权威"停了没"回填给等待中的 agent 调用(HTTP worker 线程); 手动停止路径无等待者为 null。
+			_dshStopSettled?.TrySetResult(!stillAlive);
+			_dshStopSettled = null;
 		}
 		catch (Exception ex)
 		{
 			LogError(ex, "等待 DSH 退出");
+			_dshStopSettled?.TrySetResult(false);
+			_dshStopSettled = null;
 		}
 	}
 
@@ -10878,9 +10888,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}, 60000);
 	}
 
+	// agent 停止调用的"权威收尾回执": FinishStop*Async 在 UI 线程上确认最终下场后,
+	// 用它唤醒等待中的 HTTP worker 线程; 手动点停止按钮时它们为 null(无人等待)。
+	private TaskCompletionSource<bool>? _llamaStopSettled;
+	private TaskCompletionSource<bool>? _dshStopSettled;
+
 	private string AgentLlamaStop(string body)
 	{
-		return AgentOp(delegate
+		// 停止是异步杀树: 真实下场由 FinishStopLlamaAsync 在 UI 线程上确认。用 TCS 把它透给
+		// 本(HTTP worker)线程, 从而三态回报 stopped/stop_failed —— 绝不在 UI 线程等待, 否则
+		// 会与驱动收尾的 UI 线程互锁(审计 P1: Windows 以前无论真假一律回"已停止")。
+		TaskCompletionSource<bool>? tcs = null;
+		string? early = AgentOp(delegate
 		{
 			bool was = IsAlive(_llamaProc) || (_llamaApi != null && _llamaApi.Online);
 			if (!was)
@@ -10890,17 +10909,39 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					["ok"] = true,
 					["was_running"] = false,
+					["status"] = "stopped",
 					["msg"] = "本来就未在运行"
 				}, AgentApi.JsonOpts);
 			}
+			tcs = new TaskCompletionSource<bool>();
+			_llamaStopSettled = tcs;
 			StopLlama();
-			return JsonSerializer.Serialize(new Dictionary<string, object>
-			{
-				["ok"] = true,
-				["was_running"] = true,
-				["msg"] = "已停止"
-			}, AgentApi.JsonOpts);
+			return ""; // 空串 = 让 AgentOp 放行, 真实状态在本线程等 TCS
 		}, 60000);
+		if (!string.IsNullOrEmpty(early))
+		{
+			return early!;
+		}
+		if (tcs == null)
+		{
+			return AgentErr("停止未启动(内部状态异常)");
+		}
+		bool stopped = false;
+		try
+		{
+			stopped = tcs.Task.Wait(25000) && tcs.Task.Result;
+		}
+		catch (AggregateException)
+		{
+			stopped = false;
+		}
+		return JsonSerializer.Serialize(new Dictionary<string, object>
+		{
+			["ok"] = true,
+			["was_running"] = true,
+			["status"] = stopped ? "stopped" : "stop_failed",
+			["msg"] = stopped ? "已停止" : "停止命令已发出, 但进程未在时限内确认退出(可再次停止或手动结束)"
+		}, AgentApi.JsonOpts);
 	}
 
 	private string AgentDshStart(string body)
@@ -10923,7 +10964,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private string AgentDshStop(string body)
 	{
-		return AgentOp(delegate
+		// 同 AgentLlamaStop: DSH 停止也是异步(杀树 + UIPI 回退), 由 FinishStopDshAsync 确认下场。
+		// 用 TCS 把 stopped/stop_failed 透给 HTTP worker 线程, 不在 UI 线程等待。
+		TaskCompletionSource<bool>? tcs = null;
+		string? early = AgentOp(delegate
 		{
 			bool was = HasDsh();
 			if (!was)
@@ -10932,28 +10976,70 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					["ok"] = true,
 					["was_running"] = false,
+					["status"] = "stopped",
 					["msg"] = "本来就未在运行"
 				}, AgentApi.JsonOpts);
 			}
+			tcs = new TaskCompletionSource<bool>();
+			_dshStopSettled = tcs;
 			StopDsh();
-			return JsonSerializer.Serialize(new Dictionary<string, object>
-			{
-				["ok"] = true,
-				["was_running"] = true,
-				["msg"] = "已停止"
-			}, AgentApi.JsonOpts);
+			return ""; // 空串 = 让 AgentOp 放行, 真实状态在本线程等 TCS
 		}, 60000);
+		if (!string.IsNullOrEmpty(early))
+		{
+			return early!;
+		}
+		if (tcs == null)
+		{
+			return AgentErr("停止未启动(内部状态异常)");
+		}
+		bool stopped = false;
+		try
+		{
+			stopped = tcs.Task.Wait(35000) && tcs.Task.Result;
+		}
+		catch (AggregateException)
+		{
+			stopped = false;
+		}
+		return JsonSerializer.Serialize(new Dictionary<string, object>
+		{
+			["ok"] = true,
+			["was_running"] = true,
+			["status"] = stopped ? "stopped" : "stop_failed",
+			["msg"] = stopped ? "已停止" : "停止命令已发出, 但进程未在时限内确认退出(可再次停止或手动结束)"
+		}, AgentApi.JsonOpts);
 	}
 
 	private string AgentLightweight(string body)
 	{
 		bool? on = null;
+		bool toggle = false;
 		try
 		{
 			using JsonDocument doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(body) ? "{}" : body);
-			if (doc.RootElement.TryGetProperty("on", out JsonElement v) && (v.ValueKind == JsonValueKind.True || v.ValueKind == JsonValueKind.False))
+			if (doc.RootElement.TryGetProperty("on", out JsonElement v))
 			{
-				on = v.GetBoolean();
+				if (v.ValueKind == JsonValueKind.True || v.ValueKind == JsonValueKind.False)
+				{
+					on = v.GetBoolean();
+				}
+				else if (v.ValueKind != JsonValueKind.Null)
+				{
+					// 非布尔的 on(Linux 侧由 _body_shape_error 挡成 400, 这里按业务失败回 ok:false)
+					return AgentErr("on 必须是布尔(当前是 " + v.ValueKind + ")");
+				}
+			}
+			if (doc.RootElement.TryGetProperty("toggle", out JsonElement t))
+			{
+				if (t.ValueKind == JsonValueKind.True)
+				{
+					toggle = true;
+				}
+				else if (t.ValueKind != JsonValueKind.False && t.ValueKind != JsonValueKind.Null)
+				{
+					return AgentErr("toggle 必须是布尔(当前是 " + t.ValueKind + ")");
+				}
 			}
 		}
 		catch (Exception ex)
@@ -10962,7 +11048,20 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		return AgentOp(delegate
 		{
-			_lightOn = on ?? !_lightOn; // 不带 on 字段 = toggle
+			// 两端统一语义(契约 §3.4): on(true/false)=显式设定; toggle(true)=翻转; 都不带→明确报错。
+			// 旧版"不带字段即翻转"与 Linux"不带即关"相反, 现统一为报错, 避免跨端脚本踩坑。
+			if (on.HasValue)
+			{
+				_lightOn = on.Value;
+			}
+			else if (toggle)
+			{
+				_lightOn = !_lightOn;
+			}
+			else
+			{
+				return AgentErr("需要 on(true/false) 或 toggle(true) 之一(见 API-CONTRACT §3.4)");
+			}
 			SyncTrayLightItem();
 			_perfPulse = true;
 			return JsonSerializer.Serialize(new Dictionary<string, object>

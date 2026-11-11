@@ -95,6 +95,9 @@ def _write_agent_file(port):
               % (ex, AGENT_FILE))
 
 
+_nscrub = applog.scrub_existing()
+if _nscrub:
+    applog.info("[脱敏] 已重写 %d 个历史日志文件, 抹除脱敏上线前落盘的明文凭据" % _nscrub)
 applog.info("========== LlamaDSH Launcher (Linux) 启动 ==========")
 
 # ---------------------------------------------------------------- 全局状态 --
@@ -132,7 +135,39 @@ def sync_active_profile():
     MON.active_profile = p
 
 
+def _resolve_profile(body):
+    """取本次请求要用的方案, 并在传了 profile 时写回运行时副本(契约 §4)。
+
+    传了 profile(对象)→ 写回当前方案的运行时副本并返回它(UI 是编辑中的唯一事实来源);
+    没传 / 为 null → 返回当前已存方案原样, **绝不以 {} 覆盖**, 免得一次不带 profile 的
+    调用(例如纯启动/纯预览)把用户已有方案抹成空。
+    """
+    raw = body.get("profile") if isinstance(body, dict) else None
+    name = CONFIG.get("CurrentProfile")
+    if isinstance(raw, dict):
+        if name and name in (CONFIG.get("Profiles") or {}):
+            CONFIG["Profiles"][name] = raw
+        return raw
+    _, saved = current_profile()
+    return saved
+
+
 # ------------------------------------------------------------------ 任务 ----
+
+def _redact_deep(val):
+    """递归对任务 result 里的字符串叶节点过 redact, 保持 dict/list 结构不变。
+
+    /api/job 的 result 直接进 HTTP 响应(§5 脱敏不变量): 任务里可能带回含 token 的
+    URL/头部, 结构照原样返回, 只在字符串叶子上抹凭据。
+    """
+    if isinstance(val, str):
+        return applog.redact(val)
+    if isinstance(val, dict):
+        return {k: _redact_deep(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)):
+        return [_redact_deep(v) for v in val]
+    return val
+
 
 def run_job(name, fn):
     global JOB_SEQ
@@ -143,11 +178,11 @@ def run_job(name, fn):
                      "started": time.time()}
     def wrap():
         try:
-            res = fn(lambda t: JOBS[jid]["log"].append(str(t)))
-            JOBS[jid]["result"] = res
+            res = fn(lambda t: JOBS[jid]["log"].append(applog.redact(str(t))))
+            JOBS[jid]["result"] = _redact_deep(res)
             JOBS[jid]["status"] = "done"
         except Exception as ex:
-            JOBS[jid]["result"] = str(ex)
+            JOBS[jid]["result"] = applog.redact(str(ex))
             JOBS[jid]["status"] = "error"
             HUB.error_ex(ex, "后台任务 %s" % name)
         # 长驻进程慢性泄漏: 只保留最近 20 个 job
@@ -276,12 +311,7 @@ def api_bootstrap(_):
 
 
 def api_preview(body):
-    prof = body.get("profile") or {}
-    _, saved = current_profile()
-    # UI 是编辑中的唯一事实来源:预览也把方案写回运行时副本(供监控取端口)
-    name = CONFIG.get("CurrentProfile")
-    if name and name in (CONFIG.get("Profiles") or {}):
-        CONFIG["Profiles"][name] = prof
+    prof = _resolve_profile(body)
     sync_active_profile()
     defs = SCHEMA["defs"]
     try:
@@ -307,17 +337,18 @@ def api_preview(body):
 
 
 def api_llama_start(body):
-    prof = body.get("profile") or {}
+    prof = _resolve_profile(body)
     confirm = body.get("confirm") or {}
-    name = CONFIG.get("CurrentProfile")
-    if name in (CONFIG.get("Profiles") or {}):
-        CONFIG["Profiles"][name] = prof
     sync_active_profile()
     # 确认链:safetensors → 依赖剔除 → 显存 → qwen35(与原版同序)
     if not confirm.get("done") and not confirm.get("skip_checks"):
         need = LLAMA.precheck(prof)
         if need.get("kind") in ("safetensors", "empty", "build_error", "confirm"):
             return {"need_confirm": need}
+        if need.get("kind") != "ok":
+            # 预检返回了未知 kind(含 None/缺字段): 明确报错, 不再盲取 need["cmd"] 触发 KeyError。
+            return {"started": False,
+                    "error": "预检返回异常结果(kind=%r), 未能构造启动命令" % need.get("kind")}
         cmd_list = need["cmd"]
     else:
         # 用户已在前端确认(剔除/显存/qwen35): 跳过二次硬拒,
@@ -350,15 +381,12 @@ def api_llama_start(body):
 
 
 def api_llama_stop(_):
-    LLAMA.stop()
-    return {"ok": True}
+    # 三态回报(契约 §1.1): ok 只代表"停止流程已执行", status 才是进程真实下场。
+    return {"ok": True, "status": LLAMA.stop()}
 
 
 def api_dsh_start(body):
-    prof = body.get("profile") or {}
-    name = CONFIG.get("CurrentProfile")
-    if name in (CONFIG.get("Profiles") or {}):
-        CONFIG["Profiles"][name] = prof
+    prof = _resolve_profile(body)
     sync_active_profile()
     res = DSH.start(prof)
     if isinstance(res, dict) and res.get("need_rebuild"):
@@ -389,8 +417,8 @@ def api_dsh_rebuild_and_start(body):
 
 
 def api_dsh_stop(_):
-    DSH.stop()
-    return {"ok": True}
+    # 三态回报(契约 §1.1): ok 只代表"停止流程已执行", status 才是进程真实下场。
+    return {"ok": True, "status": DSH.stop()}
 
 
 def api_dsh_rebuild(body):
@@ -505,7 +533,10 @@ def api_job(body):
     `{"job":"<id>"}`, 由调用方轮询这里。id 不存在时按 ok:false + error 说清楚, 而不是回一个
     看似正常的 `status:"unknown"` —— 服务重启后旧 id 必然查不到, 含糊的形状会让人以为任务还在跑。
     """
-    jid = str(body.get("id"))
+    raw_id = body.get("id")
+    if raw_id is None or (isinstance(raw_id, str) and not raw_id.strip()):
+        return {"ok": False, "status": "unknown", "error": "缺少 id: 请求体需带 {\"id\":\"<job id>\"}"}
+    jid = str(raw_id)
     j = JOBS.get(jid)
     if j is None:
         return {"ok": False, "id": jid, "status": "unknown",
@@ -889,8 +920,20 @@ def _mounts():
 
 
 def api_lightweight(body):
-    """轻量化模式开关(客户端最小化到托盘时调用)。"""
-    MON.lightweight = bool(body.get("on"))
+    """轻量化模式开关(客户端最小化到托盘时调用)。
+
+    两端统一语义(契约 §3.4): `{"on": true/false}`=显式设定; `{"toggle": true}`=翻转当前;
+    两者都不带 → 明确报错, 不再默认关(Linux 旧行为 bool()→关, 与 Windows 默认翻转相反)。
+    非布尔的 on/toggle 已在入口被 _body_shape_error 挡成 400。
+    """
+    on = body.get("on")
+    if isinstance(on, bool):
+        MON.lightweight = on
+    elif body.get("toggle") is True:
+        MON.lightweight = not MON.lightweight
+    else:
+        return {"ok": False, "lightweight": MON.lightweight,
+                "error": "需要 on(true/false) 或 toggle(true) 之一(见 API-CONTRACT §3.4)"}
     HUB.log("[轻量化] %s(采样间隔: %s)" % (
         "开——后台低频保活" if MON.lightweight else "关——恢复正常监控",
         "无服务 60s / 有服务 30s" if MON.lightweight else "3s"))
@@ -903,8 +946,11 @@ def api_monitor(body):
 
     打点同时记下时刻: 页面关掉时那句 visible:false 不一定发得出(卸载时的 fetch 不可靠),
     粘滞的 True 会让 30s 空转档与轻量化都进不去 —— 采样端按 8s 时效判定(见 Monitor._watched)。
+
+    visible 缺省/为 null 一律按"在看"(True); 传了非布尔已在入口被 _body_shape_error 挡成 400。
     """
-    MON.monitor_visible = bool(body.get("visible", True))
+    vis = body.get("visible")
+    MON.monitor_visible = True if vis is None else vis
     MON.monitor_seen_at = time.time() if MON.monitor_visible else 0.0
     # 契约别名(不改 Linux 原有键, 只补): Windows 侧历史序列字典叫 hist、时间戳给 ISO-8601 UTC,
     # Linux 侧历来叫 hists、只给 epoch。跨端脚本要的是"同一个名字都能取到", 所以两个都发。
@@ -920,10 +966,7 @@ def api_monitor(body):
 
 def api_args_map(body):
     """逐参数真实启动参数回显(48a9a2f)。"""
-    prof = body.get("profile") or {}
-    name = CONFIG.get("CurrentProfile")
-    if name in (CONFIG.get("Profiles") or {}):
-        CONFIG["Profiles"][name] = prof
+    prof = _resolve_profile(body)
     sync_active_profile()
     return {"flag_args": LLAMA.args_map(prof)}
 
@@ -1131,8 +1174,12 @@ def _profile_name(_body):
 
 
 def api_plugins_set_active(body):
+    active = body.get("active")
+    if not isinstance(active, bool):
+        # 缺 active / 传了 null: 不再 bool(None)→False 误关掉插件(非布尔类型已在入口挡成 400)。
+        return {"ok": False, "msg": "需要 active(true/false) 布尔入参"}
     ok, msg = compat.set_bundle_active(_profile_name(body),
-                                       body.get("name") or "", bool(body.get("active")))
+                                       body.get("name") or "", active)
     return {"ok": ok, "msg": msg}
 
 
@@ -1206,6 +1253,8 @@ def api_health(_):
 
 _BODY_DICT_KEYS = ("profile", "config")
 _BODY_STR_KEYS = ("name", "dir", "target", "url", "repo", "path", "source", "version", "outtype")
+# 布尔入参: 传了就必须是真 bool, 否则 "false"/0/[] 会被 bool() 误判成 True。
+_BODY_BOOL_KEYS = ("on", "visible", "active", "toggle")
 
 
 def _body_shape_error(body):
@@ -1220,6 +1269,10 @@ def _body_shape_error(body):
         v = body.get(k)
         if k in body and v is not None and not isinstance(v, str):
             return "%s 必须是字符串(当前是 %s)" % (k, type(v).__name__)
+    for k in _BODY_BOOL_KEYS:
+        v = body.get(k)
+        if k in body and v is not None and not isinstance(v, bool):
+            return "%s 必须是布尔(当前是 %s)" % (k, type(v).__name__)
     return None
 
 
