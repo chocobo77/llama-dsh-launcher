@@ -64,15 +64,15 @@ chinesesimplified.ConfirmUninstall=确定要完全删除 %1 及其所有组件�
 ; 安装方式选择页文案(这几个键 ChineseSimplified.isl / Default.isl 里都有, 这里按本项目的
 ; 实际默认路径改写; Text1 是默认档为 admin 时用的那套措辞, 两种都覆盖掉免得措辞不一致)
 chinesesimplified.PrivilegesRequiredOverrideTitle=选择安装方式
-chinesesimplified.PrivilegesRequiredOverrideInstruction=两种方式使用的是同一个程序，区别只在装到哪里、需不需要管理员权限。
-chinesesimplified.PrivilegesRequiredOverrideText1=%1 可以为所有用户安装（需要管理员权限，默认装到 D:\Program Files，没有 D 盘时是系统 Program Files），或仅为您自己安装（不需要管理员权限，装到当前用户目录下的 Programs 文件夹）。
-chinesesimplified.PrivilegesRequiredOverrideText2=%1 可以仅为您自己安装（不需要管理员权限，装到当前用户目录下的 Programs 文件夹），或为所有用户安装（需要管理员权限，默认装到 D:\Program Files，没有 D 盘时是系统 Program Files）。
-chinesesimplified.PrivilegesRequiredOverrideCurrentUser=仅为自己安装(&M)（不需要管理员权限）
-chinesesimplified.PrivilegesRequiredOverrideAllUsers=为所有用户安装(&A)（需要管理员权限）
-english.PrivilegesRequiredOverrideText1=%1 can be installed for all users (requires administrator privileges; into D:\Program Files by default, or the system Program Files if this PC has no D drive), or for you only (no administrator privileges; into the Programs folder inside your user profile).
-english.PrivilegesRequiredOverrideText2=%1 can be installed for you only (no administrator privileges; into the Programs folder inside your user profile), or for all users (requires administrator privileges; into D:\Program Files by default, or the system Program Files if this PC has no D drive).
-english.PrivilegesRequiredOverrideCurrentUser=Install for &me only (no administrator privileges)
-english.PrivilegesRequiredOverrideAllUsers=Install for &all users (administrator privileges required)
+chinesesimplified.PrivilegesRequiredOverrideInstruction=两种方式使用的是同一个程序，区别只在装到哪里、需不需要管理员权限（注意：本机若缺少 .NET 8 Desktop Runtime，只有"为所有用户安装"这条路能装它）。
+chinesesimplified.PrivilegesRequiredOverrideText1=%1 可以为所有用户安装（需要管理员权限，默认装到 D:\Program Files，没有 D 盘时是系统 Program Files），或仅为您自己安装（装到当前用户目录下的 Programs 文件夹；不需要管理员权限，但前提是本机已装好 .NET 8 Desktop Runtime——它只能按机器安装，缺它时仍需管理员）。
+chinesesimplified.PrivilegesRequiredOverrideText2=%1 可以仅为您自己安装（装到当前用户目录下的 Programs 文件夹；不需要管理员权限，但前提是本机已装好 .NET 8 Desktop Runtime——它只能按机器安装，缺它时仍需管理员），或为所有用户安装（需要管理员权限，默认装到 D:\Program Files，没有 D 盘时是系统 Program Files）。
+chinesesimplified.PrivilegesRequiredOverrideCurrentUser=仅为自己安装(&M)（不需要管理员权限；要求本机已有 .NET 8 运行时）
+chinesesimplified.PrivilegesRequiredOverrideAllUsers=为所有用户安装(&A)（需要管理员权限；缺 .NET 8 时可自动装）
+english.PrivilegesRequiredOverrideText1=%1 can be installed for all users (requires administrator privileges; into D:\Program Files by default, or the system Program Files if this PC has no D drive), or for you only (into the Programs folder inside your user profile; no administrator privileges, but only if the .NET 8 Desktop Runtime is already installed here - that runtime is a per-machine install and still needs an administrator).
+english.PrivilegesRequiredOverrideText2=%1 can be installed for you only (into the Programs folder inside your user profile; no administrator privileges, but only if the .NET 8 Desktop Runtime is already installed here - that runtime is a per-machine install and still needs an administrator), or for all users (requires administrator privileges; into D:\Program Files by default, or the system Program Files if this PC has no D drive).
+english.PrivilegesRequiredOverrideCurrentUser=Install for &me only (no administrator privileges; needs .NET 8 runtime already present)
+english.PrivilegesRequiredOverrideAllUsers=Install for &all users (administrator privileges required; can install .NET 8 too)
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加选项:"
@@ -91,10 +91,12 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 Name: "{autostartmenu}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\Resources\{#MyAppIcon}"; Tasks: startmenuicon
 
 [Run]
-; runasoriginaluser(Inno 6+): 装完自动启动走"原始用户"的链接令牌，不继承 Setup 的提权状态与
-; __COMPAT_LAYER 兼容层血统。少了这层血统，程序里那段"血统切断"重启就不需要介入——
-; 2026-11-10「仅为自己安装」装完无限反复启动，正是这条链上的血统 + 程序侧"非空即重启"判定
-; 叠加出来的（两边都已各自修掉，这里是第一道）。
+; runasoriginaluser(Inno 6+): 装完自动启动走"原始用户"的链接令牌，**只换令牌，不改继承的环境块**。
+; 实测(2026-11-11 09:38，机器级安装完自动启动那一份的应用日志)：仍是
+;   installer/elevated lineage detected (compat=ElevateCreateProcess, elevated=False)
+; 也就是说它挡不住 __COMPAT_LAYER 兼容层血统，只挡住了"继承提权"。别把它当第一道保险——
+; 血统这条链上真正起作用的是程序侧的两条：白名单判定 + 一次封顶(见 Services\LineageGuard.cs)。
+; 2026-11-10「仅为自己安装」装完无限反复启动，是那两条各缺一半叠加出来的。
 Filename: "{app}\{#MyAppExeName}"; Description: "启动程序"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallDelete]
@@ -582,6 +584,25 @@ end;
 // ----------------------------------------------------
 //  安装前环境检查入口
 // ----------------------------------------------------
+//  静默安装的提问规则(M2)：静默下没有任何弹窗能有人回答 —— [Code] 里的 MsgBox 不受
+//  /SUPPRESSMSGBOXES 管辖(实测)，/VERYSILENT 跑到那一行会一直等点击，现场只看到"安装器卡住"。
+//  规则：静默模式只做**硬失败检查**，一切信息性询问跳过(只写日志)，按"继续"处理。
+// ----------------------------------------------------
+function AskYesNoOrAssume(const Prompt: String): Boolean;
+var
+  OneLine: String;
+begin
+  if WizardSilent then
+  begin
+    OneLine := Prompt;
+    StringChange(OneLine, #13#10, ' | ');
+    Log('静默模式: 信息性询问已跳过，按"继续"处理。原提问: ' + OneLine);
+    Result := True;
+  end
+  else
+    Result := (MsgBox(Prompt, mbConfirmation, MB_YESNO) = IDYES);
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Messages: String;
@@ -615,9 +636,20 @@ begin
   // 检查 2.5: .NET 8 Desktop Runtime — 缺少时自动下载安装（集成到安装流程）
   if not IsDotNet8DesktopInstalled then
   begin
+    if WizardSilent then
+    begin
+      // 静默下不做"自动下载并安装 .NET"：那步走 ShellExec('runas')，无人应答就会挂住；
+      // 而且它是机器级安装 —— 「仅为自己安装」的普通用户本来也做不到。直接明确失败，
+      // 并把出路写清楚(M1: 「仅为自己安装」只在"本机已有运行时"时才真的不需要管理员)。
+      Result := '缺少 .NET ' + DOTNET8_VERSION + ' Desktop Runtime：静默安装不会自动下载安装它'
+        + '（安装运行时需要管理员权限）。请先装好 .NET ' + DOTNET8_VERSION + ' Desktop Runtime，'
+        + '或重新运行安装包并选择「为所有用户安装」。';
+      Exit;
+    end;
     if MsgBox('检测到系统缺少 .NET ' + DOTNET8_VERSION + ' Desktop Runtime（本程序运行必需，约 50MB）。' + #13#10#13#10 +
               '是否现在自动下载并安装？' + #13#10 +
-              '（下载和安装进度将显示在安装向导内，完成后继续本程序的安装）',
+              '（下载和安装进度将显示在安装向导内，完成后继续本程序的安装。'
+              + '注意：安装运行时需要管理员权限 —— 若刚才选的是「仅为自己安装」，这里得给出管理员账号）',
               mbConfirmation, MB_YESNO) = IDYES then
     begin
       if not DownloadAndInstallDotNet8() then
@@ -657,11 +689,11 @@ begin
   end
   else
   begin
-    // 非阻断性警告
+    // 非阻断性信息(✅ 已检测到显卡之类)。这台机器上 HasRealGpu 基本总为真，所以这一问
+    // 以前在 /VERYSILENT 下也照弹 = 无人值守安装卡死。静默下只记日志、继续装。
     if Length(Messages) > 0 then
     begin
-      if MsgBox('环境检查结果：' + #13#10#13#10 + Messages + #13#10 + '是否继续安装？',
-                mbConfirmation, MB_YESNO) = IDNO then
+      if not AskYesNoOrAssume('环境检查结果：' + #13#10#13#10 + Messages + #13#10 + '是否继续安装？') then
         Result := '用户取消安装。';
     end;
   end;
