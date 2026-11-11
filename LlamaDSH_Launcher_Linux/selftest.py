@@ -32,6 +32,11 @@ os.chdir(APP)
 # error.log 里就多几条测试噪声(2026-11-05 实测: 一次跑留下 "资产名形态非法:
 # ../evil.tar.gz" 与"摘要不一致"两条), 用户排障时会把它们当成真事故, 真事故的密度
 # 也被稀释。必须**在任何被测模块 import 之前**改好 —— LOG_DIR 全进程只有一份。
+# 自检绝不真的执行 sudo 血统切换：main.py 现在在 **import 时**就做这件事
+# (lineage.reset_if_sudo)，而这套自检经常以 sudo 跑(读 /proc/<pid>/maps 之类)，
+# 中途 exec 掉会把整轮测试弄没。血统逻辑由 §31 用假 execvp 直接测，这里把那条链整体关掉。
+os.environ.setdefault("LlamaDSH_NO_LINEAGE_RESET", "1")
+
 import applog as _applog_top          # noqa: E402
 _REAL_LOG_DIR = _applog_top.LOG_DIR
 _SELFTEST_HOME = tempfile.mkdtemp(prefix="llamadsh_selftest_home_")
@@ -4845,95 +4850,200 @@ finally:
 #      情形都会变成无限自我重启(2026-11-10 Windows 端「装完无限反复启动」同一类缺陷);
 #   ② HOME 必须查 passwd, 不能拼 "/home/<用户>" —— LDAP/AD 接入、自定义家目录、root 自己
 #      都不是 /home/x, 拼出来的假路径会把配置/日志指向不存在的位置, 比不修正更难排查。
-import main as _main_top            # noqa: E402
-import posixuser as _posix_top      # noqa: E402
+# 2026-11-11: 这段逻辑从 main.py 搬到了 lineage.py(它必须在 import 会快照 ~ 的模块**之前**跑，
+# 顺序约束见 §32)，所以这里打靶也从 _main_top 换成 _lineage_top，六条语义断言本身不变。
+# 整段包在 try 里(以前裸在文件末尾)：任何一个 import/断言抛异常都会让这套 4900+ 行的自检直接
+# traceback 退出 —— 连 "FAILED: N 项" 汇总和末尾的临时目录清理都不执行，现场只剩一条栈，
+# 分不清"哪条断言失败"还是"测试自己崩了"。
+try:
+    import lineage as _lineage_top      # noqa: E402
+    import posixuser as _posix_top      # noqa: E402
 
-_c31_here = os.path.dirname(os.path.abspath(__file__))
-_c31_exec = []
-_c31_geteuid_real = os.geteuid
-_c31_execvp_real = os.execvp
-_c31_env_saved = dict(os.environ)
+    _c31_here = os.path.dirname(os.path.abspath(__file__))
+    _c31_exec = []
+    _c31_geteuid_real = os.geteuid
+    _c31_execvp_real = os.execvp
+    _c31_env_saved = dict(os.environ)
 
+    def _c31_src(_m):
+        return io.open(os.path.join(_c31_here, _m), encoding="utf-8").read()
 
-def _c31_src(_m):
-    return io.open(os.path.join(_c31_here, _m), encoding="utf-8").read()
+    def _c31_reset(euid, environ, home_override="__keep__", exec_fails=False):
+        """跑一次 lineage.reset_if_sudo, 返回 (返回值, exec 的 argv 或 None)。绝不真的 exec。
 
+        exec_fails=False 模拟 execvp 成功(真机上成功就不返回, 这里让假实现直接 return,
+        被测函数随后 return True); exec_fails=True 模拟被 sudoers 拒/OSError 路径。
+        """
+        _c31_exec[:] = []
+        os.environ.clear()
+        os.environ.update(environ)
+        # 自检顶部关掉了血统切换(见文件顶部), 这一节要真的走这条链, 临时关掉那个开关
+        os.environ.pop(_lineage_top.DISABLE_ENV, None)
+        os.geteuid = lambda: euid
 
-def _c31_reset(euid, environ, home_override="__keep__", exec_fails=False):
-    """跑一次 _sudo_lineage_reset, 返回 (返回值, exec 的 argv 或 None)。绝不真的 exec。
+        def _fake_execvp(file_, args):
+            _c31_exec.append(list(args))
+            if exec_fails:
+                raise OSError("selftest: sudo 被拒")
 
-    exec_fails=False 模拟 execvp 成功(真机上成功就不返回, 这里让假实现直接 return,
-    被测函数随后 return True); exec_fails=True 模拟被 sudoers 拒/OSError 路径。
-    """
-    _c31_exec[:] = []
+        os.execvp = _fake_execvp
+        _uh_real = _posix_top.user_home
+        if home_override != "__keep__":
+            _posix_top.user_home = lambda u: home_override
+        try:
+            _r = _lineage_top.reset_if_sudo()
+        finally:
+            _posix_top.user_home = _uh_real
+            os.execvp = _c31_execvp_real
+            os.geteuid = _c31_geteuid_real
+        return _r, (_c31_exec[0] if _c31_exec else None)
+
+    _r, _argv = _c31_reset(1000, {"SUDO_USER": "someone"})
+    check("非 root 不触发血统重启", _r is False and _argv is None, str(_argv))
+
+    _r, _argv = _c31_reset(0, {"SUDO_USER": "someone", _lineage_top.LINEAGE_RESET_ENV: "1"})
+    check("已切过一次 → 绝不自我重启(一次封顶, 防无限反复启动)", _r is False and _argv is None, str(_argv))
+
+    _c31_home = tempfile.mkdtemp(prefix="c31home_")
+    _r, _argv = _c31_reset(0, {"SUDO_USER": "someone"}, home_override=_c31_home)
+    check("root + sudo 发起者 → exec 一次, 且把凭证写进 env 带过 exec",
+          _r is True and _argv is not None and (_lineage_top.LINEAGE_RESET_ENV + "=1") in _argv,
+          str(_argv))
+    check("切用户时 HOME 用解析出的家目录, 而不是拼 /home/<用户>",
+          _argv is not None
+          and ("HOME=" + _c31_home) in _argv
+          and "HOME=/home/someone" not in _argv,
+          str(_argv))
+
+    _r, _argv = _c31_reset(0, {})
+    check("root 但不是 sudo 发起 → 不重启(也保持可见的警告路径)", _r is False and _argv is None, str(_argv))
+
+    _r, _argv = _c31_reset(0, {"SUDO_USER": "nosuchuser_zzz"}, home_override=None)
+    check("查不到家目录 → 不 exec(绝不带着不存在的 HOME 重启)", _r is False and _argv is None, str(_argv))
+
+    _r, _argv = _c31_reset(0, {"SUDO_USER": "someone"}, home_override=_c31_home, exec_fails=True)
+    check("execvp 失败(没有 sudo / 被 sudoers 拒) → 只试一次并返回 False, 启动器不凭空消失",
+          _r is False and len(_c31_exec) == 1, "%d 次" % len(_c31_exec))
+    shutil.rmtree(_c31_home, ignore_errors=True)
+
     os.environ.clear()
-    os.environ.update(environ)
-    os.geteuid = lambda: euid
+    os.environ.update(_c31_env_saved)
 
-    def _fake_execvp(file_, args):
-        _c31_exec.append(list(args))
-        if exec_fails:
-            raise OSError("selftest: sudo 被拒")
+    # 机器无关: 拿当前 uid 在 passwd 里的真实条目比对, 不写死 "root"/"/root"。
+    # 以前那条断言假设 /root 存在, 在非该假设的机器上是假失败(在 Windows shim 下实测撞到)。
+    import pwd as _pwd31
+    _c31_pw = _pwd31.getpwuid(os.getuid())
+    _c31_got = _posix_top.user_home(_c31_pw.pw_name)
+    check("posixuser.user_home 查 passwd(本机真实用户的家目录, 不写死 root)",
+          _c31_got == _c31_pw.pw_dir and os.path.isdir(_c31_got),
+          "%s -> %s" % (_c31_pw.pw_name, _c31_got))
+    check("posixuser.user_home 对不存在的用户返回 None(不给拼出来的假路径)",
+          _posix_top.user_home("nosuchuser_zzz") is None, str(_posix_top.user_home("nosuchuser_zzz")))
+    check("posixuser.user_home 空输入 → None", _posix_top.user_home("") is None, "")
+    check("posixuser.sudo_initiator 无 SUDO_USER → None",
+          _posix_top.sudo_initiator() in (None, ""), str(_posix_top.sudo_initiator()))
 
-    os.execvp = _fake_execvp
-    _uh_real = _main_top.posixuser.user_home
-    if home_override != "__keep__":
-        _main_top.posixuser.user_home = lambda u: home_override
+    check("client/tray/main 不再拼 \"/home/\" + SUDO_USER(该假设对 LDAP/自定义家目录不成立)",
+          all(('/home/" + os.environ["SUDO_USER"]' not in _c31_src(_m)) for _m in ("client.py", "tray.py", "main.py")),
+          "")
+    check("main.py 确实调用了 lineage.reset_if_sudo()",
+          "lineage.reset_if_sudo()" in _c31_src("main.py"), "")
+except Exception as _c31_ex:
+    check("§31 血统/家目录 整节能跑完(不半途崩)", False,
+          "%s: %s" % (type(_c31_ex).__name__, _c31_ex))
+
+# --------------------------------------- 32. 启动顺序 / 历史脱敏 / 输出容错 / profile 合并 ---
+# 2026-11-11 review 的四条不变量，每条都对应一个"现场看不出来"的缺陷：
+#   ① 血统切换必须早于任何快照 ~ 的模块 import，且历史脱敏/启动横幅不得在 import 时执行
+#      (否则 sudo 启动会先以 root 把 /root 下的历史日志重写一遍，再 exec 成桌面用户跑第二遍)；
+#   ② 历史日志脱敏按字节做：非 UTF-8 字节不能被换成 U+FFFD(那是不可恢复的内容损失)；
+#   ③ 打警告(⚠)不得因为 stdout 不是 UTF-8 而把"提醒后继续运行"的降级路径变成崩溃；
+#   ④ 带部分 profile 的请求不得把用户已存方案的其余参数抹掉(转换完成的回调会把它永久落盘)。
+try:
+    import safeout as _safeout_top       # noqa: E402
+    _c32_here = os.path.dirname(os.path.abspath(__file__))
+
+    def _c32_src(_m):
+        return io.open(os.path.join(_c32_here, _m), encoding="utf-8").read()
+
+    _c32_main_src = _c32_src("main.py")
+    _c32_i_reset = _c32_main_src.find("lineage.reset_if_sudo()")
+    _c32_i_applog = _c32_main_src.find("import applog")
+    check("main.py: 血统切换早于 applog/core 等会快照 ~ 的 import",
+          0 < _c32_i_reset < _c32_i_applog,
+          "reset@%s / import applog@%s" % (_c32_i_reset, _c32_i_applog))
+    check("main.py: 历史脱敏与启动横幅不在模块顶层",
+          "\n_nscrub = applog.scrub_existing()" not in _c32_main_src
+          and "def startup_log_and_scrub" in _c32_main_src, "")
+    check("main.py: main() 里调用 startup_log_and_scrub(血统切完之后才写日志)",
+          ("def main(" in _c32_main_src)
+          and ("startup_log_and_scrub()" in _c32_main_src.split("def main(", 1)[1]), "")
+    check("main.py: 不再保留旧的 _sudo_lineage_reset(调用点不该被搬回 main 里)",
+          "def _sudo_lineage_reset" not in _c32_main_src, "")
+
+    # ② 按字节脱敏
+    _c32_logdir = tempfile.mkdtemp(prefix="c32log_")
+    _c32_old_ld = _applog_top.LOG_DIR
+    _applog_top.LOG_DIR = _c32_logdir
     try:
-        _r = _main_top._sudo_lineage_reset()
+        _c32_raw = (b"[2026-01-01 00:00:00] \xe4\xb8\xad\xe6\x96\x87 bad\xff\xfebytes "
+                    b"http://127.0.0.1:3080/?token=SECRETVALUE & Bearer abcdefghijklm\n")
+        with open(os.path.join(_c32_logdir, "run.log"), "wb") as _c32_f:
+            _c32_f.write(_c32_raw)
+        _c32_n = _applog_top.scrub_existing()
+        with open(os.path.join(_c32_logdir, "run.log"), "rb") as _c32_f:
+            _c32_after = _c32_f.read()
+        check("scrub_existing 重写含凭据的历史日志并抹掉 token/Bearer",
+              _c32_n == 1 and b"SECRETVALUE" not in _c32_after and b"abcdefghijklm" not in _c32_after,
+              str(_c32_n))
+        check("scrub_existing 保留非 UTF-8 字节(必须按字节重写, 不能文本 round-trip)",
+              b"bad\xff\xfebytes" in _c32_after and b"\xe4\xb8\xad\xe6\x96\x87" in _c32_after,
+              repr(_c32_after[:48]))
+        check("scrub 不留下 .scrub.tmp 残留文件",
+              not any(n.endswith(".scrub.tmp") for n in os.listdir(_c32_logdir)),
+              str(os.listdir(_c32_logdir)))
     finally:
-        _main_top.posixuser.user_home = _uh_real
-        os.execvp = _c31_execvp_real
-        os.geteuid = _c31_geteuid_real
-    return _r, (_c31_exec[0] if _c31_exec else None)
+        _applog_top.LOG_DIR = _c32_old_ld
+        shutil.rmtree(_c32_logdir, ignore_errors=True)
 
+    # ③ 输出容错: 非 UTF-8 且 errors=strict 的 stdout 上打 ⚠ 不该抛
+    _c32_buf = io.TextIOWrapper(io.BytesIO(), encoding="ascii", errors="strict")
+    _c32_old_out = sys.stdout
+    sys.stdout = _c32_buf
+    _c32_raised = None
+    try:
+        _safeout_top.fix_streams()
+        print("⚠ 以 root 运行, 且查不到用户 someone 的家目录: 保持当前身份继续")
+    except Exception as _c32_e:
+        _c32_raised = _c32_e
+    finally:
+        sys.stdout = _c32_old_out
+    check("safeout.fix_streams 之后, 非 UTF-8 stdout 上打 ⚠ 不再致命(警告不该变成启动失败)",
+          _c32_raised is None,
+          "%s: %s" % (type(_c32_raised).__name__, _c32_raised) if _c32_raised else "")
+    check("main.py 顶部调用了 safeout.fix_streams()", "safeout.fix_streams()" in _c32_main_src, "")
 
-_r, _argv = _c31_reset(1000, {"SUDO_USER": "someone"})
-check("非 root 不触发血统重启", _r is False and _argv is None, str(_argv))
-
-_r, _argv = _c31_reset(0, {"SUDO_USER": "someone", _main_top.LINEAGE_RESET_ENV: "1"})
-check("已切过一次 → 绝不自我重启(一次封顶, 防无限反复启动)", _r is False and _argv is None, str(_argv))
-
-_c31_home = tempfile.mkdtemp(prefix="c31home_")
-_r, _argv = _c31_reset(0, {"SUDO_USER": "someone"}, home_override=_c31_home)
-check("root + sudo 发起者 → exec 一次, 且把凭证写进 env 带过 exec",
-      _r is True and _argv is not None and (_main_top.LINEAGE_RESET_ENV + "=1") in _argv,
-      str(_argv))
-check("切用户时 HOME 用解析出的家目录, 而不是拼 /home/<用户>",
-      _argv is not None
-      and ("HOME=" + _c31_home) in _argv
-      and "HOME=/home/someone" not in _argv,
-      str(_argv))
-
-_r, _argv = _c31_reset(0, {})
-check("root 但不是 sudo 发起 → 不重启(也保持可见的警告路径)", _r is False and _argv is None, str(_argv))
-
-_r, _argv = _c31_reset(0, {"SUDO_USER": "nosuchuser_zzz"}, home_override=None)
-check("查不到家目录 → 不 exec(绝不带着不存在的 HOME 重启)", _r is False and _argv is None, str(_argv))
-
-_r, _argv = _c31_reset(0, {"SUDO_USER": "someone"}, home_override=_c31_home, exec_fails=True)
-check("execvp 失败(没有 sudo / 被 sudoers 拒) → 只试一次并返回 False, 启动器不凭空消失",
-      _r is False and len(_c31_exec) == 1, "%d 次" % len(_c31_exec))
-shutil.rmtree(_c31_home, ignore_errors=True)
-
-os.geteuid = _c31_geteuid_real
-os.execvp = _c31_execvp_real
-os.environ.clear()
-os.environ.update(_c31_env_saved)
-
-check("posixuser.user_home 查 passwd(root 的家目录真实存在)",
-      bool(_posix_top.user_home("root")) and os.path.isdir(_posix_top.user_home("root")),
-      str(_posix_top.user_home("root")))
-check("posixuser.user_home 对不存在的用户返回 None(不给拼出来的假路径)",
-      _posix_top.user_home("nosuchuser_zzz") is None, str(_posix_top.user_home("nosuchuser_zzz")))
-check("posixuser.user_home 空输入 → None", _posix_top.user_home("") is None, "")
-check("posixuser.sudo_initiator 无 SUDO_USER → None",
-      _posix_top.sudo_initiator() in (None, ""), str(_posix_top.sudo_initiator()))
-
-check("client/tray/main 不再拼 \"/home/\" + SUDO_USER(该假设对 LDAP/自定义家目录不成立)",
-      all(('/home/" + os.environ["SUDO_USER"]' not in _c31_src(_m)) for _m in ("client.py", "tray.py", "main.py")),
-      "")
-check("main() 里确实调用了 _sudo_lineage_reset", "_sudo_lineage_reset()" in _c31_src("main.py"), "")
+    # ④ profile 合并(部分字段请求不得抹掉已存方案的其余参数)
+    import main as _c32_main_mod        # noqa: E402  (顶部已设 LlamaDSH_NO_LINEAGE_RESET)
+    _c32_saved_cfg = {"cur": _c32_main_mod.CONFIG.get("CurrentProfile"),
+                      "profiles": _c32_main_mod.CONFIG.get("Profiles")}
+    try:
+        _c32_main_mod.CONFIG["CurrentProfile"] = "selftest_c32"
+        _c32_main_mod.CONFIG["Profiles"] = {"selftest_c32": {"model": "/m/x.gguf", "--ctx": 8192,
+                                                             "--n-gpu-layers": 99}}
+        _c32_got = _c32_main_mod._resolve_profile({"profile": {"--ctx": 4096}})
+        check("带部分 profile 的请求: 已存方案的其余参数不被抹掉(合并而非整体替换)",
+              _c32_got.get("--n-gpu-layers") == 99 and _c32_got.get("model") == "/m/x.gguf"
+              and _c32_got.get("--ctx") == 4096, str(_c32_got))
+        check("写回运行时副本的也是合并结果(转换完成回调会把它落盘)",
+              _c32_main_mod.CONFIG["Profiles"]["selftest_c32"].get("--n-gpu-layers") == 99,
+              str(_c32_main_mod.CONFIG["Profiles"]["selftest_c32"]))
+    finally:
+        _c32_main_mod.CONFIG["CurrentProfile"] = _c32_saved_cfg["cur"]
+        _c32_main_mod.CONFIG["Profiles"] = _c32_saved_cfg["profiles"]
+except Exception as _c32_ex:
+    check("§32 启动顺序/脱敏/输出/profile 整节能跑完(不半途崩)", False,
+          "%s: %s" % (type(_c32_ex).__name__, _c32_ex))
 
 shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)
