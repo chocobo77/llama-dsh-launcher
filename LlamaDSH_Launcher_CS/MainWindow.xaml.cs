@@ -266,6 +266,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		RefreshCmdNow();
 		StartPerfMonitor();
 		LoadState();
+		ApplyAdminModeScopeHint();
 		TryStartAgentApi();
 		_healthTimer.Tick += HealthCheck;
 		_healthTimer.Start();
@@ -5524,7 +5525,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					_dshProc = null;
 					_dshTracker = null;
 					_dshVerifyDeadline = DateTime.Now.AddSeconds(30.0);
-					Log("--- 正在启动 DSH (" + text3 + " · 管理员提权) ---");
+					Log("--- 正在启动 DSH (" + text3 + " · 管理员提权" + (InstallScope.IsUserScoped ? "，用户级安装：会弹 UAC 确认" : "") + ") ---");
 					StartDshVerifyLoop();
 					return;
 				}
@@ -5710,7 +5711,25 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 	}
 
-	// 管理员提权启动：ShellExecute runas 把子进程提升到 admin（本机 ConsentPromptBehaviorAdmin=0 → 静默提权，无 UAC 弹窗）；
+	// 「以管理员身份启动」两种安装方式都能勾，但安全前提不同，提示必须跟着安装方式走：
+	// 机器级安装(默认 D:\Program Files)下 exe 被 ACL 保护，提权可信；用户级安装(用户目录\Programs)
+	// 下 exe 当前用户随时能替换，这条路径提权一定要过 UAC 确认，这时还沿用 XAML 里"静默提权、无 UAC
+	// 弹窗"的说法就是在骗人。顺带把这份安装是怎么判出来的写进日志，事后排查不用猜。
+	private void ApplyAdminModeScopeHint()
+	{
+		Log("[安装] " + InstallScope.Summary);
+		if (!string.IsNullOrEmpty(InstallScope.OtherScopeRoot))
+		{
+			Log("[安装] 提示: 本机还有一份「" + InstallScope.OtherScopeLabel + "」装在 " + InstallScope.OtherScopeRoot
+				+ " ; 两种方式互不覆盖，卸载列表里会各有一条。", "WARN");
+		}
+		ChkDshAdmin.ToolTip = "以管理员身份启动 DSH（子进程为高完整性，可读取游戏进程内存，如 Elite Dangerous）。需先停止再启动才生效；取消勾选恢复普通方式启动。"
+			+ "\n\n" + InstallScope.ElevationNote
+			+ (InstallScope.IsUserScoped ? "\n需要静默提权的话：重新运行安装包并选择「为所有用户安装」。" : "");
+	}
+
+	// 管理员提权启动：ShellExecute runas 把子进程提升到 admin（是否弹 UAC 由系统 UAC 设置决定：
+	// 本机实测 ConsentPromptBehaviorAdmin=0 → 静默提权无弹窗，别的机器上会弹确认框）；
 	// 子进程为高完整性，可 OpenProcess 游戏进程内存（中完整性进程会被 UIPI 拦截）。
 	// 注意：WMI 分离路径无法提权（Win32_Process.Create 继承调用者非提权上下文），故提权必须走 ShellExecute runas。
 	// innerCmd 由调用方按启动模式拼好（node lib/bin.js web 或 pnpm dsh web 或 npx ...）。

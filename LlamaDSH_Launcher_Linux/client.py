@@ -32,6 +32,7 @@ except Exception:
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_DIR)
 import appicon   # noqa: E402  图标自举(hicolor 主题 + 窗口/托盘图标统一)
+import posixuser   # noqa: E402  查 passwd, 不拼 "/home/<用户>"
 
 try:  # python3-dbus: 托盘 SNI 需要; 缺失时客户端降级为无托盘模式
     import dbus
@@ -68,8 +69,12 @@ def ensure_server(port):
         if _probe(_server_url(p)) is not None:
             return _server_url(p)
     env = dict(os.environ)
-    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
-        env["HOME"] = "/home/" + os.environ["SUDO_USER"]  # 保险: sudo 血统修正
+    if os.geteuid() == 0:
+        # 保险: sudo 血统修正。家目录要查 passwd 而不是拼 "/home/<用户>" —— 对 LDAP/AD 接入
+        # 或自定义家目录的用户, 拼出来的路径不存在, 那种情况不设 HOME 也比设一个不存在的 HOME 好
+        h = posixuser.user_home(posixuser.sudo_initiator())
+        if h:
+            env["HOME"] = h
     subprocess.Popen([sys.executable, os.path.join(APP_DIR, "main.py"), "-p", str(port)],
                      cwd=APP_DIR, env=env, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

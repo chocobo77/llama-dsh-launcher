@@ -25,6 +25,7 @@ import applog
 import compat
 import core
 import procman
+import posixuser
 import monitor
 import nodetool
 import schema as schema_mod
@@ -1541,26 +1542,56 @@ class Handler(BaseHTTPRequestHandler):
             HUB.log("[API] %s: 客户端已断开(响应未送达)" % path)
 
 
+# sudo 血统标记: 切过一次就以这个环境标记为准, 不再自我重启(一次封顶)
+LINEAGE_RESET_ENV = "LlamaDSH_LINEAGE_RESET"
+
+
+def _sudo_lineage_reset():
+    """以 root 跑时切回发起 sudo 的桌面用户。返回 True = 已 exec 出去, 调用方直接返回。
+
+    与 C# 端 Services\\LineageGuard.cs 共享同一条硬约束: **自重启一次封顶**。
+    C# 那边凭证只能走标记文件(explorer 重启会把附加参数丢掉), 这里 execvp 会带上我们显式给的
+    env, 所以用环境变量。少了这道封顶, 任何"切完还是 root"的情形(SUDO_USER=root、sudoers
+    策略、家目录解析失败后仍 exec)都会变成无限自我重启 —— 与 2026-11-10 Windows 端
+    「装完无限反复启动」是同一类缺陷。
+    """
+    if os.geteuid() != 0:
+        return False
+    if os.environ.get(LINEAGE_RESET_ENV):
+        print("⚠ 血统已切过一次但仍是 root(%s=1): 不再自我重启, 否则会无限循环" % LINEAGE_RESET_ENV)
+        return False
+    user = posixuser.sudo_initiator()
+    if not user:
+        print("⚠ 正在以 root 运行:配置/检索/日志都会指向 /root,建议改用桌面用户启动")
+        return False
+    home = posixuser.user_home(user)
+    if not home:
+        # 查不到家目录就不 exec: 带着一个不存在的 HOME 重启, 比保持 root 更难排查
+        print("⚠ 以 root 运行, 且查不到用户 %s 的家目录: 保持当前身份继续(配置/日志会指向 /root)" % user)
+        return False
+    argv = [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:]
+    print("检测到以 sudo(root)启动——所有 ~ 路径会错位,自动切换为用户 %s 重新启动…" % user)
+    try:
+        os.execvp("sudo", ["sudo", "-u", user,
+                           "env", "HOME=" + home, "USER=" + user,
+                           "LANG=" + os.environ.get("LANG", "C.UTF-8"),
+                           LINEAGE_RESET_ENV + "=1"] + argv)
+    except OSError as ex:
+        # exec 失败(没有 sudo / 被 sudoers 拒 / 用户不存在)不能让启动器凭空消失
+        print("⚠ 切换到用户 %s 失败(%s): 保持当前身份继续" % (user, ex))
+        return False
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description="LlamaDSH Launcher (Linux 复刻版)")
     ap.add_argument("-p", "--port", type=int, default=DEFAULT_PORT)
     args = ap.parse_args()
 
-    # sudo 血统切断(对齐 C# App.OnStartup 的安装器血统检测): 以 root 运行时
-    # HOME=/root, 配置/检索/DSH_HOME/日志全部错位。检测到经 sudo 发起时,
-    # 自动以发起 sudo 的桌面用户身份重启自己, 不再以 root 继续。
-    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
-        user = os.environ["SUDO_USER"]
-        home = "/home/" + user
-        if os.path.isdir(home):
-            argv = [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:]
-            print("检测到以 sudo(root)启动——所有 ~ 路径会错位,自动切换为用户 %s 重新启动…" % user)
-            os.execvp("sudo", ["sudo", "-u", user,
-                               "env", "HOME=" + home, "USER=" + user,
-                               "LANG=" + os.environ.get("LANG", "C.UTF-8")] + argv)
-            # execvp 成功则不再返回
-    elif os.geteuid() == 0:
-        print("⚠ 正在以 root 运行:配置/检索/日志都会指向 /root,建议改用桌面用户启动")
+    # sudo 血统切断(实现见 _sudo_lineage_reset): 以 root 运行时 HOME=/root,
+    # 配置/检索/DSH_HOME/日志全部错位 —— 切回发起 sudo 的桌面用户, 并且一次封顶。
+    if _sudo_lineage_reset():
+        return
 
     # 单实例
     try:

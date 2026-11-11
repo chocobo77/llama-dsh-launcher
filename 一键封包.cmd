@@ -33,14 +33,14 @@ echo ==============================================
 echo   LlamaDSH 启动器 · 一键封包
 echo ==============================================
 
-rem ---------- [1/7] 可选: 版本号参数 (一键封包.cmd 1.2.0 [-nopause]) ----------
+rem ---------- [1/8] 可选: 版本号参数 (一键封包.cmd 1.2.0 [-nopause]) ----------
 set "VERARG=%~1"
 if /I "%VERARG%"=="-nopause" set "VERARG="
 if "%VERARG%"=="" (
-    echo [1/7] 跳过（未给版本号参数，沿用 installer.iss 当前版本）
+    echo [1/8] 跳过（未给版本号参数，沿用 installer.iss 当前版本）
     goto :envcheck
 )
-echo [1/7] 更新版本号: %VERARG%
+echo [1/8] 更新版本号: %VERARG%
 echo %VERARG%| findstr /R "^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$" >nul
 if errorlevel 1 (
     echo   [错误] 版本号格式应为 x.y.z（例如 1.2.0）
@@ -58,8 +58,8 @@ if errorlevel 1 goto :fail
 findstr /C:"<Version>" "%CSProj%"
 
 :envcheck
-echo [2/7] 检查构建环境...
-call :log "2/7 环境检查"
+echo [2/8] 检查构建环境...
+call :log "2/8 环境检查"
 where dotnet >nul 2>nul
 if errorlevel 1 (
     echo   [错误] 未找到 dotnet CLI（需要 .NET 8 SDK）
@@ -87,16 +87,16 @@ if not exist "%CSProj%" (
 )
 echo   dotnet 就绪
 echo   ISCC: %ISCC%
-rem ISCC 版本行见 [6/7] 生成的 iscc_build.log 第一行(跨机器排障先比对它)
+rem ISCC 版本行见 [7/8] 生成的 iscc_build.log 第一行(跨机器排障先比对它)
 
 rem 从 installer.iss 读取版本号, 用于 Linux 包命名 (解析失败回退 dev)
 set "LNXVER=dev"
 for /f "tokens=3" %%V in ('findstr /C:"#define MyAppVersion" "%ISS%" 2^>nul') do set "LNXVER=%%~V"
 set "LNXVER=%LNXVER:"=%"
 
-rem ---------- [3/7] 结束运行中的实例, 避免发布目录文件被占用 ----------
-echo [3/7] 结束运行中的 LlamaDSH_Launcher...
-call :log "3/7 taskkill"
+rem ---------- [3/8] 结束运行中的实例, 避免发布目录文件被占用 ----------
+echo [3/8] 结束运行中的 LlamaDSH_Launcher...
+call :log "3/8 taskkill"
 taskkill /IM LlamaDSH_Launcher.exe /F >nul 2>nul
 rem taskkill /F 返回后进程可能仍持有文件句柄, 必须等它真正消失再清目录/发布
 set "WAITN=0"
@@ -113,9 +113,9 @@ goto :waitproc
 :procgone
 echo   已确认无运行实例
 
-rem ---------- [4/7] 构建 gputemp 并发布单文件主程序 ----------
-echo [4/7] 构建 gputemp 并发布单文件主程序 (dotnet publish)...
-call :log "4/7 gputemp publish 开始"
+rem ---------- [4/8] 构建 gputemp 并发布单文件主程序 ----------
+echo [4/8] 构建 gputemp 并发布单文件主程序 (dotnet publish)...
+call :log "4/8 gputemp publish 开始"
 set "GPUBIN=%ROOT%gputemp\bin\Release\net8.0-windows\win-x64\publish\gputemp.exe"
 >>"%RUNLOG%" echo [%date% %time%] 现场: CSProj=%CSProj% PUBDIR=%PUBDIR% OUTDIR=%PKOUT%
 dotnet publish "%ROOT%gputemp\gputemp.csproj" -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:IncludeAllContentForSelfExtract=true -v q -nologo
@@ -130,8 +130,8 @@ if not exist "%GPUBIN%" (
 )
 copy /Y "%GPUBIN%" "%PROJ%\gputemp\gputemp.exe" >nul
 if errorlevel 1 goto :fail
-call :log "4/7 gputemp 完成 GPUBIN 就绪"
-call :log "4/7 llamadsh-cli publish 开始"
+call :log "4/8 gputemp 完成 GPUBIN 就绪"
+call :log "4/8 llamadsh-cli publish 开始"
 dotnet publish "%ROOT%cli\llamadsh-cli.csproj" -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -v q -nologo
 if errorlevel 1 goto :fail
 set "CLIBIN=%ROOT%cli\bin\Release\net8.0\win-x64\publish\llamadsh-cli.exe"
@@ -139,7 +139,7 @@ if not exist "%CLIBIN%" (
     echo   [错误] llamadsh-cli 构建产物缺失: %CLIBIN%
     goto :fail
 )
-call :log "4/7 llamadsh-cli 完成 CLIBIN 就绪"
+call :log "4/8 llamadsh-cli 完成 CLIBIN 就绪"
 if exist "%PUBDIR%" (
     rd /s /q "%PUBDIR%"
     if exist "%PUBDIR%" (
@@ -154,9 +154,9 @@ if not exist "%PUBDIR%\LlamaDSH_Launcher.exe" (
     goto :fail
 )
 
-rem ---------- [5/7] 刷新 installer_staging (ISCC 的打包源, 不刷新会打进旧版程序!) ----------
-echo [5/7] 刷新 installer_staging...
-call :log "4/7 主程序发布完成 / 5/7 staging 开始"
+rem ---------- [5/8] 刷新 installer_staging (ISCC 的打包源, 不刷新会打进旧版程序!) ----------
+echo [5/8] 刷新 installer_staging...
+call :log "4/8 主程序发布完成 / 5/8 staging 开始"
 rem 先清空：确保打进安装包的只有本次产物，历史残留不会混进去
 if exist "%STAGE%" rd /s /q "%STAGE%"
 mkdir "%STAGE%"
@@ -175,8 +175,32 @@ for %%F in ("%STAGE%\LlamaDSH_Launcher.exe") do if %%~zF LSS 524288 (
     goto :fail
 )
 
-rem ---------- [6/7] 生成安装包 ----------
-echo [6/7] 生成安装包 (Inno Setup)...
+rem ---------- [6/8] Windows 侧回归测试 (selftest.ps1) ----------
+rem 安装包一旦生成, 回归就得等人试装才暴露, 所以 ISCC 之前先跑一遍可自动判定的不变量:
+rem 安装方式三级判定(InstallScope)、血统自重启一次封顶(LineageGuard)、安装包与 C# 的
+rem AppId/GUID 一致性、已修掉的错误写法不得复活。需要管理员的 HKLM 用例无权限时只记 SKIP,
+rem 不会误伤打包; 真失败必须中止(不产出带已知回归的安装包)。测试只用替换过的测试 GUID,
+rem 不往本机真实卸载项写东西。
+echo [6/8] Windows 回归测试 (selftest.ps1)...
+call :log "6/8 selftest.ps1 开始"
+if not exist "%PKOUT%" mkdir "%PKOUT%"
+if not exist "%PROJ%\selftest.ps1" (
+    echo   [错误] 缺少回归测试脚本: %PROJ%\selftest.ps1
+    goto :fail
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJ%\selftest.ps1" > "%PKOUT%\selftest.log" 2>&1
+if errorlevel 1 (
+    rem 只报条数与日志路径: FAIL 行含括号/中文, 直接 echo 进批处理容易被括号截断
+    for /f %%C in ('findstr /B /C:"FAIL" "%PKOUT%\selftest.log" ^| find /c /v ""') do echo   [错误] 回归测试 %%C 项未通过
+    echo          中止打包。详情: %PKOUT%\selftest.log
+    call :log "6/8 selftest FAILED, 打包中止"
+    goto :fail
+)
+for /f "delims=" %%L in ('findstr /B /C:"SUMMARY" "%PKOUT%\selftest.log"') do echo   %%L
+call :log "6/8 selftest 通过"
+
+rem ---------- [7/8] 生成安装包 ----------
+echo [7/8] 生成安装包 (Inno Setup)...
 if not exist "%PKOUT%" mkdir "%PKOUT%"
 rem ISCC 完整输出始终写入日志文件(成功时 :cleanup 会删掉; 失败时保留供排查)
 "%ISCC%" "%ISS%" > "%PKOUT%\iscc_build.log" 2>&1
@@ -199,7 +223,7 @@ for %%F in ("%SETUPEXE%") do if %%~zF LSS 1048576 (
     goto :fail
 )
 
-call :log "6/7 ISCC 编译通过"
+call :log "7/8 ISCC 编译通过"
 rem ---------- [6.5] 代码签名(可选): 存在 %PROJ%\signtool-config.inc 才执行 ----------
 rem 该文件不入库(见 .gitignore), 从 signtool-config.inc.example 复制填写; 内容是一行
 rem   SIGNCMD=<签名命令, 用 %SETUPFILE% 占位安装包路径>
@@ -231,14 +255,14 @@ if defined SIGNCMD (
 set "SIGNCMD="
 set "SETUPFILE="
 
-rem ---------- [7/7] 打包 Linux 复刻版 (Python 源码 zip, 排除缓存与测试产物) ----------
+rem ---------- [8/8] 打包 Linux 复刻版 (Python 源码 zip, 排除缓存与测试产物) ----------
 set "LNXZIP=%PKOUT%\LlamaDSH_Launcher_Linux_%LNXVER%.zip"
 if not exist "%LNXSRC%\main.py" (
-    echo [7/7] 跳过 Linux 启动器打包（未找到 %LNXSRC%\main.py）
+    echo [8/8] 跳过 Linux 启动器打包（未找到 %LNXSRC%\main.py）
     goto :cleanup
 )
-echo [7/7] 打包 Linux 启动器...
-call :log "7/7 linux zip 开始"
+echo [8/8] 打包 Linux 启动器...
+call :log "8/8 linux zip 开始"
 if exist "%LNXSTG%" rd /s /q "%LNXSTG%"
 mkdir "%LNXSTG%"
 robocopy "%LNXSRC%" "%LNXSTG%" /E /XD __pycache__ gui-test-screenshots .git dist /XF *.pyc >nul
@@ -265,7 +289,7 @@ if errorlevel 1 (
     echo   [错误] 替换旧包失败, 新包保留在: %LNXTMPZIP%
     goto :fail
 )
-call :log "7/7 zip 完成"
+call :log "8/8 zip 完成"
 rem 打完即清理 staging 副本（否则仓库里长期留一份完整源码拷贝）
 if exist "%LNXSTG%" rd /s /q "%LNXSTG%"
 
