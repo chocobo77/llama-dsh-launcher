@@ -419,7 +419,7 @@ class LlamaRunner:
         if pid is None:
             # 没在跑(或已经自己退出): 幂等收尾, 不谎报"停止失败"也不抛异常
             self._finish_stop(quiet=True)
-            return
+            return self.status
         self.hub.log("--- 正在停止 Llama ---")
         killed = procman.kill_process_tree(pid)
         if not killed:
@@ -430,6 +430,8 @@ class LlamaRunner:
             self.hub.log("[Llama] ⚠ 进程 PID %s 未能停止或其子进程未能确认全部结束"
                          "(可能以 root 启动), 请手动结束并复核 1234 端口" % pid)
         self._finish_stop(ok=killed)
+        # 三态回报(契约 §1.1): API 侧要能把"已停止 / 没停掉"透出去, 不再恒 ok:true 就当停好了。
+        return self.status
 
     def _finish_stop(self, quiet=False, ok=True):
         self.proc = None
@@ -862,6 +864,8 @@ class DshRunner:
             self.hub.log("--- 已停止 DSH ---" if self.status == "stopped"
                          else "[DSH] ⚠ 停止未成功, 进程仍在(PID %d), 状态记为停止失败" % pid)
         state.clear_state_for("DshPid")
+        # 三态回报(契约 §1.1): 与 Llama.stop() 同族, 把 stopped / stop_failed 透给 API 层。
+        return self.status
 
     @staticmethod
     def _rebuild_script(dsh_dir, pnpm_exe, node_exe):

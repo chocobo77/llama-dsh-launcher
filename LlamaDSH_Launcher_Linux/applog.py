@@ -105,3 +105,43 @@ def crash(text: str):
 def error_ex(ex: Exception, ctx: str):
     import traceback
     _write("error.log", "%s: %s: %s\n%s" % (ctx, type(ex).__name__, ex, traceback.format_exc()))
+
+
+_LOG_FILES = ("run.log", "info.log", "error.log", "crash.log")
+
+
+def scrub_existing() -> int:
+    """把已存在的历史日志整文件重过一遍 redact, 抹掉脱敏上线之前落盘的凭据。
+
+    脱敏是后加的: 老日志里可能还躺着明文 `?token=…`/`Bearer …`。启动时扫一遍
+    run/info/error/crash 及其 .1/.2/.3 备份, 就地重写。返回改动的文件数。
+    任何单个文件的失败都吞掉, 不影响其余, 更不影响启动。
+    """
+    changed = 0
+    try:
+        names = os.listdir(LOG_DIR)
+    except OSError:
+        return 0
+    for base in _LOG_FILES:
+        for name in names:
+            if name != base and not name.startswith(base + "."):
+                continue
+            path = os.path.join(LOG_DIR, name)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    data = f.read()
+                clean = redact(data)
+                if clean == data:
+                    continue
+                tmp = path + ".scrub.tmp"
+                with open(tmp, "w", encoding="utf-8", errors="replace") as f:
+                    f.write(clean)
+                os.replace(tmp, path)
+                changed += 1
+            except Exception:
+                try:
+                    os.remove(path + ".scrub.tmp")
+                except OSError:
+                    pass
+                continue
+    return changed
