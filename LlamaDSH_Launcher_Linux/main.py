@@ -21,11 +21,23 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
 
+# 血统切换必须排在**任何快照 `~` 的模块被 import 之前**：applog / core / 本文件都在 import 时
+# 用 expanduser("~") 算出日志目录、token 文件、锁文件、/tmp 私有命名空间。以前切换发生在
+# main() 里，于是 root 那一轮 import 已经先建好 /root/.dsh_launcher_logs、写过启动横幅、
+# 跑过一次历史日志重写 —— "修掉 ~ 错位"只修了 exec 之后的那一半(2026-11-11 review 实测)。
+# 顺序约束由 selftest.py §32 守着；细节见 lineage.py 顶部。
+import posixuser
+import safeout
+import lineage
+
+safeout.fix_streams()
+if lineage.reset_if_sudo():
+    sys.exit(0)
+
 import applog
 import compat
 import core
 import procman
-import posixuser
 import monitor
 import nodetool
 import schema as schema_mod
@@ -96,10 +108,17 @@ def _write_agent_file(port):
               % (ex, AGENT_FILE))
 
 
-_nscrub = applog.scrub_existing()
-if _nscrub:
-    applog.info("[脱敏] 已重写 %d 个历史日志文件, 抹除脱敏上线前落盘的明文凭据" % _nscrub)
-applog.info("========== LlamaDSH Launcher (Linux) 启动 ==========")
+def startup_log_and_scrub() -> int:
+    """启动横幅 + 历史日志脱敏，**必须在血统切完之后**由 main() 调用。
+
+    以前这两句写在模块顶层(import 即执行)，于是 `sudo python3 main.py` 会先以 root 跑一遍：
+    按 /root 建日志目录、重写 /root 下的历史日志，然后才 exec 成桌面用户再跑一遍。
+    """
+    n = applog.scrub_existing()
+    if n:
+        applog.info("[脱敏] 已重写 %d 个历史日志文件, 抹除脱敏上线前落盘的明文凭据" % n)
+    applog.info("========== LlamaDSH Launcher (Linux) 启动 ==========")
+    return n
 
 # ---------------------------------------------------------------- 全局状态 --
 
@@ -147,7 +166,15 @@ def _resolve_profile(body):
     name = CONFIG.get("CurrentProfile")
     if isinstance(raw, dict):
         if name and name in (CONFIG.get("Profiles") or {}):
-            CONFIG["Profiles"][name] = raw
+            # **合并**而不是整体替换(2026-11-11 review): 调用方常常只带部分字段(只改 model/ctx
+            # 的启动请求), 整体替换会把用户已存方案里的其余参数抹掉 —— 而 safetensors 转换完成的
+            # 回调会 current_profile() → state.save_config() 把那份残缺 dict 永久写进 config.json。
+            # UI 每次都提交完整方案, 对 UI 行为完全等价。契约 §4 已写明这条口径。
+            saved = (CONFIG.get("Profiles") or {}).get(name)
+            merged = dict(saved) if isinstance(saved, dict) else {}
+            merged.update(raw)
+            CONFIG["Profiles"][name] = merged
+            return merged
         return raw
     _, saved = current_profile()
     return saved
@@ -1542,45 +1569,8 @@ class Handler(BaseHTTPRequestHandler):
             HUB.log("[API] %s: 客户端已断开(响应未送达)" % path)
 
 
-# sudo 血统标记: 切过一次就以这个环境标记为准, 不再自我重启(一次封顶)
-LINEAGE_RESET_ENV = "LlamaDSH_LINEAGE_RESET"
-
-
-def _sudo_lineage_reset():
-    """以 root 跑时切回发起 sudo 的桌面用户。返回 True = 已 exec 出去, 调用方直接返回。
-
-    与 C# 端 Services\\LineageGuard.cs 共享同一条硬约束: **自重启一次封顶**。
-    C# 那边凭证只能走标记文件(explorer 重启会把附加参数丢掉), 这里 execvp 会带上我们显式给的
-    env, 所以用环境变量。少了这道封顶, 任何"切完还是 root"的情形(SUDO_USER=root、sudoers
-    策略、家目录解析失败后仍 exec)都会变成无限自我重启 —— 与 2026-11-10 Windows 端
-    「装完无限反复启动」是同一类缺陷。
-    """
-    if os.geteuid() != 0:
-        return False
-    if os.environ.get(LINEAGE_RESET_ENV):
-        print("⚠ 血统已切过一次但仍是 root(%s=1): 不再自我重启, 否则会无限循环" % LINEAGE_RESET_ENV)
-        return False
-    user = posixuser.sudo_initiator()
-    if not user:
-        print("⚠ 正在以 root 运行:配置/检索/日志都会指向 /root,建议改用桌面用户启动")
-        return False
-    home = posixuser.user_home(user)
-    if not home:
-        # 查不到家目录就不 exec: 带着一个不存在的 HOME 重启, 比保持 root 更难排查
-        print("⚠ 以 root 运行, 且查不到用户 %s 的家目录: 保持当前身份继续(配置/日志会指向 /root)" % user)
-        return False
-    argv = [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:]
-    print("检测到以 sudo(root)启动——所有 ~ 路径会错位,自动切换为用户 %s 重新启动…" % user)
-    try:
-        os.execvp("sudo", ["sudo", "-u", user,
-                           "env", "HOME=" + home, "USER=" + user,
-                           "LANG=" + os.environ.get("LANG", "C.UTF-8"),
-                           LINEAGE_RESET_ENV + "=1"] + argv)
-    except OSError as ex:
-        # exec 失败(没有 sudo / 被 sudoers 拒 / 用户不存在)不能让启动器凭空消失
-        print("⚠ 切换到用户 %s 失败(%s): 保持当前身份继续" % (user, ex))
-        return False
-    return True
+# sudo 血统切断已经搬到 lineage.py，并且必须在 import 其它模块之前调用(顺序约束见 lineage.py
+# 顶部与 selftest.py §32)。这里不再保留旧实现，避免有人把调用点搬回 main() 里去。
 
 
 def main():
@@ -1588,10 +1578,9 @@ def main():
     ap.add_argument("-p", "--port", type=int, default=DEFAULT_PORT)
     args = ap.parse_args()
 
-    # sudo 血统切断(实现见 _sudo_lineage_reset): 以 root 运行时 HOME=/root,
-    # 配置/检索/DSH_HOME/日志全部错位 —— 切回发起 sudo 的桌面用户, 并且一次封顶。
-    if _sudo_lineage_reset():
-        return
+    # 血统切断已经在 import 之前做完(见文件顶部 + lineage.py)：这里只做"切完才该做"的那半 ——
+    # 启动横幅与历史日志脱敏，保证它们落在桌面用户的 HOME 而不是 /root。
+    startup_log_and_scrub()
 
     # 单实例
     try:

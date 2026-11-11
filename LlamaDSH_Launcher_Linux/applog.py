@@ -109,13 +109,33 @@ def error_ex(ex: Exception, ctx: str):
 
 _LOG_FILES = ("run.log", "info.log", "error.log", "crash.log")
 
+# 字节级形态, 与上面三个文本模式一一对应。脱敏上线前的历史日志要整文件重写一遍，
+# 而**按文本读写会永久损坏非 UTF-8 字节**：errors="replace" 把非法字节换成 U+FFFD，
+# 老日志里被捕获的子进程输出(GBK 的控制台输出、被截断的多字节字符)就再也回不来了
+# (2026-11-11 review 实测: \xff\xfe 重写后变成 ef bf bd)。要改就按字节改 —— 凭据本身
+# 全是 ASCII，模式在字节上同样成立。
+_TOKEN_QUERY_B = re.compile(rb"([?&]token=)[^&\s\"'<>|]+", re.IGNORECASE)
+_TOKEN_JSON_B = re.compile(rb'("token"\s*:\s*")[^"]*(")', re.IGNORECASE)
+_BEARER_B = re.compile(rb"(Bearer\s+)[A-Za-z0-9+_\-/=.]{12,}", re.IGNORECASE)
+_MASK_B = _MASK.encode("utf-8")
+
+
+def _redact_bytes(data: bytes) -> bytes:
+    """与 redact() 同语义，但在字节上做，不动任何其它字节。"""
+    out = _TOKEN_QUERY_B.sub(lambda m: m.group(1) + _MASK_B, data)
+    out = _TOKEN_JSON_B.sub(lambda m: m.group(1) + _MASK_B + m.group(2), out)
+    return _BEARER_B.sub(lambda m: m.group(1) + _MASK_B, out)
+
 
 def scrub_existing() -> int:
     """把已存在的历史日志整文件重过一遍 redact, 抹掉脱敏上线之前落盘的凭据。
 
     脱敏是后加的: 老日志里可能还躺着明文 `?token=…`/`Bearer …`。启动时扫一遍
-    run/info/error/crash 及其 .1/.2/.3 备份, 就地重写。返回改动的文件数。
-    任何单个文件的失败都吞掉, 不影响其余, 更不影响启动。
+    run/info/error/crash 及其 .1/.2/.3 备份, 就地重写(临时文件 + os.replace, 原子)。
+    返回改动的文件数。任何单个文件的失败都吞掉, 不影响其余, 更不影响启动。
+
+    必须按字节读写(见上面 _redact_bytes 的注释): 文本模式 round-trip 会把历史日志里
+    的非法 UTF-8 字节换成 U+FFFD, 那是不可恢复的内容损失。
     """
     changed = 0
     try:
@@ -128,13 +148,13 @@ def scrub_existing() -> int:
                 continue
             path = os.path.join(LOG_DIR, name)
             try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                with open(path, "rb") as f:
                     data = f.read()
-                clean = redact(data)
+                clean = _redact_bytes(data)
                 if clean == data:
                     continue
                 tmp = path + ".scrub.tmp"
-                with open(tmp, "w", encoding="utf-8", errors="replace") as f:
+                with open(tmp, "wb") as f:
                     f.write(clean)
                 os.replace(tmp, path)
                 changed += 1
