@@ -188,12 +188,22 @@ if not exist "%PROJ%\selftest.ps1" (
     echo   [错误] 缺少回归测试脚本: %PROJ%\selftest.ps1
     goto :fail
 )
+rem 先删旧日志: 它被别的程序开着时重定向会失败, 那时必须看得见发生了什么
+del /q "%PKOUT%\selftest.log" >nul 2>nul
+echo   运行中(编译被测源 + 跑判定用例, 约 10-30 秒; 完整输出写 installer_output\selftest.log)
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJ%\selftest.ps1" > "%PKOUT%\selftest.log" 2>&1
-if errorlevel 1 (
+set "ST_EC=%ERRORLEVEL%"
+rem 退出码必须在任何其它命令之前落日志: 没有它, 事后无法区分"测试失败中止"与"进程被外力中断"
+call :log "6/8 selftest 退出码 %ST_EC%"
+if not exist "%PKOUT%\selftest.log" (
+    rem 这里不能写括号: 它在 if 块里, cmd 会把 echo 文本里的括号当块嵌套, 后面的行就错位
+    echo   [错误] 回归测试没产生日志文件, 多半是输出文件被占用, 中止打包
+    goto :fail
+)
+if not "%ST_EC%"=="0" (
     rem 只报条数与日志路径: FAIL 行含括号/中文, 直接 echo 进批处理容易被括号截断
     for /f %%C in ('findstr /B /C:"FAIL" "%PKOUT%\selftest.log" ^| find /c /v ""') do echo   [错误] 回归测试 %%C 项未通过
     echo          中止打包。详情: %PKOUT%\selftest.log
-    call :log "6/8 selftest FAILED, 打包中止"
     goto :fail
 )
 for /f "delims=" %%L in ('findstr /B /C:"SUMMARY" "%PKOUT%\selftest.log"') do echo   %%L
