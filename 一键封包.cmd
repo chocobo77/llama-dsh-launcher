@@ -70,13 +70,19 @@ rem 原版把 ISCC 写死为 "C:\Program Files (x86)\Inno Setup 6"，换个安�
 call :find_iscc "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1"
 call :find_iscc "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1"
 call :find_iscc "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1"
+rem Inno Setup 7 只作兜底：本机装了 7 而没装 6 的机器不该直接卡在 2/8（脚本按 6 的语法写，6 优先）
+call :find_iscc "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 7_is1"
+call :find_iscc "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 7_is1"
+call :find_iscc "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 7_is1"
 for %%P in (
     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
     "C:\Program Files\Inno Setup 6\ISCC.exe"
     "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
+    "C:\Program Files\Inno Setup 7\ISCC.exe"
+    "%LOCALAPPDATA%\Programs\Inno Setup 7\ISCC.exe"
 ) do if not defined ISCC if exist "%%~P" set "ISCC=%%~P"
 if not defined ISCC (
-    echo   [错误] 未找到 Inno Setup 6 的 ISCC.exe
+    echo   [错误] 未找到 Inno Setup 的 ISCC.exe（6 或 7 都可，优先 6）
     echo          请先安装 Inno Setup 6: https://jrsoftware.org/isdl.php
     echo          安装后重跑即可（本脚本自动从注册表定位，无需手改路径）
     goto :fail
@@ -190,7 +196,7 @@ if not exist "%PROJ%\selftest.ps1" (
 )
 rem 先删旧日志: 它被别的程序开着时重定向会失败, 那时必须看得见发生了什么
 del /q "%PKOUT%\selftest.log" >nul 2>nul
-echo   运行中(编译被测源 + 跑判定用例, 约 10-30 秒; 完整输出写 installer_output\selftest.log)
+echo   运行中: 编译被测源 + 跑判定用例, 约 5-60 秒; 编译超时上限 180 秒; 完整输出写 installer_output\selftest.log
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJ%\selftest.ps1" > "%PKOUT%\selftest.log" 2>&1
 set "ST_EC=%ERRORLEVEL%"
 rem 退出码必须在任何其它命令之前落日志: 没有它, 事后无法区分"测试失败中止"与"进程被外力中断"
@@ -202,7 +208,7 @@ if not exist "%PKOUT%\selftest.log" (
 )
 if not "%ST_EC%"=="0" (
     rem 只报条数与日志路径: FAIL 行含括号/中文, 直接 echo 进批处理容易被括号截断
-    for /f %%C in ('findstr /B /C:"FAIL" "%PKOUT%\selftest.log" ^| find /c /v ""') do echo   [错误] 回归测试 %%C 项未通过
+    for /f %%C in ('findstr /B /C:"FAIL" "%PKOUT%\selftest.log" ^| find /c /v ""') do call :report_fails %%C
     echo          中止打包。详情: %PKOUT%\selftest.log
     goto :fail
 )
@@ -212,6 +218,12 @@ call :log "6/8 selftest 通过"
 rem ---------- [7/8] 生成安装包 ----------
 echo [7/8] 生成安装包 (Inno Setup)...
 if not exist "%PKOUT%" mkdir "%PKOUT%"
+rem 先把上一轮的 Setup.exe 清掉再调 ISCC: 本轮若在编译这一步失败, 目录里就不该还留着一个
+rem "名字和大小都跟本轮产物一模一样"的旧包(实测出现过: [6/8] 中止后目录里仍是上一轮的包)。
+if exist "%SETUPEXE%" (
+    del /q "%SETUPEXE%" >nul 2>nul
+    call :log "7/8 先删除上一轮 Setup.exe, 避免与本轮产物混淆"
+)
 rem ISCC 完整输出始终写入日志文件(成功时 :cleanup 会删掉; 失败时保留供排查)
 "%ISCC%" "%ISS%" > "%PKOUT%\iscc_build.log" 2>&1
 if errorlevel 1 (
@@ -332,6 +344,16 @@ if defined ISCC exit /b 0
 for /f "tokens=2,*" %%A in ('reg query %1 /v InstallLocation 2^>nul') do if not defined ISCC if exist "%%BISCC.exe" set "ISCC=%%BISCC.exe"
 exit /b 0
 
+:report_fails
+rem %~1 = selftest.log 里 FAIL 行数。计数为 0 说明测试进程根本没跑到断言（崩了/被中断/编译失败），
+rem 不能报成"0 项未通过"——那读起来像测试全过，会把人引向错误的排查方向。
+if "%~1"=="0" (
+    echo   [错误] 回归测试进程异常退出: 日志里没有 FAIL 行, 多半是测试自身崩了或被外力中断
+) else (
+    echo   [错误] 回归测试 %~1 项未通过
+)
+exit /b 0
+
 :log
 rem %~1 = 步骤标记, 追加一行带时间戳的黑匣子记录
 >>"%RUNLOG%" echo [%date% %time%] %~1
@@ -353,6 +375,8 @@ exit /b 0
 echo.
 echo   [封包失败] 请检查上方错误信息
 echo   提示: 输出目录里的临时残留（dll/pdb 等非安装包文件）会在下次成功封包时自动清理
+rem 最容易出事的一种"失败": 目录里躺着上一轮的 Setup.exe, 时间戳看不出差别, 被人当本轮产物发出去。
+if exist "%SETUPEXE%" for %%F in ("%SETUPEXE%") do echo   注意: 目录里的 %%~nxF 时间戳是 %%~tF —— 本轮已中止, 那是上一轮的旧包, 不要发布
 call :log "失败退出, OUTDIR 现场如下"
 if exist "%PKOUT%" dir /b /s "%PKOUT%" >>"%RUNLOG%" 2>nul
 call :do_pause
