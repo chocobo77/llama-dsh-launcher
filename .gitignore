@@ -40,8 +40,14 @@ LlamaDSH_Launcher_CS/installer_staging_linux/
 pack_run.log
 pack_run.log
 
-# 本地修复记录，不公开
-/docs/
+# 本地修复记录与审计报告不公开。
+# 但**契约与设计文档必须入库**：代码注释(installer.iss / InstallScope.cs)和 commit message 会
+# 引用 docs/API-CONTRACT.md、docs/安装模式与提权门控-*.md，全目录忽略会让这些引用在仓库里
+# 打不开，"是否按契约实现"也没人能核对。注意 /docs/ 这种写法会连目录一起排除，
+# 下面的 ! 反选必须配 /docs/* 才生效。
+/docs/*
+!/docs/API-CONTRACT.md
+!/docs/安装模式与提权门控-2026-11-10.md
 
 # 个人整理的参考资料，不入库
 /显存占用计算指南.md
