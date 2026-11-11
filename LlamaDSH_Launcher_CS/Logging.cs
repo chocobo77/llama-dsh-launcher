@@ -67,6 +67,42 @@ namespace LlamaDSH_Launcher
             return BearerValue.Replace(outText, "$1‹已隐藏›");
         }
 
+        // 历史日志**整文件重写**用的字节级脱敏(ScrubExisting)。把字节按 ISO-8859-1 一一映射成
+        // 字符跑同一组正则，再按同一映射写回：除被替换的凭据片段外，其余字节(含非法 UTF-8 字节)
+        // 原样保留。掩码先按 UTF-8 编码再映射成同样的字符，写回去正好是文件里的 UTF-8 文本。
+        private static readonly Encoding Latin1 = Encoding.GetEncoding("ISO-8859-1");
+        private static readonly string MaskLatin1 = Latin1.GetString(Encoding.UTF8.GetBytes("‹已隐藏›"));
+
+        /// <summary>按字节脱敏：与 Redact() 同语义，但不会损坏非 UTF-8 字节。</summary>
+        public static byte[] RedactBytes(byte[] data)
+        {
+            if (data == null || data.Length == 0)
+            {
+                return data ?? Array.Empty<byte>();
+            }
+            string s = Latin1.GetString(data);
+            s = TokenQuery.Replace(s, "$1" + MaskLatin1);
+            s = TokenJson.Replace(s, "$1" + MaskLatin1 + "$2");
+            s = BearerValue.Replace(s, "$1" + MaskLatin1);
+            return Latin1.GetBytes(s);
+        }
+
+        private static bool BytesEqual(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length)
+            {
+                return false;
+            }
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (a[i] != b[i])
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         /// <summary>
         /// 生成一段可直接粘贴给维护者的诊断文本：环境信息 + 当前错误 + 最近日志尾部。
         /// 用于"复制诊断信息"按钮，避免用户只能描述"它报错了"。
@@ -187,14 +223,18 @@ namespace LlamaDSH_Launcher
                             {
                                 continue;
                             }
-                            string text = File.ReadAllText(path);
-                            string clean = Redact(text);
-                            if (clean == text)
+                            // 必须按字节重写(与 Linux 侧 applog.scrub_existing 同一个修法)：
+                            // File.ReadAllText 按 UTF-8 解码，老日志里的非法字节(被捕获的子进程
+                            // GBK 输出、被截断的多字节字符)会变成 U+FFFD 再写回去 —— 那是不可恢复
+                            // 的内容损失(2026-11-11 review 实测)。
+                            byte[] raw = File.ReadAllBytes(path);
+                            byte[] clean = RedactBytes(raw);
+                            if (BytesEqual(clean, raw))
                             {
                                 continue;
                             }
                             string tmp = path + ".scrub.tmp";
-                            File.WriteAllText(tmp, clean, new UTF8Encoding(false));
+                            File.WriteAllBytes(tmp, clean);
                             File.Replace(tmp, path, null);
                         }
                         catch { }
