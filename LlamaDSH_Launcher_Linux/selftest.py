@@ -4839,6 +4839,102 @@ try:
 finally:
     _applog_top.LOG_DIR = _c30_old_ld
 
+# --------------------------------------------------- 31. 血统自我重启一次封顶 + 家目录查 passwd ---
+# 对齐 C# 端 Services\LineageGuard.cs 与 selftest.ps1 的同一组不变量:
+#   ① 自我重启(切回发起 sudo 的桌面用户)必须一次封顶 —— 少了封顶, 任何"切完还是 root"的
+#      情形都会变成无限自我重启(2026-11-10 Windows 端「装完无限反复启动」同一类缺陷);
+#   ② HOME 必须查 passwd, 不能拼 "/home/<用户>" —— LDAP/AD 接入、自定义家目录、root 自己
+#      都不是 /home/x, 拼出来的假路径会把配置/日志指向不存在的位置, 比不修正更难排查。
+import main as _main_top            # noqa: E402
+import posixuser as _posix_top      # noqa: E402
+
+_c31_here = os.path.dirname(os.path.abspath(__file__))
+_c31_exec = []
+_c31_geteuid_real = os.geteuid
+_c31_execvp_real = os.execvp
+_c31_env_saved = dict(os.environ)
+
+
+def _c31_src(_m):
+    return io.open(os.path.join(_c31_here, _m), encoding="utf-8").read()
+
+
+def _c31_reset(euid, environ, home_override="__keep__", exec_fails=False):
+    """跑一次 _sudo_lineage_reset, 返回 (返回值, exec 的 argv 或 None)。绝不真的 exec。
+
+    exec_fails=False 模拟 execvp 成功(真机上成功就不返回, 这里让假实现直接 return,
+    被测函数随后 return True); exec_fails=True 模拟被 sudoers 拒/OSError 路径。
+    """
+    _c31_exec[:] = []
+    os.environ.clear()
+    os.environ.update(environ)
+    os.geteuid = lambda: euid
+
+    def _fake_execvp(file_, args):
+        _c31_exec.append(list(args))
+        if exec_fails:
+            raise OSError("selftest: sudo 被拒")
+
+    os.execvp = _fake_execvp
+    _uh_real = _main_top.posixuser.user_home
+    if home_override != "__keep__":
+        _main_top.posixuser.user_home = lambda u: home_override
+    try:
+        _r = _main_top._sudo_lineage_reset()
+    finally:
+        _main_top.posixuser.user_home = _uh_real
+        os.execvp = _c31_execvp_real
+        os.geteuid = _c31_geteuid_real
+    return _r, (_c31_exec[0] if _c31_exec else None)
+
+
+_r, _argv = _c31_reset(1000, {"SUDO_USER": "someone"})
+check("非 root 不触发血统重启", _r is False and _argv is None, str(_argv))
+
+_r, _argv = _c31_reset(0, {"SUDO_USER": "someone", _main_top.LINEAGE_RESET_ENV: "1"})
+check("已切过一次 → 绝不自我重启(一次封顶, 防无限反复启动)", _r is False and _argv is None, str(_argv))
+
+_c31_home = tempfile.mkdtemp(prefix="c31home_")
+_r, _argv = _c31_reset(0, {"SUDO_USER": "someone"}, home_override=_c31_home)
+check("root + sudo 发起者 → exec 一次, 且把凭证写进 env 带过 exec",
+      _r is True and _argv is not None and (_main_top.LINEAGE_RESET_ENV + "=1") in _argv,
+      str(_argv))
+check("切用户时 HOME 用解析出的家目录, 而不是拼 /home/<用户>",
+      _argv is not None
+      and ("HOME=" + _c31_home) in _argv
+      and "HOME=/home/someone" not in _argv,
+      str(_argv))
+
+_r, _argv = _c31_reset(0, {})
+check("root 但不是 sudo 发起 → 不重启(也保持可见的警告路径)", _r is False and _argv is None, str(_argv))
+
+_r, _argv = _c31_reset(0, {"SUDO_USER": "nosuchuser_zzz"}, home_override=None)
+check("查不到家目录 → 不 exec(绝不带着不存在的 HOME 重启)", _r is False and _argv is None, str(_argv))
+
+_r, _argv = _c31_reset(0, {"SUDO_USER": "someone"}, home_override=_c31_home, exec_fails=True)
+check("execvp 失败(没有 sudo / 被 sudoers 拒) → 只试一次并返回 False, 启动器不凭空消失",
+      _r is False and len(_c31_exec) == 1, "%d 次" % len(_c31_exec))
+shutil.rmtree(_c31_home, ignore_errors=True)
+
+os.geteuid = _c31_geteuid_real
+os.execvp = _c31_execvp_real
+os.environ.clear()
+os.environ.update(_c31_env_saved)
+
+check("posixuser.user_home 查 passwd(root 的家目录真实存在)",
+      bool(_posix_top.user_home("root")) and os.path.isdir(_posix_top.user_home("root")),
+      str(_posix_top.user_home("root")))
+check("posixuser.user_home 对不存在的用户返回 None(不给拼出来的假路径)",
+      _posix_top.user_home("nosuchuser_zzz") is None, str(_posix_top.user_home("nosuchuser_zzz")))
+check("posixuser.user_home 空输入 → None", _posix_top.user_home("") is None, "")
+check("posixuser.sudo_initiator 无 SUDO_USER → None",
+      _posix_top.sudo_initiator() in (None, ""), str(_posix_top.sudo_initiator()))
+
+check("client/tray/main 不再拼 \"/home/\" + SUDO_USER(该假设对 LDAP/自定义家目录不成立)",
+      all(('/home/" + os.environ["SUDO_USER"]' not in _c31_src(_m)) for _m in ("client.py", "tray.py", "main.py")),
+      "")
+check("main() 里确实调用了 _sudo_lineage_reset", "_sudo_lineage_reset()" in _c31_src("main.py"), "")
+
 shutil.rmtree(_SELFTEST_HOME, ignore_errors=True)
 shutil.rmtree(_tmp, ignore_errors=True)
 

@@ -12,7 +12,10 @@ AppId={{A7F8B3C4-D5E6-4F78-9A0B-1C2D3E4F5A6B}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={autopf}\LlamaDSH_Launcher
+; 安装目录默认值按"安装方式"给(逻辑见 [Code] DesiredInstallDir):
+;   仅为自己安装 → {userpf} = %LocalAppData%\Programs(与 VS Code / Inno Setup 自身同一族用户级路径)
+;   为所有用户安装 → D:\Program Files\LlamaDSH_Launcher(D 盘不存在时才退回 {commonpf})
+DefaultDirName={code:PickInstallDir}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 ; MIT 许可随安装向导展示(此前 LicenseFile= 是空值, 用户装完都不知道授权条款)
@@ -24,7 +27,13 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-PrivilegesRequired=admin
+; 两种安装方式(向导里选, 也可命令行 /ALLUSERS /CURRENTUSER 覆盖):
+;   仅为自己安装 → PrivilegesRequired=lowest 的默认档, 不开 UAC, 装到 %LocalAppData%\Programs,
+;                  卸载信息写 HKCU;
+;   为所有用户安装 → Setup 自动重启为提权实例(过 UAC), 装到 Program Files, 卸载信息写 HKLM。
+; 写死 admin 的历史问题: 非管理员账户连"装给自己用"都做不到, 直接被 UAC 拦死。
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog commandline
 ; 与 App.xaml.cs 单实例 Mutex 同名: 安装/卸载前要求关闭运行中的启动器,
 ; 也防止手工跑 ISCC 时把 installer_staging 里正在被占用的旧 exe 打进包
 AppMutex=LlamaDSH_Launcher_SingleInstance_Mutex
@@ -52,6 +61,18 @@ chinesesimplified.FinishedLabel=安装已完成。您现在可以启动程序了
 chinesesimplified.ClickFinish=单击"完成"退出安装向导。
 chinesesimplified.StatusRunProgram=正在完成安装...
 chinesesimplified.ConfirmUninstall=确定要完全删除 %1 及其所有组件吗？
+; 安装方式选择页文案(这几个键 ChineseSimplified.isl / Default.isl 里都有, 这里按本项目的
+; 实际默认路径改写; Text1 是默认档为 admin 时用的那套措辞, 两种都覆盖掉免得措辞不一致)
+chinesesimplified.PrivilegesRequiredOverrideTitle=选择安装方式
+chinesesimplified.PrivilegesRequiredOverrideInstruction=两种方式使用的是同一个程序，区别只在装到哪里、需不需要管理员权限。
+chinesesimplified.PrivilegesRequiredOverrideText1=%1 可以为所有用户安装（需要管理员权限，默认装到 D:\Program Files，没有 D 盘时是系统 Program Files），或仅为您自己安装（不需要管理员权限，装到当前用户目录下的 Programs 文件夹）。
+chinesesimplified.PrivilegesRequiredOverrideText2=%1 可以仅为您自己安装（不需要管理员权限，装到当前用户目录下的 Programs 文件夹），或为所有用户安装（需要管理员权限，默认装到 D:\Program Files，没有 D 盘时是系统 Program Files）。
+chinesesimplified.PrivilegesRequiredOverrideCurrentUser=仅为自己安装(&M)（不需要管理员权限）
+chinesesimplified.PrivilegesRequiredOverrideAllUsers=为所有用户安装(&A)（需要管理员权限）
+english.PrivilegesRequiredOverrideText1=%1 can be installed for all users (requires administrator privileges; into D:\Program Files by default, or the system Program Files if this PC has no D drive), or for you only (no administrator privileges; into the Programs folder inside your user profile).
+english.PrivilegesRequiredOverrideText2=%1 can be installed for you only (no administrator privileges; into the Programs folder inside your user profile), or for all users (requires administrator privileges; into D:\Program Files by default, or the system Program Files if this PC has no D drive).
+english.PrivilegesRequiredOverrideCurrentUser=Install for &me only (no administrator privileges)
+english.PrivilegesRequiredOverrideAllUsers=Install for &all users (administrator privileges required)
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加选项:"
@@ -70,7 +91,11 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 Name: "{autostartmenu}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\Resources\{#MyAppIcon}"; Tasks: startmenuicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "启动程序"; Flags: nowait postinstall skipifsilent
+; runasoriginaluser(Inno 6+): 装完自动启动走"原始用户"的链接令牌，不继承 Setup 的提权状态与
+; __COMPAT_LAYER 兼容层血统。少了这层血统，程序里那段"血统切断"重启就不需要介入——
+; 2026-11-10「仅为自己安装」装完无限反复启动，正是这条链上的血统 + 程序侧"非空即重启"判定
+; 叠加出来的（两边都已各自修掉，这里是第一道）。
+Filename: "{app}\{#MyAppExeName}"; Description: "启动程序"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
@@ -90,6 +115,141 @@ const
   // 构建机 2026-11-04 从上述官方 URL 下载实测: 58,510,672 字节, Authenticode Valid(CN=.NET, O=Microsoft Corporation)。
   // 该运行时稍后以 runas 提权执行, 必须先过 SHA-256 + 验签双门, 不能只看文件存在。
   DOTNET8_SHA256 = '8BD710AFA5DE396C9EB2A3B68D00279B7B9ACA372A2443E9ACD4F48FFDEF3F2D';
+
+// =====================================================
+//  安装方式(仅自己 / 所有用户) —— 与程序侧 Services\InstallScope.cs 配对
+//  规则说明见 docs\安装模式与提权门控-2026-11-10.md
+// =====================================================
+
+function GetDriveTypeW2(RootPath: String): LongWord;
+external 'GetDriveTypeW@kernel32.dll stdcall';
+
+const
+  APP_DIR_NAME = 'LlamaDSH_Launcher';
+  // 机器级安装优先落这块盘: 模型权重与 DSH 依赖都在 D 盘, 装进系统盘会把 C 盘挤爆。
+  // 按要求「D:\Program Files 不存在就直接建」, 所以只拦两种情况: 压根没有 D 盘、
+  // D 盘不是本机固定盘(U 盘/网络盘/光驱上建 Program Files 是帮倒忙)。空间不足不拦。
+  DATA_DRIVE_ROOT = 'D:\';
+  DRIVE_FIXED = 3;   // GetDriveTypeW: 2=可移动 3=固定 4=网络 5=光盘 6=RAM 盘
+  SCOPE_MARKER = 'install-scope.txt';
+  // 卸载注册表子键 = [Setup] AppId + '_is1'。AppId 那边用 "{{" 转义, 这里必须是明文 GUID,
+  // 两处只能同步改, 否则"另一种安装方式已装过"的检测看不见对面那一份。
+  UNINST_SUBKEY = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{A7F8B3C4-D5E6-4F78-9A0B-1C2D3E4F5A6B}_is1';
+
+function LocalFixedDrive(DriveRoot: String): Boolean;
+begin
+  Result := DirExists(DriveRoot) and (GetDriveTypeW2(DriveRoot) = DRIVE_FIXED);
+end;
+
+// 当前安装方式下的建议安装目录。{userpf}=用户目录\Programs, {commonpf}=系统 Program Files。
+function DesiredInstallDir: String;
+begin
+  if IsAdminInstallMode then
+  begin
+    if LocalFixedDrive(DATA_DRIVE_ROOT) then
+      Result := DATA_DRIVE_ROOT + 'Program Files\' + APP_DIR_NAME
+    else
+      Result := ExpandConstant('{commonpf}\' + APP_DIR_NAME);
+  end
+  else
+    Result := ExpandConstant('{userpf}\' + APP_DIR_NAME);
+end;
+
+// DefaultDirName 走这里: 提权重启后的那次实例里 IsAdminInstallMode 才是 True,
+// 所以机器级安装看到的默认值就是 D:\Program Files 而不是用户目录。
+function PickInstallDir(Param: String): String;
+begin
+  Result := DesiredInstallDir;
+end;
+
+// 用户级卸载项在 HKCU、机器级在 HKLM, 两边互相看不见。不提醒的话,
+// 用户会以为"装了两遍"或"卸载没卸干净", 实际上是各自一份。
+function OtherScopeInstallLocation: String;
+var
+  Loc: String;
+begin
+  Result := '';
+  Loc := '';
+  if IsAdminInstallMode then
+  begin
+    if RegQueryStringValue(HKCU, UNINST_SUBKEY, 'InstallLocation', Loc) then Result := Loc;
+  end
+  else
+  begin
+    if RegQueryStringValue(HKLM, UNINST_SUBKEY, 'InstallLocation', Loc) then Result := Loc;
+  end;
+end;
+
+var
+  ScopeWarned: Boolean;   // 跨安装方式的提醒只弹一次
+
+// 另一种安装方式已经装过 → 装完会变成两份独立安装(各自的卸载项)。
+// 放在 PrepareToInstall(点"安装"之后、复制文件之前)提示: 这时还能取消回去改选方式。
+// 返回 False = 用户选择中止本次安装。
+// 注意文案与按钮必须自洽: 早期版本用 MB_OK 却让用户"点取消", 而 MB_OK 只有确定一个钮,
+// 点下去等于默认继续装 —— 提示里说的操作根本做不到。这里给 YES/NO, 选否直接中止。
+function WarnOtherScopeInstall: Boolean;
+var
+  Other: String;
+begin
+  Result := True;
+  if ScopeWarned then Exit;
+  ScopeWarned := True;
+  Other := OtherScopeInstallLocation;
+  if Other = '' then Exit;
+  // 先把检测事实写进日志: 事后能判断"到底有没有看见对面那份"。
+  Log('检测到另一种安装方式已装过: ' + Other);
+  if WizardSilent then
+  begin
+    // 静默(/SILENT /VERYSILENT)下绝对不能弹 [Code] 的 MsgBox：实测它不受 /SUPPRESSMSGBOXES
+    // 管辖，无人值守安装会一直卡在等点击（2026-11-10 我自己跑测试包时就是这样把弹窗
+    // 连拍到用户屏幕上的）。静默场景按"继续装"处理，只留日志。
+    Log('静默模式：不弹窗，继续安装（两份将并存，卸载列表里各有一条）');
+    Exit;
+  end;
+  if MsgBox('注意：这台机器上还有一份用另一种安装方式装的同一个程序，位于' + #13#10 +
+            '    ' + Other + #13#10#13#10 +
+            '两种安装方式互不覆盖，装完会在卸载列表里出现两条。' + #13#10#13#10 +
+            '要把这一份也装上吗？' + #13#10 +
+            '选「否」将取消本次安装，您可以返回上一步改选另一种安装方式，或先卸载另一份。',
+            mbConfirmation, MB_YESNO) = IDNO then
+  begin
+    Log('用户选择中止: 本机已有另一种安装方式装的同一程序');
+    Result := False;
+  end;
+end;
+
+// 把安装方式落到安装目录里, 程序启动时据此决定「以管理员身份启动」怎么呈现:
+// 机器级 = exe 由 ACL 保护, 提权运行安全; 用户级 = 当前用户能改写 exe, 提权必须过 UAC。
+procedure WriteScopeMarker;
+var
+  Scope: String;
+begin
+  try
+    if IsAdminInstallMode then Scope := 'machine' else Scope := 'user';
+    // 纯 ASCII: Inno 的 SaveStringToFile 落的是 ANSI 字节, 掺中文到了别的代码页就成了乱码,
+    // 而这个文件是要被程序逐行解析的。含义写在 docs\安装模式与提权门控-2026-11-10.md。
+    SaveStringToFile(ExpandConstant('{app}\' + SCOPE_MARKER),
+      'scope=' + Scope + #13#10 +
+      'dir=' + ExpandConstant('{app}') + #13#10 +
+      // 注意: 后两个参数是"日期分隔符/时间分隔符"(Char, 不能传空串, 传空串会 Type Mismatch),
+      // 之前写成 '"' 结果出来 2026"11"10 这种怪串。
+      'installedAt=' + GetDateTimeString('yyyy-mm-dd hh:nn:ss', '-', ':') + #13#10 +
+      'written-by=installer.iss' + #13#10 +
+      'note=scope is user (per-user install) or machine (all-users install).' + #13#10 +
+      'note2=if this file is missing the program falls back to the uninstall registry keys.' + #13#10,
+      False);
+  except
+    // 写失败不阻断安装(程序侧还有注册表与兜底两级判断), 但必须把原因留在 setup log 里,
+    // 否则事后排查只看到"标记文件没了", 分不清是防病毒拦了还是脚本自己抛的。
+    Log('安装方式标记 ' + SCOPE_MARKER + ' 写入失败: ' + GetExceptionMessage);
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then WriteScopeMarker;
+end;
 
 function IsWindows10OrLater: Boolean;
 var
@@ -430,6 +590,13 @@ begin
   Result := '';
   Messages := '';
   HasError := False;
+
+  // 检查 0: 另一种安装方式是否已经装过(先说清楚, 免得等 .NET 下载完才发现装成了两份)
+  if not WarnOtherScopeInstall then
+  begin
+    Result := '已取消安装：这台机器上已有另一种安装方式装的同一个程序（上面已说明它的位置）。';
+    Exit;
+  end;
 
   // 检查 1: Windows 版本
   if not IsWindows10OrLater then

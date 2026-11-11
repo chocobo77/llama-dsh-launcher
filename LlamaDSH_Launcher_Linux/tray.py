@@ -38,6 +38,7 @@ except Exception:
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_DIR)
 import appicon   # noqa: E402  图标自举(纯标准库, 不导入 GTK)
+import posixuser   # noqa: E402  查 passwd, 不拼 "/home/<用户>"
 
 
 def _api_token():
@@ -698,8 +699,11 @@ def ensure_server(port):
     if probe(port):
         return base
     env = dict(os.environ)
-    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
-        env["HOME"] = "/home/" + os.environ["SUDO_USER"]
+    if os.geteuid() == 0:
+        # 同 client.py: 家目录查 passwd, 拼 "/home/<用户>" 对某些用户不存在, 那时不设比设错好
+        h = posixuser.user_home(posixuser.sudo_initiator())
+        if h:
+            env["HOME"] = h
     subprocess.Popen([sys.executable, os.path.join(APP_DIR, "main.py"), "-p", str(port)],
                      cwd=APP_DIR, env=env, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
