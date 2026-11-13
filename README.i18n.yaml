@@ -1,0 +1,43 @@
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write apps/desktop-tauri/README.md
+/dsh-desktop-tauri-shell:
+  en: c253c5feee7e1869
+  zh: ce641da4b9d3fa5d
+/dsh-desktop-tauri-shell/what-it-does:
+  en: 0981e96234c5449d
+  zh: 03a99cbd904521f4
+/dsh-desktop-tauri-shell/development:
+  en: 569adf51bcb37dc0
+  zh: b3235970fb192500
+/dsh-desktop-tauri-shell/packaging-windows-nsis:
+  en: 19933c6d02bd271f
+  zh: 75e0b9ef9ce53d48
+/dsh-desktop-tauri-shell/auto-update-verified-end-to-end:
+  en: 000e34b8d892014d
+  zh: ee5f971a7e459d90
+/dsh-desktop-tauri-shell/desktop-behavior-conventions:
+  en: b58c575c8436d7b7
+  zh: a41604bc502a55f9
+/dsh-desktop-tauri-shell/host-log-pipes-silent-crash-prevention:
+  en: 556dc16af28c7556
+  zh: ee19339e3383d38a
+/dsh-desktop-tauri-shell/the-closure-must-carry-the-client-build-environment-login-regression:
+  en: 3cc79df52532abfc
+  zh: 56af3be99ca2249e
+/dsh-desktop-tauri-shell/runtime-closure-regression-guard:
+  en: ea2d4c0489076f42
+  zh: 8acd8a2824cab19c
+/dsh-desktop-tauri-shell/bundling-a-runtime-self-contained-installer:
+  en: a1994b58846d4639
+  zh: c8300bfa282926d7
+/dsh-desktop-tauri-shell/environment-overrides:
+  en: 38b2adc48a2f3820
+  zh: 9611db6fc01bc203
+/dsh-desktop-tauri-shell/one-host-per-state-root:
+  en: c7d19bc157d12ddf
+  zh: 331a21234cac898c
+/dsh-desktop-tauri-shell/differences-vs-the-electron-shell:
+  en: 0cef23259a3072a7
+  zh: e02b9862d4c25cbb

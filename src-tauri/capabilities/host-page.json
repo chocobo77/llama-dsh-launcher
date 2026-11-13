@@ -1,0 +1,15 @@
+{
+  "$schema": "gen/schemas/desktop-schema.json",
+  "identifier": "host-page-links",
+  "description": "The DSH Web GUI runs on the Host's own origin, which Tauri classifies as a remote IPC origin. This capability grants that page exactly one command: opening an http(s) link in the system browser (login popups, help links). Loopback hosts only: a Host bound to another address needs its origin added to the pattern list.",
+  "windows": ["main"],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:*",
+      "http://localhost:*",
+      "https://127.0.0.1:*",
+      "https://localhost:*"
+    ]
+  },
+  "permissions": ["allow-open-external"]
+}

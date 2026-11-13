@@ -1,0 +1,13 @@
+{
+  "$schema": "gen/schemas/desktop-schema.json",
+  "identifier": "splash-capability",
+  "description": "Local splash window only: shell status IPC, service restart, update check, quit. The shell never lets the page drive windows or the updater directly; both are tray/splash commands handled in Rust.",
+  "windows": ["splash"],
+  "permissions": [
+    "core:default",
+    "allow-server-status",
+    "allow-restart-server-cmd",
+    "allow-check-update-cmd",
+    "allow-quit-app"
+  ]
+}
