@@ -354,6 +354,26 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Diagnostics without side effects: say which launch tier would be used and
+    // with what arguments, then exit. This is how a support report distinguishes
+    // "the harness mount did not happen" from "the harness CLI is broken" without
+    // starting a Host, and it is what the installer test asserts on.
+    if std::env::args().any(|a| a == "--print-launch-plan") {
+        match server::launch_plan(3090) {
+            Ok(plan) => {
+                println!("source:  {}", plan.source);
+                println!("program: {}", plan.program);
+                println!("args:    {:?}", plan.args);
+                println!("cwd:     {:?}", plan.cwd);
+                std::process::exit(0);
+            }
+            Err(message) => {
+                eprintln!("launch plan unavailable: {message}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let hidden = std::env::args()
         .any(|a| a == "--autostart" || a == "--hidden");
     HIDDEN_START.store(hidden, Ordering::Relaxed);

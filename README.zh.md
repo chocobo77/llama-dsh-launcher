@@ -10,9 +10,9 @@
 这个目录原本是 deepseek-harness monorepo 里的 `apps/desktop-tauri`，现在拆成独立
 项目（`D:\code\DSH\dsh-desktop-tauri`），有自己独立的 git 历史。变化如下：
 
-- **构建与安装不需要别的东西。** 安装包内置的 DSH CLI 就 vendored 在本目录的
-  `runtime-cli/`（以及 `runtime-node/`），安装时复制到 `AppData\Local\DSH\`。
-  `pnpm run build`、`tauri build`、`cargo test` 都只靠本目录即可运行。
+- **构建不需要别的东西。** `pnpm run build`、`tauri build`、`cargo test` 都只靠
+  本目录即可运行。安装包**不带**运行时：它挂载进已有 harness（见下节）。
+  `runtime-cli/` 与 `runtime-node/` 只在可选的"自包含安装包"构建里才用到。
 - **重新生成那份内置 CLI 才需要 checkout。** `pnpm run prepare:runtime` 从
   monorepo 构建 `@deepseek-ai/dsh` 的生产闭包，先指一下位置：
   `set DSH_REPO_ROOT=D:\Program files\deepseek-harness`。运行期的 dev 启动档位
@@ -61,6 +61,36 @@
    删除该 Run 值，不留登录期报错残留。
 9. **更新器**：托盘「检查更新…」两段式——第一次点击只报告新版本（splash 日志 +
    托盘 tooltip 提示），再次点击才下载、验签、安装并重启，且安装前先停止 host。
+
+## 安装包：挂载到 harness
+
+安装包**不带 DSH 运行时**（约 2.8 MiB）。它先找到已安装的 harness，装进
+`<harness>\\apps\\desktop-tauri`；外壳随后直接用该 harness 自己的
+`apps\\cli\\lib\\bin.js` —— 与开发运行时相同的 checkout 档位，由可执行文件向上
+逐级查找得到。
+
+检索逻辑见 `src-tauri/installer/detect-harness.ps1`（也可独立运行，`-Best` 或
+`-Json`），按置信度依次：
+
+1. `HKCU\\Software\\DeepSeek\\DSH Desktop\\HarnessRoot`：上次安装记下的根；
+2. 当前正在运行的 DSH Host —— 它的命令行写着自己是哪个 checkout；
+3. `%USERPROFILE%\\.dsh\\sessions` 下的会话分桶：DSH 按工作区路径分桶，所以它跑过
+   的目录都在里面列出。该编码对"真实连字符"有歧义，因此逐段拿文件系统裁决；
+4. PATH 条目；
+5. 常见安装根的限深磁盘扫描（1–3 命中时跳过）。
+
+全都没找到时安装界面会问：是从 `https://github.com/deepseek-ai/deepseek-harness`
+部署一个新的 harness（需要 git 与网络），还是手动指定已有目录。取消即终止安装 ——
+装到非 harness 目录会得到一个起不来的应用。
+
+部署器还会为**没有 Node 的机器**提供 Node.js：先看 `<harness>\\node\\node.exe`，
+再看 PATH；两者都不满足 24.9+ 时，从 nodejs.org 下载官方
+`node-v*-win-x64.zip`，用发布的 `SHASUMS256.txt` 校验 SHA-256，解包到
+`<harness>\\node`，通过 corepack 取仓库钉住的 pnpm 版本，最后把该目录追加进用户
+PATH。外壳优先用 `<harness>\\node\\node.exe` 而不是 PATH，所以没有系统 Node 也能跑。
+
+卸载只删除 `<harness>\\apps\\desktop-tauri`，不动 harness 本身；注册表里的
+`HarnessRoot` 保留下来，作为下次安装的提示。
 
 ## 开发
 
@@ -171,12 +201,17 @@ cd apps\desktop-tauri; node scripts\prepare-runtime-cli.mjs
 
 ## 运行时闭包防回归
 
-`pnpm run verify:runtime`（`prepare:runtime` 尾部自动执行、`build` 前置执行）：
+`pnpm run verify:runtime`（`prepare:runtime` 尾部自动执行；默认 `build` 已不再前置执行，因为安装包不带运行时）：
 检查闭包完整性（无符号链接、web-frontend dist、workspace 依赖全解析、
 app 自链接剔除）并在闭包内跑 `bin.js --version` 功能探针。空占位目录时
 静默通过（回退链会接管）。
 
 ## 捆绑运行时（安装包自包含）
+
+> 这一节现在是**可选**的。默认安装包不带运行时，而是挂载进已有 harness（见上文
+> "安装包：挂载到 harness"）。要回到自包含形态：运行 `pnpm run prepare:runtime`，
+> 把 `bundle.resources` 里的 `../runtime-cli` 与 `../runtime-node` 加回去，并在
+> `tauri build` 前面补回 `node scripts/verify-runtime-cli.mjs &&`。
 
 一键生成（需先 `pnpm install` 且 `pnpm run build` 构建过仓库产物）：
 

@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop-tauri"
-version = "0.1.15"
+version = "0.1.16"
 description = "Tauri desktop shell for DSH"
 edition = "2021"
 publish = false

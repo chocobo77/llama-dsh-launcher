@@ -12,3 +12,4 @@ runtime-node.next/
 runtime-cli.old/
 runtime-node.old/
 dist-update/
+src-tauri/installer-hooks.nsh

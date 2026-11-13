@@ -11,10 +11,10 @@ This folder used to be `apps/desktop-tauri` inside the deepseek-harness monorepo
 It is now its own project (`D:\code\DSH\dsh-desktop-tauri`) with its own git
 history. What that changes:
 
-- **Building and installing the app needs nothing else.** The DSH CLI the
-  installer ships is vendored here in `runtime-cli/` (plus `runtime-node/`) and
-  is copied to `AppData\Local\DSH\` at install time. `pnpm run build`,
-  `tauri build` and `cargo test` all work from this folder alone.
+- **Building the app needs nothing else.** `pnpm run build`, `tauri build` and
+  `cargo test` all work from this folder alone. The installer ships no runtime:
+  it mounts into a harness instead (see below). `runtime-cli/` and
+  `runtime-node/` are only needed for the optional self-contained build.
 - **Regenerating that vendored CLI needs a checkout.** `pnpm run prepare:runtime`
   builds the `@deepseek-ai/dsh` production closure from the monorepo — name one
   first: `set DSH_REPO_ROOT=D:\Program files\deepseek-harness`. The same
@@ -77,6 +77,42 @@ history. What that changes:
 9. **Updater**: tray "Check for updates…" is two-step — the first click reports
    the version (splash log + tray tooltip), the click after it downloads,
    verifies, installs and restarts, stopping the host first.
+
+## Installer: mount into a harness
+
+The installer ships **no DSH runtime** (about 2.8 MiB). It finds an existing
+harness, installs into `<harness>\apps\desktop-tauri`, and the shell then runs
+that harness's own `apps\cli\lib\bin.js` — the same checkout tier a development
+run uses, resolved by walking up from the executable.
+
+Detection (`src-tauri/installer/detect-harness.ps1`, also usable standalone with
+`-Best` or `-Json`), in confidence order:
+
+1. `HKCU\Software\DeepSeek\DSH Desktop\HarnessRoot`, remembered by a previous
+   install;
+2. a DSH Host running right now — its command line names its own checkout;
+3. the session buckets under `%USERPROFILE%\.dsh\sessions`: DSH buckets sessions
+   per workspace path, so every directory it has run in is listed there. That
+   encoding is ambiguous about literal hyphens, so a bucket is resolved against
+   the file system one segment at a time;
+4. PATH entries;
+5. a depth-limited scan of the usual install roots, skipped when 1–3 answered.
+
+When nothing is found the installer asks: deploy a fresh harness from
+`https://github.com/deepseek-ai/deepseek-harness` (needs git and the network), or
+point at an existing directory. Cancel aborts the installation — installing
+outside a harness produces an application that cannot start.
+
+The deployer also provides **Node.js** for machines that have none: it looks for
+`<harness>\node\node.exe` and then PATH, and when neither is 24.9 or newer it
+downloads the official `node-v*-win-x64.zip` from nodejs.org, verifies its
+SHA-256 against the published `SHASUMS256.txt`, unpacks it into `<harness>\node`,
+uses corepack to obtain the pnpm version the repository pins, and finally appends
+that directory to the user PATH. The shell prefers `<harness>\node\node.exe`
+over PATH, so the deployment keeps working without a system Node.
+
+Uninstalling removes `<harness>\apps\desktop-tauri` and leaves the harness
+itself untouched; `HarnessRoot` stays in the registry as a hint for next time.
 
 ## Development
 
@@ -211,6 +247,12 @@ dist, every workspace dep resolved, app self-links removed) and runs a
 directory passes silently (the fallback chain takes over).
 
 ## Bundling a runtime (self-contained installer)
+
+> This is **opt-in**. The shipped installer carries no runtime: it mounts into a
+> harness (see "Installer: mount into a harness" above). To go self-contained
+> again, run `pnpm run prepare:runtime`, restore the `bundle.resources` entry for
+> `../runtime-cli` and `../runtime-node`, and put
+> `node scripts/verify-runtime-cli.mjs &&` back in front of `tauri build`.
 
 One-shot (requires `pnpm install` and repo build artifacts from `pnpm run build`):
 

@@ -1,5 +1,5 @@
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -197,6 +197,22 @@ fn node_program() -> String {
     })
 }
 
+/// The Node that runs a checkout's CLI. A harness deployed by the installer
+/// carries its own copy at <checkout>\node\node.exe — that is where
+/// deploy-harness.ps1 unpacks the official zip — and a terminal user may have no
+/// Node on PATH at all. Only when the checkout has none do we fall back to the
+/// bundled resource or PATH.
+fn node_for_checkout(checkout: &Path) -> String {
+    if let Some(explicit) = env_var("DSH_TAURI_NODE") {
+        return explicit;
+    }
+    let own = checkout.join("node").join("node.exe");
+    if own.is_file() {
+        return own.to_string_lossy().into_owned();
+    }
+    node_program()
+}
+
 pub fn log_file_path() -> &'static PathBuf {
     static LOG: OnceLock<PathBuf> = OnceLock::new();
     LOG.get_or_init(|| std::env::temp_dir().join("dsh-tauri.log"))
@@ -300,7 +316,7 @@ pub fn launch_plan(port: u16) -> Result<LaunchPlan, String> {
     if let Some(checkout) = checkout {
         let bin = checkout.join("apps").join("cli").join("lib").join("bin.js");
         return Ok(LaunchPlan {
-            program: node_program(),
+            program: node_for_checkout(&checkout),
             args: cli_args(bin, port),
             cwd: Some(workspace_override().unwrap_or(checkout)),
             source: "checkout apps/cli",
