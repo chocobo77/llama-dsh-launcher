@@ -5,7 +5,26 @@
 `apps/desktop`（Electron 壳）的 Tauri 版对照实现：用 Rust + WebView2 承载 DSH Web GUI，
 由外壳负责 dsh 服务进程的生命周期。
 
-## 它做什么
+## 独立项目
+
+这个目录原本是 deepseek-harness monorepo 里的 `apps/desktop-tauri`，现在拆成独立
+项目（`D:\code\DSH\dsh-desktop-tauri`），有自己独立的 git 历史。变化如下：
+
+- **构建与安装不需要别的东西。** 安装包内置的 DSH CLI 就 vendored 在本目录的
+  `runtime-cli/`（以及 `runtime-node/`），安装时复制到 `AppData\Local\DSH\`。
+  `pnpm run build`、`tauri build`、`cargo test` 都只靠本目录即可运行。
+- **重新生成那份内置 CLI 才需要 checkout。** `pnpm run prepare:runtime` 从
+  monorepo 构建 `@deepseek-ai/dsh` 的生产闭包，先指一下位置：
+  `set DSH_REPO_ROOT=D:\Program files\deepseek-harness`。运行期的 dev 启动档位
+  （`default_checkout`）也读同一个变量——它原先靠"从可执行文件往上找
+  `apps/cli/lib/bin.js`"定位 checkout，那只在这个目录位于 checkout 内部时成立。
+- **发布更新包需要 `cos-nodejs-sdk-v5`**，原先借用 monorepo 的安装：
+  `pnpm add -D cos-nodejs-sdk-v5`，或设 `DSH_REPO_ROOT`。
+- **中英 README 配对不再受 monorepo 的配对 gate 覆盖**：那个 gate 只走 checkout
+  内的文档语料（本目录移出后，它从 1211 对变成 1210 对）。记录文件 `README.i18n.yaml`
+  仍留在本目录；`README.md` 与 `README.zh.md` 需要手工保持同步，若觉得值得强制，
+  可以把校验脚本移植进本项目。
+- `keys/` 是更新签名私钥，故意被 git 忽略；请在机器外留一份备份。
 
 1. **定位 dsh 运行时**（回退链，第一个命中生效）：
    1. `DSH_TAURI_CMD`（+可选 `DSH_TAURI_ARGS` JSON 数组、`DSH_TAURI_CWD`）：完全自定义命令；

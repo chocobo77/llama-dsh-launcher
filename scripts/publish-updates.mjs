@@ -25,7 +25,6 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const appDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const repoRoot = path.join(appDir, '..', '..');
 // Tauri resolves the app version from tauri.conf.json — single source of truth.
 const VERSION = /"version"\s*:\s*"([^"]+)"/u.exec(
   fs.readFileSync(path.join(appDir, 'src-tauri', 'tauri.conf.json'), 'utf8'),
@@ -107,9 +106,33 @@ if (!cosMode) {
 const secretId = required(envName === 'production' ? 'DOWNLOAD_PROD_COS_SECRET_ID' : 'DOWNLOAD_TEST_COS_SECRET_ID');
 const secretKey = required(envName === 'production' ? 'DOWNLOAD_PROD_COS_SECRET_KEY' : 'DOWNLOAD_TEST_COS_SECRET_KEY');
 
-// Reuse the workspace-resident SDK (apps/desktop ships it); no new dependency.
-const require = createRequire(path.join(repoRoot, 'apps', 'desktop', 'noop.js'));
-const COS = require('cos-nodejs-sdk-v5');
+// The COS SDK used to be borrowed from the monorepo install (apps/desktop ships
+// it, and `noop.js` was the resolution anchor). Standalone, prefer this
+// project's own install and fall back to a named checkout — so a missing
+// dependency fails here with an instruction instead of inside the SDK.
+let COS;
+const anchors = [
+  import.meta.url,
+  process.env.DSH_REPO_ROOT
+    ? path.join(path.resolve(process.env.DSH_REPO_ROOT), 'apps', 'desktop', 'noop.js')
+    : null,
+];
+for (const anchor of anchors) {
+  if (!anchor) continue;
+  try {
+    COS = createRequire(anchor)('cos-nodejs-sdk-v5');
+    break;
+  } catch {
+    // try the next anchor
+  }
+}
+if (!COS) {
+  console.error(
+    'cos-nodejs-sdk-v5 不可用：在本项目里装一个（pnpm add -D cos-nodejs-sdk-v5），' +
+      `或设 DSH_REPO_ROOT 指向 DSH 仓库（试过：${anchors.filter(Boolean).join(' , ')}）`
+  );
+  process.exit(1);
+}
 const cos = new COS({
   SecretId: secretId, SecretKey: secretKey, Protocol: 'https:', KeepAlive: false,
   FollowRedirect: false, AutoSwitchHost: false, CorrectClockSkew: false,

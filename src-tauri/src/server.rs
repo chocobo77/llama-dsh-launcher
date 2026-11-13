@@ -216,6 +216,14 @@ pub fn append_log_file(line: &str) {
 /// Walk up from the executable looking for the monorepo checkout:
 /// <checkout>/apps/desktop-tauri/src-tauri/target/(debug|release)/<exe> in dev.
 fn default_checkout() -> Option<PathBuf> {
+    // Since the app left the monorepo, "walk up until we find apps/cli" only
+    // works when it happens to live inside a checkout. Name it when it does not:
+    // DSH_REPO_ROOT is the same variable scripts/prepare-runtime-cli.mjs uses.
+    if let Some(root) = env_var("DSH_REPO_ROOT").map(PathBuf::from) {
+        if root.join("apps").join("cli").join("lib").join("bin.js").is_file() {
+            return Some(root);
+        }
+    }
     let exe = std::env::current_exe().ok()?;
     let mut dir = exe.parent()?.to_path_buf();
     for _ in 0..8 {
@@ -2043,9 +2051,28 @@ mod tests {
         assert!(launch_plan(9).is_err());
         std::env::remove_var("DSH_CHECKOUT");
 
+        // The remaining tiers are ambient: which one answers depends on whether
+        // this folder sits inside a checkout and whether `dsh` is on PATH. Pin
+        // the checkout tier with a synthetic one instead, so the assertion holds
+        // wherever the project lives — it used to pass only by accident of being
+        // inside the monorepo, and the move broke it.
+        let fake = std::env::temp_dir().join("dsh-tauri-fake-checkout");
+        let bin = fake.join("apps").join("cli").join("lib").join("bin.js");
+        std::fs::create_dir_all(bin.parent().unwrap()).expect("fake checkout must be creatable");
+        std::fs::write(&bin, "// stands in for the real CLI").expect("fake CLI must be writable");
+        std::env::set_var("DSH_CHECKOUT", &fake);
+        let plan = launch_plan(9).expect("the checkout tier must resolve");
+        assert_eq!(plan.source, "checkout apps/cli");
+        std::env::remove_var("DSH_CHECKOUT");
+        std::env::set_var("DSH_REPO_ROOT", &fake);
+        let plan = launch_plan(9).expect("DSH_REPO_ROOT must be honoured");
+        assert_eq!(plan.source, "checkout apps/cli");
+        std::env::remove_var("DSH_REPO_ROOT");
+
         // A configured profile replaces the booted profile name and leaves the
         // app arguments intact; DSH_TAURI_HOME is handed to the child as
         // DSH_HOME (which is what actually isolates the task-board ledger).
+        std::env::set_var("DSH_CHECKOUT", &fake);
         std::env::set_var("DSH_TAURI_PROFILE", "tauri");
         let plan = launch_plan(3090).expect("profile override must still resolve a plan");
         let at = plan.args.iter().position(|a| a == "tauri").expect("profile token in args");

@@ -14,7 +14,22 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const appDir = path.join(here, '..');
-const repoRoot = path.join(appDir, '..', '..');
+// The CLI closure is built *from* a DSH checkout. This project only carries the
+// result — runtime-cli/ and runtime-node/, which the installer ships — so a
+// checkout is needed only when regenerating that closure. It used to sit two
+// levels up (apps/desktop-tauri inside the monorepo); standalone, it is named.
+const repoRoot = process.env.DSH_REPO_ROOT
+  ? path.resolve(process.env.DSH_REPO_ROOT)
+  : path.join(appDir, '..', '..');
+if (!fs.existsSync(path.join(repoRoot, 'pnpm-workspace.yaml'))) {
+  console.error(
+    `找不到 DSH 仓库根（用于构建 CLI 闭包）：${repoRoot}\n` +
+      '指向一个 deepseek-harness checkout 即可：\n' +
+      '  set DSH_REPO_ROOT=D:\\Program files\\deepseek-harness\n' +
+      '（日常的 pnpm run build / tauri build 不需要它：安装包直接用已内置的 runtime-cli/。）'
+  );
+  process.exit(1);
+}
 const cliOut = path.join(appDir, 'runtime-cli');
 const nodeOut = path.join(appDir, 'runtime-node');
 // Staging directories: the closure is built *and verified* here, and only

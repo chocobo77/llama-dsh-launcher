@@ -5,7 +5,31 @@ English | [中文](README.zh.md)
 A Tauri counterpart to `apps/desktop` (the Electron shell): a Rust + WebView2
 shell that hosts the DSH Web GUI and supervises the `dsh` service process.
 
-## What it does
+## Standalone project
+
+This folder used to be `apps/desktop-tauri` inside the deepseek-harness monorepo.
+It is now its own project (`D:\code\DSH\dsh-desktop-tauri`) with its own git
+history. What that changes:
+
+- **Building and installing the app needs nothing else.** The DSH CLI the
+  installer ships is vendored here in `runtime-cli/` (plus `runtime-node/`) and
+  is copied to `AppData\Local\DSH\` at install time. `pnpm run build`,
+  `tauri build` and `cargo test` all work from this folder alone.
+- **Regenerating that vendored CLI needs a checkout.** `pnpm run prepare:runtime`
+  builds the `@deepseek-ai/dsh` production closure from the monorepo — name one
+  first: `set DSH_REPO_ROOT=D:\Program files\deepseek-harness`. The same
+  variable is honoured at run time by the dev launch tier (`default_checkout`),
+  which used to find a checkout by walking up from the executable; that only
+  worked while this folder sat inside one.
+- **Publishing updates needs `cos-nodejs-sdk-v5`**, previously borrowed from the
+  monorepo install: `pnpm add -D cos-nodejs-sdk-v5`, or set `DSH_REPO_ROOT`.
+- **The bilingual README pair is no longer covered by the monorepo's pairing
+  gate** — that gate walks only the checkout's documentation corpus (it went from
+  1211 pairs to 1210 when this folder moved out). `README.i18n.yaml` stays here as
+  the record; keep `README.md` and `README.zh.md` in step by hand, or port the
+  checker into this project if the pair is worth enforcing.
+- `keys/` holds the updater signing key and is deliberately git-ignored; keep an
+  off-machine backup.
 
 1. **Locates the dsh runtime** (first hit wins):
    1. `DSH_TAURI_CMD` (+ optional `DSH_TAURI_ARGS` JSON array, `DSH_TAURI_CWD`) — fully custom;

@@ -1,0 +1,12 @@
+# Text is authored and stored with LF: the Rust source, the .mjs scripts and the
+# NSIS include are used across shells and toolchains, and git's CRLF translation
+# on checkout only produces churn (and broke a patch script's anchors once).
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary
+*.exe binary
+*.dll binary
+*.node binary
+*.ttf binary
