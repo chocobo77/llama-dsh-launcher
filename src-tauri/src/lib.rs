@@ -1,13 +1,14 @@
 mod server;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::UpdaterExt;
 
 pub use server::ServerState;
@@ -333,7 +334,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
             "show" => show_app(app),
             "autostart" => toggle_autostart(app),
             "restart" => manual_restart(app),
-            "update" => check_update(app),
+            "update" => check_update(app, true),
             "quit" => request_quit(app),
             _ => {}
         })
@@ -379,13 +380,20 @@ pub fn run() {
     HIDDEN_START.store(hidden, Ordering::Relaxed);
 
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // A second launch means "give this machine DSH now": focus the
             // window and retake the state root. Focusing alone would leave an
             // already-running instance (possibly one started with
             // DSH_TAURI_TAKEOVER=0) sitting there while another Host keeps the
             // task board and the session write leases.
             show_app(app);
+            // `--check-update` from a second launch routes to the running
+            // shell, so the tray entry can be exercised (and supported) without
+            // clicking the notification area.
+            if argv.iter().any(|a| a == "--check-update") {
+                check_update(app, true);
+                return;
+            }
             server::retake_state_root(app);
         }))
         .plugin(tauri_plugin_autostart::init(
@@ -404,6 +412,10 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // Update results are reported in a native dialog: the status log only
+        // reaches the splash window, so a tray-only report looked like a dead
+        // menu entry whenever the main window was open.
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(ServerState::default())
         .setup(|app| {
@@ -436,21 +448,21 @@ pub fn run() {
 
             // Support/E2E hook: `DSH_TAURI_UPDATE_CHECK=1` runs the same
             // update flow as the tray entry a few seconds after startup,
-            // then confirms it on the hook's behalf.
+            // headless: it logs instead of opening dialogs and installs an
+            // update as soon as it finds one.
             if std::env::var_os("DSH_TAURI_UPDATE_CHECK").is_some() {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_secs(3));
                     log_app(&handle, "DSH_TAURI_UPDATE_CHECK：自动检查更新".to_string());
-                    check_update(&handle);
-                    let deadline = Instant::now() + Duration::from_secs(120);
-                    while pending_update().lock().unwrap().is_none() && Instant::now() < deadline {
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
-                    if pending_update().lock().unwrap().is_some() {
-                        log_app(&handle, "DSH_TAURI_UPDATE_CHECK：自动确认安装".to_string());
-                        install_update(&handle);
-                    }
+                    check_update(&handle, false);
+                });
+            } else if std::env::args().any(|a| a == "--check-update") {
+                // First launch carried the flag: run the tray entry's flow.
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(2));
+                    check_update(&handle, true);
                 });
             }
             Ok(())
@@ -643,81 +655,164 @@ fn request_quit(app: &AppHandle) {
     app.exit(0);
 }
 
-/// Update the pending-update version recorded by a `check_update` that found
-/// one; the tray entry installs on the click that follows.
-fn pending_update() -> &'static Mutex<Option<String>> {
-    static PENDING: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    PENDING.get_or_init(|| Mutex::new(None))
+const UPDATE_TITLE: &str = "DSH 更新";
+/// How long an update check may take before it is reported as a timeout.
+const UPDATE_TIMEOUT_SECS: u64 = 30;
+
+/// Report an update outcome where the user is looking. `log_app` only feeds
+/// the splash window, so a tray click that merely logged looked like a dead
+/// menu entry once the main window was up.
+fn update_notice(app: &AppHandle, text: impl std::fmt::Display) {
+    let text = text.to_string();
+    log_app(app, format!("更新: {}", text.replace('\n', " ")));
+    app.dialog()
+        .message(text)
+        .title(UPDATE_TITLE)
+        .kind(MessageDialogKind::Info)
+        .blocking_show();
 }
 
-/// Tray "检查更新…": the first click reports the update, the click after it
-/// installs. Installing restarts the shell, so it is never done on the user's
-/// behalf from one menu entry.
-fn check_update(app: &AppHandle) {
-    if pending_update().lock().unwrap().is_some() {
-        install_update(app);
-        return;
+/// Ask before an install: it stops the DSH service and restarts the shell.
+fn update_confirm(app: &AppHandle, text: impl Into<String>) -> bool {
+    app.dialog()
+        .message(text.into())
+        .title(UPDATE_TITLE)
+        .kind(MessageDialogKind::Info)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "立即安装".into(),
+            "稍后".into(),
+        ))
+        .blocking_show()
+}
+
+/// Turn an updater error into something a user can act on. The configured
+/// endpoint is still a placeholder, and "error decoding response body" alone
+/// reads like a bug in the shell rather than a feed that does not exist yet.
+fn explain_update_error(e: &tauri_plugin_updater::Error) -> String {
+    let raw = e.to_string();
+    let lower = raw.to_lowercase();
+    if lower.contains("404") {
+        format!("更新源不存在（HTTP 404）：这个安装包还没有对应的发布清单。\n\n原始错误：{raw}")
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        format!("连接更新源超时（{UPDATE_TIMEOUT_SECS} 秒）。\n\n原始错误：{raw}")
+    } else if lower.contains("decode") || lower.contains("json") || lower.contains("expected") {
+        format!(
+            "更新源返回的不是更新清单（多为 404 页面或被代理拦截）。\n\n原始错误：{raw}"
+        )
+    } else {
+        raw
     }
-    let handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        match handle.updater() {
-            Ok(updater) => match updater.check().await {
-                Ok(Some(update)) => {
-                    let version = update.version.clone();
-                    *pending_update().lock().unwrap() = Some(version.clone());
-                    log_app(
-                        &handle,
-                        format!(
-                            "发现更新 {version}：再次点击「检查更新…」下载安装并重启（会先停止 DSH 服务）"
-                        ),
-                    );
-                    tray_notice(&format!("DSH 更新 {version} 待确认：再点「检查更新」安装"));
-                }
-                Ok(None) => log_app(&handle, "当前已是最新版本（或未配置更新端点）".to_string()),
-                Err(e) => log_app(&handle, format!("检查更新失败: {e}")),
-            },
-            Err(e) => log_app(&handle, format!("更新器不可用: {e}")),
-        }
-    });
 }
 
-fn install_update(app: &AppHandle) {
-    let version = match pending_update().lock().unwrap().as_ref() {
-        Some(version) => version.clone(),
-        None => {
-            log_app(app, "没有待安装的更新：先「检查更新…」".to_string());
-            return;
-        }
-    };
+/// Updater with a bounded wait and an endpoint override, so a test machine can
+/// point at its own feed without rebuilding:
+/// `DSH_TAURI_UPDATE_ENDPOINT=https://host/feeds/win-x64/latest.json`
+/// (comma separated for several).
+fn updater_from(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    let mut builder = app
+        .updater_builder()
+        .timeout(Duration::from_secs(UPDATE_TIMEOUT_SECS));
+    let endpoints: Vec<Url> = std::env::var("DSH_TAURI_UPDATE_ENDPOINT")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| Url::parse(s).ok())
+        .collect();
+    if !endpoints.is_empty() {
+        builder = builder.endpoints(endpoints).map_err(|e| e.to_string())?;
+    }
+    builder.build().map_err(|e| e.to_string())
+}
+
+/// Tray and splash "检查更新…": one click checks and, when a release is found,
+/// asks before downloading and installing.
+///
+/// `interactive` is false for the `DSH_TAURI_UPDATE_CHECK` support hook, which
+/// runs headless: it logs and installs without a dialog nobody is there to
+/// answer.
+fn check_update(app: &AppHandle, interactive: bool) {
     let handle = app.clone();
+    log_app(
+        &handle,
+        format!("检查更新（interactive={interactive}）"),
+    );
     tauri::async_runtime::spawn(async move {
-        log_app(&handle, format!("确认安装更新 {version}：先停止 DSH 服务"));
-        {
-            let state = handle.state::<ServerState>();
-            server::stop_server(state.inner());
-        }
-        match handle.updater() {
-            Ok(updater) => match updater.check().await {
-                Ok(Some(update)) => {
-                    log_app(&handle, format!("下载并安装 {version}…"));
-                    match update.download_and_install(|_chunk, _total| {}, || {}).await {
-                        Ok(_) => {
-                            *pending_update().lock().unwrap() = None;
-                            log_app(&handle, "更新已安装，正在重启".to_string());
-                            handle.restart();
-                        }
-                        Err(e) => log_app(&handle, format!("更新安装失败: {e}")),
+        let updater = match updater_from(&handle) {
+            Ok(updater) => updater,
+            Err(e) => {
+                let text = format!("无法检查更新：{e}");
+                if interactive {
+                    update_notice(&handle, &text);
+                } else {
+                    log_app(&handle, text);
+                }
+                return;
+            }
+        };
+        let current = handle.package_info().version.to_string();
+        match updater.check().await {
+            Ok(Some(update)) => {
+                let version = update.version.clone();
+                log_app(&handle, format!("发现更新 {version}（当前 {current}）"));
+                if interactive {
+                    let text = format!(
+                        "发现新版本 {version}（当前 {current}）。\n\n现在下载并安装吗？安装前会先停止 DSH 服务，装好后自动重启。"
+                    );
+                    if !update_confirm(&handle, text) {
+                        log_app(&handle, format!("暂缓安装 {version}"));
+                        tray_notice(&format!("DSH 更新 {version} 可用"));
+                        return;
                     }
                 }
-                Ok(None) => {
-                    *pending_update().lock().unwrap() = None;
-                    log_app(&handle, "更新已不在最新清单中".to_string());
+                install_update(&handle, update, interactive).await;
+            }
+            Ok(None) => {
+                let text = format!("当前已是最新版本 {current}。");
+                if interactive {
+                    update_notice(&handle, text);
+                } else {
+                    log_app(&handle, text);
                 }
-                Err(e) => log_app(&handle, format!("更新检查失败: {e}")),
-            },
-            Err(e) => log_app(&handle, format!("更新器不可用: {e}")),
+            }
+            Err(e) => {
+                let text = format!("检查更新失败：{}", explain_update_error(&e));
+                if interactive {
+                    update_notice(&handle, &text);
+                } else {
+                    log_app(&handle, text);
+                }
+            }
         }
     });
+}
+
+async fn install_update(
+    app: &AppHandle,
+    update: tauri_plugin_updater::Update,
+    interactive: bool,
+) {
+    let version = update.version.clone();
+    log_app(app, format!("确认安装更新 {version}：先停止 DSH 服务"));
+    {
+        let state = app.state::<ServerState>();
+        server::stop_server(state.inner());
+    }
+    tray_notice(&format!("DSH 正在安装更新 {version}…"));
+    match update.download_and_install(|_chunk, _total| {}, || {}).await {
+        Ok(_) => {
+            log_app(app, "更新已安装，正在重启".to_string());
+            app.restart();
+        }
+        Err(e) => {
+            let text = format!("更新安装失败：{}", explain_update_error(&e));
+            if interactive {
+                update_notice(app, &text);
+            } else {
+                log_app(app, text);
+            }
+        }
+    }
 }
 
 fn toggle_autostart(app: &AppHandle) {
@@ -770,7 +865,7 @@ fn restart_server_cmd(app: AppHandle) {
 
 #[tauri::command]
 fn check_update_cmd(app: AppHandle) {
-    check_update(&app);
+    check_update(&app, true);
 }
 
 #[tauri::command]

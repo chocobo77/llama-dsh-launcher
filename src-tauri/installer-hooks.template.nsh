@@ -41,6 +41,10 @@
   ${EndIf}
 
   ${If} $1 == ""
+    ; Silent install has no dialog to ask through, and skipping the MessageBox
+    ; would fall through to the Abort below. Deploy to the documented default
+    ; instead, and report the failure as an exit code a script can read.
+    IfSilent dsh_silent_deploy
     DetailPrint "未找到 Harness，等待用户选择"
     MessageBox MB_YESNOCANCEL|MB_ICONQUESTION \
       "没有找到已安装的 DeepSeek Harness。$\r$\n$\r$\n是：从官方仓库部署一个新的 Harness$\r$\n（需要 git、Node.js 24.9+ 与网络，耗时几分钟）$\r$\n否：手动指定已有的 Harness 目录$\r$\n取消：退出安装" \
@@ -88,6 +92,21 @@
         ${EndIf}
       ${EndIf}
       StrCpy $1 $4
+
+    Goto dsh_have_root
+
+    dsh_silent_deploy:
+      StrCpy $5 "D:\Program files\deepseek-harness"
+      DetailPrint "静默安装：未找到 Harness，部署到 $5"
+      nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\deploy-harness.ps1" -Target "$5"'
+      Pop $0
+      ${If} $0 != "0"
+        DetailPrint "静默安装：Harness 部署失败（退出码 $0），日志 %TEMP%\dsh-deploy.log"
+        WriteINIStr "$TEMP\dsh-install-error.txt" "install" "reason" "harness deploy failed with exit code $0; see %TEMP%\dsh-deploy.log"
+        SetErrorLevel 7
+        Abort
+      ${EndIf}
+      StrCpy $1 $5
 
     dsh_have_root:
   ${EndIf}

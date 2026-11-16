@@ -74,9 +74,14 @@ history. What that changes:
    tray, and a crash-restart splash does not pop a window either (log and tray
    tooltip only). `src-tauri/installer-hooks.nsh` deletes that Run value during
    uninstall, so removing the app leaves no login-time failure behind.
-9. **Updater**: tray "Check for updates…" is two-step — the first click reports
-   the version (splash log + tray tooltip), the click after it downloads,
-   verifies, installs and restarts, stopping the host first.
+9. **Updater**: tray "Check for updates…" is one click plus one question. The
+   click checks against the configured endpoint and reports the outcome in a
+   native dialog — newer version, already current, or the exact failure (404 /
+   timeout / malformed feed). When a release is found it asks first, because
+   installing stops the host and restarts the shell; answering "稍后/later"
+   leaves the version in the tray tooltip. The result must be a dialog: the
+   status log only feeds the splash window, so a log-only report made the menu
+   entry look dead whenever the main window was up.
 
 ## Installer: mount into a harness
 
@@ -160,7 +165,15 @@ node scripts/publish-updates.mjs --cos   # also uploads to COS (same env names)
 - The version's single source of truth is `tauri.conf.json → version`
   (package.json / Cargo.toml are kept equal but unused).
 - Support/E2E hook: start with `DSH_TAURI_UPDATE_CHECK=1` to run the tray
-  update flow (check → download → verify → install) 3 seconds after startup.
+  update flow (check → download → verify → install) 3 seconds after startup,
+  headless: it logs instead of showing dialogs and installs as soon as it finds
+  a release.
+- `--check-update` on a second launch routes into the running shell and runs the
+  same flow as the tray entry (dialogs included), so the menu entry can be
+  exercised without clicking the notification area.
+- `DSH_TAURI_UPDATE_ENDPOINT` overrides the baked endpoints at runtime
+  (comma-separated, https only in release builds) — how a test machine points
+  at a local or staging feed without a rebuild.
 - Known behavior: the silent NSIS update terminates the running app and
   does **not** relaunch it (upstream behavior). Observed: installed 0.1.0 →
   feed 0.1.1 → log "发现更新 0.1.1，开始下载并安装…" → installed version
