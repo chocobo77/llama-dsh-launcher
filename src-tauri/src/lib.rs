@@ -390,11 +390,15 @@ pub fn run() {
             // DSH_TAURI_TAKEOVER=0) sitting there while another Host keeps the
             // task board and the session write leases.
             show_app(app);
-            // `--check-update` from a second launch routes to the running
-            // shell, so the tray entry can be exercised (and supported) without
+            // Update checks from a second launch route to the running shell,
+            // so both entries can be exercised (and supported) without
             // clicking the notification area.
             if argv.iter().any(|a| a == "--check-update") {
                 check_update(app, true);
+                return;
+            }
+            if argv.iter().any(|a| a == "--check-harness-update") {
+                check_harness_update(app, true);
                 return;
             }
             server::retake_state_root(app);
@@ -461,11 +465,18 @@ pub fn run() {
                     check_update(&handle, false);
                 });
             } else if std::env::args().any(|a| a == "--check-update") {
-                // First launch carried the flag: run the tray entry's flow.
+                // First launch carried the flag: run the installer-feed flow.
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_secs(2));
                     check_update(&handle, true);
+                });
+            } else if std::env::args().any(|a| a == "--check-harness-update") {
+                // First launch carried the flag: run the harness git flow.
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(2));
+                    check_harness_update(&handle, true);
                 });
             }
             Ok(())
@@ -662,13 +673,47 @@ const UPDATE_TITLE: &str = "DSH 更新";
 /// How long an update check may take before it is reported as a timeout.
 const UPDATE_TIMEOUT_SECS: u64 = 30;
 
+/// One update flow at a time, across both entries (installer feed and
+/// harness git): the harness flow mutates a git worktree and runs pnpm, and
+/// two interleaved runs would race reset/clean/build.
+static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Held for the whole check + apply; releases on drop, so every early return
+/// and panic path unwinds the flag.
+struct UpdateSlot;
+
+impl UpdateSlot {
+    fn acquire() -> Option<Self> {
+        UPDATE_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for UpdateSlot {
+    fn drop(&mut self) {
+        UPDATE_IN_FLIGHT.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Harness git update, shallow by design: the local repo keeps no history,
 /// only the latest official state. Fetch --depth 1 → compare SHA → ask →
 /// stop host → sync (stash tracked changes, reset --hard) → rebuild → restart.
+///
+/// The whole flow runs on a plain thread: the fetch may block for minutes and
+/// the native dialogs block until answered — neither may park a tokio worker.
 fn check_harness_update(app: &AppHandle, interactive: bool) {
+    let Some(_slot) = UpdateSlot::acquire() else {
+        log_app(app, "已有更新流程在进行，忽略本次触发".to_string());
+        return;
+    };
     let handle = app.clone();
-    log_app(&handle, "检查 harness 更新（git 浅同步官方最新）".to_string());
-    tauri::async_runtime::spawn(async move {
+    let started = Instant::now();
+    log_app(&handle, "检查 harness 更新（git 浅同步官方最新发布 tag）".to_string());
+    tray_notice("正在检查 harness 更新…");
+    std::thread::spawn(move || {
+        let _slot = _slot;
         let root = match harness_update::harness_root() {
             Some(root) => root,
             None => {
@@ -684,7 +729,10 @@ fn check_harness_update(app: &AppHandle, interactive: bool) {
         let info = match harness_update::check(&root) {
             Ok(info) => info,
             Err(e) => {
-                let text = format!("检查 harness 更新失败：\n{e}");
+                let text = format!(
+                    "检查 harness 更新失败（{} 秒后放弃）：\n{e}",
+                    started.elapsed().as_secs()
+                );
                 if interactive {
                     update_notice(&handle, &text);
                 } else {
@@ -697,14 +745,14 @@ fn check_harness_update(app: &AppHandle, interactive: bool) {
             // Deployed file copy, not a repo: offer to build the local git
             // store in place, history-free, aligned to the official latest.
             let text = format!(
-                "harness 不是 git 仓库（{}）。\n\n现在初始化本地 git 并同步官方最新版本吗？\n  - 无历史：只保留官方最新状态（fetch --depth 1）\n  - 已跟踪文件的本地改动会先存入 stash（不会丢失，但不会自动恢复）\n  - 构建产物、node_modules、已安装的外壳不受影响\n  - 随后自动重建并重启外壳",
+                "harness 不是 git 仓库（{}）。\n\n现在初始化本地 git 并同步官方最新版本吗？\n  - 无历史：只保留官方最新状态（fetch --depth 1）\n  - 已跟踪文件的本地改动会先存入 stash（同步失败会自动放回）\n  - 上个版本残留的未跟踪文件将被清理（已安装的外壳、LOCAL-CHANGES*、.agents、.claude、*.log 保留）\n  - 构建产物、node_modules 不受影响\n  - 随后自动重建并重启外壳",
                 root.display()
             );
             if interactive && !update_confirm(&handle, text) {
                 log_app(&handle, "暂缓 harness 初始化".to_string());
                 return;
             }
-            apply_harness_update(&handle, root, true);
+            apply_harness_update(&handle, root, true, _slot, false);
             return;
         }
         let via_note = if info.via == "origin" || info.via.is_empty() {
@@ -721,41 +769,51 @@ fn check_harness_update(app: &AppHandle, interactive: bool) {
             }
             return;
         }
-        let short = |s: &str| s[..8.min(s.len())].to_string();
         log_app(
             &handle,
             format!(
                 "harness 有更新：本地 {} → 官方 {} {}",
-                short(&info.local),
-                short(&info.remote),
+                harness_update::short(&info.local),
+                harness_update::short(&info.remote),
                 via_note
             ),
         );
-        let dirty_note = if info.dirty {
-            "\n注意：检测到本地未提交改动，会在同步前存入 stash（保留，不自动恢复）。"
-        } else {
-            ""
-        };
+        let mut notes = String::new();
+        if info.dirty {
+            notes.push_str("\n注意：检测到本地未提交改动，会在同步前存入 stash（同步失败自动放回；成功则保留在 stash 里供手动恢复）。");
+        }
+        notes.push_str("\n注意：上个版本残留的未跟踪文件会被清理（已安装的外壳、LOCAL-CHANGES*、.agents、.claude、*.log 保留）。");
         let text = format!(
-            "harness 有新版本：{local} → {remote}。{note}\n\n现在同步吗？将执行：\n  1. 停止 DSH 服务\n  2. 同步官方最新（fetch --depth 1 + reset，无历史）\n  3. 重建（clean → build:lib → build:web，需几分钟）\n  4. 重启外壳",
-            local = short(&info.local),
-            remote = short(&info.remote),
-            note = dirty_note,
+            "harness 有新版本：{local} → {remote}。{notes}\n\n现在同步吗？将执行：\n  1. 停止 DSH 服务\n  2. 同步官方最新（fetch --depth 1 + reset，无历史）\n  3. 重建（pnpm install + 官方 artifacts 管线，需几分钟）\n  4. 重启外壳",
+            local = harness_update::short(&info.local),
+            remote = harness_update::short(&info.remote),
         );
         if interactive && !update_confirm(&handle, text) {
             log_app(&handle, "暂缓 harness 更新".to_string());
             tray_notice("harness 更新待确认：官方有新版本");
             return;
         }
-        apply_harness_update(&handle, root, false);
+        // The check just fetched; reuse its FETCH_HEAD. If upstream moved in
+        // the seconds the dialog was open, the next check catches it.
+        apply_harness_update(&handle, root, false, _slot, true);
     });
 }
 
 /// The mutating half, on its own thread so dialogs and the UI stay responsive.
-/// Progress streams into the status log and the tray tooltip.
-fn apply_harness_update(app: &AppHandle, root: std::path::PathBuf, bootstrap: bool) {
+/// Progress streams into the status log and the tray tooltip. `_slot` keeps
+/// the in-flight guard held for the whole run; failures on the sync side
+/// restart the host on the old artifacts, rebuild failures leave the choice
+/// to the user (a half-built tree must not auto-spawn).
+fn apply_harness_update(
+    app: &AppHandle,
+    root: std::path::PathBuf,
+    bootstrap: bool,
+    _slot: UpdateSlot,
+    reuse_fetch: bool,
+) {
     let handle = app.clone();
     std::thread::spawn(move || {
+        let _slot = _slot;
         {
             let state = handle.state::<ServerState>();
             server::stop_server(state.inner());
@@ -773,20 +831,23 @@ fn apply_harness_update(app: &AppHandle, root: std::path::PathBuf, bootstrap: bo
         let synced = if bootstrap {
             harness_update::bootstrap(&root, &log)
         } else {
-            harness_update::sync(&root, &log)
+            harness_update::sync(&root, &log, reuse_fetch)
         };
         match synced {
-            Ok(head) => log(format!("当前版本 {}", &head[..8.min(head.len())])),
+            Ok(head) => log(format!("当前版本 {}", harness_update::short(&head))),
             Err(e) => {
                 log(format!("同步失败：{e}"));
-                update_notice(&handle, format!("harness 更新失败（同步）：\n{e}\n\nDSH 服务已停止，可在托盘「重启 DSH 服务」恢复。"));
+                // Sources may be half-moved but the built artifacts are still
+                // the consistent pre-sync set: bring the service back.
+                manual_restart(&handle);
+                update_notice(&handle, format!("harness 更新失败（同步）：\n{e}\n\n已用原产物恢复 DSH 服务。"));
                 return;
             }
         }
         tray_notice("harness 更新中：重建…");
         if let Err(e) = harness_update::rebuild(&root, log.clone()) {
             log(format!("重建失败：{e}"));
-            update_notice(&handle, format!("harness 更新失败（重建）：\n{e}\n\nDSH 服务已停止；代码已更新。可在托盘「重启 DSH 服务」用旧产物恢复，或修复后重试。"));
+            update_notice(&handle, format!("harness 更新失败（重建）：\n{e}\n\nDSH 服务保持停止：产物可能不完整，自动重启有崩溃风险。修复后重试更新，或在托盘「重启 DSH 服务」手动拉起。"));
             return;
         }
         log("重建完成，重启外壳以加载新产物".into());
@@ -869,12 +930,17 @@ fn updater_from(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String
 /// runs headless: it logs and installs without a dialog nobody is there to
 /// answer.
 fn check_update(app: &AppHandle, interactive: bool) {
+    let Some(_slot) = UpdateSlot::acquire() else {
+        log_app(app, "已有更新流程在进行，忽略本次触发".to_string());
+        return;
+    };
     let handle = app.clone();
     log_app(
         &handle,
-        format!("检查更新（interactive={interactive}）"),
+        format!("检查安装包更新（interactive={interactive}）"),
     );
     tauri::async_runtime::spawn(async move {
+        let _slot = _slot;
         let updater = match updater_from(&handle) {
             Ok(updater) => updater,
             Err(e) => {

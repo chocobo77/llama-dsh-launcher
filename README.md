@@ -75,18 +75,31 @@ history. What that changes:
    tooltip only). `src-tauri/installer-hooks.nsh` deletes that Run value during
    uninstall, so removing the app leaves no login-time failure behind.
 9. **Updater, two flavors**:
-   - **"检查 harness 更新…"** syncs the harness to the official latest with **no
-     local history** (`fetch --depth 1` + `reset --hard`): a harness that is a
-     file copy gets bootstrapped in place (`git init` + remote + shallow
-     fetch + align) on first use; an existing shallow repo just re-fetches and
-     compares SHAs — different SHA means a newer official state. Tracked-file
-     modifications are stashed before the reset (kept, never popped);
-     untracked paths — built libs, node_modules, the installed shell — are
-     never touched. Direct git goes out with an HTTP/1.1 retry and then
+   - **"检查 harness 更新…"** syncs the harness to the newest official release
+     tag with **no local history** (`fetch --depth 1` + `reset --hard`; the
+     newest `dsh-v*` tag is chosen by version sort, `DSH_REPO_REF` overrides,
+     and master is only a last-resort fallback because its worktree-sync tips
+     routinely fail to compile). A harness that is a file copy gets
+     bootstrapped in place (`git init` + remote + shallow fetch + align) on
+     first use; an existing shallow repo re-fetches and compares SHAs —
+     different SHA means a newer official state. Tracked-file modifications
+     are stashed before the reset (kept on success, restored on failure);
+     untracked leftovers from the previous ref are cleaned after a dry-run
+     listing (kept: the installed shell, `LOCAL-CHANGES*`, `.agents`,
+     `.claude`, `*.log`; node_modules and build outputs are ignored paths).
+     One update flow at a time machine-wide; a second trigger while one is
+     running is logged and ignored. After syncing it rebuilds via the
+     upstream artifacts pipeline (`pnpm install` with a frozen-lockfile
+     fallback, then `build.ts --scope artifacts`) and restarts the shell; a
+     failed sync restores the service on the old artifacts, a failed rebuild
+     leaves the shell stopped by choice (half-built artifacts must not
+     auto-spawn). Direct git goes out with an HTTP/1.1 retry and then
      gh-proxy mirrors (`DSH_GIT_MIRROR` custom entries); the upstream is the
-     official repo unless `DSH_REPO_URL` overrides it. After syncing it
-     rebuilds (`pnpm clean`, `build:lib`, `build:web`) and restarts the shell.
-   - **"检查安装包更新…"** is the NSIS feed flow (below).
+     official repo unless `DSH_REPO_URL` overrides it.
+   - **"检查安装包更新…"** is the NSIS feed flow (below). Both flows share a
+     machine-wide in-flight lock; `--check-update` and
+     `--check-harness-update` on a second launch trigger them without the
+     notification area.
 
 ## Installer: mount into a harness
 

@@ -196,11 +196,19 @@ fn run_git(git: &Path, dir: &Path, args: &[&str], timeout: Duration) -> (i32, St
                         if Instant::now() > deadline {
                             let _ = child.kill();
                             let _ = child.wait();
+                            // Drain the pump threads so their pipes close
+                            // instead of leaking until process exit.
+                            let _ = t_out.join();
+                            let _ = t_err.join();
                             return (-1, "git command timed out".into());
                         }
                         std::thread::sleep(Duration::from_millis(100));
                     }
-                    Err(e) => return (-1, format!("git wait failed: {e}")),
+                    Err(e) => {
+                        let _ = t_out.join();
+                        let _ = t_err.join();
+                        return (-1, format!("git wait failed: {e}"));
+                    }
                 }
             }
         }
@@ -422,7 +430,7 @@ fn tail(s: &str, max: usize) -> &str {
     }
 }
 
-fn stash_tracked_changes(git: &Path, root: &Path, log: &dyn Fn(String)) {
+fn stash_tracked_changes(git: &Path, root: &Path, log: &dyn Fn(String)) -> bool {
     let (code, sha) = run_git(
         git,
         root,
@@ -431,7 +439,7 @@ fn stash_tracked_changes(git: &Path, root: &Path, log: &dyn Fn(String)) {
     );
     if code != 0 {
         log("警告：本地改动 stash 失败，reset 将直接覆盖它们".into());
-        return;
+        return false;
     }
     let sha = sha.trim();
     // push exits 0 with "No local changes to save" when nothing was stored.
@@ -442,59 +450,140 @@ fn stash_tracked_changes(git: &Path, root: &Path, log: &dyn Fn(String)) {
         == 40
     {
         log(format!(
-            "本地已跟踪文件的改动已存入 stash（{sha}），未自动恢复；需要时 git stash pop 手动取回"
+            "本地已跟踪文件的改动已存入 stash（{sha}），未自动恢复；需要时 git stash pop 手动取回（git stash list 可见历史积累）"
+        ));
+        return true;
+    }
+    false
+}
+
+fn stash_pop_best_effort(git: &Path, root: &Path, log: &dyn Fn(String)) {
+    let (code, out) = run_git(git, root, &["stash", "pop", "stash@{0}"], SHORT);
+    if code == 0 {
+        log("同步失败回滚：已把 stash 的本地改动放回工作树".into());
+    } else {
+        log(format!(
+            "同步失败回滚：stash pop 失败，改动仍在 stash@{{0}}，请手动处理：\n{}",
+            tail(&out, 400)
         ));
     }
 }
 
+/// Shorten a SHA (or any diagnostic string) safely for logs: char-boundary
+/// aware, so a non-SHA payload can never split a UTF-8 sequence.
+pub fn short(s: &str) -> String {
+    s.chars().take(8).collect()
+}
+
 /// Bring the worktree to exactly the fetched upstream state. Local history is
 /// irrelevant by design; tracked-file modifications are stashed (kept) first.
+/// Any failure AFTER the stash rolls it back (best-effort pop) so a failed
+/// network sync never relocates the user's uncommitted work.
+///
 /// After the reset, untracked leftover sources from a previous (possibly
 /// different) ref are removed — they pollute the tag's build otherwise
 /// (observed: master-only office.ts broke the release tag's compile). The
-/// exclusions preserve genuinely local assets: the installed shell, local
-/// notes and logs. Ignored paths (node_modules, build outputs) are untouched
-/// because clean runs without -x.
-pub fn sync(root: &Path, log: &dyn Fn(String)) -> Result<String, String> {
+/// dry-run logs what will go first; the exclusions preserve genuinely local
+/// assets: the installed shell, local notes and logs. Ignored paths
+/// (node_modules, build outputs) are untouched because clean runs without -x.
+///
+/// `reuse_fetch` skips the network fetch, trusting the FETCH_HEAD a
+/// `check()` moments earlier produced (same user interaction, seconds apart).
+pub fn sync(root: &Path, log: &dyn Fn(String), reuse_fetch: bool) -> Result<String, String> {
     let git = git_exe().ok_or("未找到 git.exe：无法同步上游")?;
-    if has_local_changes(&git, root) {
-        stash_tracked_changes(&git, root, log);
+    let stashed = if has_local_changes(&git, root) {
+        stash_tracked_changes(&git, root, log)
+    } else {
+        false
+    };
+    let run = || -> Result<String, String> {
+        let (head, _via) = if reuse_fetch {
+            let head = run_git(&git, root, &["rev-parse", "FETCH_HEAD"], SHORT)
+                .1
+                .trim()
+                .to_string();
+            if head.len() != 40 {
+                return Err("没有可用的 FETCH_HEAD（上一轮检查未成功 fetch）".into());
+            }
+            (head, String::new())
+        } else {
+            shallow_fetch(&git, root)?
+        };
+        let (code, out) = run_git(&git, root, &["reset", "--hard", "FETCH_HEAD"], RESET);
+        if code != 0 {
+            return Err(format!("git reset 失败：\n{}", tail(&out, 800)));
+        }
+        // Dry-run first: what is about to go is logged before it goes.
+        let (_, plan) = run_git(
+            &git,
+            root,
+            &[
+                "clean",
+                "-fdn",
+                "-e",
+                "apps/desktop-tauri",
+                "-e",
+                "LOCAL-CHANGES*",
+                "-e",
+                ".agents",
+                "-e",
+                ".claude",
+                "-e",
+                "*.log",
+            ],
+            SHORT,
+        );
+        if !plan.trim().is_empty() {
+            for line in plan.lines().take(20) {
+                log(format!("clean: {line}"));
+            }
+            let more = plan.lines().count().saturating_sub(20);
+            if more > 0 {
+                log(format!("clean: …共 {} 项", plan.lines().count()));
+            }
+        }
+        let (ccode, clean_out) = run_git(
+            &git,
+            root,
+            &[
+                "clean",
+                "-fd",
+                "-e",
+                "apps/desktop-tauri",
+                "-e",
+                "LOCAL-CHANGES*",
+                "-e",
+                ".agents",
+                "-e",
+                ".claude",
+                "-e",
+                "*.log",
+            ],
+            RESET,
+        );
+        if ccode != 0 {
+            log(format!("警告：git clean 失败（残留未跟踪文件可能污染下次构建）：\n{}", tail(&clean_out, 400)));
+        } else if !clean_out.trim().is_empty() {
+            log(format!(
+                "清理了上个版本残留的未跟踪文件（{} 项）",
+                clean_out.lines().count()
+            ));
+        }
+        // Bookkeeping so later fetches and status read sensibly.
+        let _ = run_git(&git, root, &["update-ref", "refs/remotes/origin/master", "FETCH_HEAD"], SHORT);
+        let _ = run_git(&git, root, &["symbolic-ref", "HEAD", "refs/heads/master"], SHORT);
+        log(format!("已对齐官方最新版本 {}", short(&head)));
+        Ok(head)
+    };
+    match run() {
+        Ok(head) => Ok(head),
+        Err(e) => {
+            if stashed {
+                stash_pop_best_effort(&git, root, log);
+            }
+            Err(e)
+        }
     }
-    let (head, _via) = shallow_fetch(&git, root)?;
-    let (code, out) = run_git(&git, root, &["reset", "--hard", "FETCH_HEAD"], RESET);
-    if code != 0 {
-        return Err(format!("git reset 失败：\n{}", tail(&out, 800)));
-    }
-    let (ccode, clean_out) = run_git(
-        &git,
-        root,
-        &[
-            "clean",
-            "-fd",
-            "-e",
-            "apps/desktop-tauri",
-            "-e",
-            "LOCAL-CHANGES*",
-            "-e",
-            ".agents",
-            "-e",
-            ".claude",
-            "-e",
-            "*.log",
-        ],
-        RESET,
-    );
-    if ccode == 0 && !clean_out.trim().is_empty() {
-        log(format!(
-            "清理了上个版本残留的未跟踪文件（{} 项）",
-            clean_out.lines().count()
-        ));
-    }
-    // Bookkeeping so later fetches and status read sensibly.
-    let _ = run_git(&git, root, &["update-ref", "refs/remotes/origin/master", "FETCH_HEAD"], SHORT);
-    let _ = run_git(&git, root, &["symbolic-ref", "HEAD", "refs/heads/master"], SHORT);
-    log(format!("已对齐官方最新版本 {}", &head[..8.min(head.len())]));
-    Ok(head)
 }
 
 /// Bootstrap a deployed-but-not-a-repo harness in place: init, wire the
@@ -520,7 +609,7 @@ pub fn bootstrap(root: &Path, log: &dyn Fn(String)) -> Result<String, String> {
         }
         log(format!("已挂接官方仓库 {url}"));
     }
-    sync(root, log)
+    sync(root, log, false)
 }
 
 /// Where pnpm lives for this harness: the deployed node dir ships corepack

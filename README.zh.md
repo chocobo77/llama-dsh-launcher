@@ -60,15 +60,23 @@
    不弹 splash（只写日志与 tooltip）。卸载时由 `src-tauri/installer-hooks.nsh`
    删除该 Run 值，不留登录期报错残留。
 9. **更新器，两种**：
-   - **「检查 harness 更新…」**把 harness 同步到官方最新版，**本地不留历史**
-     （`fetch --depth 1` + `reset --hard`）：裸文件部署的 harness 首次使用时
-     原地初始化（`git init` + remote + 浅 fetch + 对齐）；已是浅仓库的只重新
-     fetch 并对比 SHA——SHA 不同即官方有新版本。已跟踪文件的本地改动在 reset
-     前存入 stash（保留，不自动恢复）；untracked 路径（构建产物、node_modules、
-     已安装的外壳）一概不动。git 直连失败先 HTTP/1.1 重试再走 gh-proxy 镜像
-     （`DSH_GIT_MIRROR` 自定义）；上游默认官方仓库，`DSH_REPO_URL` 可覆盖。
-     同步后自动重建（`pnpm clean`、`build:lib`、`build:web`）并重启外壳。
-   - **「检查安装包更新…」**是安装包 feed 流程（见下）。
+   - **「检查 harness 更新…」**把 harness 同步到**最新的官方发布 tag**，本地不留
+     历史（`fetch --depth 1` + `reset --hard`；`ls-remote` 按版本排序选最新
+     `dsh-v*` tag，`DSH_REPO_REF` 可覆盖；master 只作最后兜底——其 worktree-sync
+     tip 经常编译不过）。裸文件部署的 harness 首次使用时原地初始化（`git init`
+     + remote + 浅 fetch + 对齐）；已是浅仓库的只重新 fetch 并对比 SHA——SHA
+     不同即官方有新版本。已跟踪文件的本地改动在 reset 前存入 stash（成功则保留
+     供手动恢复，失败自动放回工作树）；换 ref 残留的未跟踪文件先 dry-run 列清单
+     再清理（保留：已安装的外壳、`LOCAL-CHANGES*`、`.agents`、`.claude`、
+     `*.log`；node_modules 与构建产物是 ignore 路径不受影响）。全机同时只允许
+     一个更新流程，进行中再次触发会记日志并忽略。同步后走上游 artifacts 管线
+     重建（`pnpm install`，frozen 失败自动回退；`build.ts --scope artifacts`）
+     并重启外壳；同步失败会用原产物自动恢复服务，重建失败则保持停止由用户决
+     断（半成品产物不宜自动拉起）。git 直连失败先 HTTP/1.1 重试再走 gh-proxy
+     镜像（`DSH_GIT_MIRROR` 自定义）；上游默认官方仓库，`DSH_REPO_URL` 可覆盖。
+   - **「检查安装包更新…」**是安装包 feed 流程（见下）。两个入口共享全机
+     in-flight 锁；第二次启动带 `--check-update` / `--check-harness-update`
+     可不点通知区直接触发。
 
 ## 安装包：挂载到 harness
 
