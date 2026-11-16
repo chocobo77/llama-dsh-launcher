@@ -77,7 +77,9 @@ fn sync_ref(git: &Path, root: &Path) -> String {
                 continue;
             };
             if best.as_ref().map_or(true, |b| v > (b.0, b.1, b.2, b.3)) {
-                best = Some((v.0, v.1, v.2, v.3, format!("refs/tags/{TAG_PREFIX}{name}")));
+                // `name` is what remains after TAG_PREFIX; the full ref is
+                // the prefix itself — no second "refs/tags/".
+                best = Some((v.0, v.1, v.2, v.3, format!("{TAG_PREFIX}{name}")));
             }
         }
         if best.is_some() {
@@ -758,5 +760,16 @@ mod tests {
         assert!(v("0.2.2-beta.1") > v("0.2.2-alpha.5"));
         assert!(v("0.10.0") > v("0.9.9"));
         assert!(v("1.0.0") > v("0.99.99"));
+    }
+
+    /// Regression for the doubled "refs/tags/refs/tags/…" fetch target: the
+    /// resolved ref must be the full ref the ls-remote line carried.
+    #[test]
+    fn resolved_ref_is_the_full_ls_remote_ref() {
+        const PREFIX: &str = "refs/tags/dsh-v";
+        let line_ref = "refs/tags/dsh-v0.2.2-rc.3";
+        let name = line_ref.strip_prefix(PREFIX).unwrap();
+        assert_eq!(format!("{PREFIX}{name}"), line_ref);
+        assert_ne!(format!("{PREFIX}{name}"), format!("refs/tags/{line_ref}"));
     }
 }
