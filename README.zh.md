@@ -60,12 +60,14 @@
    不弹 splash（只写日志与 tooltip）。卸载时由 `src-tauri/installer-hooks.nsh`
    删除该 Run 值，不留登录期报错残留。
 9. **更新器，两种**：
-   - **「检查 harness 更新…」**移植启动器（LlamaDSH Launcher）的方式：对 harness
-     checkout `git fetch`（HTTP/1.1 重试，失败走 gh-proxy 镜像，可用
-     `DSH_GIT_MIRROR` 自定义），对比 ahead/behind，确认后执行：停 host →
-     `git pull --ff-only`（本地未提交改动自动 stash 并恢复）→ 重建
-     （`pnpm clean`、`build:lib`、`build:web`）→ 重启外壳。要求 checkout 是真正的
-     git 克隆——部署器的完整克隆满足；裸文件复制会被如实告知无法更新。
+   - **「检查 harness 更新…」**把 harness 同步到官方最新版，**本地不留历史**
+     （`fetch --depth 1` + `reset --hard`）：裸文件部署的 harness 首次使用时
+     原地初始化（`git init` + remote + 浅 fetch + 对齐）；已是浅仓库的只重新
+     fetch 并对比 SHA——SHA 不同即官方有新版本。已跟踪文件的本地改动在 reset
+     前存入 stash（保留，不自动恢复）；untracked 路径（构建产物、node_modules、
+     已安装的外壳）一概不动。git 直连失败先 HTTP/1.1 重试再走 gh-proxy 镜像
+     （`DSH_GIT_MIRROR` 自定义）；上游默认官方仓库，`DSH_REPO_URL` 可覆盖。
+     同步后自动重建（`pnpm clean`、`build:lib`、`build:web`）并重启外壳。
    - **「检查安装包更新…」**是安装包 feed 流程（见下）。
 
 ## 安装包：挂载到 harness

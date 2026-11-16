@@ -75,13 +75,17 @@ history. What that changes:
    tooltip only). `src-tauri/installer-hooks.nsh` deletes that Run value during
    uninstall, so removing the app leaves no login-time failure behind.
 9. **Updater, two flavors**:
-   - **"检查 harness 更新…"** ports the LlamaDSH launcher's method: `git fetch`
-     the harness checkout (HTTP/1.1 retry, then gh-proxy mirrors via
-     `DSH_GIT_MIRROR`), compare ahead/behind, and on the user's confirmation
-     stop the host → `git pull --ff-only` (uncommitted changes stashed and
-     restored) → rebuild (`pnpm clean`, `build:lib`, `build:web`) → restart the
-     shell. Requires the checkout to be a real git clone — the deployer's full
-     clone qualifies; a bare file copy does not and is told so.
+   - **"检查 harness 更新…"** syncs the harness to the official latest with **no
+     local history** (`fetch --depth 1` + `reset --hard`): a harness that is a
+     file copy gets bootstrapped in place (`git init` + remote + shallow
+     fetch + align) on first use; an existing shallow repo just re-fetches and
+     compares SHAs — different SHA means a newer official state. Tracked-file
+     modifications are stashed before the reset (kept, never popped);
+     untracked paths — built libs, node_modules, the installed shell — are
+     never touched. Direct git goes out with an HTTP/1.1 retry and then
+     gh-proxy mirrors (`DSH_GIT_MIRROR` custom entries); the upstream is the
+     official repo unless `DSH_REPO_URL` overrides it. After syncing it
+     rebuilds (`pnpm clean`, `build:lib`, `build:web`) and restarts the shell.
    - **"检查安装包更新…"** is the NSIS feed flow (below).
 
 ## Installer: mount into a harness

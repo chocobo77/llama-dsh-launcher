@@ -662,12 +662,12 @@ const UPDATE_TITLE: &str = "DSH 更新";
 /// How long an update check may take before it is reported as a timeout.
 const UPDATE_TIMEOUT_SECS: u64 = 30;
 
-/// Harness git update (the LlamaDSH launcher's method): fetch → compare →
-/// ask → stop host → pull --ff-only (stash/restore local changes, mirror
-/// fallback) → rebuild (clean, build:lib, build:web) → restart the shell.
+/// Harness git update, shallow by design: the local repo keeps no history,
+/// only the latest official state. Fetch --depth 1 → compare SHA → ask →
+/// stop host → sync (stash tracked changes, reset --hard) → rebuild → restart.
 fn check_harness_update(app: &AppHandle, interactive: bool) {
     let handle = app.clone();
-    log_app(&handle, "检查 harness 更新（git fetch 对比上游）".to_string());
+    log_app(&handle, "检查 harness 更新（git 浅同步官方最新）".to_string());
     tauri::async_runtime::spawn(async move {
         let root = match harness_update::harness_root() {
             Some(root) => root,
@@ -693,26 +693,27 @@ fn check_harness_update(app: &AppHandle, interactive: bool) {
                 return;
             }
         };
-        let via_note = if info.via == "origin" {
+        if info.needs_init {
+            // Deployed file copy, not a repo: offer to build the local git
+            // store in place, history-free, aligned to the official latest.
+            let text = format!(
+                "harness 不是 git 仓库（{}）。\n\n现在初始化本地 git 并同步官方最新版本吗？\n  - 无历史：只保留官方最新状态（fetch --depth 1）\n  - 已跟踪文件的本地改动会先存入 stash（不会丢失，但不会自动恢复）\n  - 构建产物、node_modules、已安装的外壳不受影响\n  - 随后自动重建并重启外壳",
+                root.display()
+            );
+            if interactive && !update_confirm(&handle, text) {
+                log_app(&handle, "暂缓 harness 初始化".to_string());
+                return;
+            }
+            apply_harness_update(&handle, root, true);
+            return;
+        }
+        let via_note = if info.via == "origin" || info.via.is_empty() {
             String::new()
         } else {
-            format!("\n（经镜像 {}）", info.via)
+            format!("（经镜像 {}）", info.via)
         };
-        log_app(
-            &handle,
-            format!(
-                "harness {}：本地 {}，上游 {}（ahead {} / behind {}）",
-                info.branch, &info.local[..8.min(info.local.len())],
-                &info.remote[..8.min(info.remote.len())], info.ahead, info.behind
-            ),
-        );
-        if info.behind == 0 {
-            let extra = if info.ahead > 0 {
-                format!("（本地领先 {ahead} 个提交，未推送）", ahead = info.ahead)
-            } else {
-                String::new()
-            };
-            let text = format!("harness 已是最新（{}{}）。{extra}", info.branch, via_note);
+        if !info.update_available() {
+            let text = "harness 已与官方最新版本一致。".to_string();
             if interactive {
                 update_notice(&handle, &text);
             } else {
@@ -720,24 +721,39 @@ fn check_harness_update(app: &AppHandle, interactive: bool) {
             }
             return;
         }
+        let short = |s: &str| s[..8.min(s.len())].to_string();
+        log_app(
+            &handle,
+            format!(
+                "harness 有更新：本地 {} → 官方 {} {}",
+                short(&info.local),
+                short(&info.remote),
+                via_note
+            ),
+        );
+        let dirty_note = if info.dirty {
+            "\n注意：检测到本地未提交改动，会在同步前存入 stash（保留，不自动恢复）。"
+        } else {
+            ""
+        };
         let text = format!(
-            "harness 落后上游 {behind} 个提交（{branch}，ahead {ahead}）。\n\n现在更新吗？将执行：\n  1. 停止 DSH 服务\n  2. git pull --ff-only（本地未提交改动自动 stash 并恢复）\n  3. 重建（clean → build:lib → build:web，需几分钟）\n  4. 重启外壳",
-            behind = info.behind,
-            branch = info.branch,
-            ahead = info.ahead,
+            "harness 有新版本：{local} → {remote}。{note}\n\n现在同步吗？将执行：\n  1. 停止 DSH 服务\n  2. 同步官方最新（fetch --depth 1 + reset，无历史）\n  3. 重建（clean → build:lib → build:web，需几分钟）\n  4. 重启外壳",
+            local = short(&info.local),
+            remote = short(&info.remote),
+            note = dirty_note,
         );
         if interactive && !update_confirm(&handle, text) {
-            log_app(&handle, format!("暂缓 harness 更新（behind {}）", info.behind));
-            tray_notice(&format!("harness 更新待确认：落后 {} 个提交", info.behind));
+            log_app(&handle, "暂缓 harness 更新".to_string());
+            tray_notice("harness 更新待确认：官方有新版本");
             return;
         }
-        apply_harness_update(&handle, root);
+        apply_harness_update(&handle, root, false);
     });
 }
 
 /// The mutating half, on its own thread so dialogs and the UI stay responsive.
 /// Progress streams into the status log and the tray tooltip.
-fn apply_harness_update(app: &AppHandle, root: std::path::PathBuf) {
+fn apply_harness_update(app: &AppHandle, root: std::path::PathBuf, bootstrap: bool) {
     let handle = app.clone();
     std::thread::spawn(move || {
         {
@@ -745,7 +761,7 @@ fn apply_harness_update(app: &AppHandle, root: std::path::PathBuf) {
             server::stop_server(state.inner());
             server::push_log(state.inner(), "harness 更新：已停止 DSH 服务".into());
         }
-        tray_notice("harness 更新中：git pull…");
+        tray_notice("harness 更新中：同步官方最新…");
         let log = {
             let handle = handle.clone();
             move |line: String| {
@@ -754,12 +770,16 @@ fn apply_harness_update(app: &AppHandle, root: std::path::PathBuf) {
             }
         };
         log(format!("checkout: {}", root.display()));
-        let pulled = harness_update::pull(&root, &log);
-        match pulled {
-            Ok(head) => log(format!("已快进到 {}", &head[..8.min(head.len())])),
+        let synced = if bootstrap {
+            harness_update::bootstrap(&root, &log)
+        } else {
+            harness_update::sync(&root, &log)
+        };
+        match synced {
+            Ok(head) => log(format!("当前版本 {}", &head[..8.min(head.len())])),
             Err(e) => {
-                log(format!("拉取失败：{e}"));
-                update_notice(&handle, format!("harness 更新失败（git pull）：\n{e}\n\nDSH 服务已停止，可在托盘「重启 DSH 服务」恢复。"));
+                log(format!("同步失败：{e}"));
+                update_notice(&handle, format!("harness 更新失败（同步）：\n{e}\n\nDSH 服务已停止，可在托盘「重启 DSH 服务」恢复。"));
                 return;
             }
         }
@@ -770,7 +790,7 @@ fn apply_harness_update(app: &AppHandle, root: std::path::PathBuf) {
             return;
         }
         log("重建完成，重启外壳以加载新产物".into());
-        update_notice(&handle, "harness 已更新并重建完成，即将重启外壳。");
+        update_notice(&handle, "harness 已同步官方最新并重建完成，即将重启外壳。");
         handle.restart();
     });
 }
