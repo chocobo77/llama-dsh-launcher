@@ -59,11 +59,14 @@
    `HKCU\...\Run\DSH`，命令带 `--autostart`；这类启动保持托盘静默，崩溃重启也
    不弹 splash（只写日志与 tooltip）。卸载时由 `src-tauri/installer-hooks.nsh`
    删除该 Run 值，不留登录期报错残留。
-9. **更新器**：托盘「检查更新…」一次点击 + 一次确认。点击即按配置的端点检查，
-   结果用原生对话框说清楚——有新版本、已是最新、或失败的确切原因（404／超时／
-   清单格式不对）。发现新版本先问一次再装（安装会停 host 并重启外壳），选「稍后」
-   则版本号留在托盘 tooltip。必须用对话框：状态日志只喂 splash 窗口，主窗口开着
-   时纯日志报告会让这个菜单项看起来是死的。
+9. **更新器，两种**：
+   - **「检查 harness 更新…」**移植启动器（LlamaDSH Launcher）的方式：对 harness
+     checkout `git fetch`（HTTP/1.1 重试，失败走 gh-proxy 镜像，可用
+     `DSH_GIT_MIRROR` 自定义），对比 ahead/behind，确认后执行：停 host →
+     `git pull --ff-only`（本地未提交改动自动 stash 并恢复）→ 重建
+     （`pnpm clean`、`build:lib`、`build:web`）→ 重启外壳。要求 checkout 是真正的
+     git 克隆——部署器的完整克隆满足；裸文件复制会被如实告知无法更新。
+   - **「检查安装包更新…」**是安装包 feed 流程（见下）。
 
 ## 安装包：挂载到 harness
 

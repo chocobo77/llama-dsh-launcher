@@ -74,14 +74,15 @@ history. What that changes:
    tray, and a crash-restart splash does not pop a window either (log and tray
    tooltip only). `src-tauri/installer-hooks.nsh` deletes that Run value during
    uninstall, so removing the app leaves no login-time failure behind.
-9. **Updater**: tray "Check for updates…" is one click plus one question. The
-   click checks against the configured endpoint and reports the outcome in a
-   native dialog — newer version, already current, or the exact failure (404 /
-   timeout / malformed feed). When a release is found it asks first, because
-   installing stops the host and restarts the shell; answering "稍后/later"
-   leaves the version in the tray tooltip. The result must be a dialog: the
-   status log only feeds the splash window, so a log-only report made the menu
-   entry look dead whenever the main window was up.
+9. **Updater, two flavors**:
+   - **"检查 harness 更新…"** ports the LlamaDSH launcher's method: `git fetch`
+     the harness checkout (HTTP/1.1 retry, then gh-proxy mirrors via
+     `DSH_GIT_MIRROR`), compare ahead/behind, and on the user's confirmation
+     stop the host → `git pull --ff-only` (uncommitted changes stashed and
+     restored) → rebuild (`pnpm clean`, `build:lib`, `build:web`) → restart the
+     shell. Requires the checkout to be a real git clone — the deployer's full
+     clone qualifies; a bare file copy does not and is told so.
+   - **"检查安装包更新…"** is the NSIS feed flow (below).
 
 ## Installer: mount into a harness
 

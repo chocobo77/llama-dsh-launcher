@@ -163,7 +163,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $Target 'apps\cli\lib\bin.js'))) {
     Log "pnpm $(& pnpm -v)"
 
     # -------------------------------------------------------------------- clone
-    $cloneArgs = @('clone', '--depth', '1')
+    # Full clone on purpose (no --depth 1): the desktop shell's "check for
+    # harness updates" flow reads ahead/behind counts across the history, and
+    # a shallow boundary makes them wrong.
+    $cloneArgs = @('clone')
     if ($Ref) { $cloneArgs += @('--branch', $Ref) }
     $cloneArgs += @($Repo, $Target)
     Log "git $($cloneArgs -join ' ')"

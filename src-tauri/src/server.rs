@@ -231,7 +231,8 @@ pub fn append_log_file(line: &str) {
 
 /// Walk up from the executable looking for the monorepo checkout:
 /// <checkout>/apps/desktop-tauri/src-tauri/target/(debug|release)/<exe> in dev.
-fn default_checkout() -> Option<PathBuf> {
+/// Also the harness-update flow's root discovery, hence pub(crate).
+pub(crate) fn default_checkout() -> Option<PathBuf> {
     // Since the app left the monorepo, "walk up until we find apps/cli" only
     // works when it happens to live inside a checkout. Name it when it does not:
     // DSH_REPO_ROOT is the same variable scripts/prepare-runtime-cli.mjs uses.

@@ -1,3 +1,4 @@
+mod harness_update;
 mod server;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -315,9 +316,10 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let show = MenuItem::with_id(app.handle(), "show", "显示 DSH", true, None::<&str>)?;
     let autostart = MenuItem::with_id(app.handle(), "autostart", "开机自动启动（切换）", true, None::<&str>)?;
     let restart = MenuItem::with_id(app.handle(), "restart", "重启 DSH 服务", true, None::<&str>)?;
-    let update = MenuItem::with_id(app.handle(), "update", "检查更新…", true, None::<&str>)?;
+    let hupdate = MenuItem::with_id(app.handle(), "hupdate", "检查 harness 更新…", true, None::<&str>)?;
+    let update = MenuItem::with_id(app.handle(), "update", "检查安装包更新…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app.handle(), "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app.handle(), &[&show, &autostart, &restart, &update, &quit])?;
+    let menu = Menu::with_items(app.handle(), &[&show, &autostart, &restart, &hupdate, &update, &quit])?;
 
     let icon = app
         .default_window_icon()
@@ -334,6 +336,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
             "show" => show_app(app),
             "autostart" => toggle_autostart(app),
             "restart" => manual_restart(app),
+            "hupdate" => check_harness_update(app, true),
             "update" => check_update(app, true),
             "quit" => request_quit(app),
             _ => {}
@@ -658,6 +661,120 @@ fn request_quit(app: &AppHandle) {
 const UPDATE_TITLE: &str = "DSH 更新";
 /// How long an update check may take before it is reported as a timeout.
 const UPDATE_TIMEOUT_SECS: u64 = 30;
+
+/// Harness git update (the LlamaDSH launcher's method): fetch → compare →
+/// ask → stop host → pull --ff-only (stash/restore local changes, mirror
+/// fallback) → rebuild (clean, build:lib, build:web) → restart the shell.
+fn check_harness_update(app: &AppHandle, interactive: bool) {
+    let handle = app.clone();
+    log_app(&handle, "检查 harness 更新（git fetch 对比上游）".to_string());
+    tauri::async_runtime::spawn(async move {
+        let root = match harness_update::harness_root() {
+            Some(root) => root,
+            None => {
+                let text = "未找到 harness checkout：外壳必须挂在 harness 内（或设置 DSH_REPO_ROOT）才能按 git 方式更新。".to_string();
+                if interactive {
+                    update_notice(&handle, &text);
+                } else {
+                    log_app(&handle, text);
+                }
+                return;
+            }
+        };
+        let info = match harness_update::check(&root) {
+            Ok(info) => info,
+            Err(e) => {
+                let text = format!("检查 harness 更新失败：\n{e}");
+                if interactive {
+                    update_notice(&handle, &text);
+                } else {
+                    log_app(&handle, text);
+                }
+                return;
+            }
+        };
+        let via_note = if info.via == "origin" {
+            String::new()
+        } else {
+            format!("\n（经镜像 {}）", info.via)
+        };
+        log_app(
+            &handle,
+            format!(
+                "harness {}：本地 {}，上游 {}（ahead {} / behind {}）",
+                info.branch, &info.local[..8.min(info.local.len())],
+                &info.remote[..8.min(info.remote.len())], info.ahead, info.behind
+            ),
+        );
+        if info.behind == 0 {
+            let extra = if info.ahead > 0 {
+                format!("（本地领先 {ahead} 个提交，未推送）", ahead = info.ahead)
+            } else {
+                String::new()
+            };
+            let text = format!("harness 已是最新（{}{}）。{extra}", info.branch, via_note);
+            if interactive {
+                update_notice(&handle, &text);
+            } else {
+                log_app(&handle, text);
+            }
+            return;
+        }
+        let text = format!(
+            "harness 落后上游 {behind} 个提交（{branch}，ahead {ahead}）。\n\n现在更新吗？将执行：\n  1. 停止 DSH 服务\n  2. git pull --ff-only（本地未提交改动自动 stash 并恢复）\n  3. 重建（clean → build:lib → build:web，需几分钟）\n  4. 重启外壳",
+            behind = info.behind,
+            branch = info.branch,
+            ahead = info.ahead,
+        );
+        if interactive && !update_confirm(&handle, text) {
+            log_app(&handle, format!("暂缓 harness 更新（behind {}）", info.behind));
+            tray_notice(&format!("harness 更新待确认：落后 {} 个提交", info.behind));
+            return;
+        }
+        apply_harness_update(&handle, root);
+    });
+}
+
+/// The mutating half, on its own thread so dialogs and the UI stay responsive.
+/// Progress streams into the status log and the tray tooltip.
+fn apply_harness_update(app: &AppHandle, root: std::path::PathBuf) {
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        {
+            let state = handle.state::<ServerState>();
+            server::stop_server(state.inner());
+            server::push_log(state.inner(), "harness 更新：已停止 DSH 服务".into());
+        }
+        tray_notice("harness 更新中：git pull…");
+        let log = {
+            let handle = handle.clone();
+            move |line: String| {
+                let state = handle.state::<ServerState>();
+                server::push_log(state.inner(), format!("harness-update: {line}"));
+            }
+        };
+        log(format!("checkout: {}", root.display()));
+        let pulled = harness_update::pull(&root, &log);
+        match pulled {
+            Ok(head) => log(format!("已快进到 {}", &head[..8.min(head.len())])),
+            Err(e) => {
+                log(format!("拉取失败：{e}"));
+                update_notice(&handle, format!("harness 更新失败（git pull）：\n{e}\n\nDSH 服务已停止，可在托盘「重启 DSH 服务」恢复。"));
+                return;
+            }
+        }
+        tray_notice("harness 更新中：重建…");
+        if let Err(e) = harness_update::rebuild(&root, log.clone()) {
+            log(format!("重建失败：{e}"));
+            update_notice(&handle, format!("harness 更新失败（重建）：\n{e}\n\nDSH 服务已停止；代码已更新。可在托盘「重启 DSH 服务」用旧产物恢复，或修复后重试。"));
+            return;
+        }
+        log("重建完成，重启外壳以加载新产物".into());
+        update_notice(&handle, "harness 已更新并重建完成，即将重启外壳。");
+        handle.restart();
+    });
+}
+
 
 /// Report an update outcome where the user is looking. `log_app` only feeds
 /// the splash window, so a tray click that merely logged looked like a dead
