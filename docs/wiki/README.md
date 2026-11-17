@@ -16,6 +16,7 @@
 | [06-构建打包与发布](06-构建打包与发布.md) | 构建命令、一键封包.cmd 八步流程、Inno Setup 双安装模式、Linux 打包安装、版本同步规则 |
 | [07-Agent-API与CLI](07-Agent-API与CLI.md) | 本机 HTTP 控制面契约、两端端点差异、字段别名口径、任务模型、llamadsh-cli 用法 |
 | [08-配置与数据文件](08-配置与数据文件.md) | 配置 JSON、状态文件、日志目录、agent.json、llama_params.yml 参数表结构 |
+| [09-DSH桌面壳-dsh-desktop-tauri](09-DSH桌面壳-dsh-desktop-tauri.md) | Tauri 桌面壳子项目：架构、双更新器、安装包挂载 harness、构建发布、与启动器的边界 |
 
 ## 一分钟了解本项目
 

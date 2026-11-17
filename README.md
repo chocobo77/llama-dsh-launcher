@@ -143,8 +143,9 @@ llamadsh-cli quit              退出（默认先停服务）
   - Services：进程执行、工具链探测、兼容修复、更新、GPU 采样
   - Resources/llama_params.yml：参数表
 - LlamaDSH_Launcher_Linux：Linux 侧的 webui 版本，实验性质，能用但没细磨
+- dsh-desktop-tauri：DSH 桌面壳（Tauri/Rust+WebView2），承载 DSH Web GUI 并负责 host 生命周期、托盘、双更新器；经 subtree 并入、保留上游历史，详见其 README.zh.md 与 docs/wiki/09
 - tests/SmokeTests：不依赖 NuGet 的冒烟测试，覆盖进程超时、大输出、验签、日志轮转
-- WmiProbe：读进程命令行的小工具
+- WmiProbe：已退役（只剩 bin/obj 残留，源码在仓库外归档）
 
 ## 常见问题
 
@@ -184,7 +185,7 @@ DSH 目录搬过家，pnpm 的软链还指着旧路径。点「兼容性修复�
 
     dotnet build LlamaDSH_Launcher_CS/LlamaDSH_Launcher.csproj
 
-打安装包运行 一键封包.cmd，内部是 dotnet publish 单文件加 Inno Setup。
+打安装包运行 一键封包.cmd，内部是 dotnet publish 单文件加 Inno Setup。加 `-tauri` 参数会额外构建 DSH 桌面壳的 Tauri 安装包（需要 Node+pnpm 与 Rust MSVC 工具链，签名私钥在 dsh-desktop-tauri/keys/，已 gitignore 不入库）。
 
 跑测试：
 
