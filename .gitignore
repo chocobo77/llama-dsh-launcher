@@ -48,6 +48,10 @@ pack_run.log
 /docs/*
 !/docs/API-CONTRACT.md
 !/docs/安装模式与提权门控-2026-11-10.md
+# 可复用的发布链路手册与 wiki 设计文档同属"契约与设计"一类，引用它们的地方必须在仓库里打得开；
+# 审计报告(AUDIT-*)与逐次修复记录(修复记录-*)仍按上面的策略留在本地不入库。
+!/docs/GITHUB-PUSH-PIPELINE.md
+!/docs/wiki/
 
 # 个人整理的参考资料，不入库
 /显存占用计算指南.md
