@@ -222,8 +222,13 @@ class T
                 "reason=" + reason);
             // 封顶是"判定持续成立"那类机器上唯一的下限: 凭证写不出来就必须返回 false,
             // 由调用方放弃重启(fail-closed)。返回 true 就等于把无限反复启动放回去。
-            Chk("TryMark 写不出来(建不出目录) -> false",
-                !LineageGuard.TryMarkRelaunchAttempted(@"Z:\llamadsh-nope\x.marker", out reason), "reason=" + reason);
+            // 构造必须与机器无关: 早先写死 @"Z:\llamadsh-nope\x.marker" 假设本机没有 Z: 盘,
+            // 一旦挂了映射盘这段就变成"居然写成功了"而误报(2026-11-17 实测 Z: 为映射盘,
+            // 封包因此在 6/8 selftest 卡住)。改用"父路径是文件": 任何机器上建目录都必然失败。
+            string selftestBlocker = Path.Combine(Path.GetTempPath(), "scopeself_blocker_" + Guid.NewGuid().ToString("N"));
+            File.WriteAllText(selftestBlocker, "x");
+            Chk("TryMark 写不出来(父路径是文件) -> false",
+                !LineageGuard.TryMarkRelaunchAttempted(Path.Combine(selftestBlocker, "nope", "x.marker"), out reason), "reason=" + reason);
             // 被封顶放过的那次启动会主动清凭证: 留着只靠 TTL 过期, 会把窗口内下一次真需要
             // 切血统的启动也压掉(= 当初 WMI 必失败的症状回来)
             LineageGuard.ClearRelaunchMarker(mk);
