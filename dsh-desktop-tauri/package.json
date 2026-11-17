@@ -1,0 +1,25 @@
+{
+  "name": "@deepseek-ai/dsh-desktop-tauri",
+  "description": "Tauri desktop shell for DSH: launches the dsh web host, hosts its Web GUI in a native WebView, with tray, single-instance, window-state and updater scaffolding",
+  "version": "0.1.21",
+  "private": true,
+  "license": "MIT",
+  "author": {
+    "name": "Hangzhou DeepSeek Artificial Intelligence Co., Ltd."
+  },
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "node scripts/prepare-installer-hooks.mjs && tauri dev",
+    "build": "node scripts/prepare-installer-hooks.mjs && tauri build",
+    "build:debug": "node scripts/prepare-installer-hooks.mjs && tauri build --debug",
+    "prepare:runtime": "node scripts/prepare-runtime-cli.mjs",
+    "verify:runtime": "node scripts/verify-runtime-cli.mjs",
+    "publish:updates": "node scripts/publish-updates.mjs",
+    "icon": "tauri icon icon-src/icon.png",
+    "installer:hooks": "node scripts/prepare-installer-hooks.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
