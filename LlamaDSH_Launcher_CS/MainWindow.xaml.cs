@@ -2090,12 +2090,20 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			string msg = "发现 deepseek-harness 上游更新（落后 " + info.Behind + " 个提交）:\n\n"
 				+ "  当前: " + info.LocalHead.Substring(0, 7) + "\n"
 				+ "  上游: " + info.RemoteHead.Substring(0, 7) + " (" + info.Branch + ")\n\n"
-				+ "将执行:\n  1. git pull --ff-only（本地未提交改动会自动 stash 并在完成后恢复）\n  2. 全量重建 (clean + build:lib + build:web)\n\n继续？";
+				+ "将执行:\n  1. 校验本地内核补丁基线（只记录，不阻断）\n  2. git pull --ff-only（本地未提交改动会自动 stash 并在完成后恢复）\n  3. 重放本地内核补丁并断言（失败即中止更新，不重建）\n  4. 全量重建 (clean + build:lib + build:web)\n  5. 校验产物确实带补丁后才启动 DSH\n\n继续？";
 			if (System.Windows.MessageBox.Show(msg, "更新 deepseek-harness", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
 			{
 				Log("[更新] 用户取消 DSH 更新");
 				return;
 			}
+			// 阶段0：拉取前只记录基线——"更新前就已缺失"正是阶段2要修的情形，拦住它反而无法自愈。
+			LocalPatchGuard.PatchResult baseline = await Task.Run(delegate
+			{
+				return LocalPatchGuard.Verify(dir, buildStage: false);
+			});
+			Log(baseline.Ok
+				? "[更新] 阶段0：本地内核补丁基线完整"
+				: "[更新] 阶段0：更新前补丁基线未通过（拉取后会重放）:\n" + baseline.Verdict);
 			SetDshUpdBtn(true, "⏳ 拉取中...");
 			(bool ok, string m) = await Task.Run(() => UpdateService.PullDsh(dir, delegate (string msg) { Log(msg); }));
 			if (!ok)
@@ -2107,6 +2115,26 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			SetDshUpdBtn(false);
 			string newHead = m;
+			// 阶段2：pull 之后工作区已换到新版本（stash/pop 也可能冲突），先把只存在于本机的
+			// 两处内核补丁重放回来并断言；不成立就中止——不重建、不启动。
+			SetDshUpdBtn(true, "⏳ 校验本地补丁...");
+			LocalPatchGuard.PatchResult patched = await Task.Run(delegate
+			{
+				return LocalPatchGuard.EnsureAfterUpdate(dir);
+			});
+			if (!patched.Ok)
+			{
+				SetDshUpdBtn(false);
+				Log("[更新] 阶段2 失败：本地内核补丁未能就位:\n" + patched);
+				ShowNotice("DSH 已拉取到 " + newHead.Substring(0, 7) + "，但本地内核补丁未能就位，已按失败语义中止更新:\n\n"
+					+ patched.ToString()
+					+ "\n\n没有重建、也没有启动 DSH（源码已在新版本，产物仍是更新前那套）。\n"
+					+ "若刚才的 stash pop 有冲突，改动仍在 stash 里（git stash list / git stash pop 手动处理）。\n"
+					+ "修好补丁后可重试更新，或点「🔨 重建 DSH」。", isError: true);
+				return;
+			}
+			SetDshUpdBtn(false);
+			Log("[更新] 阶段2：" + patched.Detail);
 			Log("[更新] DSH 已拉取到 " + newHead.Substring(0, 7) + "，开始全量重建...");
 			StartDshRebuild(dir, newHead, delegate
 			{
@@ -5346,13 +5374,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					BtnDshStop.IsEnabled = false;
 					if (exitCode == "0")
 					{
-						DshMaintenance.SaveBuildState(_dshRebuildHead);
-						Log("--- [DSH重建] ✅ 重建完成，基线已更新为 " + _dshRebuildHead.Substring(0, 7) + "，继续启动 DSH ---");
-						LblDshStatus.Text = "Stopped";
-						LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
+						// 阶段4：产物必须真的带着那两处防线，否则不记基线、也不启动 DSH。
 						Action? done = _dshRebuildDone;
 						_dshRebuildDone = null;
-						_ = CompleteRebuildWithCompatAsync(done);
+						string rebuildDir = _dshRebuildDir;
+						string rebuildHead = _dshRebuildHead;
+						Log("--- [DSH重建] ✅ 重建完成，校验产物中的本地内核补丁 ...");
+						_ = FinishRebuildAfterPatchCheckAsync(rebuildDir, rebuildHead, done);
 					}
 					else
 					{
@@ -5375,6 +5403,41 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		catch (Exception ex2)
 		{
 			LogError(ex2, "DSH 重建轮询");
+		}
+	}
+
+	/// <summary>
+	/// 重建完成后先断言产物确实带着本地内核补丁，再记基线并进入兼容性检查。
+	/// 断言失败即不启动 DSH：缺防线的构建会静默退化（模型把工具调用写成正文而无人拦截），比停机更难查。
+	/// </summary>
+	private async Task FinishRebuildAfterPatchCheckAsync(string dir, string head, Action? done)
+	{
+		try
+		{
+			LocalPatchGuard.PatchResult patched = await Task.Run(delegate
+			{
+				return LocalPatchGuard.Verify(dir, buildStage: true);
+			});
+			if (!patched.Ok)
+			{
+				LblDshStatus.Text = "Patch check failed";
+				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(248, 81, 73));
+				Log("--- [DSH重建] ❌ 产物缺少本地内核补丁（阶段4）:\n" + patched);
+				ShowNotice("DSH 重建完成，但产物里缺少本地内核补丁（text-tool-call 兜底 / tool-fs-search 路径预检）:\n\n"
+					+ patched.ToString()
+					+ "\n\n已按失败语义不启动 DSH。修好源码补丁（或设 " + LocalPatchGuard.PatchesDirEnv
+					+ " 指向规范副本）后重新重建；确需先跑起来，可直接点「启动 DSH」。", isError: true);
+				return;
+			}
+			DshMaintenance.SaveBuildState(head);
+			Log("--- [DSH重建] ✅ 产物已带本地内核补丁，基线更新为 " + head.Substring(0, 7) + "，继续启动 DSH ---");
+			LblDshStatus.Text = "Stopped";
+			LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
+			await CompleteRebuildWithCompatAsync(done);
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "重建后补丁校验");
 		}
 	}
 
