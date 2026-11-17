@@ -29,13 +29,20 @@ set "NOPAUSE="
 if /I "%~1"=="-nopause" set "NOPAUSE=1"
 if /I "%~2"=="-nopause" set "NOPAUSE=1"
 
+rem -tauri（位置任意）：额外构建 DSH 桌面壳的 Tauri 安装包（需 Node+pnpm 与 Rust MSVC 工具链）
+set "TAURIPACK="
+if /I "%~1"=="-tauri" set "TAURIPACK=1"
+if /I "%~2"=="-tauri" set "TAURIPACK=1"
+if /I "%~3"=="-tauri" set "TAURIPACK=1"
+
 echo ==============================================
 echo   LlamaDSH 启动器 · 一键封包
 echo ==============================================
 
-rem ---------- [1/8] 可选: 版本号参数 (一键封包.cmd 1.2.0 [-nopause]) ----------
+rem ---------- [1/8] 可选: 版本号参数 (一键封包.cmd 1.2.0 [-nopause] [-tauri]) ----------
 set "VERARG=%~1"
 if /I "%VERARG%"=="-nopause" set "VERARG="
+if /I "%VERARG%"=="-tauri" set "VERARG="
 if "%VERARG%"=="" (
     echo [1/8] 跳过（未给版本号参数，沿用 installer.iss 当前版本）
     goto :envcheck
@@ -281,7 +288,7 @@ rem ---------- [8/8] 打包 Linux 复刻版 (Python 源码 zip, 排除缓存与�
 set "LNXZIP=%PKOUT%\LlamaDSH_Launcher_Linux_%LNXVER%.zip"
 if not exist "%LNXSRC%\main.py" (
     echo [8/8] 跳过 Linux 启动器打包（未找到 %LNXSRC%\main.py）
-    goto :cleanup
+    goto :tauri_step
 )
 echo [8/8] 打包 Linux 启动器...
 call :log "8/8 linux zip 开始"
@@ -314,6 +321,40 @@ if errorlevel 1 (
 call :log "8/8 zip 完成"
 rem 打完即清理 staging 副本（否则仓库里长期留一份完整源码拷贝）
 if exist "%LNXSTG%" rd /s /q "%LNXSTG%"
+
+:tauri_step
+rem ---------- [9/8] 可选: DSH 桌面壳 Tauri 安装包 (传 -tauri 才执行) ----------
+if not defined TAURIPACK goto :cleanup
+echo [9/8] 构建 DSH 桌面壳 Tauri 安装包...
+call :log "9/8 tauri 开始"
+set "TAURIDIR=%ROOT%dsh-desktop-tauri"
+where pnpm >nul 2>nul
+if errorlevel 1 goto :fail_tauri_tool
+where cargo >nul 2>nul
+if errorlevel 1 goto :fail_tauri_tool
+if not exist "%TAURIDIR%\keys\updater.key" goto :fail_tauri_key
+echo   pnpm install + tauri build。Rust 全量编译第一回可能要十几分钟，后续走增量。
+pushd "%TAURIDIR%"
+rem 签名私钥按 Tauri 官方口径经环境变量传入（内容多行，cmd 的 for /f 读不了），
+rem 密码按 keys 生成时的约定为空串；env 只存在于本次 powershell 进程，不落盘。
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content -Raw 'keys\updater.key'; $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ''; pnpm install --frozen-lockfile; if ($LASTEXITCODE) { exit 1 }; pnpm run build; if ($LASTEXITCODE) { exit 1 }"
+set "TAURI_ERR=%errorlevel%"
+popd
+if not "%TAURI_ERR%"=="0" goto :fail_tauri_build
+echo   Tauri 产物在: %TAURIDIR%\src-tauri\target\release\bundle\nsis\
+echo   含 setup.exe 与 .sig 更新签名；发 feed 用 dsh-desktop-tauri\scripts\publish-updates.mjs。
+call :log "9/8 tauri 完成"
+goto :cleanup
+
+:fail_tauri_tool
+echo   [错误] 未找到 pnpm 或 cargo。桌面壳构建需要 Node+pnpm 与 Rust MSVC 工具链。
+goto :fail
+:fail_tauri_key
+echo   [错误] 缺少更新签名私钥 %TAURIDIR%\keys\updater.key —— 它被 gitignore，须按桌面壳 README 在本机备好。
+goto :fail
+:fail_tauri_build
+echo   [错误] Tauri 构建失败，详见上方输出。
+goto :fail
 
 :cleanup
 call :log "cleanup 清理输出目录"
