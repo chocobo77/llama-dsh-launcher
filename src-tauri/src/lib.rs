@@ -745,7 +745,7 @@ fn check_harness_update(app: &AppHandle, interactive: bool) {
             // Deployed file copy, not a repo: offer to build the local git
             // store in place, history-free, aligned to the official latest.
             let text = format!(
-                "harness 不是 git 仓库（{}）。\n\n现在初始化本地 git 并同步官方最新版本吗？\n  - 无历史：只保留官方最新状态（fetch --depth 1）\n  - 已跟踪文件的本地改动会先存入 stash（同步失败会自动放回）\n  - 上个版本残留的未跟踪文件将被清理（已安装的外壳、LOCAL-CHANGES*、.agents、.claude、*.log 保留）\n  - 构建产物、node_modules 不受影响\n  - 随后自动重建并重启外壳",
+                "harness 不是 git 仓库（{}）。\n\n现在初始化本地 git 并同步官方最新版本吗？\n  - 无历史：只保留官方最新状态（fetch --depth 1）\n  - 已跟踪文件的本地改动会先存入 stash（同步失败会自动放回）\n  - 上个版本残留的未跟踪文件将被清理（已安装的外壳、LOCAL-CHANGES*、scripts/verify-local-changes.mjs、.agents、.claude、*.log 保留）\n  - 构建产物、node_modules 不受影响\n  - 随后自动重放本地内核补丁 → 重建 → 校验，任一阶段失败即判定更新失败（不会以缺防线的版本启动），最后重启外壳",
                 root.display()
             );
             if interactive && !update_confirm(&handle, text) {
@@ -761,7 +761,20 @@ fn check_harness_update(app: &AppHandle, interactive: bool) {
             format!("（经镜像 {}）", info.via)
         };
         if !info.update_available() {
-            let text = "harness 已与官方最新版本一致。".to_string();
+            let mut text = "harness 已与官方最新版本一致。".to_string();
+            // Nothing to gate, but a patch that is already gone still has to be
+            // said out loud: it errors nowhere else (2026-11-16/17 accident).
+            if !harness_update::skip_local_patches() && harness_update::has_patch_verifier(&root) {
+                let sink = {
+                    let handle = handle.clone();
+                    move |line: String| log_app(&handle, format!("harness-update: {line}"))
+                };
+                if harness_update::verify_local_changes(&root, "source", sink).is_err() {
+                    text = "harness 已与官方最新版本一致，但本地内核补丁校验未通过。
+
+运行中的实例可能已静默失去 text-tool-call 兜底 / tool-fs-search 路径预检。修复：在 checkout 内跑 node scripts/verify-local-changes.mjs 确认缺哪条，再用 restore-local-patches.mjs（harness-patches，或 DSH_LOCAL_PATCHES_DIR 所指）重放后重建。".to_string();
+                }
+            }
             if interactive {
                 update_notice(&handle, &text);
             } else {
@@ -782,9 +795,10 @@ fn check_harness_update(app: &AppHandle, interactive: bool) {
         if info.dirty {
             notes.push_str("\n注意：检测到本地未提交改动，会在同步前存入 stash（同步失败自动放回；成功则保留在 stash 里供手动恢复）。");
         }
-        notes.push_str("\n注意：上个版本残留的未跟踪文件会被清理（已安装的外壳、LOCAL-CHANGES*、.agents、.claude、*.log 保留）。");
+        notes.push_str("\n注意：上个版本残留的未跟踪文件会被清理（已安装的外壳、LOCAL-CHANGES*、scripts/verify-local-changes.mjs、.agents、.claude、*.log 保留）。");
+        notes.push_str("\n注意：本地内核补丁（text-tool-call 兜底、tool-fs-search 路径预检）会被 reset/clean 抹掉，同步后自动从 checkout 外的规范副本重放；阶段0/2/4 任一步非零退出即判定更新失败。");
         let text = format!(
-            "harness 有新版本：{local} → {remote}。{notes}\n\n现在同步吗？将执行：\n  1. 停止 DSH 服务\n  2. 同步官方最新（fetch --depth 1 + reset，无历史）\n  3. 重建（pnpm install + 官方 artifacts 管线，需几分钟）\n  4. 重启外壳",
+            "harness 有新版本：{local} → {remote}。{notes}\n\n现在同步吗？将执行：\n  1. 停止 DSH 服务\n  2. 同步官方最新（fetch --depth 1 + reset，无历史）\n  3. 重放本地内核补丁（阶段2；锚点失配即中止）\n  4. 重建（pnpm install + 官方 artifacts 管线，需几分钟）\n  5. 校验产物已带补丁（阶段4），通过才重启外壳",
             local = harness_update::short(&info.local),
             remote = harness_update::short(&info.remote),
         );
@@ -804,6 +818,12 @@ fn check_harness_update(app: &AppHandle, interactive: bool) {
 /// the in-flight guard held for the whole run; failures on the sync side
 /// restart the host on the old artifacts, rebuild failures leave the choice
 /// to the user (a half-built tree must not auto-spawn).
+///
+/// Around the sync sit the local-patch stages (see harness_update): 0 records
+/// the pre-overwrite baseline, 2 replays the patches the reset/clean just wiped,
+/// 4 asserts the rebuilt products still carry them. Any non-zero exit there
+/// fails the update — 0 only logs, 2 rolls back to the old artifacts, 4 leaves
+/// the service down rather than boot a build whose defences are silently gone.
 fn apply_harness_update(
     app: &AppHandle,
     root: std::path::PathBuf,
@@ -828,6 +848,36 @@ fn apply_harness_update(
             }
         };
         log(format!("checkout: {}", root.display()));
+        // 补丁门禁：阶段 0 记录基线，阶段 2 重放，阶段 4 校验产物。
+        // replay = 补丁有规范副本可重放；asserted = checkout 带断言可跑门禁。
+        // 两者分开：校验脚本自己丢了，也不能顺手把重放关掉——那正是补丁丢失后
+        // 最可能出现的状态（重放才是恢复手段）。
+        let asserted = !harness_update::skip_local_patches() && harness_update::has_patch_verifier(&root);
+        let replay = !harness_update::skip_local_patches()
+            && (asserted || harness_update::local_patches_dir(&root).is_some());
+        if harness_update::skip_local_patches() {
+            log(format!(
+                "已设置 {}：本次更新跳过补丁阶段 0/2/4",
+                harness_update::SKIP_PATCHES_ENV
+            ));
+        } else if !replay {
+            log(format!(
+                "既没有 scripts/verify-local-changes.mjs 也没有补丁规范副本（{} 未设置）：本次更新无补丁可重放",
+                harness_update::PATCHES_DIR_ENV
+            ));
+        } else if !asserted {
+            log("该 checkout 没有 scripts/verify-local-changes.mjs：仍能重放补丁，但产物无法校验（阶段 0/4 跳过）".into());
+        }
+        if asserted {
+            // 阶段 0（覆盖前）只记录不阻断："更新前就已缺失"正是阶段 2 要修的
+            // 情形，拦住它等于让人无法自愈。
+            tray_notice("harness 更新中：校验补丁基线（阶段 0）…");
+            match harness_update::verify_local_changes(&root, "source", log.clone()) {
+                Ok(()) => log("阶段 0 通过：本地补丁基线完整".into()),
+                Err(e) => log(format!("警告（阶段 0）：更新前补丁基线未通过，阶段 2 将重放补丁：\n{e}")),
+            }
+        }
+        tray_notice("harness 更新中：同步官方最新…");
         let synced = if bootstrap {
             harness_update::bootstrap(&root, &log)
         } else {
@@ -844,14 +894,47 @@ fn apply_harness_update(
                 return;
             }
         }
+        // 阶段 2（重放）：补丁源文件 + agent.ts 四处接线，规范副本在 checkout 外。
+        if replay {
+            tray_notice("harness 更新中：重放本地内核补丁（阶段 2）…");
+            // 重放脚本只看文件在不在，"文件在但内容被清空"也报 OK；所以立刻用
+            // 源码断言复核一遍——缺防线要在几分钟重建之前失败，并报在阶段 2。
+            let replayed = harness_update::restore_local_patches(&root, log.clone())
+                .and_then(|()| {
+                    if asserted {
+                        harness_update::verify_local_changes(&root, "source", log.clone())
+                    } else {
+                        Ok(())
+                    }
+                });
+            if let Err(e) = replayed {
+                log(format!("阶段 2 失败：本地补丁未能重放：\n{e}"));
+                // 源码已在新版本，产物仍是更新前那一套完整的：用它把服务拉回来。
+                // 绝不带着缺防线的源码去构建，更不以新版本启动。
+                manual_restart(&handle);
+                update_notice(&handle, format!("harness 更新失败（阶段 2 重放本地补丁）：\n{e}\n\n已按失败语义中止：未重建、未以新版本启动，DSH 服务已用更新前的产物恢复。锚点失配说明官方代码结构变了，需要人工适配补丁（对照 LOCAL-CHANGES.txt 与 harness-patches），修好后再跑一次更新。"));
+                return;
+            }
+            log("阶段 2 通过：本地补丁已重放，源码断言复核通过".into());
+        }
         tray_notice("harness 更新中：重建…");
         if let Err(e) = harness_update::rebuild(&root, log.clone()) {
             log(format!("重建失败：{e}"));
             update_notice(&handle, format!("harness 更新失败（重建）：\n{e}\n\nDSH 服务保持停止：产物可能不完整，自动重启有崩溃风险。修复后重试更新，或在托盘「重启 DSH 服务」手动拉起。"));
             return;
         }
-        log("重建完成，重启外壳以加载新产物".into());
-        update_notice(&handle, "harness 已同步官方最新并重建完成，即将重启外壳。");
+        // 阶段 4（校验）：产物里必须真的带着那两处防线，否则不启动新版本。
+        if asserted {
+            tray_notice("harness 更新中：校验构建产物（阶段 4）…");
+            if let Err(e) = harness_update::verify_local_changes(&root, "build", log.clone()) {
+                log(format!("阶段 4 失败：构建产物未通过补丁校验：\n{e}"));
+                update_notice(&handle, format!("harness 更新失败（阶段 4 产物校验）：\n{e}\n\n已重建但产物缺少本地防线，按失败语义不启动新版本：DSH 服务保持停止——缺防线的构建会静默退化，比停机更难查。修复后重试更新；确需先跑起来再用托盘「重启 DSH 服务」。"));
+                return;
+            }
+            log("阶段 4 通过：产物已带本地补丁".into());
+        }
+        log("重建与补丁校验完成，重启外壳以加载新产物".into());
+        update_notice(&handle, "harness 已同步官方最新，补丁重放与产物校验均通过，即将重启外壳。");
         handle.restart();
     });
 }

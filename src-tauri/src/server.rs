@@ -202,7 +202,7 @@ fn node_program() -> String {
 /// deploy-harness.ps1 unpacks the official zip — and a terminal user may have no
 /// Node on PATH at all. Only when the checkout has none do we fall back to the
 /// bundled resource or PATH.
-fn node_for_checkout(checkout: &Path) -> String {
+pub(crate) fn node_for_checkout(checkout: &Path) -> String {
     if let Some(explicit) = env_var("DSH_TAURI_NODE") {
         return explicit;
     }

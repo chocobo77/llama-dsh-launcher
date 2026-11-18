@@ -11,8 +11,18 @@
 //!    the stash for manual recovery, never popped), then `reset --hard` to the
 //!    fetched SHA. Untracked paths — built libs, node_modules, the installed
 //!    shell — are never touched; only `reset`-managed files align to upstream.
-//! 3. `rebuild`: `pnpm clean → build:lib → build:web` (`pnpm install` only when
-//!    node_modules is missing), the recipe the deployed artifacts need.
+//! 3. `restore_local_patches`: the checkout is a run source, not a pristine
+//!    official copy — kernel fixes that exist only here (ledger:
+//!    LOCAL-CHANGES.txt) live in its sources, and step 2 wipes them: `reset
+//!    --hard` over the tracked edits, `clean -fd` over the untracked new file.
+//!    The replay reads canonical copies kept OUTSIDE the checkout, so nothing an
+//!    update can wipe is the thing that has to restore it.
+//! 4. `rebuild`: `pnpm install` + the upstream artifacts pipeline (fallback
+//!    `build:lib` + `build:web`), the recipe the deployed artifacts need.
+//! 5. `verify_local_changes --stage build`: the checkout's own assertions must
+//!    hold over the build products the Host actually loads. A non-zero exit in
+//!    2–5 fails the update: the shell is never started on a tree that has
+//!    silently lost its defences (2026-11-16/17, LOCAL-CHANGES.txt).
 //!
 //! Direct git goes out with an HTTP/1.1 retry and then gh-proxy mirrors
 //! (`DSH_GIT_MIRROR` for custom entries) — proven necessary on networks where
@@ -21,6 +31,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Official upstream; a bootstrapped repo gets this remote unless
@@ -430,6 +441,29 @@ fn tail(s: &str, max: usize) -> &str {
     }
 }
 
+/// The checkout's own patch assertions — untracked, so the clean step below has
+/// to spare it or an update deletes the checker it then has to run.
+const VERIFY_SCRIPT: &str = "scripts/verify-local-changes.mjs";
+
+/// `git clean -fd` exclusions: what an update spares on purpose.
+const CLEAN_EXCLUDES: &[&str] = &[
+    "apps/desktop-tauri",
+    "LOCAL-CHANGES*",
+    VERIFY_SCRIPT,
+    ".agents",
+    ".claude",
+    "*.log",
+];
+
+fn clean_args(mode: &str) -> Vec<&str> {
+    let mut args: Vec<&str> = vec!["clean", mode];
+    for exclude in CLEAN_EXCLUDES {
+        args.push("-e");
+        args.push(exclude);
+    }
+    args
+}
+
 fn stash_tracked_changes(git: &Path, root: &Path, log: &dyn Fn(String)) -> bool {
     let (code, sha) = run_git(
         git,
@@ -514,25 +548,7 @@ pub fn sync(root: &Path, log: &dyn Fn(String), reuse_fetch: bool) -> Result<Stri
             return Err(format!("git reset 失败：\n{}", tail(&out, 800)));
         }
         // Dry-run first: what is about to go is logged before it goes.
-        let (_, plan) = run_git(
-            &git,
-            root,
-            &[
-                "clean",
-                "-fdn",
-                "-e",
-                "apps/desktop-tauri",
-                "-e",
-                "LOCAL-CHANGES*",
-                "-e",
-                ".agents",
-                "-e",
-                ".claude",
-                "-e",
-                "*.log",
-            ],
-            SHORT,
-        );
+        let (_, plan) = run_git(&git, root, &clean_args("-fdn"), SHORT);
         if !plan.trim().is_empty() {
             for line in plan.lines().take(20) {
                 log(format!("clean: {line}"));
@@ -542,25 +558,7 @@ pub fn sync(root: &Path, log: &dyn Fn(String), reuse_fetch: bool) -> Result<Stri
                 log(format!("clean: …共 {} 项", plan.lines().count()));
             }
         }
-        let (ccode, clean_out) = run_git(
-            &git,
-            root,
-            &[
-                "clean",
-                "-fd",
-                "-e",
-                "apps/desktop-tauri",
-                "-e",
-                "LOCAL-CHANGES*",
-                "-e",
-                ".agents",
-                "-e",
-                ".claude",
-                "-e",
-                "*.log",
-            ],
-            RESET,
-        );
+        let (ccode, clean_out) = run_git(&git, root, &clean_args("-fd"), RESET);
         if ccode != 0 {
             log(format!("警告：git clean 失败（残留未跟踪文件可能污染下次构建）：\n{}", tail(&clean_out, 400)));
         } else if !clean_out.trim().is_empty() {
@@ -644,7 +642,34 @@ fn run_step<L>(
 where
     L: Fn(String) + Send + Sync + Clone + 'static,
 {
+    run_captured(program, args, cwd, extra_path, log, timeout).0
+}
+
+/// The same, but every streamed line also comes back, so a caller can quote the
+/// script's own verdict ("FAIL 锚点失配…") instead of "步骤失败（exit 1）".
+fn run_captured<L>(
+    program: &Path,
+    args: &[&str],
+    cwd: &Path,
+    extra_path: &Path,
+    log: L,
+    timeout: Duration,
+) -> (Result<(), String>, Vec<String>)
+where
+    L: Fn(String) + Send + Sync + Clone + 'static,
+{
     log(format!("$ {} {}", program.display(), args.join(" ")));
+    let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = {
+        let log = log.clone();
+        let lines = lines.clone();
+        move |line: String| {
+            if !line.trim().is_empty() {
+                lines.lock().unwrap().push(line.clone());
+                log(format!("  {line}"));
+            }
+        }
+    };
     let mut cmd = Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
@@ -659,19 +684,23 @@ where
     // PATH precedence: <harness>\node first, then the inherited PATH.
     let inherited = std::env::var("PATH").unwrap_or_default();
     cmd.env("PATH", format!("{};{}", extra_path.display(), inherited));
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("无法启动 {}：{e}", program.display()))?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return (
+                Err(format!("无法启动 {}：{e}", program.display())),
+                Vec::new(),
+            )
+        }
+    };
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let t_err: std::thread::JoinHandle<()> = {
-        let log = log.clone();
+        let record = record.clone();
         std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {
-                if !line.trim().is_empty() {
-                    log(format!("  {line}"));
-                }
+                record(line);
             }
         })
     };
@@ -684,24 +713,36 @@ where
             break;
         }
         match line {
-            Ok(l) if !l.trim().is_empty() => log(format!("  {l}")),
-            Ok(_) => {}
+            Ok(l) => record(l),
             Err(_) => break,
         }
     }
     if timed_out {
         let _ = child.kill();
         let _ = child.wait();
-        return Err("步骤超时".into());
+        return (
+            Err("步骤超时".into()),
+            lines.lock().unwrap().clone(),
+        );
     }
     let _ = t_err.join();
-    let status = child
-        .wait()
-        .map_err(|e| format!("等待步骤结束失败：{e}"))?;
+    let collected = lines.lock().unwrap().clone();
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(e) => {
+            return (
+                Err(format!("等待步骤结束失败：{e}")),
+                collected,
+            )
+        }
+    };
     if status.success() {
-        Ok(())
+        (Ok(()), collected)
     } else {
-        Err(format!("步骤失败（exit {}）", status.code().unwrap_or(-1)))
+        (
+            Err(format!("步骤失败（exit {}）", status.code().unwrap_or(-1))),
+            collected,
+        )
     }
 }
 
@@ -777,9 +818,190 @@ where
     Ok(())
 }
 
+// ── Local kernel patches: replay (阶段 2) and gates (阶段 0 / 4) ─────────────
+//
+// Why the updater owns this: a wiped patch prints nothing anywhere. The model
+// just starts writing tool calls as prose and no one catches it, until a
+// production session degrades — that is how 2026-11-16/17 went. So the update
+// itself replays the patches and refuses to come back up on a tree that fails
+// its own assertions.
+
+/// Canonical patch copies (restore script + patch sources) live here, outside the
+/// checkout: a copy inside it can be wiped by the very update it must recover.
+pub const PATCHES_DIR_ENV: &str = "DSH_LOCAL_PATCHES_DIR";
+/// Non-empty = run an update with no patch stages at all, for a deployment that
+/// carries no kernel patches. Opting out of the gate stays deliberate & logged.
+pub const SKIP_PATCHES_ENV: &str = "DSH_SKIP_LOCAL_PATCHES";
+const RESTORE_SCRIPT: &str = "restore-local-patches.mjs";
+
+pub fn skip_local_patches() -> bool {
+    std::env::var_os(SKIP_PATCHES_ENV).map_or(false, |v| !v.is_empty())
+}
+
+/// Does this checkout carry its own assertions at all? Without them there is no
+/// verdict to report — that must not read as "the patches are gone".
+pub fn has_patch_verifier(root: &Path) -> bool {
+    root.join(VERIFY_SCRIPT).is_file()
+}
+
+/// Where the canonical copies are. An explicit DSH_LOCAL_PATCHES_DIR is taken
+/// at face value: a wrong one fails loudly rather than falling back to another
+/// tree's copies and silently replaying those instead.
+pub fn local_patches_dir(root: &Path) -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(PATCHES_DIR_ENV).filter(|s| !s.is_empty()) {
+        let dir = PathBuf::from(dir);
+        return dir.join(RESTORE_SCRIPT).is_file().then_some(dir);
+    }
+    local_patches_candidates(root)
+        .into_iter()
+        .find(|dir| dir.join(RESTORE_SCRIPT).is_file())
+}
+
+fn local_patches_candidates(root: &Path) -> Vec<PathBuf> {
+    let mut out = vec![root.join("harness-patches")];
+    if let Some(parent) = root.parent() {
+        out.push(parent.join("harness-patches"));
+    }
+    // Dev layout: <DSH>\dsh-desktop-tauri\src-tauri\target\release\<exe> → <DSH>.
+    if let Ok(exe) = std::env::current_exe() {
+        let mut next = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..6 {
+            let Some(ancestor) = next else { break };
+            out.push(ancestor.join("harness-patches"));
+            next = ancestor.parent().map(|p| p.to_path_buf());
+        }
+    }
+    // This deployment's documented home (UPDATE-RULE-REQUEST.md §4).
+    out.push(PathBuf::from(r"D:\code\DSH\harness-patches"));
+    out
+}
+
+/// The script's verdict, not its progress chatter: what a dialog can show.
+fn patch_verdict(lines: &[String]) -> String {
+    let mut kept: Vec<&str> = lines
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| {
+            l.starts_with("FAIL")
+                || l.starts_with("MISSING")
+                || l.contains("missing —")
+                || l.contains("未应用")
+        })
+        .collect();
+    if kept.is_empty() {
+        if let Some(last) = lines.last() {
+            kept.push(last.trim());
+        }
+    }
+    kept.truncate(8);
+    kept.join("\n")
+}
+
+fn quote_verdict(err: String, out: &[String]) -> String {
+    let verdict = patch_verdict(out);
+    if verdict.is_empty() {
+        err
+    } else {
+        format!("{err}\n{verdict}")
+    }
+}
+
+/// 阶段 0 / 阶段 4: the checkout's own assertions. stage = "source" (the
+/// worktree) or "build" (the lib/ products the Host actually loads). Non-zero
+/// exit ⇒ the update fails; 阶段 0 only records it, because patches already
+/// missing before the overwrite is exactly what 阶段 2 exists to repair.
+pub fn verify_local_changes<L>(root: &Path, stage: &str, log: L) -> Result<(), String>
+where
+    L: Fn(String) + Send + Sync + Clone + 'static,
+{
+    let script = root.join(VERIFY_SCRIPT);
+    if !script.is_file() {
+        return Err(format!("缺少校验脚本：{}", script.display()));
+    }
+    let node = crate::server::node_for_checkout(root);
+    let script_arg = script.to_string_lossy().to_string();
+    let mut argv: Vec<&str> = vec![script_arg.as_str()];
+    if stage == "build" {
+        argv.extend_from_slice(&["--stage", "build"]);
+    }
+    let (result, out) = run_captured(
+        Path::new(&node),
+        &argv,
+        root,
+        &root.join("node"),
+        log,
+        Duration::from_secs(180),
+    );
+    result.map_err(|e| quote_verdict(e, &out))
+}
+
+/// 阶段 2: replay the patch sources and the four anchor wirings. An anchor
+/// mismatch exits 1 by design — a new official structure needs a human, and a
+/// silently skipped patch is the exact failure this stage exists to catch.
+pub fn restore_local_patches<L>(root: &Path, log: L) -> Result<(), String>
+where
+    L: Fn(String) + Send + Sync + Clone + 'static,
+{
+    let dir = local_patches_dir(root).ok_or_else(|| {
+        format!(
+            "找不到 {RESTORE_SCRIPT}（依次查过：{}）。把补丁规范副本放好，或用 {PATCHES_DIR_ENV} 指向它。",
+            local_patches_candidates(root)
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("、")
+        )
+    })?;
+    let script = dir.join(RESTORE_SCRIPT);
+    let node = crate::server::node_for_checkout(root);
+    let script_arg = script.to_string_lossy().to_string();
+    let root_arg = root.to_string_lossy().to_string();
+    let (result, out) = run_captured(
+        Path::new(&node),
+        &[script_arg.as_str(), root_arg.as_str()],
+        root,
+        &root.join("node"),
+        log,
+        Duration::from_secs(300),
+    );
+    result.map_err(|e| quote_verdict(e, &out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_excludes_spare_the_patch_checker() {
+        assert!(CLEAN_EXCLUDES.contains(&VERIFY_SCRIPT));
+        assert!(CLEAN_EXCLUDES.contains(&"LOCAL-CHANGES*"));
+        let args = clean_args("-fd");
+        assert_eq!(args[0], "clean");
+        assert_eq!(args[1], "-fd");
+        assert_eq!(
+            args.iter().filter(|a| **a == "-e").count(),
+            CLEAN_EXCLUDES.len()
+        );
+    }
+
+    #[test]
+    fn patch_verdict_keeps_failures_and_drops_progress() {
+        let lines = vec![
+            "OK   packages/core/agent-loop/src/text-tool-call.ts（新文件已复制）".to_string(),
+            "FAIL turn 收尾: 锚点失配（官方 if 结构变化），需人工适配".to_string(),
+            "2 处补丁未应用——启动流程必须中止，人工恢复后重试".to_string(),
+        ];
+        let v = patch_verdict(&lines);
+        assert!(v.contains("锚点失配"));
+        assert!(!v.contains("OK"));
+    }
+
+    #[test]
+    fn patch_candidates_probe_checkout_sibling_and_documented_home() {
+        let c = local_patches_candidates(Path::new(r"D:\Program files\deepseek-harness"));
+        assert!(c.contains(&PathBuf::from(r"D:\Program files\harness-patches")));
+        assert!(c.contains(&PathBuf::from(r"D:\code\DSH\harness-patches")));
+    }
 
     #[test]
     fn normalizes_remote_forms() {
