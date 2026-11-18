@@ -1,7 +1,14 @@
 @echo off
-chcp 65001 >nul
+rem [ENCODING] This file is intentionally GBK(cp936)-encoded, NOT UTF-8.
+rem Windows 11 24H2+ (KB5132688, installed 2026-11-14) misparses UTF-8 batch
+rem files under `chcp 65001`: line splitting breaks inside multibyte text,
+rem producing "is not recognized" garbage lines and fatal syntax aborts.
+rem The `chcp 936` below pins the parse codepage to the DBCS-stable path.
+rem To edit: iconv -f gbk -t utf-8 -> edit -> iconv -f utf-8 -t gbk.
+rem Never let a UTF-8 editor save this file directly.
+chcp 936 >nul
 setlocal EnableExtensions
-title LlamaDSH å¯åŠ¨å™¨ Â· ä¸€é”®å°åŒ…
+title LlamaDSH Æô¶¯Æ÷ ¡¤ Ò»¼ü·â°ü
 
 set "ROOT=%~dp0"
 set "PROJ=%ROOT%LlamaDSH_Launcher_CS"
@@ -15,69 +22,69 @@ set "LNXSTG=%PROJ%\installer_staging_linux"
 set "SETUPEXE=%PKOUT%\LlamaDSH_Launcher_Setup.exe"
 set "RUNLOG=%ROOT%pack_run.log"
 
-rem æ¯æ­¥å†™é»‘åŒ£å­æ—¥å¿—: é—ªé€€/ä¸­æ–­åå‡­ pack_run.log å®šä½æ–­ç‚¹
->>"%RUNLOG%" echo ==== [%date% %time%] å¼€å§‹ æœºå™¨=%COMPUTERNAME% ç”¨æˆ·=%USERNAME% æ–‡ä»¶=%~f0
+rem Ã¿²½Ğ´ºÚÏ»×ÓÈÕÖ¾: ÉÁÍË/ÖĞ¶ÏºóÆ¾ pack_run.log ¶¨Î»¶Ïµã
+>>"%RUNLOG%" echo ==== [%date% %time%] ¿ªÊ¼ »úÆ÷=%COMPUTERNAME% ÓÃ»§=%USERNAME% ÎÄ¼ş=%~f0
 if exist "%PKOUT%" (
-    >>"%RUNLOG%" echo [%date% %time%] å¯åŠ¨æ—¶ OUTDIR å·²æœ‰å†…å®¹:
+    >>"%RUNLOG%" echo [%date% %time%] Æô¶¯Ê± OUTDIR ÒÑÓĞÄÚÈİ:
     dir /b "%PKOUT%" >>"%RUNLOG%" 2>nul
 ) else (
-    >>"%RUNLOG%" echo [%date% %time%] å¯åŠ¨æ—¶ OUTDIR ä¸å­˜åœ¨
+    >>"%RUNLOG%" echo [%date% %time%] Æô¶¯Ê± OUTDIR ²»´æÔÚ
 )
 
-rem -nopauseï¼ˆä½ç½®ä»»æ„ï¼‰æˆ– set NOPAUSE=1ï¼šè‡ªåŠ¨åŒ–/CI ä¸‹ä¸æŒ‚ä½
+rem -nopause£¨Î»ÖÃÈÎÒâ£©»ò set NOPAUSE=1£º×Ô¶¯»¯/CI ÏÂ²»¹Ò×¡
 set "NOPAUSE="
 if /I "%~1"=="-nopause" set "NOPAUSE=1"
 if /I "%~2"=="-nopause" set "NOPAUSE=1"
 
-rem -tauriï¼ˆä½ç½®ä»»æ„ï¼‰ï¼šé¢å¤–æ„å»º DSH æ¡Œé¢å£³çš„ Tauri å®‰è£…åŒ…ï¼ˆéœ€ Node+pnpm ä¸ Rust MSVC å·¥å…·é“¾ï¼‰
+rem -tauri£¨Î»ÖÃÈÎÒâ£©£º¶îÍâ¹¹½¨ DSH ×ÀÃæ¿ÇµÄ Tauri °²×°°ü£¨Ğè Node+pnpm Óë Rust MSVC ¹¤¾ßÁ´£©
 set "TAURIPACK="
 if /I "%~1"=="-tauri" set "TAURIPACK=1"
 if /I "%~2"=="-tauri" set "TAURIPACK=1"
 if /I "%~3"=="-tauri" set "TAURIPACK=1"
 
 echo ==============================================
-echo   LlamaDSH å¯åŠ¨å™¨ Â· ä¸€é”®å°åŒ…
+echo   LlamaDSH Æô¶¯Æ÷ ¡¤ Ò»¼ü·â°ü
 echo ==============================================
 
-rem ---------- [1/8] å¯é€‰: ç‰ˆæœ¬å·å‚æ•° (ä¸€é”®å°åŒ….cmd 1.2.0 [-nopause] [-tauri]) ----------
+rem ---------- [1/8] ¿ÉÑ¡: °æ±¾ºÅ²ÎÊı (Ò»¼ü·â°ü.cmd 1.2.0 [-nopause] [-tauri]) ----------
 set "VERARG=%~1"
 if /I "%VERARG%"=="-nopause" set "VERARG="
 if /I "%VERARG%"=="-tauri" set "VERARG="
 if "%VERARG%"=="" (
-    echo [1/8] è·³è¿‡ï¼ˆæœªç»™ç‰ˆæœ¬å·å‚æ•°ï¼Œæ²¿ç”¨ installer.iss å½“å‰ç‰ˆæœ¬ï¼‰
+    echo [1/8] Ìø¹ı£¨Î´¸ø°æ±¾ºÅ²ÎÊı£¬ÑØÓÃ installer.iss µ±Ç°°æ±¾£©
     goto :envcheck
 )
-echo [1/8] æ›´æ–°ç‰ˆæœ¬å·: %VERARG%
+echo [1/8] ¸üĞÂ°æ±¾ºÅ: %VERARG%
 echo %VERARG%| findstr /R "^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$" >nul
 if errorlevel 1 (
-    echo   [é”™è¯¯] ç‰ˆæœ¬å·æ ¼å¼åº”ä¸º x.y.zï¼ˆä¾‹å¦‚ 1.2.0ï¼‰
+    echo   [´íÎó] °æ±¾ºÅ¸ñÊ½Ó¦Îª x.y.z£¨ÀıÈç 1.2.0£©
     goto :fail
 )
-rem åªæ›¿æ¢ MyAppVersion é‚£ä¸€è¡Œï¼Œä¿ç•™åŸè¡Œå°¾ï¼ˆCRLFï¼‰ä¸ BOM çŠ¶æ€
+rem Ö»Ìæ»» MyAppVersion ÄÇÒ»ĞĞ£¬±£ÁôÔ­ĞĞÎ²£¨CRLF£©Óë BOM ×´Ì¬
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
  "$p='%ISS%'; $b=[IO.File]::ReadAllBytes($p); $bom=($b.Length -ge 3 -and $b[0] -eq 239 -and $b[1] -eq 187 -and $b[2] -eq 191); $q=[char]34; $t=[IO.File]::ReadAllText($p); $t=[regex]::Replace($t,'(?m)^#define\s+MyAppVersion\s+[^\r\n]*','#define MyAppVersion '+$q+'%VERARG%'+$q); [IO.File]::WriteAllText($p,$t,(New-Object System.Text.UTF8Encoding($bom)))"
 if errorlevel 1 goto :fail
 findstr /C:"#define MyAppVersion" "%ISS%"
-rem åŒä¸€ç‰ˆæœ¬å·å†™è¿› csproj: exe æ–‡ä»¶å±æ€§ä¸ `cli status` æŠ¥å‘Šçš„ç‰ˆæœ¬å¿…é¡»å’Œå®‰è£…åŒ…ä¸€è‡´
+rem Í¬Ò»°æ±¾ºÅĞ´½ø csproj: exe ÎÄ¼şÊôĞÔÓë `cli status` ±¨¸æµÄ°æ±¾±ØĞëºÍ°²×°°üÒ»ÖÂ
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
  "$p='%CSProj%'; $b=[IO.File]::ReadAllBytes($p); $bom=($b.Length -ge 3 -and $b[0] -eq 239 -and $b[1] -eq 187 -and $b[2] -eq 191); $t=[IO.File]::ReadAllText($p); $v='%VERARG%'; $t=[regex]::Replace($t,'(?m)^\s*<Version>[^\u003c]*</Version>','    <Version>'+$v+'</Version>'); $t=[regex]::Replace($t,'(?m)^\s*<AssemblyVersion>[^\u003c]*</AssemblyVersion>','    <AssemblyVersion>'+$v+'.0</AssemblyVersion>'); $t=[regex]::Replace($t,'(?m)^\s*<FileVersion>[^\u003c]*</FileVersion>','    <FileVersion>'+$v+'.0</FileVersion>'); [IO.File]::WriteAllText($p,$t,(New-Object System.Text.UTF8Encoding($bom)))"
 if errorlevel 1 goto :fail
 findstr /C:"<Version>" "%CSProj%"
 
 :envcheck
-echo [2/8] æ£€æŸ¥æ„å»ºç¯å¢ƒ...
-call :log "2/8 ç¯å¢ƒæ£€æŸ¥"
+echo [2/8] ¼ì²é¹¹½¨»·¾³...
+call :log "2/8 »·¾³¼ì²é"
 where dotnet >nul 2>nul
 if errorlevel 1 (
-    echo   [é”™è¯¯] æœªæ‰¾åˆ° dotnet CLIï¼ˆéœ€è¦ .NET 8 SDKï¼‰
+    echo   [´íÎó] Î´ÕÒµ½ dotnet CLI£¨ĞèÒª .NET 8 SDK£©
     goto :fail
 )
-rem Inno Setup è‡ªåŠ¨å®šä½ï¼šæ³¨å†Œè¡¨(64/32 ä½ + å½“å‰ç”¨æˆ·) â†’ å¸¸è§å®‰è£…è·¯å¾„ã€‚
-rem åŸç‰ˆæŠŠ ISCC å†™æ­»ä¸º "C:\Program Files (x86)\Inno Setup 6"ï¼Œæ¢ä¸ªå®‰è£…ä½ç½®/åˆ«çš„ç”¨æˆ·ç›´æ¥å¡åœ¨è¿™ä¸€æ­¥ã€‚
+rem Inno Setup ×Ô¶¯¶¨Î»£º×¢²á±í(64/32 Î» + µ±Ç°ÓÃ»§) ¡ú ³£¼û°²×°Â·¾¶¡£
+rem Ô­°æ°Ñ ISCC Ğ´ËÀÎª "C:\Program Files (x86)\Inno Setup 6"£¬»»¸ö°²×°Î»ÖÃ/±ğµÄÓÃ»§Ö±½Ó¿¨ÔÚÕâÒ»²½¡£
 call :find_iscc "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1"
 call :find_iscc "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1"
 call :find_iscc "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1"
-rem Inno Setup 7 åªä½œå…œåº•ï¼šæœ¬æœºè£…äº† 7 è€Œæ²¡è£… 6 çš„æœºå™¨ä¸è¯¥ç›´æ¥å¡åœ¨ 2/8ï¼ˆè„šæœ¬æŒ‰ 6 çš„è¯­æ³•å†™ï¼Œ6 ä¼˜å…ˆï¼‰
+rem Inno Setup 7 Ö»×÷¶µµ×£º±¾»ú×°ÁË 7 ¶øÃ»×° 6 µÄ»úÆ÷²»¸ÃÖ±½Ó¿¨ÔÚ 2/8£¨½Å±¾°´ 6 µÄÓï·¨Ğ´£¬6 ÓÅÏÈ£©
 call :find_iscc "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 7_is1"
 call :find_iscc "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 7_is1"
 call :find_iscc "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 7_is1"
@@ -89,88 +96,88 @@ for %%P in (
     "%LOCALAPPDATA%\Programs\Inno Setup 7\ISCC.exe"
 ) do if not defined ISCC if exist "%%~P" set "ISCC=%%~P"
 if not defined ISCC (
-    echo   [é”™è¯¯] æœªæ‰¾åˆ° Inno Setup çš„ ISCC.exeï¼ˆ6 æˆ– 7 éƒ½å¯ï¼Œä¼˜å…ˆ 6ï¼‰
-    echo          è¯·å…ˆå®‰è£… Inno Setup 6: https://jrsoftware.org/isdl.php
-    echo          å®‰è£…åé‡è·‘å³å¯ï¼ˆæœ¬è„šæœ¬è‡ªåŠ¨ä»æ³¨å†Œè¡¨å®šä½ï¼Œæ— éœ€æ‰‹æ”¹è·¯å¾„ï¼‰
+    echo   [´íÎó] Î´ÕÒµ½ Inno Setup µÄ ISCC.exe£¨6 »ò 7 ¶¼¿É£¬ÓÅÏÈ 6£©
+    echo          ÇëÏÈ°²×° Inno Setup 6: https://jrsoftware.org/isdl.php
+    echo          °²×°ºóÖØÅÜ¼´¿É£¨±¾½Å±¾×Ô¶¯´Ó×¢²á±í¶¨Î»£¬ÎŞĞèÊÖ¸ÄÂ·¾¶£©
     goto :fail
 )
 if not exist "%CSProj%" (
-    echo   [é”™è¯¯] æœªæ‰¾åˆ°å·¥ç¨‹: %CSProj%
+    echo   [´íÎó] Î´ÕÒµ½¹¤³Ì: %CSProj%
     goto :fail
 )
-echo   dotnet å°±ç»ª
+echo   dotnet ¾ÍĞ÷
 echo   ISCC: %ISCC%
-rem ISCC ç‰ˆæœ¬è¡Œè§ [7/8] ç”Ÿæˆçš„ iscc_build.log ç¬¬ä¸€è¡Œ(è·¨æœºå™¨æ’éšœå…ˆæ¯”å¯¹å®ƒ)
+rem ISCC °æ±¾ĞĞ¼û [7/8] Éú³ÉµÄ iscc_build.log µÚÒ»ĞĞ(¿ç»úÆ÷ÅÅÕÏÏÈ±È¶ÔËü)
 
-rem ä» installer.iss è¯»å–ç‰ˆæœ¬å·, ç”¨äº Linux åŒ…å‘½å (è§£æå¤±è´¥å›é€€ dev)
+rem ´Ó installer.iss ¶ÁÈ¡°æ±¾ºÅ, ÓÃÓÚ Linux °üÃüÃû (½âÎöÊ§°Ü»ØÍË dev)
 set "LNXVER=dev"
 for /f "tokens=3" %%V in ('findstr /C:"#define MyAppVersion" "%ISS%" 2^>nul') do set "LNXVER=%%~V"
 set "LNXVER=%LNXVER:"=%"
 
-rem ---------- [3/8] ç»“æŸè¿è¡Œä¸­çš„å®ä¾‹, é¿å…å‘å¸ƒç›®å½•æ–‡ä»¶è¢«å ç”¨ ----------
-echo [3/8] ç»“æŸè¿è¡Œä¸­çš„ LlamaDSH_Launcher...
+rem ---------- [3/8] ½áÊøÔËĞĞÖĞµÄÊµÀı, ±ÜÃâ·¢²¼Ä¿Â¼ÎÄ¼ş±»Õ¼ÓÃ ----------
+echo [3/8] ½áÊøÔËĞĞÖĞµÄ LlamaDSH_Launcher...
 call :log "3/8 taskkill"
 taskkill /IM LlamaDSH_Launcher.exe /F >nul 2>nul
-rem taskkill /F è¿”å›åè¿›ç¨‹å¯èƒ½ä»æŒæœ‰æ–‡ä»¶å¥æŸ„, å¿…é¡»ç­‰å®ƒçœŸæ­£æ¶ˆå¤±å†æ¸…ç›®å½•/å‘å¸ƒ
+rem taskkill /F ·µ»Øºó½ø³Ì¿ÉÄÜÈÔ³ÖÓĞÎÄ¼ş¾ä±ú, ±ØĞëµÈËüÕæÕıÏûÊ§ÔÙÇåÄ¿Â¼/·¢²¼
 set "WAITN=0"
 :waitproc
 tasklist /FI "IMAGENAME eq LlamaDSH_Launcher.exe" 2>nul | findstr /I "LlamaDSH_Launcher.exe" >nul
 if errorlevel 1 goto :procgone
 set /a WAITN+=1
 if %WAITN% GEQ 20 (
-    echo   [é”™è¯¯] LlamaDSH_Launcher.exe ä»åœ¨è¿è¡Œï¼Œæ— æ³•å®‰å…¨æ”¹å†™äº§ç‰©
+    echo   [´íÎó] LlamaDSH_Launcher.exe ÈÔÔÚÔËĞĞ£¬ÎŞ·¨°²È«¸ÄĞ´²úÎï
     goto :fail
 )
 ping -n 2 127.0.0.1 >nul 2>nul
 goto :waitproc
 :procgone
-echo   å·²ç¡®è®¤æ— è¿è¡Œå®ä¾‹
+echo   ÒÑÈ·ÈÏÎŞÔËĞĞÊµÀı
 
-rem ---------- [4/8] æ„å»º gputemp å¹¶å‘å¸ƒå•æ–‡ä»¶ä¸»ç¨‹åº ----------
-echo [4/8] æ„å»º gputemp å¹¶å‘å¸ƒå•æ–‡ä»¶ä¸»ç¨‹åº (dotnet publish)...
-call :log "4/8 gputemp publish å¼€å§‹"
+rem ---------- [4/8] ¹¹½¨ gputemp ²¢·¢²¼µ¥ÎÄ¼şÖ÷³ÌĞò ----------
+echo [4/8] ¹¹½¨ gputemp ²¢·¢²¼µ¥ÎÄ¼şÖ÷³ÌĞò (dotnet publish)...
+call :log "4/8 gputemp publish ¿ªÊ¼"
 set "GPUBIN=%ROOT%gputemp\bin\Release\net8.0-windows\win-x64\publish\gputemp.exe"
->>"%RUNLOG%" echo [%date% %time%] ç°åœº: CSProj=%CSProj% PUBDIR=%PUBDIR% OUTDIR=%PKOUT%
+>>"%RUNLOG%" echo [%date% %time%] ÏÖ³¡: CSProj=%CSProj% PUBDIR=%PUBDIR% OUTDIR=%PKOUT%
 dotnet publish "%ROOT%gputemp\gputemp.csproj" -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:IncludeAllContentForSelfExtract=true -v q -nologo
 if errorlevel 1 goto :fail
->>"%RUNLOG%" echo [%date% %time%] gputemp publish å PUBDIR:
+>>"%RUNLOG%" echo [%date% %time%] gputemp publish ºó PUBDIR:
 dir /b "%ROOT%gputemp\bin\Release\net8.0-windows\win-x64\publish" >>"%RUNLOG%" 2>nul
->>"%RUNLOG%" echo [%date% %time%] gputemp publish å PKOUT:
+>>"%RUNLOG%" echo [%date% %time%] gputemp publish ºó PKOUT:
 dir /b "%PKOUT%" >>"%RUNLOG%" 2>nul
 if not exist "%GPUBIN%" (
-    echo   [é”™è¯¯] gputemp æ„å»ºäº§ç‰©ç¼ºå¤±: %GPUBIN%
+    echo   [´íÎó] gputemp ¹¹½¨²úÎïÈ±Ê§: %GPUBIN%
     goto :fail
 )
 copy /Y "%GPUBIN%" "%PROJ%\gputemp\gputemp.exe" >nul
 if errorlevel 1 goto :fail
-call :log "4/8 gputemp å®Œæˆ GPUBIN å°±ç»ª"
-call :log "4/8 llamadsh-cli publish å¼€å§‹"
+call :log "4/8 gputemp Íê³É GPUBIN ¾ÍĞ÷"
+call :log "4/8 llamadsh-cli publish ¿ªÊ¼"
 dotnet publish "%ROOT%cli\llamadsh-cli.csproj" -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -v q -nologo
 if errorlevel 1 goto :fail
 set "CLIBIN=%ROOT%cli\bin\Release\net8.0\win-x64\publish\llamadsh-cli.exe"
 if not exist "%CLIBIN%" (
-    echo   [é”™è¯¯] llamadsh-cli æ„å»ºäº§ç‰©ç¼ºå¤±: %CLIBIN%
+    echo   [´íÎó] llamadsh-cli ¹¹½¨²úÎïÈ±Ê§: %CLIBIN%
     goto :fail
 )
-call :log "4/8 llamadsh-cli å®Œæˆ CLIBIN å°±ç»ª"
+call :log "4/8 llamadsh-cli Íê³É CLIBIN ¾ÍĞ÷"
 if exist "%PUBDIR%" (
     rd /s /q "%PUBDIR%"
     if exist "%PUBDIR%" (
-        echo   [é”™è¯¯] æ— æ³•æ¸…ç†å‘å¸ƒç›®å½•ï¼ˆå¯èƒ½è¢«å ç”¨ï¼‰: %PUBDIR%
+        echo   [´íÎó] ÎŞ·¨ÇåÀí·¢²¼Ä¿Â¼£¨¿ÉÄÜ±»Õ¼ÓÃ£©: %PUBDIR%
         goto :fail
     )
 )
 dotnet publish "%CSProj%" -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:IncludeAllContentForSelfExtract=true -v q -nologo
 if errorlevel 1 goto :fail
 if not exist "%PUBDIR%\LlamaDSH_Launcher.exe" (
-    echo   [é”™è¯¯] å‘å¸ƒäº§ç‰©ç¼ºå¤±: %PUBDIR%\LlamaDSH_Launcher.exe
+    echo   [´íÎó] ·¢²¼²úÎïÈ±Ê§: %PUBDIR%\LlamaDSH_Launcher.exe
     goto :fail
 )
 
-rem ---------- [5/8] åˆ·æ–° installer_staging (ISCC çš„æ‰“åŒ…æº, ä¸åˆ·æ–°ä¼šæ‰“è¿›æ—§ç‰ˆç¨‹åº!) ----------
-echo [5/8] åˆ·æ–° installer_staging...
-call :log "4/8 ä¸»ç¨‹åºå‘å¸ƒå®Œæˆ / 5/8 staging å¼€å§‹"
-rem å…ˆæ¸…ç©ºï¼šç¡®ä¿æ‰“è¿›å®‰è£…åŒ…çš„åªæœ‰æœ¬æ¬¡äº§ç‰©ï¼Œå†å²æ®‹ç•™ä¸ä¼šæ··è¿›å»
+rem ---------- [5/8] Ë¢ĞÂ installer_staging (ISCC µÄ´ò°üÔ´, ²»Ë¢ĞÂ»á´ò½ø¾É°æ³ÌĞò!) ----------
+echo [5/8] Ë¢ĞÂ installer_staging...
+call :log "4/8 Ö÷³ÌĞò·¢²¼Íê³É / 5/8 staging ¿ªÊ¼"
+rem ÏÈÇå¿Õ£ºÈ·±£´ò½ø°²×°°üµÄÖ»ÓĞ±¾´Î²úÎï£¬ÀúÊ·²ĞÁô²»»á»ì½øÈ¥
 if exist "%STAGE%" rd /s /q "%STAGE%"
 mkdir "%STAGE%"
 if errorlevel 1 goto :fail
@@ -182,80 +189,80 @@ copy /Y "%CLIBIN%" "%STAGE%\llamadsh-cli.exe" >nul
 if errorlevel 1 goto :fail
 copy /Y "%PROJ%\Resources\app.ico" "%STAGE%\app.ico" >nul
 if errorlevel 1 goto :fail
-rem å°ºå¯¸å…œåº•ï¼šä¸»ç¨‹åºå¼‚å¸¸åå°è¯´æ˜å‘å¸ƒæ²¡çœŸæ­£å®Œæˆ
+rem ³ß´ç¶µµ×£ºÖ÷³ÌĞòÒì³£Æ«Ğ¡ËµÃ÷·¢²¼Ã»ÕæÕıÍê³É
 for %%F in ("%STAGE%\LlamaDSH_Launcher.exe") do if %%~zF LSS 524288 (
-    echo   [é”™è¯¯] ä¸»ç¨‹åºå¼‚å¸¸åå°: %%~zF å­—èŠ‚
+    echo   [´íÎó] Ö÷³ÌĞòÒì³£Æ«Ğ¡: %%~zF ×Ö½Ú
     goto :fail
 )
 
-rem ---------- [6/8] Windows ä¾§å›å½’æµ‹è¯• (selftest.ps1) ----------
-rem å®‰è£…åŒ…ä¸€æ—¦ç”Ÿæˆ, å›å½’å°±å¾—ç­‰äººè¯•è£…æ‰æš´éœ², æ‰€ä»¥ ISCC ä¹‹å‰å…ˆè·‘ä¸€éå¯è‡ªåŠ¨åˆ¤å®šçš„ä¸å˜é‡:
-rem å®‰è£…æ–¹å¼ä¸‰çº§åˆ¤å®š(InstallScope)ã€è¡€ç»Ÿè‡ªé‡å¯ä¸€æ¬¡å°é¡¶(LineageGuard)ã€å®‰è£…åŒ…ä¸ C# çš„
-rem AppId/GUID ä¸€è‡´æ€§ã€å·²ä¿®æ‰çš„é”™è¯¯å†™æ³•ä¸å¾—å¤æ´»ã€‚éœ€è¦ç®¡ç†å‘˜çš„ HKLM ç”¨ä¾‹æ— æƒé™æ—¶åªè®° SKIP,
-rem ä¸ä¼šè¯¯ä¼¤æ‰“åŒ…; çœŸå¤±è´¥å¿…é¡»ä¸­æ­¢(ä¸äº§å‡ºå¸¦å·²çŸ¥å›å½’çš„å®‰è£…åŒ…)ã€‚æµ‹è¯•åªç”¨æ›¿æ¢è¿‡çš„æµ‹è¯• GUID,
-rem ä¸å¾€æœ¬æœºçœŸå®å¸è½½é¡¹å†™ä¸œè¥¿ã€‚
-echo [6/8] Windows å›å½’æµ‹è¯• (selftest.ps1)...
-call :log "6/8 selftest.ps1 å¼€å§‹"
+rem ---------- [6/8] Windows ²à»Ø¹é²âÊÔ (selftest.ps1) ----------
+rem °²×°°üÒ»µ©Éú³É, »Ø¹é¾ÍµÃµÈÈËÊÔ×°²Å±©Â¶, ËùÒÔ ISCC Ö®Ç°ÏÈÅÜÒ»±é¿É×Ô¶¯ÅĞ¶¨µÄ²»±äÁ¿:
+rem °²×°·½Ê½Èı¼¶ÅĞ¶¨(InstallScope)¡¢ÑªÍ³×ÔÖØÆôÒ»´Î·â¶¥(LineageGuard)¡¢°²×°°üÓë C# µÄ
+rem AppId/GUID Ò»ÖÂĞÔ¡¢ÒÑĞŞµôµÄ´íÎóĞ´·¨²»µÃ¸´»î¡£ĞèÒª¹ÜÀíÔ±µÄ HKLM ÓÃÀıÎŞÈ¨ÏŞÊ±Ö»¼Ç SKIP,
+rem ²»»áÎóÉË´ò°ü; ÕæÊ§°Ü±ØĞëÖĞÖ¹(²»²ú³ö´øÒÑÖª»Ø¹éµÄ°²×°°ü)¡£²âÊÔÖ»ÓÃÌæ»»¹ıµÄ²âÊÔ GUID,
+rem ²»Íù±¾»úÕæÊµĞ¶ÔØÏîĞ´¶«Î÷¡£
+echo [6/8] Windows »Ø¹é²âÊÔ (selftest.ps1)...
+call :log "6/8 selftest.ps1 ¿ªÊ¼"
 if not exist "%PKOUT%" mkdir "%PKOUT%"
 if not exist "%PROJ%\selftest.ps1" (
-    echo   [é”™è¯¯] ç¼ºå°‘å›å½’æµ‹è¯•è„šæœ¬: %PROJ%\selftest.ps1
+    echo   [´íÎó] È±ÉÙ»Ø¹é²âÊÔ½Å±¾: %PROJ%\selftest.ps1
     goto :fail
 )
-rem å…ˆåˆ æ—§æ—¥å¿—: å®ƒè¢«åˆ«çš„ç¨‹åºå¼€ç€æ—¶é‡å®šå‘ä¼šå¤±è´¥, é‚£æ—¶å¿…é¡»çœ‹å¾—è§å‘ç”Ÿäº†ä»€ä¹ˆ
+rem ÏÈÉ¾¾ÉÈÕÖ¾: Ëü±»±ğµÄ³ÌĞò¿ª×ÅÊ±ÖØ¶¨Ïò»áÊ§°Ü, ÄÇÊ±±ØĞë¿´µÃ¼û·¢ÉúÁËÊ²Ã´
 del /q "%PKOUT%\selftest.log" >nul 2>nul
-echo   è¿è¡Œä¸­: ç¼–è¯‘è¢«æµ‹æº + è·‘åˆ¤å®šç”¨ä¾‹, çº¦ 5-60 ç§’; ç¼–è¯‘è¶…æ—¶ä¸Šé™ 180 ç§’; å®Œæ•´è¾“å‡ºå†™ installer_output\selftest.log
+echo   ÔËĞĞÖĞ: ±àÒë±»²âÔ´ + ÅÜÅĞ¶¨ÓÃÀı, Ô¼ 5-60 Ãë; ±àÒë³¬Ê±ÉÏÏŞ 180 Ãë; ÍêÕûÊä³öĞ´ installer_output\selftest.log
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJ%\selftest.ps1" > "%PKOUT%\selftest.log" 2>&1
 set "ST_EC=%ERRORLEVEL%"
-rem é€€å‡ºç å¿…é¡»åœ¨ä»»ä½•å…¶å®ƒå‘½ä»¤ä¹‹å‰è½æ—¥å¿—: æ²¡æœ‰å®ƒ, äº‹åæ— æ³•åŒºåˆ†"æµ‹è¯•å¤±è´¥ä¸­æ­¢"ä¸"è¿›ç¨‹è¢«å¤–åŠ›ä¸­æ–­"
-call :log "6/8 selftest é€€å‡ºç  %ST_EC%"
+rem ÍË³öÂë±ØĞëÔÚÈÎºÎÆäËüÃüÁîÖ®Ç°ÂäÈÕÖ¾: Ã»ÓĞËü, ÊÂºóÎŞ·¨Çø·Ö"²âÊÔÊ§°ÜÖĞÖ¹"Óë"½ø³Ì±»ÍâÁ¦ÖĞ¶Ï"
+call :log "6/8 selftest ÍË³öÂë %ST_EC%"
 if not exist "%PKOUT%\selftest.log" (
-    rem è¿™é‡Œä¸èƒ½å†™æ‹¬å·: å®ƒåœ¨ if å—é‡Œ, cmd ä¼šæŠŠ echo æ–‡æœ¬é‡Œçš„æ‹¬å·å½“å—åµŒå¥—, åé¢çš„è¡Œå°±é”™ä½
-    echo   [é”™è¯¯] å›å½’æµ‹è¯•æ²¡äº§ç”Ÿæ—¥å¿—æ–‡ä»¶, å¤šåŠæ˜¯è¾“å‡ºæ–‡ä»¶è¢«å ç”¨, ä¸­æ­¢æ‰“åŒ…
+    rem ÕâÀï²»ÄÜĞ´À¨ºÅ: ËüÔÚ if ¿éÀï, cmd »á°Ñ echo ÎÄ±¾ÀïµÄÀ¨ºÅµ±¿éÇ¶Ì×, ºóÃæµÄĞĞ¾Í´íÎ»
+    echo   [´íÎó] »Ø¹é²âÊÔÃ»²úÉúÈÕÖ¾ÎÄ¼ş, ¶à°ëÊÇÊä³öÎÄ¼ş±»Õ¼ÓÃ, ÖĞÖ¹´ò°ü
     goto :fail
 )
 if not "%ST_EC%"=="0" (
-    rem åªæŠ¥æ¡æ•°ä¸æ—¥å¿—è·¯å¾„: FAIL è¡Œå«æ‹¬å·/ä¸­æ–‡, ç›´æ¥ echo è¿›æ‰¹å¤„ç†å®¹æ˜“è¢«æ‹¬å·æˆªæ–­
+    rem Ö»±¨ÌõÊıÓëÈÕÖ¾Â·¾¶: FAIL ĞĞº¬À¨ºÅ/ÖĞÎÄ, Ö±½Ó echo ½øÅú´¦ÀíÈİÒ×±»À¨ºÅ½Ø¶Ï
     for /f %%C in ('findstr /B /C:"FAIL" "%PKOUT%\selftest.log" ^| find /c /v ""') do call :report_fails %%C
-    echo          ä¸­æ­¢æ‰“åŒ…ã€‚è¯¦æƒ…: %PKOUT%\selftest.log
+    echo          ÖĞÖ¹´ò°ü¡£ÏêÇé: %PKOUT%\selftest.log
     goto :fail
 )
 for /f "delims=" %%L in ('findstr /B /C:"SUMMARY" "%PKOUT%\selftest.log"') do echo   %%L
-call :log "6/8 selftest é€šè¿‡"
+call :log "6/8 selftest Í¨¹ı"
 
-rem ---------- [7/8] ç”Ÿæˆå®‰è£…åŒ… ----------
-echo [7/8] ç”Ÿæˆå®‰è£…åŒ… (Inno Setup)...
+rem ---------- [7/8] Éú³É°²×°°ü ----------
+echo [7/8] Éú³É°²×°°ü (Inno Setup)...
 if not exist "%PKOUT%" mkdir "%PKOUT%"
-rem å…ˆæŠŠä¸Šä¸€è½®çš„ Setup.exe æ¸…æ‰å†è°ƒ ISCC: æœ¬è½®è‹¥åœ¨ç¼–è¯‘è¿™ä¸€æ­¥å¤±è´¥, ç›®å½•é‡Œå°±ä¸è¯¥è¿˜ç•™ç€ä¸€ä¸ª
-rem "åå­—å’Œå¤§å°éƒ½è·Ÿæœ¬è½®äº§ç‰©ä¸€æ¨¡ä¸€æ ·"çš„æ—§åŒ…(å®æµ‹å‡ºç°è¿‡: [6/8] ä¸­æ­¢åç›®å½•é‡Œä»æ˜¯ä¸Šä¸€è½®çš„åŒ…)ã€‚
+rem ÏÈ°ÑÉÏÒ»ÂÖµÄ Setup.exe ÇåµôÔÙµ÷ ISCC: ±¾ÂÖÈôÔÚ±àÒëÕâÒ»²½Ê§°Ü, Ä¿Â¼Àï¾Í²»¸Ã»¹Áô×ÅÒ»¸ö
+rem "Ãû×ÖºÍ´óĞ¡¶¼¸ú±¾ÂÖ²úÎïÒ»Ä£Ò»Ñù"µÄ¾É°ü(Êµ²â³öÏÖ¹ı: [6/8] ÖĞÖ¹ºóÄ¿Â¼ÀïÈÔÊÇÉÏÒ»ÂÖµÄ°ü)¡£
 if exist "%SETUPEXE%" (
     del /q "%SETUPEXE%" >nul 2>nul
-    call :log "7/8 å…ˆåˆ é™¤ä¸Šä¸€è½® Setup.exe, é¿å…ä¸æœ¬è½®äº§ç‰©æ··æ·†"
+    call :log "7/8 ÏÈÉ¾³ıÉÏÒ»ÂÖ Setup.exe, ±ÜÃâÓë±¾ÂÖ²úÎï»ìÏı"
 )
-rem ISCC å®Œæ•´è¾“å‡ºå§‹ç»ˆå†™å…¥æ—¥å¿—æ–‡ä»¶(æˆåŠŸæ—¶ :cleanup ä¼šåˆ æ‰; å¤±è´¥æ—¶ä¿ç•™ä¾›æ’æŸ¥)
+rem ISCC ÍêÕûÊä³öÊ¼ÖÕĞ´ÈëÈÕÖ¾ÎÄ¼ş(³É¹¦Ê± :cleanup »áÉ¾µô; Ê§°ÜÊ±±£Áô¹©ÅÅ²é)
 "%ISCC%" "%ISS%" > "%PKOUT%\iscc_build.log" 2>&1
 if errorlevel 1 (
-    echo   [é”™è¯¯] Inno Setup ç¼–è¯‘å¤±è´¥ï¼ˆé€€å‡ºç  %errorlevel%ï¼‰
-    echo   å®Œæ•´æ—¥å¿—: %PKOUT%\iscc_build.log  â€”â€”æœ€å 30 è¡Œå¦‚ä¸‹:
+    echo   [´íÎó] Inno Setup ±àÒëÊ§°Ü£¨ÍË³öÂë %errorlevel%£©
+    echo   ÍêÕûÈÕÖ¾: %PKOUT%\iscc_build.log  ¡ª¡ª×îºó 30 ĞĞÈçÏÂ:
     echo   ------------------------------------------------------------
     powershell -NoProfile -Command "Get-Content -LiteralPath '%PKOUT%\iscc_build.log' -Tail 30"
     echo   ------------------------------------------------------------
-    echo   å¸¸è§åŸå› : â‘  Setup.exe æ­£è¢«å ç”¨ï¼ˆåŒå‡»è¿‡å®‰è£…åŒ…/æ€è½¯æ‰«æä¸­ï¼‰, å…³æ‰åé‡è·‘;
-    echo             â‘¡ ç£ç›˜æ»¡æˆ– installer_output ç›®å½•æƒé™é—®é¢˜ã€‚
+    echo   ³£¼ûÔ­Òò: ¢Ù Setup.exe Õı±»Õ¼ÓÃ£¨Ë«»÷¹ı°²×°°ü/É±ÈíÉ¨ÃèÖĞ£©, ¹ØµôºóÖØÅÜ;
+    echo             ¢Ú ´ÅÅÌÂú»ò installer_output Ä¿Â¼È¨ÏŞÎÊÌâ¡£
     goto :fail
 )
 if not exist "%SETUPEXE%" (
-    echo   [é”™è¯¯] æœªç”Ÿæˆå®‰è£…åŒ…: %SETUPEXE%
+    echo   [´íÎó] Î´Éú³É°²×°°ü: %SETUPEXE%
     goto :fail
 )
 for %%F in ("%SETUPEXE%") do if %%~zF LSS 1048576 (
-    echo   [é”™è¯¯] å®‰è£…åŒ…å¼‚å¸¸åå°: %%~zF å­—èŠ‚
+    echo   [´íÎó] °²×°°üÒì³£Æ«Ğ¡: %%~zF ×Ö½Ú
     goto :fail
 )
 
-call :log "7/8 ISCC ç¼–è¯‘é€šè¿‡"
-rem ---------- [6.5] ä»£ç ç­¾å(å¯é€‰): å­˜åœ¨ %PROJ%\signtool-config.inc æ‰æ‰§è¡Œ ----------
-rem è¯¥æ–‡ä»¶ä¸å…¥åº“(è§ .gitignore), ä» signtool-config.inc.example å¤åˆ¶å¡«å†™; å†…å®¹æ˜¯ä¸€è¡Œ
-rem   SIGNCMD=<ç­¾åå‘½ä»¤, ç”¨ %SETUPFILE% å ä½å®‰è£…åŒ…è·¯å¾„>
+call :log "7/8 ISCC ±àÒëÍ¨¹ı"
+rem ---------- [6.5] ´úÂëÇ©Ãû(¿ÉÑ¡): ´æÔÚ %PROJ%\signtool-config.inc ²ÅÖ´ĞĞ ----------
+rem ¸ÃÎÄ¼ş²»Èë¿â(¼û .gitignore), ´Ó signtool-config.inc.example ¸´ÖÆÌîĞ´; ÄÚÈİÊÇÒ»ĞĞ
+rem   SIGNCMD=<Ç©ÃûÃüÁî, ÓÃ %SETUPFILE% Õ¼Î»°²×°°üÂ·¾¶>
 set "SIGNCMD="
 set "SIGINC=%PROJ%\signtool-config.inc"
 if exist "%SIGINC%" (
@@ -264,147 +271,147 @@ if exist "%SIGINC%" (
     )
 )
 if defined SIGNCMD (
-    echo [ç­¾å] æ­£åœ¨å¯¹å®‰è£…åŒ…åšä»£ç ç­¾å...
-    call :log "6.5 ç­¾åæ‰§è¡Œä¸­"
+    echo [Ç©Ãû] ÕıÔÚ¶Ô°²×°°ü×ö´úÂëÇ©Ãû...
+    call :log "6.5 Ç©ÃûÖ´ĞĞÖĞ"
     set "SETUPFILE=%SETUPEXE%"
-    rem call äºŒæ¬¡å±•å¼€: SIGNCMD é‡Œçš„ %SETUPFILE% åœ¨è¿è¡Œæ—¶æ›¿æ¢ä¸ºå®‰è£…åŒ…å®Œæ•´è·¯å¾„
+    rem call ¶ş´ÎÕ¹¿ª: SIGNCMD ÀïµÄ %SETUPFILE% ÔÚÔËĞĞÊ±Ìæ»»Îª°²×°°üÍêÕûÂ·¾¶
     call %SIGNCMD%
     if errorlevel 1 (
-        echo   [é”™è¯¯] ç­¾åå¤±è´¥â€”â€”æœªç­¾åçš„å®‰è£…åŒ…ä¸å¯¹å¤–åˆ†å‘, ä¸­æ­¢
+        echo   [´íÎó] Ç©ÃûÊ§°Ü¡ª¡ªÎ´Ç©ÃûµÄ°²×°°ü²»¶ÔÍâ·Ö·¢, ÖĞÖ¹
         set "SIGNCMD="
         set "SETUPFILE="
         goto :fail
     )
-    powershell -NoProfile -Command "$s=Get-AuthenticodeSignature -LiteralPath '%SETUPEXE%'; if ($s.Status -ne 'Valid') { Write-Host '  [é”™è¯¯] ç­¾åéªŒè¯å¤±è´¥:' $s.Status; exit 1 } else { Write-Host ('  ç­¾åæœ‰æ•ˆ: ' + $s.SignerCertificate.Subject) }"
+    powershell -NoProfile -Command "$s=Get-AuthenticodeSignature -LiteralPath '%SETUPEXE%'; if ($s.Status -ne 'Valid') { Write-Host '  [´íÎó] Ç©ÃûÑéÖ¤Ê§°Ü:' $s.Status; exit 1 } else { Write-Host ('  Ç©ÃûÓĞĞ§: ' + $s.SignerCertificate.Subject) }"
     if errorlevel 1 goto :fail
 ) else (
-    echo [ç­¾å] æœªé…ç½® signtool-config.inc, è·³è¿‡ä»£ç ç­¾åï¼ˆåˆ†å‘ç»™ä»–äººä¼šé‡ SmartScreen è­¦å‘Šï¼‰
-    call :log "6.5 æ— ç­¾åé…ç½® è·³è¿‡"
+    echo [Ç©Ãû] Î´ÅäÖÃ signtool-config.inc, Ìø¹ı´úÂëÇ©Ãû£¨·Ö·¢¸øËûÈË»áÓö SmartScreen ¾¯¸æ£©
+    call :log "6.5 ÎŞÇ©ÃûÅäÖÃ Ìø¹ı"
 )
 set "SIGNCMD="
 set "SETUPFILE="
 
-rem ---------- [8/8] æ‰“åŒ… Linux å¤åˆ»ç‰ˆ (Python æºç  zip, æ’é™¤ç¼“å­˜ä¸æµ‹è¯•äº§ç‰©) ----------
+rem ---------- [8/8] ´ò°ü Linux ¸´¿Ì°æ (Python Ô´Âë zip, ÅÅ³ı»º´æÓë²âÊÔ²úÎï) ----------
 set "LNXZIP=%PKOUT%\LlamaDSH_Launcher_Linux_%LNXVER%.zip"
 if not exist "%LNXSRC%\main.py" (
-    echo [8/8] è·³è¿‡ Linux å¯åŠ¨å™¨æ‰“åŒ…ï¼ˆæœªæ‰¾åˆ° %LNXSRC%\main.pyï¼‰
+    echo [8/8] Ìø¹ı Linux Æô¶¯Æ÷´ò°ü£¨Î´ÕÒµ½ %LNXSRC%\main.py£©
     goto :tauri_step
 )
-echo [8/8] æ‰“åŒ… Linux å¯åŠ¨å™¨...
-call :log "8/8 linux zip å¼€å§‹"
+echo [8/8] ´ò°ü Linux Æô¶¯Æ÷...
+call :log "8/8 linux zip ¿ªÊ¼"
 if exist "%LNXSTG%" rd /s /q "%LNXSTG%"
 mkdir "%LNXSTG%"
 robocopy "%LNXSRC%" "%LNXSTG%" /E /XD __pycache__ gui-test-screenshots .git dist /XF *.pyc >nul
-rem robocopy é€€å‡ºç  <8 å‡ä¸ºæˆåŠŸ
+rem robocopy ÍË³öÂë <8 ¾ùÎª³É¹¦
 if errorlevel 8 goto :fail
-rem å…ˆå‹åˆ°ä¸´æ—¶å, æˆåŠŸåæ‰æ›¿æ¢æ—§åŒ…â€”â€”ä¸­é€”å¤±è´¥ä¸ä¼šæŠŠä¸Šæ¬¡çš„å¥½åŒ…åˆ æ‰
+rem ÏÈÑ¹µ½ÁÙÊ±Ãû, ³É¹¦ºó²ÅÌæ»»¾É°ü¡ª¡ªÖĞÍ¾Ê§°Ü²»»á°ÑÉÏ´ÎµÄºÃ°üÉ¾µô
 set "LNXTMPZIP=%PKOUT%\_linux_new.zip"
 if exist "%LNXTMPZIP%" del /f /q "%LNXTMPZIP%"
-rem æ€è½¯å¸¸å®æ—¶æ‰«æåˆšç”Ÿæˆçš„æ–‡ä»¶å¯¼è‡´å¶å‘å…±äº«å†²çª, å¤±è´¥è‡ªåŠ¨é‡è¯•ä¸€æ¬¡
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Compress-Archive -Path '%LNXSTG%\*' -DestinationPath '%LNXTMPZIP%' -Force -ErrorAction Stop } catch { Write-Host ('  å‹ç¼©å‡ºé”™: ' + $_.Exception.Message); exit 1 }"
+rem É±Èí³£ÊµÊ±É¨Ãè¸ÕÉú³ÉµÄÎÄ¼şµ¼ÖÂÅ¼·¢¹²Ïí³åÍ», Ê§°Ü×Ô¶¯ÖØÊÔÒ»´Î
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Compress-Archive -Path '%LNXSTG%\*' -DestinationPath '%LNXTMPZIP%' -Force -ErrorAction Stop } catch { Write-Host ('  Ñ¹Ëõ³ö´í: ' + $_.Exception.Message); exit 1 }"
 if errorlevel 1 (
-    echo   é‡è¯•ä¸€æ¬¡...
+    echo   ÖØÊÔÒ»´Î...
     ping -n 3 127.0.0.1 >nul 2>nul
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Compress-Archive -Path '%LNXSTG%\*' -DestinationPath '%LNXTMPZIP%' -Force -ErrorAction Stop } catch { Write-Host ('  å‹ç¼©å‡ºé”™: ' + $_.Exception.Message); exit 1 }"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Compress-Archive -Path '%LNXSTG%\*' -DestinationPath '%LNXTMPZIP%' -Force -ErrorAction Stop } catch { Write-Host ('  Ñ¹Ëõ³ö´í: ' + $_.Exception.Message); exit 1 }"
     if errorlevel 1 goto :fail
 )
 if not exist "%LNXTMPZIP%" (
-    echo   [é”™è¯¯] æœªç”Ÿæˆ Linux ä¸´æ—¶åŒ…: %LNXTMPZIP%
+    echo   [´íÎó] Î´Éú³É Linux ÁÙÊ±°ü: %LNXTMPZIP%
     goto :fail
 )
 if exist "%LNXZIP%" del /f /q "%LNXZIP%"
 ren "%LNXTMPZIP%" "LlamaDSH_Launcher_Linux_%LNXVER%.zip"
 if errorlevel 1 (
-    echo   [é”™è¯¯] æ›¿æ¢æ—§åŒ…å¤±è´¥, æ–°åŒ…ä¿ç•™åœ¨: %LNXTMPZIP%
+    echo   [´íÎó] Ìæ»»¾É°üÊ§°Ü, ĞÂ°ü±£ÁôÔÚ: %LNXTMPZIP%
     goto :fail
 )
-call :log "8/8 zip å®Œæˆ"
-rem æ‰“å®Œå³æ¸…ç† staging å‰¯æœ¬ï¼ˆå¦åˆ™ä»“åº“é‡Œé•¿æœŸç•™ä¸€ä»½å®Œæ•´æºç æ‹·è´ï¼‰
+call :log "8/8 zip Íê³É"
+rem ´òÍê¼´ÇåÀí staging ¸±±¾£¨·ñÔò²Ö¿âÀï³¤ÆÚÁôÒ»·İÍêÕûÔ´Âë¿½±´£©
 if exist "%LNXSTG%" rd /s /q "%LNXSTG%"
 
 :tauri_step
-rem ---------- [9/8] å¯é€‰: DSH æ¡Œé¢å£³ Tauri å®‰è£…åŒ… (ä¼  -tauri æ‰æ‰§è¡Œ) ----------
+rem ---------- [9/8] ¿ÉÑ¡: DSH ×ÀÃæ¿Ç Tauri °²×°°ü (´« -tauri ²ÅÖ´ĞĞ) ----------
 if not defined TAURIPACK goto :cleanup
-echo [9/8] æ„å»º DSH æ¡Œé¢å£³ Tauri å®‰è£…åŒ…...
-call :log "9/8 tauri å¼€å§‹"
+echo [9/8] ¹¹½¨ DSH ×ÀÃæ¿Ç Tauri °²×°°ü...
+call :log "9/8 tauri ¿ªÊ¼"
 set "TAURIDIR=%ROOT%dsh-desktop-tauri"
 where pnpm >nul 2>nul
 if errorlevel 1 goto :fail_tauri_tool
 where cargo >nul 2>nul
 if errorlevel 1 goto :fail_tauri_tool
 if not exist "%TAURIDIR%\keys\updater.key" goto :fail_tauri_key
-echo   pnpm install + tauri buildã€‚Rust å…¨é‡ç¼–è¯‘ç¬¬ä¸€å›å¯èƒ½è¦åå‡ åˆ†é’Ÿï¼Œåç»­èµ°å¢é‡ã€‚
+echo   pnpm install + tauri build¡£Rust È«Á¿±àÒëµÚÒ»»Ø¿ÉÄÜÒªÊ®¼¸·ÖÖÓ£¬ºóĞø×ßÔöÁ¿¡£
 pushd "%TAURIDIR%"
-rem ç­¾åç§é’¥æŒ‰ Tauri å®˜æ–¹å£å¾„ç»ç¯å¢ƒå˜é‡ä¼ å…¥ï¼ˆå†…å®¹å¤šè¡Œï¼Œcmd çš„ for /f è¯»ä¸äº†ï¼‰ï¼Œ
-rem å¯†ç æŒ‰ keys ç”Ÿæˆæ—¶çš„çº¦å®šä¸ºç©ºä¸²ï¼›env åªå­˜åœ¨äºæœ¬æ¬¡ powershell è¿›ç¨‹ï¼Œä¸è½ç›˜ã€‚
+rem Ç©ÃûË½Ô¿°´ Tauri ¹Ù·½¿Ú¾¶¾­»·¾³±äÁ¿´«Èë£¨ÄÚÈİ¶àĞĞ£¬cmd µÄ for /f ¶Á²»ÁË£©£¬
+rem ÃÜÂë°´ keys Éú³ÉÊ±µÄÔ¼¶¨Îª¿Õ´®£»env Ö»´æÔÚÓÚ±¾´Î powershell ½ø³Ì£¬²»ÂäÅÌ¡£
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content -Raw 'keys\updater.key'; $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ''; pnpm install --frozen-lockfile; if ($LASTEXITCODE) { exit 1 }; pnpm run build; if ($LASTEXITCODE) { exit 1 }"
 set "TAURI_ERR=%errorlevel%"
 popd
 if not "%TAURI_ERR%"=="0" goto :fail_tauri_build
-rem äº§ç‰©å­˜åœ¨æ€§å…œåº•: tauri æç«¯æƒ…å†µé€€å‡ºç  0 ä½† makensis æ²¡å‡ºåŒ…, ä¸èƒ½æŠ¥æˆåŠŸ
+rem ²úÎï´æÔÚĞÔ¶µµ×: tauri ¼«¶ËÇé¿öÍË³öÂë 0 µ« makensis Ã»³ö°ü, ²»ÄÜ±¨³É¹¦
 dir /b "%TAURIDIR%\src-tauri\target\release\bundle\nsis\*.exe" >nul 2>nul
 if errorlevel 1 goto :fail_tauri_build
-echo   Tauri äº§ç‰©åœ¨: %TAURIDIR%\src-tauri\target\release\bundle\nsis\
-echo   å« setup.exe ä¸ .sig æ›´æ–°ç­¾åï¼›å‘ feed ç”¨ dsh-desktop-tauri\scripts\publish-updates.mjsã€‚
-call :log "9/8 tauri å®Œæˆ"
+echo   Tauri ²úÎïÔÚ: %TAURIDIR%\src-tauri\target\release\bundle\nsis\
+echo   º¬ setup.exe Óë .sig ¸üĞÂÇ©Ãû£»·¢ feed ÓÃ dsh-desktop-tauri\scripts\publish-updates.mjs¡£
+call :log "9/8 tauri Íê³É"
 goto :cleanup
 
 :fail_tauri_tool
-echo   [é”™è¯¯] æœªæ‰¾åˆ° pnpm æˆ– cargoã€‚æ¡Œé¢å£³æ„å»ºéœ€è¦ Node+pnpm ä¸ Rust MSVC å·¥å…·é“¾ã€‚
+echo   [´íÎó] Î´ÕÒµ½ pnpm »ò cargo¡£×ÀÃæ¿Ç¹¹½¨ĞèÒª Node+pnpm Óë Rust MSVC ¹¤¾ßÁ´¡£
 goto :fail
 :fail_tauri_key
-echo   [é”™è¯¯] ç¼ºå°‘æ›´æ–°ç­¾åç§é’¥ %TAURIDIR%\keys\updater.key â€”â€” å®ƒè¢« gitignoreï¼Œé¡»æŒ‰æ¡Œé¢å£³ README åœ¨æœ¬æœºå¤‡å¥½ã€‚
+echo   [´íÎó] È±ÉÙ¸üĞÂÇ©ÃûË½Ô¿ %TAURIDIR%\keys\updater.key ¡ª¡ª Ëü±» gitignore£¬Ğë°´×ÀÃæ¿Ç README ÔÚ±¾»ú±¸ºÃ¡£
 goto :fail
 :fail_tauri_build
-echo   [é”™è¯¯] Tauri æ„å»ºå¤±è´¥ï¼Œè¯¦è§ä¸Šæ–¹è¾“å‡ºã€‚
+echo   [´íÎó] Tauri ¹¹½¨Ê§°Ü£¬Ïê¼ûÉÏ·½Êä³ö¡£
 goto :fail
 
 :cleanup
-call :log "cleanup æ¸…ç†è¾“å‡ºç›®å½•"
-rem æ¸…ç†è¾“å‡ºç›®å½•, åªä¿ç•™ Setup.exe ä¸ Linux zip (é˜²æ­¢å†å²æ•£æ–‡ä»¶æ··å…¥è¯¯å¯¼)
+call :log "cleanup ÇåÀíÊä³öÄ¿Â¼"
+rem ÇåÀíÊä³öÄ¿Â¼, Ö»±£Áô Setup.exe Óë Linux zip (·ÀÖ¹ÀúÊ·É¢ÎÄ¼ş»ìÈëÎóµ¼)
 if exist "%PKOUT%" powershell -NoProfile -Command "Get-ChildItem -LiteralPath '%PKOUT%' | Where-Object { $_.Name -ne 'LlamaDSH_Launcher_Setup.exe' -and $_.Name -notlike 'LlamaDSH_Launcher_Linux_*.zip' } | Remove-Item -Recurse -Force"
 
 echo.
 echo ==============================================
-echo   å°åŒ…å®Œæˆ
+echo   ·â°üÍê³É
 set "SETUP_HASH="
 set "ZIP_HASH="
 call :hash "%SETUPEXE%" SETUP_HASH
-for %%F in ("%SETUPEXE%") do echo   å®‰è£…åŒ…: %%~fF
-for %%F in ("%SETUPEXE%") do echo          å¤§å° %%~zF å­—èŠ‚  SHA256 %SETUP_HASH%
-rem æ³¨æ„ï¼šä¸èƒ½åœ¨ if(...) å—é‡Œ echo åˆšç”± call èµ‹å€¼çš„å˜é‡â€”â€”å—åœ¨è§£ææœŸå°±å±•å¼€äº†å®ƒï¼Œä¼šæ‰“å°ç©ºå€¼
+for %%F in ("%SETUPEXE%") do echo   °²×°°ü: %%~fF
+for %%F in ("%SETUPEXE%") do echo          ´óĞ¡ %%~zF ×Ö½Ú  SHA256 %SETUP_HASH%
+rem ×¢Òâ£º²»ÄÜÔÚ if(...) ¿éÀï echo ¸ÕÓÉ call ¸³ÖµµÄ±äÁ¿¡ª¡ª¿éÔÚ½âÎöÆÚ¾ÍÕ¹¿ªÁËËü£¬»á´òÓ¡¿ÕÖµ
 if exist "%LNXZIP%" call :hash "%LNXZIP%" ZIP_HASH
-if exist "%LNXZIP%" for %%F in ("%LNXZIP%") do echo   Linux åŒ…: %%~fF
-if exist "%LNXZIP%" for %%F in ("%LNXZIP%") do echo          å¤§å° %%~zF å­—èŠ‚  SHA256 %ZIP_HASH%
-echo   å•æ–‡ä»¶ä¸»ç¨‹åº: %PUBDIR%\LlamaDSH_Launcher.exe
+if exist "%LNXZIP%" for %%F in ("%LNXZIP%") do echo   Linux °ü: %%~fF
+if exist "%LNXZIP%" for %%F in ("%LNXZIP%") do echo          ´óĞ¡ %%~zF ×Ö½Ú  SHA256 %ZIP_HASH%
+echo   µ¥ÎÄ¼şÖ÷³ÌĞò: %PUBDIR%\LlamaDSH_Launcher.exe
 findstr /C:"#define MyAppVersion" "%ISS%"
 echo ==============================================
 call :do_pause
 exit /b 0
 
 :find_iscc
-rem %~1 = æ³¨å†Œè¡¨é”®ï¼›è¯»å– InstallLocation å¹¶éªŒè¯ ISCC.exe æ˜¯å¦å­˜åœ¨
+rem %~1 = ×¢²á±í¼ü£»¶ÁÈ¡ InstallLocation ²¢ÑéÖ¤ ISCC.exe ÊÇ·ñ´æÔÚ
 if defined ISCC exit /b 0
 for /f "tokens=2,*" %%A in ('reg query %1 /v InstallLocation 2^>nul') do if not defined ISCC if exist "%%BISCC.exe" set "ISCC=%%BISCC.exe"
 exit /b 0
 
 :report_fails
-rem %~1 = selftest.log é‡Œ FAIL è¡Œæ•°ã€‚è®¡æ•°ä¸º 0 è¯´æ˜æµ‹è¯•è¿›ç¨‹æ ¹æœ¬æ²¡è·‘åˆ°æ–­è¨€ï¼ˆå´©äº†/è¢«ä¸­æ–­/ç¼–è¯‘å¤±è´¥ï¼‰ï¼Œ
-rem ä¸èƒ½æŠ¥æˆ"0 é¡¹æœªé€šè¿‡"â€”â€”é‚£è¯»èµ·æ¥åƒæµ‹è¯•å…¨è¿‡ï¼Œä¼šæŠŠäººå¼•å‘é”™è¯¯çš„æ’æŸ¥æ–¹å‘ã€‚
+rem %~1 = selftest.log Àï FAIL ĞĞÊı¡£¼ÆÊıÎª 0 ËµÃ÷²âÊÔ½ø³Ì¸ù±¾Ã»ÅÜµ½¶ÏÑÔ£¨±ÀÁË/±»ÖĞ¶Ï/±àÒëÊ§°Ü£©£¬
+rem ²»ÄÜ±¨³É"0 ÏîÎ´Í¨¹ı"¡ª¡ªÄÇ¶ÁÆğÀ´Ïñ²âÊÔÈ«¹ı£¬»á°ÑÈËÒıÏò´íÎóµÄÅÅ²é·½Ïò¡£
 if "%~1"=="0" (
-    echo   [é”™è¯¯] å›å½’æµ‹è¯•è¿›ç¨‹å¼‚å¸¸é€€å‡º: æ—¥å¿—é‡Œæ²¡æœ‰ FAIL è¡Œ, å¤šåŠæ˜¯æµ‹è¯•è‡ªèº«å´©äº†æˆ–è¢«å¤–åŠ›ä¸­æ–­
+    echo   [´íÎó] »Ø¹é²âÊÔ½ø³ÌÒì³£ÍË³ö: ÈÕÖ¾ÀïÃ»ÓĞ FAIL ĞĞ, ¶à°ëÊÇ²âÊÔ×ÔÉí±ÀÁË»ò±»ÍâÁ¦ÖĞ¶Ï
 ) else (
-    echo   [é”™è¯¯] å›å½’æµ‹è¯• %~1 é¡¹æœªé€šè¿‡
+    echo   [´íÎó] »Ø¹é²âÊÔ %~1 ÏîÎ´Í¨¹ı
 )
 exit /b 0
 
 :log
-rem %~1 = æ­¥éª¤æ ‡è®°, è¿½åŠ ä¸€è¡Œå¸¦æ—¶é—´æˆ³çš„é»‘åŒ£å­è®°å½•
+rem %~1 = ²½Öè±ê¼Ç, ×·¼ÓÒ»ĞĞ´øÊ±¼ä´ÁµÄºÚÏ»×Ó¼ÇÂ¼
 >>"%RUNLOG%" echo [%date% %time%] %~1
 exit /b 0
 
 :hash
-rem %~1 = æ–‡ä»¶ï¼Œ%~2 = æ¥æ”¶ SHA256 çš„å˜é‡å
+rem %~1 = ÎÄ¼ş£¬%~2 = ½ÓÊÕ SHA256 µÄ±äÁ¿Ãû
 set "%~2="
 if not exist "%~1" exit /b 0
 for /f "skip=1 tokens=*" %%H in ('certutil -hashfile "%~1" SHA256 2^>nul') do if not defined %~2 set "%~2=%%H"
@@ -417,11 +424,11 @@ exit /b 0
 
 :fail
 echo.
-echo   [å°åŒ…å¤±è´¥] è¯·æ£€æŸ¥ä¸Šæ–¹é”™è¯¯ä¿¡æ¯
-echo   æç¤º: è¾“å‡ºç›®å½•é‡Œçš„ä¸´æ—¶æ®‹ç•™ï¼ˆdll/pdb ç­‰éå®‰è£…åŒ…æ–‡ä»¶ï¼‰ä¼šåœ¨ä¸‹æ¬¡æˆåŠŸå°åŒ…æ—¶è‡ªåŠ¨æ¸…ç†
-rem æœ€å®¹æ˜“å‡ºäº‹çš„ä¸€ç§"å¤±è´¥": ç›®å½•é‡Œèººç€ä¸Šä¸€è½®çš„ Setup.exe, æ—¶é—´æˆ³çœ‹ä¸å‡ºå·®åˆ«, è¢«äººå½“æœ¬è½®äº§ç‰©å‘å‡ºå»ã€‚
-if exist "%SETUPEXE%" for %%F in ("%SETUPEXE%") do echo   æ³¨æ„: ç›®å½•é‡Œçš„ %%~nxF æ—¶é—´æˆ³æ˜¯ %%~tF â€”â€” æœ¬è½®å·²ä¸­æ­¢, é‚£æ˜¯ä¸Šä¸€è½®çš„æ—§åŒ…, ä¸è¦å‘å¸ƒ
-call :log "å¤±è´¥é€€å‡º, OUTDIR ç°åœºå¦‚ä¸‹"
+echo   [·â°üÊ§°Ü] Çë¼ì²éÉÏ·½´íÎóĞÅÏ¢
+echo   ÌáÊ¾: Êä³öÄ¿Â¼ÀïµÄÁÙÊ±²ĞÁô£¨dll/pdb µÈ·Ç°²×°°üÎÄ¼ş£©»áÔÚÏÂ´Î³É¹¦·â°üÊ±×Ô¶¯ÇåÀí
+rem ×îÈİÒ×³öÊÂµÄÒ»ÖÖ"Ê§°Ü": Ä¿Â¼ÀïÌÉ×ÅÉÏÒ»ÂÖµÄ Setup.exe, Ê±¼ä´Á¿´²»³ö²î±ğ, ±»ÈËµ±±¾ÂÖ²úÎï·¢³öÈ¥¡£
+if exist "%SETUPEXE%" for %%F in ("%SETUPEXE%") do echo   ×¢Òâ: Ä¿Â¼ÀïµÄ %%~nxF Ê±¼ä´ÁÊÇ %%~tF ¡ª¡ª ±¾ÂÖÒÑÖĞÖ¹, ÄÇÊÇÉÏÒ»ÂÖµÄ¾É°ü, ²»Òª·¢²¼
+call :log "Ê§°ÜÍË³ö, OUTDIR ÏÖ³¡ÈçÏÂ"
 if exist "%PKOUT%" dir /b /s "%PKOUT%" >>"%RUNLOG%" 2>nul
 call :do_pause
 exit /b 1
