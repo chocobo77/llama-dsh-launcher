@@ -1795,6 +1795,7 @@ mod tests {
         assert_eq!(parse_board_lock("{\"pid\":0}"), None);
     }
 
+    #[test]
     fn process_rows_survive_pipes_inside_the_command_line() {
         let rows = parse_process_rows(
             "4368|1794536344074|node.exe|15280|1|node cli/lib/bin.js web --no-open --port 3114\n\
