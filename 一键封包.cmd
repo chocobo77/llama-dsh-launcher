@@ -341,6 +341,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:TAURI_SIGNING_PRIVA
 set "TAURI_ERR=%errorlevel%"
 popd
 if not "%TAURI_ERR%"=="0" goto :fail_tauri_build
+rem 产物存在性兜底: tauri 极端情况退出码 0 但 makensis 没出包, 不能报成功
+dir /b "%TAURIDIR%\src-tauri\target\release\bundle\nsis\*.exe" >nul 2>nul
+if errorlevel 1 goto :fail_tauri_build
 echo   Tauri 产物在: %TAURIDIR%\src-tauri\target\release\bundle\nsis\
 echo   含 setup.exe 与 .sig 更新签名；发 feed 用 dsh-desktop-tauri\scripts\publish-updates.mjs。
 call :log "9/8 tauri 完成"

@@ -1,6 +1,6 @@
 # 09 DSH 桌面壳：dsh-desktop-tauri
 
-> 2026-11-17 经 `git subtree add --prefix=dsh-desktop-tauri` 并入本仓库，上游独立 git 历史（8 个提交）完整保留在 master 图中；随后一个提交同步了上游工作树未提交的改动（v0.1.22 + 本地内核补丁阶段 0/2/4）。
+> 2026-11-17 经 `git subtree add --prefix=dsh-desktop-tauri` 并入本仓库，上游独立 git 历史（9 个提交）完整保留在 master 图中；随后一个提交同步了上游工作树未提交的改动（v0.1.22 + 本地内核补丁阶段 0/2/4）。
 > 原始位置 `D:\code\DSH\dsh-desktop-tauri` 保留为工作副本（构建缓存 target/ 与 node_modules 在那边），融合后以仓库内 `dsh-desktop-tauri/` 为真源。
 
 ## 定位
@@ -94,6 +94,6 @@ cargo test                       # 单测
 
 ## 融合与上游同步口径
 
-- 仓库内 `dsh-desktop-tauri/` 为真源；`git log -- dsh-desktop-tauri` 可见上游 8 个提交（`2a680d1` 初始提交 → `57fa07a` 更新流加固）。
+- 仓库内 `dsh-desktop-tauri/` 为真源；上游 9 个提交（`2a680d1` 初始提交 → `57fa07a` 更新流加固）完整保留在 master 历史图中。注意路径过滤的 `git log -- dsh-desktop-tauri` 只显示 merge 与 overlay 两个提交（上游提交改的是其根级路径）；查上游链用 `git log 2a680d1..57fa07a`。
 - 若原位置还要继续开发：在原仓库提交后用 `git subtree pull --prefix=dsh-desktop-tauri D:\code\DSH\dsh-desktop-tauri main` 同步进来；或直接在本仓库的子目录里开发（推荐），原位置退役。
 - `dsh-desktop-tauri/.gitignore`/`.gitattributes` 随 subtree 保留，嵌套规则生效（`keys/`、`target/`、`node_modules/`、`runtime-*`、`dist-update/`、生成的 `installer-hooks.nsh` 均被正确排除，已用 `git check-ignore` 验证私钥路径）。
