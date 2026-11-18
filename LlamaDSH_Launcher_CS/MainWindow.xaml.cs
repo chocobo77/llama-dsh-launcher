@@ -167,6 +167,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>本次点击"启动"后是否已经尝试过"重连 node_modules 链接"自愈，避免反复触发。</summary>
 	private bool _dshModuleHealTried;
 
+	/// <summary>本次启动就绪后是否已经自动开过界面（Web 方式弹系统浏览器；每次手动"启动 DSH"只开一次）。</summary>
+	private bool _dshFrontAutoOpened;
+
+	/// <summary>界面方式=桌面壳时本面板拉起的壳进程（host 由壳自管，面板只负责拉起与停止）。</summary>
+	private Process? _dshShellProc;
+
 	// 启动前检查(残留锁/升级检测)进行中标记: 检查已移出 UI 线程, 期间再点按钮会并发两次
 	private bool _dshPrepareBusy;
 
@@ -267,6 +273,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		StartPerfMonitor();
 		LoadState();
 		ApplyAdminModeScopeHint();
+		// 界面方式控件灰显按当前选择收敛（XAML 默认=桌面壳；profile 异步加载后 ApplyConfig 会再刷一次）
+		ApplyDshFrontUiState();
 		TryStartAgentApi();
 		_healthTimer.Tick += HealthCheck;
 		_healthTimer.Start();
@@ -1014,7 +1022,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		if (_trayIcon != null)
 		{
 			string text = (IsAlive(_llamaProc) ? "运行中" : "已停止");
-			string text2 = (HasDsh() ? "运行中" : "已停止");
+			// 桌面壳方式的存活：面板拉起的壳进程或 3090 端口有监听（托盘不跑按名扫描，够判常见情形）
+			bool shellUp = (_dshShellProc != null && IsAlive(_dshShellProc)) || ProcessHelper.FindProcessByPort(3090).HasValue;
+			string text2 = ((HasDsh() || shellUp) ? "运行中" : "已停止");
 			_trayIcon.Text = "Llama:" + text + " | DSH:" + text2;
 		}
 	}
@@ -1036,7 +1046,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	private void QuitApp()
 	{
 		bool flag = IsAlive(_llamaProc);
-		bool flag2 = HasDsh();
+		// 桌面壳在跑也算"有服务在运行"：ExitCore→StopDsh 已含壳的收尾
+		bool flag2 = HasDsh() || ShellUp();
 		bool flag3 = true;
 		if (flag | flag2)
 		{
@@ -1045,9 +1056,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				text += "  • Llama Server\n";
 			}
-			if (flag2)
+			if (HasDsh())
 			{
 				text += "  • DSH Web\n";
+			}
+			if (ShellUp())
+			{
+				text += "  • DSH 桌面壳\n";
 			}
 			text += "\n请选择操作：\n\n  是(Y) — 停止所有服务并退出\n  否(N) — 不停止服务直接退出\n  取消 — 返回程序";
 			MessageBoxResult messageBoxResult = System.Windows.MessageBox.Show(text, "确认退出", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
@@ -1895,7 +1910,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			int? local = await Task.Run(() => UpdateService.GetLocalLlamaBuild(dir));
 			string repo = CurrentLlamaRepo();
 			string backendUpd = ResolveBackend();
-			Services.UpdateService.LlamaReleaseInfo? latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease(repo, backendUpd));
+			Services.UpdateService.LlamaReleaseInfo? latest = await Task.Run(() => UpdateService.FetchLatestLlamaRelease(repo, backendUpd, local));
 			SetLlamaUpdBtn(false);
 			if (latest == null)
 			{
@@ -4980,6 +4995,19 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		// 每次手动点击启动都允许重新尝试一次"链接自愈"
 		_dshModuleHealTried = false;
+		// 也允许就绪后重新自动开一次界面（Web 方式弹浏览器）
+		_dshFrontAutoOpened = false;
+		if (ShellFront)
+		{
+			// 桌面壳方式：本面板不启动 3080 host——壳自带 host(3090) 与崩溃监管。
+			// 端口上残留的外部 DSH host 由壳的 TAKEOVER 清点同一状态根的旧持有者，面板不越权处理。
+			if (ProcessHelper.FindProcessByPort(3080).HasValue)
+			{
+				Log("[桌面壳] 端口 3080 上有进程：壳启动后按其 TAKEOVER 语义处理同一状态根的旧 host。");
+			}
+			StartDshShell();
+			return;
+		}
 		int? existing = ProcessHelper.FindProcessByPort(3080);
 		if (existing.HasValue)
 		{
@@ -5036,8 +5064,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return;
 		}
 		string msg = "将执行全量重建:\n  1/3 pnpm clean\n  2/3 pnpm build:lib\n  3/3 build:web (vite)\n"
-				+ (HasDsh() ? "\nDSH 正在运行，会先停止 DSH。" : "")
-				+ "\n重建完成后自动做兼容性检查并启动 DSH。\n继续？";
+				+ ((HasDsh() || ShellUp()) ? "\nDSH 正在运行（Web host / 桌面壳），会先停止。" : "")
+				+ "\n重建完成后自动做兼容性检查并按所选界面方式启动。\n继续？";
 		if (System.Windows.MessageBox.Show(msg, "重建 DSH", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
 		{
 			return;
@@ -5045,17 +5073,18 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		BtnRebuildDsh.IsEnabled = false;
 		LblDshStatus.Text = "准备重建...";
 		LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(240, 136, 62));
-		if (HasDsh())
+		if (HasDsh() || ShellUp())
 		{
+			// 桌面壳也要停：pnpm clean 会删掉壳 host 正在加载的编译产物（StopDsh 已含壳收尾）
 			StopDsh();
 			bool stillRunning = await Task.Run(() =>
 			{
 				DateTime stopDeadline = DateTime.Now.AddSeconds(20.0);
-				while ((HasDsh() || ProcessHelper.FindProcessByPort(3080).HasValue) && DateTime.Now < stopDeadline)
+				while ((HasDsh() || ProcessHelper.FindProcessByPort(3080).HasValue || ProcessHelper.FindProcessByPort(3090).HasValue) && DateTime.Now < stopDeadline)
 				{
 					System.Threading.Thread.Sleep(500);
 				}
-				return HasDsh() || ProcessHelper.FindProcessByPort(3080).HasValue;
+				return HasDsh() || ProcessHelper.FindProcessByPort(3080).HasValue || ProcessHelper.FindProcessByPort(3090).HasValue;
 			});
 			if (stillRunning)
 			{
@@ -5074,6 +5103,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// </summary>
 	private async void PrepareDshThenStart()
 	{
+		if (ShellFront)
+		{
+			// 壳方式（含「重建后自动启动」的收尾回调）：Web 预备链（残留锁/HEAD 重建检查）不适用——
+			// 壳自己清点任务板并监管 host；重建过 harness 产物后同样只负责把壳拉起来。
+			StartDshShell();
+			return;
+		}
 		if (_dshPrepareBusy)
 		{
 			Log("[DSH] 启动前检查已在进行，忽略重复点击");
@@ -5081,6 +5117,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		_dshPrepareBusy = true;
 		bool started = false;
+		// Web 方式与桌面壳互斥：壳的 3090 host 会与新起的 3080 host 顶同一张任务板，
+		// 而壳的监管会把被顶掉的 host 再拉回来，形成顶班循环——先请壳退场（连带 host）。
+		if (ShellUp())
+		{
+			Log("[桌面壳] Web 方式启动前先停止桌面壳（连带其 3090 host）");
+			StopDshShell();
+		}
 		try
 		{
 			string dshDir = EffectiveDshDir();
@@ -5093,6 +5136,11 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			// 留在 UI 线程上就是"点启动整窗冻住"的直接原因。
 			await Task.Run(delegate
 			{
+				// 壳的 kill-on-close 作业对象收尾需要一点时间：等 3090 让位，别带着旧 host 去抢任务板
+				for (int w = 0; w < 30 && ProcessHelper.FindProcessByPort(3090).HasValue; w++)
+				{
+					System.Threading.Thread.Sleep(200);
+				}
 				try
 				{
 					staleLock = DshMaintenance.IsStaleLockPresent(3080);
@@ -5175,6 +5223,42 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 	}
 
+	/// <summary>把 pnpm 脚本按 &amp;&amp; 拆段并剔除启动器产物链用不到的段。
+	/// 只剔除精确匹配的已知段；脚本为空/形态变化/无段可剔时返回 null，调用方整体回退原样脚本。</summary>
+	private static List<string>? TrimRebuildSegments(string? script, bool trimDesktopBundle, bool trimClientTypecheck)
+	{
+		if (string.IsNullOrWhiteSpace(script))
+		{
+			return null;
+		}
+		List<string> keep = new();
+		bool trimmed = false;
+		foreach (string raw in script.Split("&&"))
+		{
+			string seg = raw.Trim();
+			if (seg.Length == 0)
+			{
+				return null;
+			}
+			if (trimDesktopBundle && Regex.IsMatch(seg, @"^pnpm\s+--filter\s+@deepseek-ai/dsh-desktop\s+run\s+bundle$"))
+			{
+				trimmed = true;
+				continue;
+			}
+			if (trimClientTypecheck && Regex.IsMatch(seg, @"^tsc\s+-b\s+tsconfig\.client\.json$"))
+			{
+				trimmed = true;
+				continue;
+			}
+			keep.Add(seg);
+		}
+		if (!trimmed || keep.Count == 0)
+		{
+			return null;
+		}
+		return keep;
+	}
+
 	/// <summary>
 	/// DSH 编译产物全量重建: WMI 分离运行 cmd 脚本(clean → build:lib → node24 vite build)，
 	/// 输出重定向到日志文件由轮询器尾随显示。断开远程/关闭启动器都不会中断重建。
@@ -5209,27 +5293,83 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			string cmdPath = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_rebuild_" + stamp + ".cmd");
 			string nodeDir = Path.GetDirectoryName(nodeExe) ?? "";
 			string pnpmDir = Path.GetDirectoryName(pnpmExe) ?? "";
-			string pathPrefix = string.Join(";", new[] { nodeDir, pnpmDir }.Where(delegate (string x) { return !string.IsNullOrEmpty(x); }));
+			// 直接执行 build:lib 的脚本段时需要 node_modules/.bin 里的 tsx/tsdown 垫片
+			string binsDir = Path.Combine(dshDir, "node_modules", ".bin");
+			string pathPrefix = string.Join(";", new[] { nodeDir, pnpmDir, binsDir }.Where(delegate (string x) { return !string.IsNullOrEmpty(x); }));
 			string q = "\"";
 			string redirect = " >> " + q + logPath + q + " 2>&1";
-			string cmdText = "@echo off" + Environment.NewLine
-				+ "set \"PATH=" + pathPrefix + ";%PATH%\"" + Environment.NewLine
-				+ "cd /d " + q + dshDir + q + Environment.NewLine
-				+ "echo [REBUILD] 1/3 pnpm clean" + redirect + Environment.NewLine
-				+ "call pnpm clean" + redirect + Environment.NewLine
-				+ "if errorlevel 1 goto :fail" + Environment.NewLine
-				+ "echo [REBUILD] 2/3 pnpm build:lib" + redirect + Environment.NewLine
-				+ "call pnpm build:lib" + redirect + Environment.NewLine
-				+ "if errorlevel 1 goto :fail" + Environment.NewLine
-				+ "echo [REBUILD] 3/3 build:web (node24 vite)" + redirect + Environment.NewLine
-				+ "cd /d " + q + dshDir + "\\apps\\web" + q + Environment.NewLine
-				+ q + nodeExe + q + " node_modules\\vite\\bin\\vite.js build" + redirect + Environment.NewLine
-				+ "if errorlevel 1 goto :fail" + Environment.NewLine
-				+ "echo EXITCODE:0" + redirect + Environment.NewLine
-				+ "exit /b 0" + Environment.NewLine
-				+ ":fail" + Environment.NewLine
-				+ "echo EXITCODE:1" + redirect + Environment.NewLine
-				+ "exit /b 1";
+			// 2/3 步按 package.json 的 build:lib:host/client 原脚本执行，但裁掉两段启动器用不到的开销
+			// （与上游 build.ts --scope artifacts "纯产物管线不做测试类型检查" 的取舍一致）：
+			//   a) Electron 桌面包打包 (--filter @deepseek-ai/dsh-desktop run bundle)：
+			//      启动器只运行 apps/cli 的 bin.js host + Web 前端 + Tauri 壳，Electron 客户端产物无人消费；
+			//   b) tsc -b tsconfig.client.json：noEmit 的 client 测试类型检查聚合，实测静默跑约 2 分钟
+			//      （整次重建近 6 分钟里的最大单段）；运行时产物由紧随其后的 tsdown client face 独立产出。
+			// 脚本解析失败或形态对不上就整体回退为原样 pnpm build:lib，绝不猜。
+			List<string> libSegments = new();
+			bool trimmedLib = false;
+			try
+			{
+				using (JsonDocument doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(dshDir, "package.json"))))
+				{
+					string? hostScript = doc.RootElement.TryGetProperty("scripts", out JsonElement scriptsEl)
+						&& scriptsEl.TryGetProperty("build:lib:host", out JsonElement h) ? h.GetString() : null;
+					string? clientScript = doc.RootElement.TryGetProperty("scripts", out JsonElement scriptsEl2)
+						&& scriptsEl2.TryGetProperty("build:lib:client", out JsonElement c) ? c.GetString() : null;
+					List<string>? hostSegs = TrimRebuildSegments(hostScript, trimDesktopBundle: true, trimClientTypecheck: false);
+					List<string>? clientSegs = TrimRebuildSegments(clientScript, trimDesktopBundle: false, trimClientTypecheck: true);
+					if (hostSegs != null && clientSegs != null)
+					{
+						libSegments.AddRange(hostSegs);
+						libSegments.AddRange(clientSegs);
+						trimmedLib = true;
+					}
+				}
+			}
+			catch (Exception scriptEx)
+			{
+				Log("[DSH重建] 读取 build:lib 脚本失败，按原样执行 pnpm build:lib: " + scriptEx.Message);
+			}
+			if (trimmedLib)
+			{
+				Log("[DSH重建] build:lib 精简链: 跳过 Electron 桌面包打包与 client 测试类型检查（运行产物不受影响，预计省约 2 分钟）");
+			}
+			var cmdLines = new List<string>
+			{
+				"@echo off",
+				"set \"PATH=" + pathPrefix + ";%PATH%\"",
+				"cd /d " + q + dshDir + q,
+				"echo [REBUILD] %time% 1/3 pnpm clean" + redirect,
+				"call pnpm clean" + redirect,
+				"if errorlevel 1 goto :fail"
+			};
+			if (trimmedLib)
+			{
+				// cmd.exe 按 cp936 解析批处理文件，而本文件是 UTF-8 无 BOM——echo 内容一律 ASCII，
+				// 否则中文变乱码且 CJK 尾字节可能吞掉后续 ASCII 字节破坏 >> 重定向（见 GBK 封包脚本教训）
+				cmdLines.Add("echo [REBUILD] %time% 2/3 build:lib (trimmed: skip electron bundle + client typecheck)" + redirect);
+				foreach (string seg in libSegments)
+				{
+					cmdLines.Add("call " + seg + redirect);
+					cmdLines.Add("if errorlevel 1 goto :fail");
+				}
+			}
+			else
+			{
+				cmdLines.Add("echo [REBUILD] %time% 2/3 pnpm build:lib" + redirect);
+				cmdLines.Add("call pnpm build:lib" + redirect);
+				cmdLines.Add("if errorlevel 1 goto :fail");
+			}
+			cmdLines.Add("echo [REBUILD] %time% 3/3 build:web (node24 vite)" + redirect);
+			cmdLines.Add("cd /d " + q + dshDir + "\\apps\\web" + q);
+			cmdLines.Add(q + nodeExe + q + " node_modules\\vite\\bin\\vite.js build" + redirect);
+			cmdLines.Add("if errorlevel 1 goto :fail");
+			cmdLines.Add("echo [REBUILD] %time% done" + redirect);
+			cmdLines.Add("echo EXITCODE:0" + redirect);
+			cmdLines.Add("exit /b 0");
+			cmdLines.Add(":fail");
+			cmdLines.Add("echo EXITCODE:1" + redirect);
+			cmdLines.Add("exit /b 1");
+			string cmdText = string.Join(Environment.NewLine, cmdLines);
 			File.WriteAllText(cmdPath, cmdText);
 			File.WriteAllText(logPath, "");
 			bool spawned = false;
@@ -5443,12 +5583,17 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void StopDsh_Click(object s, RoutedEventArgs e)
 	{
-		if (!HasDsh() && !ProcessHelper.FindProcessByPort(3080).HasValue)
+		// 停止按钮不按界面方式挑对象：Web host 与桌面壳，在场的一律停掉
+		bool webUp = HasDsh() || ProcessHelper.FindProcessByPort(3080).HasValue;
+		bool shellUp = ShellUp();
+		if (!webUp && !shellUp)
 		{
 			return;
 		}
-		if (System.Windows.MessageBox.Show("确定要停止 DSH Web 吗？\n\n正在运行的任务/会话会中断。",
-			"停止 DSH Web", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+		string what = (webUp && shellUp) ? "DSH（Web host 与桌面壳都在运行）"
+			: (shellUp ? "桌面壳（连同它的 3090 host）" : "DSH Web");
+		if (System.Windows.MessageBox.Show($"确定要停止 {what} 吗？\n\n正在运行的任务/会话会中断。",
+			"停止 DSH", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
 		{
 			return;
 		}
@@ -5569,7 +5714,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			BtnDshStart.IsEnabled = false;
 			BtnDshStop.IsEnabled = true;
-			BtnOpenDsh.IsEnabled = false;
 			LblDshStatus.Text = "Starting...";
 			LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(240, 136, 62));
 				// 优先：WMI 分离启动。进程由 WmiPrvSE.exe 服务拉起，与启动器无进程亲缘，
@@ -5584,7 +5728,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			string pnpmCmd = string.IsNullOrEmpty(pnpmExe) ? "pnpm" : "\"" + pnpmExe + "\"";
 			if (ChkDshAdmin.IsChecked == true)
 			{
-				string innerCmd = ((ComboDshMode.SelectedIndex == 0) ? (((text3 == "compiled-js") ? nodeCmd + " apps/cli/lib/bin.js web" : pnpmCmd + " dsh web")) : "npx --yes @deepseek-ai/dsh web");
+				// --no-open：不再由 DSH 自动弹系统浏览器；默认界面入口改为桌面壳（就绪后自动拉起）
+				string innerCmd = ((ComboDshMode.SelectedIndex == 0) ? (((text3 == "compiled-js") ? nodeCmd + " apps/cli/lib/bin.js web --no-open" : pnpmCmd + " dsh web --no-open")) : "npx --yes @deepseek-ai/dsh web --no-open");
 				if (TryStartDshElevated(dshDir, innerCmd))
 				{
 					_dshProc = null;
@@ -5619,7 +5764,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				if (text3 == "compiled-js")
 				{
-					text2 = "cd /d \"" + dshDir + "\" && " + nodeCmd + " apps/cli/lib/bin.js web";
+					text2 = "cd /d \"" + dshDir + "\" && " + nodeCmd + " apps/cli/lib/bin.js web --no-open";
 				}
 				else
 				{
@@ -5627,12 +5772,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 					{
 						Log("--- 编译版连续启动失败，本次回退到 pnpm dsh web ---");
 					}
-					text2 = "cd /d \"" + dshDir + "\" && " + pnpmCmd + " dsh web";
+					text2 = "cd /d \"" + dshDir + "\" && " + pnpmCmd + " dsh web --no-open";
 				}
 			}
 			else
 			{
-				text2 = "npx --yes @deepseek-ai/dsh web";
+				text2 = "npx --yes @deepseek-ai/dsh web --no-open";
 			}
 			ProcessStartInfo startInfo = new ProcessStartInfo
 			{
@@ -5686,7 +5831,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			string? detPnpm = Toolchain.ResolvePnpmExe();
 			string detNodeCmd = string.IsNullOrEmpty(detNode) ? "node" : "\"" + detNode + "\"";
 			string detPnpmCmd = string.IsNullOrEmpty(detPnpm) ? "pnpm" : "\"" + detPnpm + "\"";
-			string text = ((modeLabel == "compiled-js") ? detNodeCmd + " apps/cli/lib/bin.js web" : detPnpmCmd + " dsh web");
+			string text = ((modeLabel == "compiled-js") ? detNodeCmd + " apps/cli/lib/bin.js web --no-open" : detPnpmCmd + " dsh web --no-open");
 			string text2 = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_boot.log");
 			try
 			{
@@ -5955,9 +6100,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				_dshTracker = new ProcessTracker(num.Value);
 				LblDshStatus.Text = (_dshAdminMode ? "● 运行中(管理员)" : "● 运行中");
 				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
-				BtnOpenDsh.IsEnabled = true;
 				SaveState();
 				Log("DSH real PID:" + num.Value);
+				TryAutoOpenWeb();
 			}
 			else if (flag || DateTime.Now >= _dshVerifyDeadline)
 			{
@@ -6008,7 +6153,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				{
 					BtnDshStart.IsEnabled = true;
 					BtnDshStop.IsEnabled = false;
-					BtnOpenDsh.IsEnabled = false;
 					LblDshStatus.Text = "● 启动失败";
 					LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
 					ClearStateFor("dsh");
@@ -6050,7 +6194,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			LblDshStatus.Text = (_dshAdminMode ? "● 运行中(管理员)" : "● 运行中");
 			LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
-			BtnOpenDsh.IsEnabled = true;
+			TryAutoOpenWeb();
 		}
 		else
 		{
@@ -6067,7 +6211,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			}
 			BtnDshStart.IsEnabled = true;
 			BtnDshStop.IsEnabled = false;
-			BtnOpenDsh.IsEnabled = false;
 			LblDshStatus.Text = "● 启动失败";
 			LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
 			ClearStateFor("dsh");
@@ -6131,7 +6274,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			_dshTracker = new ProcessTracker(num2.Value);
 			DisposeProc(ref _dshProc);
 			SaveState();
-			BtnOpenDsh.IsEnabled = true;
 			Log($"DSH wrapper {num}->{num2.Value}");
 		}
 		else
@@ -6141,7 +6283,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			_dshTracker = null;
 			BtnDshStart.IsEnabled = true;
 			BtnDshStop.IsEnabled = false;
-			BtnOpenDsh.IsEnabled = false;
 			if (exitCode != 0)
 			{
 				// 崩溃与主动停止必须可区分：否则用户只看到"已停止"，排障只能翻日志猜
@@ -6161,6 +6302,12 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void StopDsh()
 	{
+		// 桌面壳与 Web host 都要清（在场才动手）：停止就是停止，不按界面方式挑对象
+		bool shellWasUp = ShellUp();
+		if (shellWasUp)
+		{
+			StopDshShell();
+		}
 		int? portOwner = ProcessHelper.FindProcessByPort(3080);
 		if (portOwner.HasValue && !ProcessHelper.LooksLikeDshProcess(portOwner.Value, EffectiveDshDir()))
 		{
@@ -6169,6 +6316,19 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		if (!HasDsh() && !portOwner.HasValue)
 		{
+			if (shellWasUp)
+			{
+				// 只有壳在跑：杀壳已连带 3090 host（kill-on-close 作业对象），直接收尾到已停止；
+				// 3090 端口残留由 HealthCheck 的壳状态收敛兜底复核。
+				BtnDshStart.IsEnabled = _dshRebuildTimer == null;
+				BtnDshStop.IsEnabled = false;
+				LblDshStatus.Text = "● 已停止";
+				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
+				Log("--- 桌面壳已停止 ---");
+				// agent 的 stop-dsh 在"只有壳在跑"时也会进到这里：没有 FinishStopDshAsync，
+				// 等待者必须在这里结算，否则 HTTP worker 会白等到自己的 35s 超时。
+				SettleStopWaiters(_dshStopSettled, true);
+			}
 			return;
 		}
 		StopDshVerifyLoop();
@@ -6266,7 +6426,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		_dshAdminMode = false;
 		DetachProc(ref _dshProc); // 不提前 Dispose: 让读线程把管道尾巴塞完
 		_dshTracker = null;
-		BtnOpenDsh.IsEnabled = false;
 		Log("--- 已下发停止 DSH 指令，等待进程彻底退出 ---");
 		ClearStateFor("dsh");
 		_ = FinishStopDshAsync(adminKillPid);
@@ -6308,7 +6467,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				// 重建期间 StartDshRebuild 已锁住启动按钮，停止收尾任务不能把它重新打开。
 				BtnDshStart.IsEnabled = _dshRebuildTimer == null;
 				BtnDshStop.IsEnabled = false;
-				BtnOpenDsh.IsEnabled = false;
 				LblDshStatus.Text = "● 已停止";
 				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
 				Log("--- DSH 已彻底停止 ---");
@@ -6346,14 +6504,251 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 	}
 
-	private void OpenDsh_Click(object s, RoutedEventArgs e)
+	// ── 界面方式：桌面壳 ⇄ Web（互斥, 由 ComboDshFront 决定）──────────────────────
+	// 「启动 DSH」按所选方式启动对应后台（壳=StartDshShell；Web=现链 3080 host），
+	// 「停止 DSH」两个后台都清（在场才动手）。任意时刻至多一个存活 host（任务板单持有者+壳 TAKEOVER）。
+	private bool ShellFront => ComboDshFront.SelectedIndex != 1;
+
+	/// <summary>「桌面壳运行中」的标签文本单源：StartDshShell 写它，HealthCheck 的壳状态收敛
+	/// 按它与当前标签**精确相等**判定"面板正处于壳运行态"——显示即状态（任何 Web 流程覆写标签
+	/// 后收敛自动失活），不存在需要各写入点配合维护的影子字段。</summary>
+	private const string ShellStatusRunningText = "● 运行中(桌面壳)";
+
+	private void DshFrontChanged(object s, SelectionChangedEventArgs e)
 	{
-		string text = "http://127.0.0.1:3080";
-		Log("Open:" + text);
-		Process.Start(new ProcessStartInfo(text)
+		ApplyDshFrontUiState();
+	}
+
+	/// <summary>回显与真实行为同源：管理员提权、启动模式(编译版/npx)只作用于 Web 方式的
+	/// 3080 host，壳的内核选择与提权由壳自己决定，壳方式下灰掉以免误导。</summary>
+	private void ApplyDshFrontUiState()
+	{
+		if (ChkDshAdmin != null && ComboDshMode != null)
 		{
-			UseShellExecute = true
-		});
+			bool web = !ShellFront;
+			ChkDshAdmin.IsEnabled = web;
+			ComboDshMode.IsEnabled = web;
+		}
+		if (InputDshDir != null && BtnSearchDsh != null)
+		{
+			// 壳方式同样需要 DSH 目录（定位壳 exe + 注入 DSH_REPO_ROOT），不因 npx 选项而锁死
+			bool isEnabled = ShellFront || ComboDshMode.SelectedIndex == 0;
+			InputDshDir.IsEnabled = isEnabled;
+			BtnSearchDsh.IsEnabled = isEnabled;
+		}
+	}
+
+	// ── Tauri 桌面壳（dsh-desktop-tauri）────────────────────────────────────────
+	// 壳自带独立 DSH host(固定端口 3090)并负责崩溃监管；面板只负责定位、拉起、停止壳进程——
+	// 壳方式下面板不启动自己的 3080 host；Web 方式启动前会先清掉在场的壳（防两 host 顶班循环）。
+	private string? FindDshShellExe()
+	{
+		// 产物名两种都要认：安装包按 productName(Tauri 改名)可能落 DSH.exe，
+		// 而按 Cargo bin 名的包与本地开发构建落 dsh-desktop-tauri.exe——本机实装即后者。
+		string[] names = { "DSH.exe", "dsh-desktop-tauri.exe" };
+		try
+		{
+			string? dd = EffectiveDshDir();
+			if (!string.IsNullOrEmpty(dd))
+			{
+				// 安装器固定落点：NSIS hook 把 $INSTDIR 指到 <harness>\apps\desktop-tauri
+				foreach (string n in names)
+				{
+					string installed = Path.Combine(dd!, "apps", "desktop-tauri", n);
+					if (File.Exists(installed))
+					{
+						return installed;
+					}
+				}
+			}
+			// 开发构建：从启动器自身目录逐级向上找仓内 dsh-desktop-tauri 的 release 产物
+			for (string? dir = AppContext.BaseDirectory, up = null; dir != null && up != dir; up = dir, dir = Path.GetDirectoryName(dir))
+			{
+				foreach (string n in names)
+				{
+					string dev = Path.Combine(dir, "dsh-desktop-tauri", "src-tauri", "target", "release", n);
+					if (File.Exists(dev))
+					{
+						return dev;
+					}
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "定位桌面壳失败");
+		}
+		return null;
+	}
+
+	/// <summary>桌面壳方式下的「启动 DSH」：拉起壳进程并进入运行态。存活判定交给
+	/// HealthCheck 的壳状态收敛（壳进程 + 3090 端口互证——单实例转发/外部入口启动都不影响判定）。</summary>
+	private void StartDshShell()
+	{
+		string? exe = FindDshShellExe();
+		if (exe == null)
+		{
+			ShowNotice("未找到桌面壳（DSH.exe / dsh-desktop-tauri.exe）。\n\n查过 <DSH目录>\\apps\\desktop-tauri\\（安装器落点）与启动器向上各层的 dsh-desktop-tauri 开发构建。\n安装方式：运行桌面壳安装包（会装进 DSH 目录），或在启动器仓库构建 dsh-desktop-tauri；也可把上方下拉切到 Web 方式。", isError: true);
+			return;
+		}
+		try
+		{
+			// UseShellExecute=false 只为注入 DSH_REPO_ROOT（壳的运行期检出第一来源；安装壳本可从注册表找到
+			// harness，开发构建则完全依赖它），与面板的 DSH 目录保持一致，避免壳的梯级找不到内核
+			ProcessStartInfo psi = new ProcessStartInfo(exe)
+			{
+				UseShellExecute = false
+			};
+			string? dd = EffectiveDshDir();
+			if (!string.IsNullOrEmpty(dd))
+			{
+				psi.EnvironmentVariables["DSH_REPO_ROOT"] = dd!;
+			}
+			_dshShellProc = Process.Start(psi);
+			BtnDshStart.IsEnabled = false;
+			BtnDshStop.IsEnabled = true;
+			LblDshStatus.Text = ShellStatusRunningText;
+			LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
+			Log("--- 桌面壳启动: " + exe + "（host 由壳自管, 端口 3090；崩溃重启/托盘监管都在壳内）---");
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "启动桌面壳");
+			ShowNotice("启动桌面壳失败: " + ex.Message, isError: true);
+			BtnDshStart.IsEnabled = true;
+			BtnDshStop.IsEnabled = false;
+			LblDshStatus.Text = "● 启动失败";
+			LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
+		}
+	}
+
+	/// <summary>桌面壳是否存活：三个证据互证——本面板拉起的壳进程；按名扫到的合法落点壳
+	/// （单实例转发时面板那个壳进程会即时退出；开机自启/手动双击启动的壳也算）；3090 端口有监听。</summary>
+	private bool ShellUp()
+	{
+		if (_dshShellProc != null && IsAlive(_dshShellProc))
+		{
+			return true;
+		}
+		return FindOurShellProcessId().HasValue || ProcessHelper.FindProcessByPort(3090).HasValue;
+	}
+
+	/// <summary>按名扫描运行中的桌面壳（dsh-desktop-tauri / DSH），只认合法落点路径，返回其 PID。
+	/// 安装落点按本机 EffectiveDshDir 精确对目录，避免误伤其它 harness 安装里的同名壳。</summary>
+	private int? FindOurShellProcessId()
+	{
+		string? dshDir = EffectiveDshDir();
+		foreach (string name in new[] { "dsh-desktop-tauri", "DSH" })
+		{
+			foreach (Process p in Process.GetProcessesByName(name))
+			{
+				try
+				{
+					string? path = null;
+					try
+					{
+						path = p.MainModule?.FileName;
+					}
+					catch
+					{
+					}
+					if (path != null && IsOurShellPath(path, dshDir))
+					{
+						return p.Id;
+					}
+				}
+				finally
+				{
+					p.Dispose();
+				}
+			}
+		}
+		return null;
+	}
+
+	private static bool IsOurShellPath(string path, string? dshDir)
+	{
+		// 只认两处合法落点：安装器落点 <本机DSH目录>\apps\desktop-tauri\（精确对目录, 不认其它
+		// harness 安装里的同名壳）与仓内开发构建 <repo>\dsh-desktop-tauri\src-tauri\target\{release,debug}\
+		// ——同名进程但不在此列的一律不动。
+		string d = (Path.GetDirectoryName(path) ?? string.Empty).TrimEnd('\\').ToLowerInvariant();
+		if (!string.IsNullOrEmpty(dshDir))
+		{
+			string installed = Path.Combine(dshDir, "apps", "desktop-tauri").TrimEnd('\\').ToLowerInvariant();
+			if (string.Equals(d, installed, StringComparison.OrdinalIgnoreCase))
+			{
+				return true;
+			}
+		}
+		return d.EndsWith(@"\dsh-desktop-tauri\src-tauri\target\release")
+			|| d.EndsWith(@"\dsh-desktop-tauri\src-tauri\target\debug");
+	}
+
+	/// <summary>停止桌面壳（若在运行）：杀壳进程树——host 挂进壳的 kill-on-close 作业对象，
+	/// 壳死则 3090 host 连带退出。面板拉起的壳之外按名兜底，覆盖「单实例转发后面板壳进程已退出」
+	/// 与外部入口（开机自启等）启动的壳；只认 IsOurShellPath 的合法落点。返回是否动过手。</summary>
+	private bool StopDshShell()
+	{
+		bool acted = false;
+		Process? sp = _dshShellProc;
+		if (sp != null && IsAlive(sp))
+		{
+			try
+			{
+				ProcessHelper.KillProcessTree(sp.Id);
+				Log("[桌面壳] 已结束壳进程树 pid=" + sp.Id + "（其 3090 host 随作业对象一并退出）");
+				acted = true;
+			}
+			catch (Exception ex)
+			{
+				LogError(ex, "停止桌面壳(面板拉起的进程)");
+			}
+		}
+		DisposeProc(ref _dshShellProc);
+		for (int round = 0; round < 4; round++)
+		{
+			int? other = FindOurShellProcessId();
+			if (!other.HasValue)
+			{
+				break;
+			}
+			try
+			{
+				ProcessHelper.KillProcessTree(other.Value);
+				Log("[桌面壳] 已结束外部启动的壳进程树 pid=" + other.Value);
+				acted = true;
+			}
+			catch (Exception ex2)
+			{
+				LogError(ex2, "停止桌面壳(按名兜底)");
+				break;
+			}
+		}
+		return acted;
+	}
+
+	/// <summary>Web 方式就绪后自动弹一次系统浏览器（启动命令带 --no-open，由面板掌握这一次打开）。
+	/// 每次手动「启动 DSH」只开一次；接管/恢复场景走不到这里，不会自动弹。</summary>
+	private void TryAutoOpenWeb()
+	{
+		if (_dshFrontAutoOpened)
+		{
+			return;
+		}
+		_dshFrontAutoOpened = true;
+		string url = "http://127.0.0.1:3080";
+		Log("Open:" + url);
+		try
+		{
+			Process.Start(new ProcessStartInfo(url)
+			{
+				UseShellExecute = true
+			});
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "自动打开 Web 失败");
+		}
 	}
 
 	private bool HasDsh()
@@ -6730,7 +7125,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// </summary>
 	private void CopyDiagInfo_Click(object sender, RoutedEventArgs e)
 	{
-		string text = AppLog.BuildDiagnostics(NodeLog.Text);
+		// Node 专属日志窗已并入运行日志：诊断改为默认构成（环境信息 + 最近错误/崩溃日志尾部），
+		// Node 安装细节可在「运行日志」里直接查看/全选复制。
+		string text = AppLog.BuildDiagnostics();
 		Exception? last = null;
 		for (int attempt = 0; attempt < 3; attempt++)
 		{
@@ -8759,6 +9156,31 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		{
 			OnDshDone();
 		}
+		// 桌面壳状态收敛（仅当面板没有自己的 Web host 在场时）：壳进程与 3090 端口互证。
+		// 开机自启/手动双击等外部入口启动的壳也被接管显示；壳单独退出时恢复启动按钮。
+		if (_dshProc == null && _dshTracker == null)
+		{
+			bool shellUp = ShellUp();
+			// 精确相等(而非 Contains)：标签文本被任何 Web 流程覆写后这里自动失活, 不会误判
+			bool labelShell = string.Equals(LblDshStatus.Text, ShellStatusRunningText, StringComparison.Ordinal);
+			if (shellUp && !labelShell)
+			{
+				BtnDshStart.IsEnabled = false;
+				BtnDshStop.IsEnabled = true;
+				LblDshStatus.Text = ShellStatusRunningText;
+				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
+				Log("[桌面壳] 检测到桌面壳在运行（非本面板启动），已接管显示；「停止 DSH」可停它");
+			}
+			else if (!shellUp && labelShell)
+			{
+				DisposeProc(ref _dshShellProc);
+				BtnDshStart.IsEnabled = _dshRebuildTimer == null;
+				BtnDshStop.IsEnabled = false;
+				LblDshStatus.Text = "● 已停止";
+				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
+				Log("--- 桌面壳已退出 ---");
+			}
+		}
 		UpdateTray();
 	}
 
@@ -8963,7 +9385,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		_dshTracker = new ProcessTracker(pid);
 		BtnDshStart.IsEnabled = false;
 		BtnDshStop.IsEnabled = true;
-		BtnOpenDsh.IsEnabled = true;
 		LblDshStatus.Text = "● 接管运行中";
 		LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(63, 185, 80));
 		Log($"{logPrefix}:{pid}" + (v.CommandLineReadable ? "" : " (按 " + v.Reason + ")"));
@@ -9122,6 +9543,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			LlamaVariants = _llamaVariants,
 			ActiveLlamaVariant = _activeVariant,
 			DshDir = InputDshDir.Text,
+			DshFront = ComboDshFront.SelectedIndex,
 			DshMode = ComboDshMode.SelectedIndex,
 			DshAdminMode = (ChkDshAdmin.IsChecked == true),
 			MinimizeToTray = (ChkMinimizeToTray.IsChecked == true)
@@ -9216,8 +9638,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		LoadLlamaVariants(c);
 		SetComboBackendChoice(c.LlamaBackend);
 		InputDshDir.Text = c.DshDir;
+		ComboDshFront.SelectedIndex = c.DshFront;
 		ComboDshMode.SelectedIndex = c.DshMode;
 		ChkDshAdmin.IsChecked = c.DshAdminMode;
+		ApplyDshFrontUiState();
 		ChkMinimizeToTray.IsChecked = c.MinimizeToTray;
 		if (ChkVramBreaker != null)
 		{
@@ -9749,17 +10173,10 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void NodeLogLine(string line)
 	{
-		Dispatcher.BeginInvoke((Action)(() =>
-		{
-			NodeLog.Text += "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + line + Environment.NewLine;
-			// 与 LogArea 同款上限: pnpm install 输出可达上千行, 不裁剪会逐渐卡顿
-			var nl = NodeLog.Text.Split('\n');
-			if (nl.Length > 500)
-			{
-				NodeLog.Text = string.Join("\n", nl[^500..]);
-			}
-			NodeLog.CaretIndex = NodeLog.Text.Length;
-		}));
+		// Node 环境的专属日志窗已移除：统一并入右侧「运行日志」，带 [Node] 前缀便于过滤；
+		// Log 自带 UI 线程转发，与原先的 BeginInvoke 等价。pnpm install 上千行输出由
+		// LogArea/AppendRunLog 的既有截断逻辑兜住，这里不再自设 500 行上限。
+		Log("[Node] " + line);
 	}
 
 	private async void RefreshNodeEnv_Click(object sender, RoutedEventArgs e)
@@ -9830,7 +10247,6 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	{
 		if (_nodeEnvBusy) return;
 		SetNodeEnvBusy(true);
-		NodeLog.Text = "";
 		// 必须在 UI 线程取（EffectiveDshDir 会读控件），后台线程只消费字符串
 		string dshDirForLinks = EffectiveDshDir();
 		try
@@ -10019,7 +10435,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			return;
 		}
 		bool flag = IsAlive(_llamaProc);
-		bool flag2 = HasDsh();
+		// 桌面壳在跑也算"有服务在运行"：ExitCore→StopDsh 已含壳的收尾
+		bool flag2 = HasDsh() || ShellUp();
 		bool flag3 = true;
 		if (flag | flag2)
 		{
@@ -10028,9 +10445,13 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			{
 				text += "  • Llama Server\n";
 			}
-			if (flag2)
+			if (HasDsh())
 			{
 				text += "  • DSH Web\n";
+			}
+			if (ShellUp())
+			{
+				text += "  • DSH 桌面壳\n";
 			}
 			text += "\n请选择操作：\n\n  是(Y) — 停止所有服务并退出\n  否(N) — 不停止服务直接退出\n  取消 — 返回程序";
 			MessageBoxResult messageBoxResult = System.Windows.MessageBox.Show(text, "确认退出", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
@@ -11084,7 +11505,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		TaskCompletionSource<bool>? tcs = null;
 		string? early = AgentOp(delegate
 		{
-			bool was = HasDsh();
+			// 桌面壳方式下"DSH 在运行"= 壳活着（含 3090 host）——与托盘/退出确认的口径一致
+			bool was = HasDsh() || ShellUp();
 			if (!was)
 			{
 				return JsonSerializer.Serialize(new Dictionary<string, object>

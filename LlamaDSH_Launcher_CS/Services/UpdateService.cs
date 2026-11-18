@@ -139,18 +139,30 @@ public static class UpdateService
 	/// 因此优先读 stable release 的 nightly-tag.txt → 定位稳定构建资产；
 	/// 失败时回退扫描最近 releases 列表取最新 bNNNNN（滚动构建）。
 	/// </summary>
-	public static LlamaReleaseInfo? FetchLatestLlamaRelease(string repo = "ggml-org/llama.cpp", string backend = "vulkan")
+	public static LlamaReleaseInfo? FetchLatestLlamaRelease(string repo = "ggml-org/llama.cpp", string backend = "vulkan", int? localBuild = null)
 	{
 		// 1) 稳定版：latest release 里读 nightly-tag.txt
 		try
 		{
-			string? latestJson = HttpGetString($"https://api.github.com/repos/{repo}/releases/latest", 10);
+			string? latestJson = HttpGetRace($"https://api.github.com/repos/{repo}/releases/latest", 10);
 			if (latestJson != null)
 			{
 				using (JsonDocument doc = JsonDocument.Parse(latestJson))
 				{
 					JsonElement root = doc.RootElement;
 					string stableTag = root.TryGetProperty("tag_name", out JsonElement se) ? se.GetString() ?? "" : "";
+					// 稳定版已比本地新：latest 的资产本身就是答案，跳过 nightly 追链（省 2 个请求，
+					// 其中 1 个是整份 release JSON 的重复下载）。安装变体路径不传 localBuild（恒追最新 nightly）。
+					int? tagBuildEarly = ParseBuildFromTag(stableTag);
+					if (localBuild.HasValue && tagBuildEarly.HasValue && tagBuildEarly.Value > localBuild.Value)
+					{
+						LlamaReleaseInfo? ri = BuildFromReleaseJson(root, tagBuildEarly.Value, backend);
+						if (ri != null)
+						{
+							ri.StableVersion = stableTag;
+							return ri;
+						}
+					}
 					string? nightlyUrl = null;
 					if (root.TryGetProperty("assets", out JsonElement assets) && assets.ValueKind == JsonValueKind.Array)
 					{
@@ -166,7 +178,7 @@ public static class UpdateService
 					}
 					if (!string.IsNullOrEmpty(nightlyUrl))
 					{
-						string content = HttpGetString(nightlyUrl, 10) ?? "";
+						string content = HttpGetRace(nightlyUrl, 10) ?? "";
 						int? build = ParseBuildFromTag(content.Trim());
 						if (build != null)
 						{
@@ -199,7 +211,7 @@ public static class UpdateService
 		// 2) 回退：滚动构建（最新 bNNNNN）
 		try
 		{
-			string? listJson = HttpGetString($"https://api.github.com/repos/{repo}/releases?per_page=20", 10);
+			string? listJson = HttpGetRace($"https://api.github.com/repos/{repo}/releases?per_page=20", 10);
 			if (listJson != null)
 			{
 				using (JsonDocument doc = JsonDocument.Parse(listJson))
@@ -233,7 +245,7 @@ public static class UpdateService
 	/// <summary>按 bNNNNN 标签拉取对应 release 并解析 Windows 预编译资产。</summary>
 	private static LlamaReleaseInfo? FetchBuildRelease(int build, string repo, string backend = "vulkan")
 	{
-		string? json = HttpGetString($"https://api.github.com/repos/{repo}/releases/tags/b{build}", 10);
+		string? json = HttpGetRace($"https://api.github.com/repos/{repo}/releases/tags/b{build}", 10);
 		if (json == null)
 		{
 			return null;
@@ -418,6 +430,81 @@ public static class UpdateService
 		{
 			return null;
 		}
+	}
+
+	/// <summary>并行竞速直连与镜像：谁先返回 200 用谁。串行重试梯在网络坏时是
+	/// 直连×2 + 每个镜像×2 的顺序烧超时（最坏 ~60s/请求、检查三个请求最坏 ~180s）；
+	/// 竞速后单请求最坏=单次超时，直连可用时仍以直连快为先到者。整体 timeoutSec 兜底封顶。</summary>
+	private static string? HttpGetRace(string url, int timeoutSec = 10)
+	{
+		List<string> candidates = new() { url };
+		if (url.Contains("github.com", StringComparison.OrdinalIgnoreCase))
+		{
+			candidates.Add("https://gh-proxy.com/" + url);
+			candidates.Add("https://ghfast.top/" + url);
+		}
+		if (candidates.Count == 1)
+		{
+			return HttpGetString(url, timeoutSec);
+		}
+		string? first = null;
+		try
+		{
+			using CancellationTokenSource race = new(TimeSpan.FromSeconds(timeoutSec));
+			List<Task<string?>> tasks = new();
+			foreach (string candidate in candidates)
+			{
+				tasks.Add(Task.Run<string?>(delegate
+				{
+					try
+					{
+						using HttpRequestMessage req = new(HttpMethod.Get, candidate);
+						req.Headers.TryAddWithoutValidation("User-Agent", "LlamaDSH_Launcher");
+						using HttpResponseMessage resp = Http.Send(req, race.Token);
+						if (!resp.IsSuccessStatusCode)
+						{
+							return null;
+						}
+						return resp.Content.ReadAsStringAsync(race.Token).GetAwaiter().GetResult();
+					}
+					catch
+					{
+						return null;
+					}
+				}));
+			}
+			try
+			{
+				while (first == null && tasks.Any(t => !t.IsCompleted))
+				{
+					int idx = Task.WaitAny(tasks.Cast<Task>().ToArray(), race.Token);
+					Task<string?> t = tasks[idx];
+					if (t.Status == TaskStatus.RanToCompletion && !string.IsNullOrEmpty(t.Result))
+					{
+						first = t.Result;
+					}
+					else
+					{
+						if (t.IsFaulted)
+						{
+							_ = t.Exception; // 观察异常，避免 UnobservedTaskException
+						}
+						tasks.RemoveAll(x => x.IsCompleted);
+					}
+				}
+			}
+			catch (OperationCanceledException)
+			{
+			}
+			finally
+			{
+				race.Cancel(); // 落选者立刻停手，不留悬空连接
+			}
+		}
+		catch (ObjectDisposedException)
+		{
+		}
+		return first;
 	}
 
 	/// <summary>
@@ -856,14 +943,60 @@ public static class UpdateService
 			return null;
 		}
 
+		string originUrl = RunGit(dir, "remote get-url origin", 15).Output.Trim();
 		string remote = "";
 		string mirror = "origin";
-		(int ExitCode, string Output) fetch = RunGit(dir, "fetch origin --prune", 180);
+		// 快路径：ls-remote 只取引用通告（协议 v2 按 ref 服务端过滤），不传任何对象——
+		// "已是最新"（大多数检查）在此直接得出结论，省掉整段 fetch。大仓库直连被 reset 时，
+		// 旧流程要先烧 ~20s 再排队 240s 的 HTTP/1.1 重试，最后才轮到镜像；探针直连 8s 封顶。
+		// 探针 sha 只当哨兵用：真要拉对象仍走下方 fetch 阶梯（直连优先、镜像兜底）。
+		string? probeSha = null;
+		string probeVia = "origin";
+		(int ExitCode, string Output) lsr = RunGit(dir, "ls-remote origin refs/heads/" + branch, 8);
+		if (lsr.ExitCode == 0)
+		{
+			probeSha = ExtractLsRemoteSha(lsr.Output, branch);
+		}
+		if (probeSha == null && Environment.GetEnvironmentVariable("LLAMADSH_PROBE_MIRROR") != "0")
+		{
+			// 镜像探针的 sha 结论默认可信（与既有 fetch 镜像兜底同一信任级别）；镜像若缓存滞后会
+			// 把"有更新"误判成"已最新"——对这种顾虑设 LLAMADSH_PROBE_MIRROR=0 整体关闭镜像探针。
+			foreach (string candidate in MirrorUrls(originUrl))
+			{
+				(int ExitCode, string Output) ml = RunGit(dir,
+					"-c http.version=HTTP/1.1 ls-remote \"" + candidate + "\" refs/heads/" + branch, 12);
+				if (ml.ExitCode == 0)
+				{
+					probeSha = ExtractLsRemoteSha(ml.Output, branch);
+					if (probeSha != null)
+					{
+						probeVia = candidate;
+						break;
+					}
+				}
+			}
+		}
+		if (probeSha != null && string.Equals(probeSha, local, StringComparison.OrdinalIgnoreCase))
+		{
+			return new DshUpdateInfo
+			{
+				Branch = branch,
+				LocalHead = local,
+				RemoteHead = probeSha,
+				Ahead = 0,
+				Behind = 0,
+				Mirror = probeVia
+			};
+		}
+		// 慢路径：上游有新提交（或探针全不可用）才真正 fetch 拿领先/落后计数。
+		// 只抓当前分支（--no-tags 单分支），不再全量 --prune——检查用不到 prune，
+		// 而大仓库的全分支 fetch 是检查慢的主因之一。
+		(int ExitCode, string Output) fetch = RunGit(dir, "fetch --no-tags origin " + branch, 180);
 		string lastMirrorError = "";
 		if (fetch.ExitCode != 0)
 		{
 			// 一些代理/网络对 HTTP/2 支持不好，会报 RPC failed / malloc failed；用 HTTP/1.1 重试直连。
-			(int ExitCode, string Output) retry = RunGit(dir, "-c http.version=HTTP/1.1 fetch origin --prune", 240);
+			(int ExitCode, string Output) retry = RunGit(dir, "-c http.version=HTTP/1.1 fetch --no-tags origin " + branch, 240);
 			if (retry.ExitCode == 0)
 			{
 				fetch = retry;
@@ -879,8 +1012,7 @@ public static class UpdateService
 		}
 		else
 		{
-			string origin = RunGit(dir, "remote get-url origin", 15).Output.Trim();
-			foreach (string candidate in MirrorUrls(origin))
+			foreach (string candidate in MirrorUrls(originUrl))
 			{
 				(int ExitCode, string Output) mf = RunGit(dir,
 					"-c http.version=HTTP/1.1 fetch --no-tags \"" + candidate + "\" " + branch, 120);
@@ -916,6 +1048,38 @@ public static class UpdateService
 			Behind = behind,
 			Mirror = mirror
 		};
+	}
+
+	/// <summary>从 ls-remote 输出提取指定分支的 40 位 sha；任何格式不对一律 null（宁可走慢路径，不猜）。</summary>
+	private static string? ExtractLsRemoteSha(string output, string branch)
+	{
+		foreach (string line in output.Split('\n'))
+		{
+			string t = line.Trim();
+			if (t.Length < 41 || t[40] != '\t')
+			{
+				continue;
+			}
+			string sha = t.Substring(0, 40);
+			bool hex = true;
+			foreach (char c in sha)
+			{
+				if (!Uri.IsHexDigit(c))
+				{
+					hex = false;
+					break;
+				}
+			}
+			if (!hex)
+			{
+				continue;
+			}
+			if (string.Equals(t.Substring(41).Trim(), "refs/heads/" + branch, StringComparison.Ordinal))
+			{
+				return sha;
+			}
+		}
+		return null;
 	}
 
 	/// <summary>执行 git pull --ff-only；直连失败时用镜像 fetch 后本地快进合并（不产生 merge 提交）。</summary>

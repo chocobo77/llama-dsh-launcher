@@ -34,6 +34,9 @@ public class ProfileConfig
 
 	public string DshDir { get; set; } = "";
 
+	// DSH 界面方式: 0=桌面壳(Tauri, host 端口 3090) 1=Web(面板直启 host 端口 3080)。旧 profile 无此字段时默认桌面壳。
+	public int DshFront { get; set; }
+
 	public int DshMode { get; set; }
 
 	// 以管理员身份启动 DSH（runas 静默提权，可读游戏内存）。旧 profile 无此字段时反序列化保留默认值 true。
