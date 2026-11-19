@@ -11,6 +11,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace LlamaDSH_Launcher.Services;
 
@@ -1573,11 +1574,19 @@ public static class DshCompatService
                         // 1) manifest / bundle 激活
                         AuditManifestAndBundles(r, log);
 
-                        // 2) dump-config：补丁目标 + 合成树
+                        // 2) dump-config 与插件探针是两个相互独立的 node 子进程，并行跑——
+                        //    串行时它们是插件扫描里最大的两个固定耗时点。子进程结果先落纯数据，
+                        //    回到主线程再合并进 report（后台任务只读 r，不产生竞态）。
                         DumpData dump = new DumpData();
-                        if (includeDumpConfig && r.BinBuilt && r.Node24Ok)
+                        Task<DumpData>? dumpTask = (includeDumpConfig && r.BinBuilt && r.Node24Ok)
+                                ? Task.Run(() => RunDumpConfigCore(r, log))
+                                : null;
+                        Task<ProbeData?> probeTask = (r.BinBuilt && r.Node24Ok)
+                                ? Task.Run(() => RunNodeProbeCore(r, log))
+                                : null;
+                        if (dumpTask != null)
                         {
-                                dump = RunDumpConfig(r, log);
+                                dump = MergeDumpConfig(r, dumpTask.GetAwaiter().GetResult(), log);
                         }
                         else if (includeDumpConfig && !r.BinBuilt)
                         {
@@ -1592,7 +1601,7 @@ public static class DshCompatService
                         AuditBundlePatchRows(r, dump, log);
 
                         // 4) 插件 peer 兼容 + 解析
-                        AuditPlugins(r, log);
+                        AuditPlugins(r, log, probeTask?.GetAwaiter().GetResult());
 
                         // 5) node_modules 失效链接
                         AuditLinks(r, log);
@@ -1629,6 +1638,10 @@ public static class DshCompatService
                 public int ExitCode = -1;
                 public string StdOut = "";
                 public string StdErr = "";
+                /// <summary>子进程没跑起来时的说明（MergeDumpConfig 落成 report 警告）。</summary>
+                public string SpawnMessage = "";
+                /// <summary>非零退出码时的 stderr 尾部（MergeDumpConfig 落成 report 错误）。</summary>
+                public string ExitFailureDetail = "";
                 public HashSet<string> EntryIds = new(StringComparer.Ordinal);
                 /// <summary>合成树里的每个 loader 行：(行 id, 模块名 name)。字面 disabled: true 的行不入内。</summary>
                 public List<(string RowId, string ModuleName)> Rows = new();
@@ -1637,7 +1650,8 @@ public static class DshCompatService
                 public List<string> BundleWarnings = new();
         }
 
-        private static DumpData RunDumpConfig(DshCompatReport r, Action<string>? log)
+        /// <summary>跑 --dump-config 子进程（纯数据，不碰 report）：失败信息写进 DumpData，由 MergeDumpConfig 落到 report。</summary>
+        private static DumpData RunDumpConfigCore(DshCompatReport r, Action<string>? log)
         {
                 DumpData d = new DumpData();
                 string bin = Path.Combine(r.DshDir, "apps", "cli", "lib", "bin.js");
@@ -1651,23 +1665,40 @@ public static class DshCompatService
                         new[] { bin, "--profile", r.Profile, "--dump-config" }, r.DshDir, 180);
                 if (!res.HasValue)
                 {
-                        r.Add(DshCompatLevel.Warning, "补丁", "--dump-config 无法启动", "node 进程启动失败；跳过补丁目标检查");
+                        d.SpawnMessage = "node 进程启动失败；跳过补丁目标检查";
                         return d;
                 }
                 d.Ran = true;
                 d.ExitCode = res.Value.ExitCode;
                 d.StdOut = res.Value.StdOut ?? "";
                 d.StdErr = res.Value.StdErr ?? "";
+                if (d.ExitCode != 0)
+                {
+                        d.ExitFailureDetail = Tail(d.StdErr, 1200);
+                }
+                ParseDumpOutput(d);
+                return d;
+        }
+
+        /// <summary>把 DumpData 的结果落进 report（与拆分前 RunDumpConfig 对 report 的副作用一一对应）。</summary>
+        private static DumpData MergeDumpConfig(DshCompatReport r, DumpData d, Action<string>? log)
+        {
+                if (!d.Ran)
+                {
+                        if (d.SpawnMessage.Length > 0)
+                        {
+                                r.Add(DshCompatLevel.Warning, "补丁", "--dump-config 无法启动", d.SpawnMessage);
+                        }
+                        return d;
+                }
                 r.DumpConfigRan = true;
                 r.DumpConfigExitCode = d.ExitCode;
                 r.DumpConfigOk = d.ExitCode == 0;
                 if (d.ExitCode != 0)
                 {
-                        string tail = Tail(d.StdErr, 1200);
-                        r.DumpConfigErrors.Add(tail);
-                        r.Add(DshCompatLevel.Error, "补丁", "--dump-config 退出码 " + d.ExitCode, tail, false, "");
+                        r.DumpConfigErrors.Add(d.ExitFailureDetail);
+                        r.Add(DshCompatLevel.Error, "补丁", "--dump-config 退出码 " + d.ExitCode, d.ExitFailureDetail, false, "");
                 }
-                ParseDumpOutput(d);
                 return d;
         }
 
@@ -2398,7 +2429,9 @@ public static class DshCompatService
         }
 
         // ============================== 插件 peer / 解析 ==============================
-        public static void AuditPlugins(DshCompatReport r, Action<string>? log)
+        /// <summary>插件 peer 兼容审计。preloadedProbe: Audit 已并行预取的探针结果（null = 同步补跑）。
+        /// 仅内部调用；probe 数据类型是私有的，故本方法收为 internal。</summary>
+        internal static void AuditPlugins(DshCompatReport r, Action<string>? log, ProbeData? preloadedProbe = null)
         {
                 Dictionary<string, List<string>> exemptions = ReadExemptions(r.ProfileDir);
 
@@ -2464,7 +2497,29 @@ public static class DshCompatService
                 }
                 ScanStaleExemptions(r, exemptions);
 
-                MergeNodeProbe(r, log);
+                MergeNodeProbe(r, log, preloadedProbe);
+
+                // Registry 预热：冷缓存时逐个串行 npm view 是插件扫描的最大耗时点（每插件最长 25s×3 档回退）。
+                // 按两个汇总循环将来会查询的插件名并行预热缓存（并发上限 6），循环里的查询全部落在缓存上。
+                List<string> prefetch = new List<string>();
+                foreach (DshPluginInfo x in r.Plugins.Where((DshPluginInfo p) => p.Installed))
+                {
+                        bool fromRegistry = x.Spec.Length > 0
+                                && !x.Spec.StartsWith("file:", StringComparison.OrdinalIgnoreCase)
+                                && !x.Spec.StartsWith("link:", StringComparison.OrdinalIgnoreCase)
+                                && !x.Spec.StartsWith("workspace:", StringComparison.OrdinalIgnoreCase)
+                                && !Path.IsPathRooted(x.Spec);
+                        if (!fromRegistry)
+                        {
+                                continue;
+                        }
+                        bool hasDeadPeer = r.DeadPeerFixes.Any((DshDeadPeerFix f) => f.PluginName == x.Name);
+                        if ((x.Compatible == false && !x.Exempted && !hasDeadPeer) || x.Exempted)
+                        {
+                                prefetch.Add(x.Name);
+                        }
+                }
+                PrefetchRegistry(prefetch.Distinct(StringComparer.Ordinal).ToArray(), r.ProfileDir, log);
 
                 // 汇总不兼容插件：registry 依赖 → 可自动升级；本地/源码安装 → 只提示
                 foreach (DshPluginInfo info in r.Plugins.Where((DshPluginInfo x) => x.Installed && x.Compatible == false))
@@ -3002,13 +3057,46 @@ public static class DshCompatService
 
         // ============================== Node 探针（权威判定 + 解析） ==============================
 
-        private static void MergeNodeProbe(DshCompatReport r, Action<string>? log)
+        internal sealed class ProbePlugin
+        {
+                public string Name = "";
+                public bool Installed;
+                public string Dir = "";
+                public string Version = "";
+                public bool IsBundle;
+                public bool InBundles;
+                /// <summary>探针给出 compatible 字段时置位（三态：未给出 = 保持现状）。</summary>
+                public bool CompatibleSet;
+                public bool Compatible;
+                public bool Exempted;
+                public string Spec = "";
+                public Dictionary<string, string> PeerIssues = new(StringComparer.Ordinal);
+                public List<string> MissingSpecs = new();
+                public List<string> Errors = new();
+        }
+
+        /// <summary>探针子进程的纯数据结果（RunNodeProbeCore 产出，MergeNodeProbe 合并）。</summary>
+        internal sealed class ProbeData
+        {
+                /// <summary>进程跑完且 JSON 解析成功。</summary>
+                public bool Ran;
+                /// <summary>失败清单（生成时已按旧口径打好 Tail），合并时直接进 report.ProbeErrors。</summary>
+                public List<string> Failures = new();
+                /// <summary>探针脚本自己报的运行时错误（区别于进程失败）。</summary>
+                public List<string> Errors = new();
+                public string RuntimeVersion = "";
+                public List<ProbePlugin> Plugins = new();
+        }
+
+        /// <summary>跑插件探针子进程并解析成纯数据（不碰 report）。node 缺失/产物未编译返回 null。</summary>
+        private static ProbeData? RunNodeProbeCore(DshCompatReport r, Action<string>? log)
         {
                 string? node = ResolveNodeExe();
                 if (node == null || !r.BinBuilt)
                 {
-                        return;
+                        return null;
                 }
+                ProbeData d = new ProbeData();
                 // GUID 名: 固定名在写入与执行之间可被同用户进程改写(node 完整语义), 且并发实例会互踩
                 string script = Path.Combine(Path.GetTempPath(), "LlamaDSH_dsh_compat_probe_" + Guid.NewGuid().ToString("N") + ".mjs");
                 try
@@ -3017,8 +3105,8 @@ public static class DshCompatService
                 }
                 catch (Exception ex)
                 {
-                        r.ProbeErrors.Add("探针写入失败: " + ex.Message);
-                        return;
+                        d.Failures.Add("探针写入失败: " + ex.Message);
+                        return d;
                 }
                 (int ExitCode, string StdOut, string StdErr)? res;
                 try
@@ -3031,14 +3119,14 @@ public static class DshCompatService
                 }
                 if (!res.HasValue || res.Value.ExitCode != 0)
                 {
-                        r.ProbeErrors.Add(Tail(res?.StdErr ?? "node 启动失败", 800));
-                        return;
+                        d.Failures.Add(Tail(res?.StdErr ?? "node 启动失败", 800));
+                        return d;
                 }
                 string json = ExtractJson(res.Value.StdOut);
                 if (json.Length == 0)
                 {
-                        r.ProbeErrors.Add(Tail(res.Value.StdErr, 800));
-                        return;
+                        d.Failures.Add(Tail(res.Value.StdErr, 800));
+                        return d;
                 }
                 try
                 {
@@ -3049,7 +3137,7 @@ public static class DshCompatService
                                 string? s = rv.GetString();
                                 if (!string.IsNullOrWhiteSpace(s))
                                 {
-                                        r.DshVersion = s!;
+                                        d.RuntimeVersion = s!;
                                 }
                         }
                         if (root.TryGetProperty("errors", out JsonElement errs) && errs.ValueKind == JsonValueKind.Array)
@@ -3058,91 +3146,147 @@ public static class DshCompatService
                                 {
                                         if (e.ValueKind == JsonValueKind.String)
                                         {
-                                                r.ProbeErrors.Add(e.GetString() ?? "");
+                                                d.Errors.Add(e.GetString() ?? "");
                                         }
                                 }
                         }
-                        if (!root.TryGetProperty("plugins", out JsonElement plugins) || plugins.ValueKind != JsonValueKind.Array)
+                        if (root.TryGetProperty("plugins", out JsonElement plugins) && plugins.ValueKind == JsonValueKind.Array)
                         {
-                                return;
-                        }
-                        foreach (JsonElement p in plugins.EnumerateArray())
-                        {
-                                string name = p.TryGetProperty("name", out JsonElement ne) ? ne.GetString() ?? "" : "";
-                                if (name.Length == 0)
+                                foreach (JsonElement p in plugins.EnumerateArray())
                                 {
-                                        continue;
-                                }
-                                DshPluginInfo? info = r.Plugins.FirstOrDefault((DshPluginInfo x) => string.Equals(x.Name, name, StringComparison.Ordinal));
-                                if (info == null)
-                                {
-                                        info = new DshPluginInfo { Name = name };
-                                        r.Plugins.Add(info);
-                                }
-                                info.Installed = p.TryGetProperty("installed", out JsonElement ie) && ie.ValueKind == JsonValueKind.True;
-                                if (p.TryGetProperty("dir", out JsonElement de) && de.ValueKind == JsonValueKind.String)
-                                {
-                                        info.Dir = de.GetString() ?? info.Dir;
-                                }
-                                if (p.TryGetProperty("version", out JsonElement ve) && ve.ValueKind == JsonValueKind.String)
-                                {
-                                        info.Version = ve.GetString() ?? info.Version;
-                                }
-                                info.IsBundle = p.TryGetProperty("isBundle", out JsonElement be) && be.ValueKind == JsonValueKind.True;
-                                info.InBundles = p.TryGetProperty("inBundles", out JsonElement ib) && ib.ValueKind == JsonValueKind.True;
-                                if (p.TryGetProperty("compatible", out JsonElement ce))
-                                {
-                                        if (ce.ValueKind == JsonValueKind.True)
+                                        string name = p.TryGetProperty("name", out JsonElement ne) ? ne.GetString() ?? "" : "";
+                                        if (name.Length == 0)
                                         {
-                                                info.Compatible = true;
+                                                continue;
                                         }
-                                        else if (ce.ValueKind == JsonValueKind.False)
+                                        ProbePlugin info = new ProbePlugin { Name = name };
+                                        info.Installed = p.TryGetProperty("installed", out JsonElement ie) && ie.ValueKind == JsonValueKind.True;
+                                        if (p.TryGetProperty("dir", out JsonElement de) && de.ValueKind == JsonValueKind.String)
                                         {
-                                                info.Compatible = false;
+                                                info.Dir = de.GetString() ?? info.Dir;
                                         }
-                                }
-                                info.Exempted = p.TryGetProperty("exempted", out JsonElement ex) && ex.ValueKind == JsonValueKind.True;
-                                if (p.TryGetProperty("spec", out JsonElement sp) && sp.ValueKind == JsonValueKind.String)
-                                {
-                                        info.Spec = sp.GetString() ?? "";
-                                }
-                                info.PeerIssues.Clear();
-                                if (p.TryGetProperty("peers", out JsonElement pes) && pes.ValueKind == JsonValueKind.Object)
-                                {
-                                        foreach (JsonProperty kv in pes.EnumerateObject())
+                                        if (p.TryGetProperty("version", out JsonElement ve) && ve.ValueKind == JsonValueKind.String)
                                         {
-                                                info.PeerIssues[kv.Name] = kv.Value.ToString();
+                                                info.Version = ve.GetString() ?? info.Version;
                                         }
-                                }
-                                info.MissingSpecs.Clear();
-                                if (p.TryGetProperty("missing", out JsonElement miss) && miss.ValueKind == JsonValueKind.Array)
-                                {
-                                        foreach (JsonElement e in miss.EnumerateArray())
+                                        info.IsBundle = p.TryGetProperty("isBundle", out JsonElement be) && be.ValueKind == JsonValueKind.True;
+                                        info.InBundles = p.TryGetProperty("inBundles", out JsonElement ib) && ib.ValueKind == JsonValueKind.True;
+                                        if (p.TryGetProperty("compatible", out JsonElement ce))
                                         {
-                                                if (e.ValueKind == JsonValueKind.String && e.GetString() is string spec)
+                                                info.Compatible = ce.ValueKind == JsonValueKind.True;
+                                                info.CompatibleSet = true;
+                                        }
+                                        info.Exempted = p.TryGetProperty("exempted", out JsonElement ex) && ex.ValueKind == JsonValueKind.True;
+                                        if (p.TryGetProperty("spec", out JsonElement sp) && sp.ValueKind == JsonValueKind.String)
+                                        {
+                                                info.Spec = sp.GetString() ?? "";
+                                        }
+                                        if (p.TryGetProperty("peers", out JsonElement pes) && pes.ValueKind == JsonValueKind.Object)
+                                        {
+                                                foreach (JsonProperty kv in pes.EnumerateObject())
                                                 {
-                                                        info.MissingSpecs.Add(spec);
+                                                        info.PeerIssues[kv.Name] = kv.Value.ToString();
                                                 }
                                         }
-                                }
-                                if (p.TryGetProperty("errors", out JsonElement pe) && pe.ValueKind == JsonValueKind.Array)
-                                {
-                                        foreach (JsonElement e in pe.EnumerateArray())
+                                        if (p.TryGetProperty("missing", out JsonElement miss) && miss.ValueKind == JsonValueKind.Array)
                                         {
-                                                if (e.ValueKind == JsonValueKind.String)
+                                                foreach (JsonElement e in miss.EnumerateArray())
                                                 {
-                                                        info.Errors.Add(e.GetString() ?? "");
+                                                        if (e.ValueKind == JsonValueKind.String && e.GetString() is string spec)
+                                                        {
+                                                                info.MissingSpecs.Add(spec);
+                                                        }
                                                 }
                                         }
+                                        if (p.TryGetProperty("errors", out JsonElement pe) && pe.ValueKind == JsonValueKind.Array)
+                                        {
+                                                foreach (JsonElement e in pe.EnumerateArray())
+                                                {
+                                                        if (e.ValueKind == JsonValueKind.String)
+                                                        {
+                                                                info.Errors.Add(e.GetString() ?? "");
+                                                        }
+                                                }
+                                        }
+                                        d.Plugins.Add(info);
                                 }
                         }
-                        r.ProbeRan = true;
-                        log?.Invoke("[兼容] DSH 探针: 权威判定完成（runtime " + r.DshVersion + "）");
+                        d.Ran = true;
                 }
                 catch (Exception ex)
                 {
-                        r.ProbeErrors.Add("探针 JSON 解析失败: " + ex.Message);
+                        d.Failures.Add("探针 JSON 解析失败: " + ex.Message);
                 }
+                return d;
+        }
+
+        /// <summary>把探针结果合并进 report。pre=null 时同步跑一次（旧路径），并行化调用点传入预取数据。
+        /// 合并是原子的：解析中途失败不再留下半更新的 report（旧实现边解析边写 report）。</summary>
+        private static void MergeNodeProbe(DshCompatReport r, Action<string>? log, ProbeData? pre = null)
+        {
+                ProbeData? d = pre ?? RunNodeProbeCore(r, log);
+                if (d == null)
+                {
+                        return;
+                }
+                foreach (string f in d.Failures)
+                {
+                        r.ProbeErrors.Add(f);
+                }
+                if (!d.Ran)
+                {
+                        return;
+                }
+                if (!string.IsNullOrWhiteSpace(d.RuntimeVersion))
+                {
+                        r.DshVersion = d.RuntimeVersion;
+                }
+                foreach (ProbePlugin p in d.Plugins)
+                {
+                        DshPluginInfo? info = r.Plugins.FirstOrDefault((DshPluginInfo x) => string.Equals(x.Name, p.Name, StringComparison.Ordinal));
+                        if (info == null)
+                        {
+                                info = new DshPluginInfo { Name = p.Name };
+                                r.Plugins.Add(info);
+                        }
+                        info.Installed = p.Installed;
+                        if (p.Dir.Length > 0)
+                        {
+                                info.Dir = p.Dir;
+                        }
+                        if (p.Version.Length > 0)
+                        {
+                                info.Version = p.Version;
+                        }
+                        info.IsBundle = p.IsBundle;
+                        info.InBundles = p.InBundles;
+                        if (p.CompatibleSet)
+                        {
+                                info.Compatible = p.Compatible;
+                        }
+                        info.Exempted = p.Exempted;
+                        if (p.Spec.Length > 0)
+                        {
+                                info.Spec = p.Spec;
+                        }
+                        info.PeerIssues.Clear();
+                        foreach (KeyValuePair<string, string> kv in p.PeerIssues)
+                        {
+                                info.PeerIssues[kv.Key] = kv.Value;
+                        }
+                        info.MissingSpecs.Clear();
+                        foreach (string spec in p.MissingSpecs)
+                        {
+                                info.MissingSpecs.Add(spec);
+                        }
+                        info.Errors.Clear();
+                        foreach (string e in p.Errors)
+                        {
+                                info.Errors.Add(e);
+                        }
+                }
+                r.ProbeRan = true;
+                log?.Invoke("[兼容] DSH 探针: 权威判定完成（runtime " + r.DshVersion + "）");
         }
 
         private static string ExtractJson(string stdout)
@@ -3260,7 +3404,34 @@ process.stdout.write(JSON.stringify(out));
                 return (detected, relinked, removed, failed);
         }
 
+        /// <summary>修复互斥闸门：手动修复与 agent 修复（以及并发的多个 agent 调用）必须串行——
+        /// 备份/cordis.patch.yml/链接/junction 各步骤交错执行会互相踩同一 checkout。</summary>
+        private static readonly SemaphoreSlim RepairGate = new(1, 1);
+
+        /// <summary>对外入口：过修复闸门后执行 RepairCore。排队与超时都显式记录，不静默。</summary>
         public static DshCompatRepairResult Repair(string dshDir, string profile, DshCompatReport report, Action<string>? log = null)
+        {
+                if (!RepairGate.Wait(TimeSpan.FromSeconds(5)))
+                {
+                        log?.Invoke("[兼容修复] 另一个兼容修复正在进行，排队等待 ...");
+                        if (!RepairGate.Wait(TimeSpan.FromMinutes(20)))
+                        {
+                                DshCompatRepairResult r0 = new DshCompatRepairResult();
+                                r0.Messages.Add("修复超时: 已有兼容修复超过 20 分钟未结束，本次未执行");
+                                return r0;
+                        }
+                }
+                try
+                {
+                        return RepairCore(dshDir, profile, report, log);
+                }
+                finally
+                {
+                        RepairGate.Release();
+                }
+        }
+
+        private static DshCompatRepairResult RepairCore(string dshDir, string profile, DshCompatReport report, Action<string>? log)
         {
                 DshCompatRepairResult res = new DshCompatRepairResult();
                 string dir = string.IsNullOrWhiteSpace(dshDir) ? report.DshDir : dshDir.Trim().Trim('"');
@@ -3285,6 +3456,11 @@ process.stdout.write(JSON.stringify(out));
                         //    确认期间 DSH 自身/插件管理窗口可能已改动, 全部修复决策基于当前状态
                         log?.Invoke("[兼容修复] 重新审计以获取当前状态 ...");
                         DshCompatReport fresh = Audit(dir, prof, log, includeDumpConfig: true);
+                        // 结论基准戳: 修复决策与最终结论都锚定在这份重审上（版本/HEAD/时刻），
+                        // 报告被用户/agent 引用时可以对照是否已过期。
+                        res.Messages.Add("结论基准: 重审于 " + DateTime.Now.ToString("HH:mm:ss")
+                                + " · DSH " + fresh.DshVersion + " @ " + Short(fresh.Head)
+                                + " · 错误 " + fresh.ErrorCount + " · 可修复 " + fresh.RepairableCount);
 
                         // 1) bundle 激活表
                         if (fresh.ManifestRepairNeeded)
@@ -4553,6 +4729,60 @@ process.stdout.write(JSON.stringify(out));
         /// 直接查询 npm registry 的最新版与 peer/engines 门禁，避免市场 discovery 缓存过期
         /// 导致“明明有兼容新版却判定已是最新/升级无法解决”。查询失败返回 null（由调用方回退缓存）。
         /// </summary>
+        /// <summary>并行预热 registry 查询缓存（并发上限 6，总窗口 120s）：结果进 RegistryCache，
+        /// 后续逐插件查询全部落在缓存上。单插件查询失败静默——汇总循环里的串行查询会自己兜底。</summary>
+        private static void PrefetchRegistry(string[] names, string profileDir, Action<string>? log)
+        {
+                if (names.Length == 0)
+                {
+                        return;
+                }
+                int cold = 0;
+                lock (RegistryCacheLock)
+                {
+                        foreach (string n in names)
+                        {
+                                if (!RegistryCache.TryGetValue(n, out var hit)
+                                        || DateTime.UtcNow - hit.At >= (hit.Info == null ? TimeSpan.FromMinutes(2) : TimeSpan.FromMinutes(10)))
+                                {
+                                        cold++;
+                                }
+                        }
+                }
+                if (cold == 0)
+                {
+                        return;
+                }
+                log?.Invoke("[兼容] registry 预热: " + cold + "/" + names.Length + " 个插件并行查询 ...");
+                using SemaphoreSlim gate = new SemaphoreSlim(6, 6);
+                List<Task> tasks = new List<Task>();
+                foreach (string n in names)
+                {
+                        tasks.Add(Task.Run(delegate
+                        {
+                                gate.Wait();
+                                try
+                                {
+                                        QueryRegistryPackage(n, profileDir, 25);
+                                }
+                                catch
+                                {
+                                }
+                                finally
+                                {
+                                        gate.Release();
+                                }
+                        }));
+                }
+                try
+                {
+                        Task.WaitAll(tasks.ToArray(), TimeSpan.FromSeconds(120));
+                }
+                catch
+                {
+                }
+        }
+
         public static RegistryPackageInfo? QueryRegistryPackage(string name, string profileDir, int timeoutSec = 30, bool force = false)
         {
                 string key = name.Trim();
@@ -4879,29 +5109,54 @@ process.stdout.write(JSON.stringify(out));
         }
 
         /// <summary>
-        /// 轻量 JS 词法状态机: 判定 pos 处是否处于"代码"上下文(非字符串/模板/注释)。
-        /// 不识别正则字面量(已知局限), 但足以排除绝大多数字符串/注释里的同名片段误修。
+        /// 轻量 JS 词法状态机: 判定 pos 处是否处于"代码"上下文(非字符串/模板/注释/正则)。
+        /// 正则字面量用经典启发识别: '/' 出现在"表达式开始位置"(前一个非空白字符属于
+        /// ( , = : [ ! &amp; | ? { } ; + - * % ~ ^ &lt; &gt; 或行首)时视为正则开头, 其余按除法。
+        /// 除法前的 ) 标识符 数字 ] 都会正确落回除法; 启发仍可能个别误判, 但误判只会把
+        /// 正则里的字符当字符串边界——此前正则里的引号会把整段后续代码误标成字符串。
         /// </summary>
         private static bool IsInCodeAtContext(string text, int pos)
         {
-                bool sq = false, dq = false, bt = false, lineC = false, blockC = false;
+                static bool RegexAllowedAfter(char prev)
+                {
+                        return prev == '\0'
+                                || prev == '(' || prev == ',' || prev == '=' || prev == ':' || prev == '['
+                                || prev == '!' || prev == '&' || prev == '|' || prev == '?' || prev == '{'
+                                || prev == '}' || prev == ';' || prev == '+' || prev == '-' || prev == '*'
+                                || prev == '%' || prev == '~' || prev == '^' || prev == '<' || prev == '>';
+                }
+                bool sq = false, dq = false, bt = false, lineC = false, blockC = false, rx = false, rxClass = false;
+                char prev = '\0'; // 代码上下文里最近一个非空白字符
                 for (int i = 0; i < pos; i++)
                 {
                         char c = text[i];
                         char n = i + 1 < text.Length ? text[i + 1] : '\0';
                         if (lineC) { if (c == '\n') lineC = false; continue; }
                         if (blockC) { if (c == '*' && n == '/') { blockC = false; i++; } continue; }
+                        if (rx)
+                        {
+                                if (c == '\\') { i++; continue; }
+                                if (rxClass) { if (c == ']') rxClass = false; continue; }
+                                if (c == '[') { rxClass = true; continue; }
+                                if (c == '/') { rx = false; continue; }
+                                continue;
+                        }
                         if (sq) { if (c == '\\') { i++; continue; } if (c == '\'') sq = false; continue; }
                         if (dq) { if (c == '\\') { i++; continue; } if (c == '"') dq = false; continue; }
                         if (bt) { if (c == '\\') { i++; continue; } if (c == '`') bt = false; continue; }
                         if (c == '/' && n == '/') { lineC = true; i++; continue; }
                         if (c == '/' && n == '*') { blockC = true; i++; continue; }
+                        if (c == '/' && RegexAllowedAfter(prev)) { rx = true; continue; }
                         if (c == '\'') sq = true;
                         else if (c == '"') dq = true;
                         else if (c == '`') bt = true;
+                        if (!char.IsWhiteSpace(c))
+                        {
+                                prev = c;
+                        }
                 }
-                return !lineC && !blockC && !sq && !dq && !bt;
-        }
+                return !lineC && !blockC && !sq && !dq && !bt && !rx;
+            }
 
         /// <summary>入口文件运行时代码里是否直接访问了 ctx.&lt;服务&gt;(只认代码上下文的命中)。</summary>
         public static bool HasCtxServiceAccess(string text, string service)

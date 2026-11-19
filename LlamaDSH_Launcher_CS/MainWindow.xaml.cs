@@ -5583,6 +5583,20 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		catch (Exception ex)
 		{
 			LogError(ex, "重建后补丁校验");
+			// 收尾异常也要把界面从"重建中"解锁：重建监视计时器最长要 30 分钟才兜底放行
+			try
+			{
+				StopDshRebuildTimer();
+				BtnDshStart.IsEnabled = true;
+				BtnRebuildDsh.IsEnabled = true;
+				LblDshStatus.Text = "● 重建收尾异常";
+				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
+				Log("[DSH重建] 收尾异常已中止，按钮已恢复；可重新点「🔨 重建 DSH」或直接「▶ 启动 DSH」。");
+			}
+			catch (Exception ex2)
+			{
+				LogError(ex2, "重建后补丁校验(恢复 UI)");
+			}
 		}
 	}
 
@@ -11089,6 +11103,22 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		return AgentRunJob("dsh/compat/repair", delegate (Action<string> jl)
 		{
+			// 与手动链路同一守卫：DSH 运行中绝不写修复（桌面壳方式的 host 几乎常驻，改 node_modules/
+			// cordis.patch.yml 会打断运行中的 host）；同时查手动修复的进行中标记防两路交错。
+			// 并发窗口由 DshCompatService.Repair 的服务级闸门兜底。
+			bool dshUp = AgentUi<bool>(delegate
+			{
+				return IsDshRunning() || _dshCompatRunning;
+			}, 5000);
+			if (dshUp)
+			{
+				return JsonSerializer.Serialize(new Dictionary<string, object>
+				{
+					["ok"] = false,
+					["error"] = "dsh_running",
+					["msg"] = "DSH 正在运行（或另一个兼容修复在进行），拒绝写入修复。请先停止 DSH / 等当前修复完成。"
+				}, AgentApi.JsonOpts);
+			}
 			DshCompatReport report = DshCompatService.Audit(dir, profile, jl, false);
 			DshCompatRepairResult res = DshCompatService.Repair(dir, profile, report, jl);
 			return JsonSerializer.Serialize(new Dictionary<string, object>

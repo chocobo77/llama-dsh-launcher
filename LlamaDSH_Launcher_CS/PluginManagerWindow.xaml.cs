@@ -457,7 +457,11 @@ public partial class PluginManagerWindow : Window
 		{
 			return;
 		}
-		_busy = true;
+		if (BusyBlocked())
+		{
+			return;
+		}
+		SetBusy(true, "安装本地插件");
 		try
 		{
 			Log("[安装] 开始安装本地插件: " + source);
