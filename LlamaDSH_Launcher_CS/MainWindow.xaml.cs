@@ -173,6 +173,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 	/// <summary>界面方式=桌面壳时本面板拉起的壳进程（host 由壳自管，面板只负责拉起与停止）。</summary>
 	private Process? _dshShellProc;
 
+	/// <summary>桌面壳停止流程在途（FinishStopShellAsync 收尾中）：HealthCheck 的壳状态收敛此时不抢标签。</summary>
+	private bool _dshShellStopping;
+
 	// 启动前检查(残留锁/升级检测)进行中标记: 检查已移出 UI 线程, 期间再点按钮会并发两次
 	private bool _dshPrepareBusy;
 
@@ -5122,7 +5125,9 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		if (ShellUp())
 		{
 			Log("[桌面壳] Web 方式启动前先停止桌面壳（连带其 3090 host）");
-			StopDshShell();
+			_dshShellStopping = true;
+			_ = StopDshShell();
+			_ = FinishStopShellAsync(true, webPart: true, EffectiveDshDir());
 		}
 		try
 		{
@@ -6302,32 +6307,35 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 
 	private void StopDsh()
 	{
-		// 桌面壳与 Web host 都要清（在场才动手）：停止就是停止，不按界面方式挑对象
+		// 桌面壳与 Web host 都要清（在场才动手）：停止就是停止，不按界面方式挑对象。
+		// 壳的收尾在 FinishStopShellAsync 后台核对（3090 让位才报"已停止"，残留如实报停止失败）。
 		bool shellWasUp = ShellUp();
-		if (shellWasUp)
-		{
-			StopDshShell();
-		}
 		int? portOwner = ProcessHelper.FindProcessByPort(3080);
 		if (portOwner.HasValue && !ProcessHelper.LooksLikeDshProcess(portOwner.Value, EffectiveDshDir()))
 		{
 			// 3080 上的进程不是 DSH：既不该被停止，也不该成为提权 taskkill 的目标
 			portOwner = null;
 		}
-		if (!HasDsh() && !portOwner.HasValue)
+		bool webPart = HasDsh() || portOwner.HasValue;
+		if (shellWasUp)
+		{
+			_dshShellStopping = true;
+			bool acted = StopDshShell();
+			_ = FinishStopShellAsync(acted, webPart, EffectiveDshDir());
+		}
+		if (!webPart)
 		{
 			if (shellWasUp)
 			{
-				// 只有壳在跑：杀壳已连带 3090 host（kill-on-close 作业对象），直接收尾到已停止；
-				// 3090 端口残留由 HealthCheck 的壳状态收敛兜底复核。
-				BtnDshStart.IsEnabled = _dshRebuildTimer == null;
-				BtnDshStop.IsEnabled = false;
-				LblDshStatus.Text = "● 已停止";
-				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
-				Log("--- 桌面壳已停止 ---");
-				// agent 的 stop-dsh 在"只有壳在跑"时也会进到这里：没有 FinishStopDshAsync，
-				// 等待者必须在这里结算，否则 HTTP worker 会白等到自己的 35s 超时。
-				SettleStopWaiters(_dshStopSettled, true);
+				// 只有壳在跑：杀段已同步下发（含提权兜底），核对与 UI 回填在 FinishStopShellAsync；
+				// 停止结果不谎报——干净才翻回"已停止"。
+				StopDshVerifyLoop();
+				StopDshLogTailer();
+				BtnDshStart.IsEnabled = false;
+				BtnDshStop.IsEnabled = true;
+				LblDshStatus.Text = "● 停止中...";
+				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(240, 136, 62));
+				Log("--- 正在停止桌面壳（含其 3090 host）---");
 			}
 			return;
 		}
@@ -6461,7 +6469,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 				}
 				await Task.Delay(200);
 			}
-			bool stillAlive = ProcessHelper.FindProcessByPort(3080).HasValue || HasDsh() || IsProcessAlive(pid);
+			bool stillAlive = ProcessHelper.FindProcessByPort(3080).HasValue || HasDsh() || IsProcessAlive(pid) || ShellUp();
 			if (!stillAlive)
 			{
 				// 重建期间 StartDshRebuild 已锁住启动按钮，停止收尾任务不能把它重新打开。
@@ -6684,47 +6692,241 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			|| d.EndsWith(@"\dsh-desktop-tauri\src-tauri\target\debug");
 	}
 
-	/// <summary>停止桌面壳（若在运行）：杀壳进程树——host 挂进壳的 kill-on-close 作业对象，
-	/// 壳死则 3090 host 连带退出。面板拉起的壳之外按名兜底，覆盖「单实例转发后面板壳进程已退出」
-	/// 与外部入口（开机自启等）启动的壳；只认 IsOurShellPath 的合法落点。返回是否动过手。</summary>
+	/// <summary>按名收集桌面壳候选进程：MainModule 读不到时用 WMI 命令行兜底再验一次路径
+	/// （提权启动的进程两者都可能读不到，此时 verified=false，交给调用方结合 3090 指纹判断）。</summary>
+	private List<(int pid, string name, bool verified)> CollectShellCandidates(string? dshDir)
+	{
+		var found = new List<(int, string, bool)>();
+		foreach (string name in new[] { "dsh-desktop-tauri", "DSH" })
+		{
+			foreach (Process p in Process.GetProcessesByName(name))
+			{
+				try
+				{
+					string? path = null;
+					try
+					{
+						path = p.MainModule?.FileName;
+					}
+					catch
+					{
+						// 跨完整性级别读不到: 落到 WMI 命令行兜底
+					}
+					if (path == null)
+					{
+						path = ImagePathFromCommandLine(ProcessHelper.GetCommandLine(p.Id));
+					}
+					bool verified = path != null && IsOurShellPath(path, dshDir);
+					found.Add((p.Id, name, verified));
+				}
+				catch
+				{
+				}
+				finally
+				{
+					p.Dispose();
+				}
+			}
+		}
+		return found;
+	}
+
+	/// <summary>从命令行提取镜像路径（引号包裹取引号内，否则截到 .exe）；解析不出返回 null。</summary>
+	private static string? ImagePathFromCommandLine(string? cmd)
+	{
+		if (string.IsNullOrWhiteSpace(cmd))
+		{
+			return null;
+		}
+		string s = cmd.Trim();
+		if (s.StartsWith("\""))
+		{
+			int q = s.IndexOf('"', 1);
+			return q > 1 ? s.Substring(1, q - 1) : null;
+		}
+		int ex = s.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+		if (ex >= 0)
+		{
+			return s.Substring(0, ex + 4);
+		}
+		int sp2 = s.IndexOf(' ');
+		return sp2 > 0 ? s.Substring(0, sp2) : s;
+	}
+
+	/// <summary>UIPI 兜底：runas 静默提权 taskkill /F /T /PID。带启动时刻守卫（防 PID 复用），
+	/// 下发后短暂核对是否真的退出；用户拒绝 UAC 或核对失败返回 false。</summary>
+	private bool ElevatedTaskkill(int pid, string what)
+	{
+		DateTime? start = null;
+		try
+		{
+			using Process p = Process.GetProcessById(pid);
+			start = p.StartTime;
+		}
+		catch
+		{
+			return true; // 已退出，无需处理
+		}
+		try
+		{
+			Process.Start(new ProcessStartInfo
+			{
+				UseShellExecute = true,
+				Verb = "runas",
+				FileName = "taskkill.exe",
+				WindowStyle = ProcessWindowStyle.Hidden,
+				Arguments = "/F /T /PID " + pid
+			});
+			Log("--- " + what + " 进程普通停止无效（UIPI），已下发提权 taskkill pid=" + pid + " ---");
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, what + " 提权 taskkill 下发失败（用户拒绝 UAC 或其他）");
+			return false;
+		}
+		for (int i = 0; i < 10; i++)
+		{
+			try
+			{
+				using Process p2 = Process.GetProcessById(pid);
+				if (!IsAlive(p2) || (start.HasValue && p2.StartTime != start.Value))
+				{
+					return true;
+				}
+			}
+			catch
+			{
+				return true;
+			}
+			System.Threading.Thread.Sleep(200);
+		}
+		return false;
+	}
+
+	/// <summary>停止桌面壳（若在运行）的同步杀段：面板句柄 + 按名候选（路径可验证者）直接杀树；
+	/// 杀不动（提权壳对非提权启动器 AccessDenied）或读不到路径但 3090 有 DSH host 指纹的同名
+	/// 进程 → 下发提权 taskkill（UIPI）。host 挂在壳的 kill-on-close 作业对象上，壳死则连带退出；
+	/// 3090 是否真让位由 FinishStopShellAsync 后台核对。返回是否有动作。</summary>
 	private bool StopDshShell()
 	{
 		bool acted = false;
 		Process? sp = _dshShellProc;
 		if (sp != null && IsAlive(sp))
 		{
-			try
+			acted = true;
+			int pid = sp.Id;
+			if (ProcessHelper.KillProcessTree(pid))
 			{
-				ProcessHelper.KillProcessTree(sp.Id);
-				Log("[桌面壳] 已结束壳进程树 pid=" + sp.Id + "（其 3090 host 随作业对象一并退出）");
-				acted = true;
+				Log("[桌面壳] 已结束壳进程树 pid=" + pid + "（其 3090 host 随作业对象一并退出）");
 			}
-			catch (Exception ex)
+			else
 			{
-				LogError(ex, "停止桌面壳(面板拉起的进程)");
+				// KillProcessTree 曾经吞掉 AccessDenied: 不转提权就会谎报成功、壳和 3090 host 全泄漏
+				Log("[桌面壳] 壳进程树 pid=" + pid + " 常规杀树失败（疑似权限不足），转提权 taskkill", "WARN");
+				ElevatedTaskkill(pid, "桌面壳");
 			}
 		}
 		DisposeProc(ref _dshShellProc);
-		for (int round = 0; round < 4; round++)
+		string? dshDir = EffectiveDshDir();
+		foreach ((int pid, string name, bool verified) in CollectShellCandidates(dshDir))
 		{
-			int? other = FindOurShellProcessId();
-			if (!other.HasValue)
+			acted = true;
+			if (verified)
 			{
-				break;
+				if (ProcessHelper.KillProcessTree(pid))
+				{
+					Log("[桌面壳] 已结束外部壳进程树 pid=" + pid);
+				}
+				else
+				{
+					Log("[桌面壳] 外部壳 pid=" + pid + " 常规杀树失败（疑似权限不足），转提权 taskkill", "WARN");
+					ElevatedTaskkill(pid, "桌面壳");
+				}
+				continue;
 			}
-			try
+			// 同名但读不到路径（疑似提权启动的壳）：3090 有 DSH host 指纹才认定是我们的
+			bool hostFingerprint = DshIdentity.HttpFingerprint(3090) == true;
+			if (hostFingerprint)
 			{
-				ProcessHelper.KillProcessTree(other.Value);
-				Log("[桌面壳] 已结束外部启动的壳进程树 pid=" + other.Value);
-				acted = true;
+				Log("[桌面壳] 同名壳 pid=" + pid + " 读不到路径（疑似管理员权限启动），3090 有 DSH host——下发提权 taskkill", "WARN");
+				ElevatedTaskkill(pid, "桌面壳");
 			}
-			catch (Exception ex2)
+			else
 			{
-				LogError(ex2, "停止桌面壳(按名兜底)");
-				break;
+				Log("[桌面壳] 同名进程 pid=" + pid + " 无法验证身份且 3090 无 DSH host，未动", "WARN");
 			}
 		}
 		return acted;
+	}
+
+	/// <summary>壳停止的后台收尾：等按名候选清空 + 3090 让位（壳死则 host 随 kill-on-close 退出）；
+	/// 3090 残留且身份核验是 DSH host 的补杀（先常规后提权一次）。最终把结果回填 UI 并结算
+	/// agent 停止等待者；webPart=true 时 UI/等待者归 FinishStopDshAsync 管，这里只核对与补杀。
+	/// 杀不掉就不谎报——如实报「停止失败/仍在运行」。</summary>
+	private async Task FinishStopShellAsync(bool acted, bool webPart, string? dshDir)
+	{
+		bool clean = false;
+		try
+		{
+			bool escalatedOnce = false;
+			for (int i = 0; i < 50; i++) // ~15s
+			{
+				List<(int pid, string name, bool verified)> cands = CollectShellCandidates(dshDir);
+				int? owner3090 = ProcessHelper.FindProcessByPort(3090);
+				bool hostFingerprint = DshIdentity.HttpFingerprint(3090) == true;
+				// 残留只算"我们的东西"：可验证的壳候选；读不到路径但 3090 有 DSH 指纹的候选；
+				// 3090 上身份核验通过的 DSH host。无关同名进程/无关端口占用者不算，也不误报停止失败。
+				bool relevant = cands.Any(c => c.verified)
+					|| (hostFingerprint && cands.Any(c => !c.verified))
+					|| (owner3090.HasValue && ProcessHelper.LooksLikeDshProcess(owner3090.Value, dshDir, 3090));
+				if (!relevant)
+				{
+					clean = true;
+					break;
+				}
+				// 壳候选已清但 3090 仍被 DSH host 监听：作业对象没抓到的漏网，补杀
+				if (cands.Count == 0 && owner3090.HasValue
+					&& ProcessHelper.LooksLikeDshProcess(owner3090.Value, dshDir, 3090))
+				{
+					Log("[桌面壳] 壳已退出但 3090 host 仍在（pid=" + owner3090.Value + "），身份核验通过，补杀", "WARN");
+					if (!ProcessHelper.KillProcessTree(owner3090.Value) && !escalatedOnce)
+					{
+						escalatedOnce = true;
+						ElevatedTaskkill(owner3090.Value, "3090 DSH host");
+					}
+				}
+				await Task.Delay(300);
+			}
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "桌面壳停止收尾");
+		}
+		_ = Dispatcher.BeginInvoke((Action)(() =>
+		{
+			_dshShellStopping = false;
+			if (webPart || _dshProc != null || _dshTracker != null)
+			{
+				return; // Web 链路的 UI/等待者归 FinishStopDshAsync；用户已改启 Web 时不抢标签
+			}
+			if (clean)
+			{
+				BtnDshStart.IsEnabled = _dshRebuildTimer == null;
+				BtnDshStop.IsEnabled = false;
+				LblDshStatus.Text = "● 已停止";
+				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(139, 148, 158));
+				Log("--- 桌面壳已停止 ---");
+			}
+			else
+			{
+				BtnDshStart.IsEnabled = false;
+				BtnDshStop.IsEnabled = true;
+				LblDshStatus.Text = "● 停止失败/仍在运行";
+				LblDshStatus.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 54, 51));
+				Log("--- 桌面壳未在时限内干净退出（仍有壳进程或 3090 host），可再次点停止或手动结束 ---");
+			}
+			SettleStopWaiters(_dshStopSettled, clean);
+		}));
 	}
 
 	/// <summary>Web 方式就绪后自动弹一次系统浏览器（启动命令带 --no-open，由面板掌握这一次打开）。
@@ -9158,7 +9360,7 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		}
 		// 桌面壳状态收敛（仅当面板没有自己的 Web host 在场时）：壳进程与 3090 端口互证。
 		// 开机自启/手动双击等外部入口启动的壳也被接管显示；壳单独退出时恢复启动按钮。
-		if (_dshProc == null && _dshTracker == null)
+		if (_dshProc == null && _dshTracker == null && !_dshShellStopping)
 		{
 			bool shellUp = ShellUp();
 			// 精确相等(而非 Contains)：标签文本被任何 Web 流程覆写后这里自动失活, 不会误判

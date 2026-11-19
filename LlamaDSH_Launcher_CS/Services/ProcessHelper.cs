@@ -16,7 +16,7 @@ public static class ProcessHelper
 
 	private static readonly object _cmdCacheLock = new object();
 
-	public static void KillProcessTree(int pid, int timeoutMs = 3000)
+	public static bool KillProcessTree(int pid, int timeoutMs = 3000)
 	{
 		// Kill(entireProcessTree) 由内核按父子关系整树终止, 无"先收集后击杀"窗口——
 		// 旧 WMI 递归收集在收集与击杀之间子进程退出且 PID 被复用时, 会误杀无辜进程
@@ -24,10 +24,21 @@ public static class ProcessHelper
 		{
 			using Process p = Process.GetProcessById(pid);
 			p.Kill(entireProcessTree: true);
+			return true;
 		}
 		catch
 		{
-			// 进程已退出: 无需处理
+			// 进程已退出: 视作已清干净; 打不开句柄(提权进程 AccessDenied)返回 false,
+			// 让调用方走提权 taskkill 兜底——吞掉这个失败曾让"停止"谎报成功
+			try
+			{
+				using Process q = Process.GetProcessById(pid);
+				return !ProcLiveness.Alive(q);
+			}
+			catch
+			{
+				return true;
+			}
 		}
 	}
 
