@@ -6541,8 +6541,8 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 		ApplyDshFrontUiState();
 	}
 
-	/// <summary>回显与真实行为同源：管理员提权、启动模式(编译版/npx)只作用于 Web 方式的
-	/// 3080 host，壳的内核选择与提权由壳自己决定，壳方式下灰掉以免误导。</summary>
+	/// <summary>回显与真实行为同源：管理员提权、启动模式(编译版/npx)与「打开 Web」只作用于
+	/// Web 方式的 3080 host，壳的内核选择与提权由壳自己决定，壳方式下灰掉以免误导。</summary>
 	private void ApplyDshFrontUiState()
 	{
 		if (ChkDshAdmin != null && ComboDshMode != null)
@@ -6551,12 +6551,38 @@ public partial class MainWindow : Window, IComponentConnector, IParamState
 			ChkDshAdmin.IsEnabled = web;
 			ComboDshMode.IsEnabled = web;
 		}
+		if (BtnOpenDsh != null)
+		{
+			// 「打开 Web」只属于 Web 方式（可用性跟方式走，不跟运行态走：未运行时点开
+			// 浏览器得到连接失败页，也是有效的状态反馈）。
+			BtnOpenDsh.IsEnabled = !ShellFront;
+		}
 		if (InputDshDir != null && BtnSearchDsh != null)
 		{
 			// 壳方式同样需要 DSH 目录（定位壳 exe + 注入 DSH_REPO_ROOT），不因 npx 选项而锁死
 			bool isEnabled = ShellFront || ComboDshMode.SelectedIndex == 0;
 			InputDshDir.IsEnabled = isEnabled;
 			BtnSearchDsh.IsEnabled = isEnabled;
+		}
+	}
+
+	/// <summary>「🌐 打开 Web」：打开 Web 方式的 host 界面（3080）。host 未运行时浏览器
+	/// 显示连接失败页——如实反馈，不做拦截。</summary>
+	private void OpenDsh_Click(object s, RoutedEventArgs e)
+	{
+		string url = "http://127.0.0.1:3080";
+		Log("Open:" + url);
+		try
+		{
+			Process.Start(new ProcessStartInfo(url)
+			{
+				UseShellExecute = true
+			});
+		}
+		catch (Exception ex)
+		{
+			LogError(ex, "打开 Web 失败");
+			ShowNotice("打开 Web 失败: " + ex.Message, isError: true);
 		}
 	}
 

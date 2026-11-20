@@ -365,6 +365,7 @@
                 <ComboBoxItem Content="🖥 桌面壳" IsSelected="True" />
                 <ComboBoxItem Content="🌐 Web" />
               </local:NoScrollComboBox>
+              <Button Name="BtnOpenDsh" Content="🌐 打开 Web" Height="30" Width="122" FontSize="12" Margin="0,0,10,0" HorizontalAlignment="Left" Click="OpenDsh_Click" ToolTip="打开 DSH Web 界面（http://127.0.0.1:3080）。仅 Web 方式下可用；Web host 就绪后也会自动打开一次。若 host 未在运行，浏览器会显示无法连接。" />
               <Button Name="BtnRebuildDsh" Content="🔨 重建 DSH" Height="30" Width="122" FontSize="12" Margin="0,0,10,0" HorizontalAlignment="Left" Click="RebuildDsh_Click" ToolTip="全量重建 DSH 编译产物 (pnpm clean + build:lib + vite)。若 DSH 正在运行会先停止；重建完成后自动做兼容性检查并按所选界面方式启动。" />
             </StackPanel>
           </Grid>
